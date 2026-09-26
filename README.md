@@ -2,7 +2,7 @@
 
 `skynet-flywow` 是面向商业游戏项目的模块化 Skynet Server 基础框架。它沉淀多个项目都能复用的基础能力，不承载某个游戏的 Battle、SLG 规则或业务数据。
 
-当前处于初始化阶段。仓库先固定工程原则、模块准入规则、接入合同和 P0 编码规范；第一个模块将在学习项目形成真实、经过测试的实现后迁入。这里不会用空目录和占位接口伪装框架完整度。
+Gateway 模块已从学习项目形成真实调用者和可运行实现，当前提供 TCP 与 Skynet 内置 WebSocket transport、构建期协议 registry、统一错误/告警和资源上限。协议 registry 生成器归框架所有，业务仓库只维护 `.proto` 并在构建时调用 FlyWow 工具。其它模块仍按真实调用者和独立测试逐步进入；不会用空目录和占位接口伪装框架完整度。
 
 ## 目标
 
@@ -48,6 +48,7 @@ Service 启停、依赖注入和健康检查
 - [演进路线](docs/ROADMAP.md)
 - [工程决策](docs/ENGINEERING_DECISIONS.md)
 - [P0 编码规范 Skill](.agents/skills/skynet-flywow-coding-standard/SKILL.md)
+- [Gateway 模块接入与合同](docs/gateway/README.md)
 
 ## 开发规则
 

@@ -30,6 +30,13 @@
 - 所有资源增长有上限，过载、超时、重试和关闭行为显式。
 - 公开协议、配置、资产和持久状态有版本以及兼容/迁移/回滚策略。
 
+## Gateway 协议生成边界
+
+- `.proto` 是宿主项目维护的唯一协议源；`tools/generate_gateway_registry.py` 是 FlyWow 框架实现，业务仓库不得复制。
+- `*_registry.lua` 是构建生成物，运行时只加载生成结果，不在 Service 启动时解析 `.proto`。
+- 宿主通过 `FLYWOW_ROOT` 或固定 vendored framework 调用生成器；宿主的 `run_server.sh` 只做 orchestration 和输出路径选择。
+- `config/gateway.lua` 是宿主默认配置；Gateway Service 只要求显式注入业务 handler handle，特殊部署才覆盖 transport、协议 bundle 或资源上限。
+
 ## 不提前造框架
 
 模块只有在出现真实调用者、实现已运行、成功与失败路径都有测试后，才从学习项目整理进入本仓库。不得提前创建空 Service、占位 interface、未来 DTO 或最终目录树。
