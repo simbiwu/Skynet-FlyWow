@@ -16,7 +16,10 @@ Skynet-FlyWow 使用独立 Git 仓库。课程项目是实现和教学来源之�
 
 `.agents/skills/skynet-flywow-coding-standard/SKILL.md` 是实现和评审的强制门槛。源码注释与工程文档使用中文，注释描述领域合同、ownership、失败、yield/I/O 和不变量，不只翻译语法。
 
-## D005 - 发布和许可证暂缓
+## D005 - 远端已确定，发布和许可证暂缓
 
-远端地址、许可证、首个固定 Skynet/Lua 版本和模块发布载体由用户后续确认。初始化阶段不得擅自假设开源、Push 或建立不兼容承诺。
+远端固定为 `https://github.com/simbiwu/Skynet-FlyWow.git`。许可证、首个固定 Skynet/Lua 版本和模块发布载体由用户后续确认；不得因为仓库公开就擅自假设开源许可、创建 Release 或建立不兼容承诺。
 
+## D006 - UTF-8、LF 与自动质量门禁
+
+源码注释和文档使用中文，需要跨 Windows、WSL 和 Linux Runner 保持稳定编码与 diff。仓库通过 `.editorconfig`、`.gitattributes`、自检工具及 GitHub CI 固定 UTF-8、LF、末尾换行、必要文档和 Skill 合同。该门禁只覆盖仓库基线，不能代替模块 build、运行或集成测试。

@@ -1,0 +1,16 @@
+# 职责：固定仓库文本换行为 LF，并阻止 Git 对未来二进制资产做文本转换。
+# 边界：Git 存储与 checkout；不参与运行时，也不决定源码字符编码。
+# 输入/输出：工作区文件 -> 规范化后的 Git blob 与可预测 diff。
+# 生命周期：Git add/checkout 时生效；新增二进制类型时必须同步补充。
+# 不负责：不格式化内容，不识别尚未列出的专有二进制格式。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.so binary
+*.a binary
+*.zip binary
+

@@ -27,3 +27,6 @@ Thumbs.db
 *.gcda
 *.gcno
 
+# Python-based repository tooling
+__pycache__/
+*.py[cod]

@@ -75,4 +75,15 @@
 -> 版本与发布
 ```
 
-没有用户明确的“开始、修改、执行、更新、同步”等指令时，只讨论，不修改文件。远端地址由用户稍后提供；在此之前不得 Push。不要自行选择开源许可证。
+## 当前质量门禁
+
+任何提交前至少运行：
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+python3 scripts/ci/check_repository.py
+```
+
+具体模块进入仓库时，必须在同一次变更中增加自己的 build、运行、成功/边界/失败测试。通用仓库检查不能替代模块验证。
+
+没有用户明确的“开始、修改、执行、更新、同步”等指令时，只讨论，不修改文件。`origin` 固定为 `https://github.com/simbiwu/Skynet-FlyWow.git`；只有用户明确要求提交或同步时才 Push。不要自行选择开源许可证。

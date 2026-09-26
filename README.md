@@ -43,11 +43,19 @@ Service 启停、依赖注入和健康检查
 - [工程架构](docs/ARCHITECTURE.md)
 - [模块准入与完成标准](docs/MODULE_STANDARD.md)
 - [商业项目接入原则](docs/ADOPTION.md)
+- [质量门禁](docs/QUALITY_GATES.md)
+- [版本与兼容策略](docs/VERSIONING.md)
 - [演进路线](docs/ROADMAP.md)
 - [工程决策](docs/ENGINEERING_DECISIONS.md)
 - [P0 编码规范 Skill](.agents/skills/skynet-flywow-coding-standard/SKILL.md)
 
 ## 开发规则
 
-所有实现和评审必须先遵守根目录 `AGENTS.md`，并加载 `skynet-flywow-coding-standard` Skill。远端仓库、许可证和首个可发布版本在后续明确；初始化阶段不 Push，也不假设开源许可证。
+所有实现和评审必须先遵守根目录 `AGENTS.md`，并加载 `skynet-flywow-coding-standard` Skill。远端固定为 `https://github.com/simbiwu/Skynet-FlyWow.git`；许可证和首个可发布版本在后续明确，不因仓库公开而自动假设开源许可证。
 
+当前仓库基线验证：
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+python3 scripts/ci/check_repository.py
+```

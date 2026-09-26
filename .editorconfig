@@ -1,0 +1,24 @@
+# 职责：统一不同编辑器写入 Skynet-FlyWow 文本文件时的编码、换行和基础缩进。
+# 边界：仓库开发配置；不参与 Server Runtime，也不替代语言格式化与静态检查。
+# 输入/输出：编辑器读取本文件 -> 以 UTF-8、LF 和文件末尾换行保存受支持文本。
+# 生命周期：克隆仓库后持续生效；具体支持程度由编辑器及其插件决定。
+# 不负责：不修改已经提交的文件，不定义 Lua/C/C++ 的全部排版规则。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{lua,py,sh,yml,yaml,proto}]
+indent_style = space
+indent_size = 4
+
+[*.{c,cc,cpp,cxx,h,hh,hpp,hxx}]
+indent_style = space
+indent_size = 4
+
+[*.md]
+trim_trailing_whitespace = false
+

@@ -1,0 +1,34 @@
+# 职责：在 Pull Request 和 main 提交上执行仓库结构、编码、文档与自检工具测试。
+# 边界：GitHub CI；只读检出内容，不发布版本、不访问商业项目或生产环境。
+# 输入/输出：提交内容 -> 可重复的通过/失败状态与中文错误信息。
+# 生命周期：push/PR 时在 GitHub 托管 Linux Runner 中运行，单次最长五分钟。
+# 不负责：不代表具体模块的 build、集成、性能、安全或故障演练已经完成。
+name: quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 检出源码
+        # 固定 actions/checkout v7.0.1 的 commit，避免可变 tag 静默改变 CI 行为。
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: 运行仓库自检工具测试
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - name: 检查仓库合同
+        run: python3 scripts/ci/check_repository.py
+
