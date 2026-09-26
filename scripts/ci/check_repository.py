@@ -68,6 +68,8 @@ def check_text_content(path: Path, content: bytes) -> list[str]:
         errors.append(f"{path}: 必须使用 LF，不能包含 CR/CRLF")
     if content and not content.endswith(b"\n"):
         errors.append(f"{path}: 文件末尾缺少换行")
+    if content.endswith(b"\n\n"):
+        errors.append(f"{path}: 文件末尾存在多余空白行")
     try:
         content.decode("utf-8")
     except UnicodeDecodeError as exception:
@@ -186,4 +188,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -31,4 +31,3 @@ jobs:
 
       - name: 检查仓库合同
         run: python3 scripts/ci/check_repository.py
-

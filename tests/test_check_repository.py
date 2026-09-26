@@ -43,6 +43,12 @@ class CheckTextContentTests(unittest.TestCase):
         errors = CHECKER.check_text_content(Path("demo.md"), b"\xff\n")
         self.assertTrue(any("UTF-8" in error for error in errors))
 
+    def test_rejects_extra_blank_line_at_eof(self) -> None:
+        """末尾两个换行表示多余空白行，必须失败以保持稳定 diff。"""
+
+        errors = CHECKER.check_text_content(Path("demo.md"), "中文\n\n".encode("utf-8"))
+        self.assertTrue(any("多余空白行" in error for error in errors))
+
 
 class CheckMarkdownTests(unittest.TestCase):
     """验证中文文档和代码围栏的最低结构合同。"""
@@ -68,4 +74,3 @@ class CheckMarkdownTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
