@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skynet-FlyWow 编码规范"
+  short_description: "按 P0 商业级编码和注释规范实现或评审 Skynet-FlyWow"
+  default_prompt: "使用 $skynet-flywow-coding-standard 实现或评审这项 Skynet-FlyWow 修改。"

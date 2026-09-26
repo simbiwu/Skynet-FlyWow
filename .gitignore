@@ -1,0 +1,29 @@
+# Build and runtime output
+build/
+bin/
+logs/
+tmp/
+*.log
+*.pid
+*.core
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+config/local/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Native compilation
+*.o
+*.a
+*.so
+*.d
+*.gcda
+*.gcno
+
