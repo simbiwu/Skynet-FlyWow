@@ -37,3 +37,21 @@
 - 升级 diff 清晰；
 - 不允许宿主静默修改框架源码；
 - 支持紧急修复、回滚和多项目兼容窗口。
+
+## 6. 地图与战斗接入
+
+宿主如果只需要地图和寻路，可以不接入 Gateway；如果只需要 Gateway，也不被地图模块强制依赖。宿主 composition root 选择 space_type、地图版本、寻路 profile 和 Battle Service，并把业务 DTO 转换成框架 request/result record。
+
+俯视角 2D 的 H5 项目可以复用 2.5D 项目的地图查询、Grid A*、动态占位、确定性 BattleWorker 和 Replay 合同；差异放在离线资产导入和客户端 Adapter。横版平台游戏需要额外的运动模型，不应直接声明为已有 2D 支持。
+
+每个资产发布包至少包含：
+
+```text
+map_id
+map_version
+space_type
+coordinate/projection metadata
+content hash
+```
+
+Server 只消费已发布资产，不读取 Unity、Tiled、H5 或构建机的绝对路径。

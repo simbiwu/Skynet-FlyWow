@@ -38,6 +38,18 @@ Service 启停、依赖注入和健康检查
 
 模块之间保持单向依赖。网络模块不依赖地图，地图模块不依赖网络；业务工程通过 composition root 选择并连接模块。
 
+地图、寻路和战斗能力也遵守这个边界。FlyWow 可以逐步接入静态地图加载、导航查询和确定性战斗，但这些模块不读取客户端工程目录，不依赖 Gateway，也不携带 Battle/SLG 业务对象。
+
+框架从现在起保留两类真实地图空间：
+
+```text
+2.5D ground：X/Z Grid 与地表高度
+top-down 2D：二维逻辑平面，可固定高度或不带高度
+side-view 2D：重力、跳跃和平台层，属于不同运动模型
+```
+
+宿主通过地图资产 manifest、寻路 profile 和客户端 Adapter 选择实际空间。Unity BMAP、H5/Tiled/JSON 等来源由离线工具转换，运行时只消费固定版本和内容 hash。
+
 ## 当前文档
 
 - [工程架构](docs/ARCHITECTURE.md)

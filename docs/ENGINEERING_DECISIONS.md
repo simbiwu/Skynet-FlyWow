@@ -23,3 +23,11 @@ Skynet-FlyWow 使用独立 Git 仓库。课程项目是实现和教学来源之�
 ## D006 - UTF-8、LF 与自动质量门禁
 
 源码注释和文档使用中文，需要跨 Windows、WSL 和 Linux Runner 保持稳定编码与 diff。仓库通过 `.editorconfig`、`.gitattributes`、自检工具及 GitHub CI 固定 UTF-8、LF、末尾换行、必要文档和 Skill 合同。该门禁只覆盖仓库基线，不能代替模块 build、运行或集成测试。
+## D007 - 地图、寻路与战斗模块保持空间中立
+
+
+FlyWow 后续可以承载静态地图、导航查询和确定性战斗，但不把任何游戏的 Battle/SLG DTO 放进框架。公共合同使用整数世界/逻辑坐标、地图 ID、版本和内容 hash；manifest 声明空间类型、坐标轴、原点、Cell 尺寸和资产格式版本。
+
+当前真实调用者是 2.5D Ground Grid。未来 H5 俯视角 2D 可以复用 Grid A*、动态占位、BattleWorker 和 Replay，Unity 与 H5 只替换离线资产导入器及表现层 Adapter。横版平台的重力、跳跃和多层平台是不同运动模型，必须有独立实现和测试。
+
+网络、地图、寻路和战斗模块形成单向依赖：Gateway 不依赖地图，地图/寻路不依赖网络，战斗核心不依赖客户端协议。只有第二个真实消费者或第二种空间实现出现后，才从共同调用面提取公开扩展点，不提前创建空接口。
