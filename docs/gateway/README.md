@@ -69,6 +69,12 @@ skynet.retpack({
 
 Gateway 不把 `fd` 传给业务。业务看到的是 `connection_id`、`peer`、`transport`、`request_id`、`command_id`、`command` 和已解码 `request`。
 
+## 多实例与端口
+
+每个 flywow_gateway Service 都拥有独立 Lua State、监听 fd、连接表、协议 codec 和生命周期。需要监听多个端口时，宿主只需创建多个 Gateway Service，并为每个实例传入不同的 port；可以让它们共享同一个业务 handler，也可以注入不同的 handler。
+
+多实例启动时，分别调用 start 并保存每个 Service handle。每个实例的 config.gateway 仍提供默认值，start 只覆盖当前实例的顶层字段。停服时分别调用 stop。不能让多个实例共享连接表、监听 fd 或可变配置，也不能使用全局服务名隐藏这些依赖。
+
 ## 协议生成
 
 RPC 前的注释声明 command id：
