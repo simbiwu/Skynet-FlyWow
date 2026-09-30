@@ -119,6 +119,8 @@ require "http.websocket"
 
 Skynet 负责 Upgrade、mask、fragment、ping/pong 和 close frame。FlyWow 只接收 binary message，并复用同一套 Envelope/registry/handler。文本消息拒绝，协议错误关闭连接并产生 error 事件。
 
+当前公开合同只提供 `ws`。TLS 由宿主前置终止；Gateway 不使用 Skynet `wss` 的默认证书路径，也不把未实现的证书注入、轮换和失败回滚包装成已交付能力。
+
 ## error 与 warning
 
 Gateway 统一记录并可选投递 `observer_service`：

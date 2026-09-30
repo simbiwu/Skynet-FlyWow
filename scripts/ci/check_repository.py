@@ -38,6 +38,7 @@ TEXT_NAMES = {".editorconfig", ".gitattributes", ".gitignore", "CMakeLists.txt",
 CHINESE_PATTERN = re.compile(r"[\u3400-\u9fff]")
 
 
+# 只扫描维护者可读的源码和工程说明；排除 .git 与二进制资产。
 def iter_text_files(root: Path) -> Iterable[Path]:
     """枚举仓库内受文本合同约束的文件。
 
@@ -153,7 +154,11 @@ def check_repository(root: Path) -> list[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    """解析只读检查入口参数；不访问文件系统、不分配无界数据、不 yield。"""
+    """解析仓库级检查的命令行参数。
+
+    --root 可指定待检查仓库目录；缺省值由脚本路径定位，不依赖当前工作目录。
+    返回 argparse.Namespace；参数错误由 argparse 打印并以非零退出。本函数不读写文件、不 yield。
+    """
 
     parser = argparse.ArgumentParser(description="检查 Skynet-FlyWow 仓库基础合同")
     parser.add_argument(
@@ -168,8 +173,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     """执行命令行检查并把所有失败一次性报告给开发者。
 
-    返回：0 表示全部静态合同通过，1 表示至少一项失败。
-    I/O：读取仓库并写 stdout/stderr；不修改文件、不联网、不 yield。
+    无位置参数；--root 指定仓库根目录，未指定时使用脚本所在仓库。返回 0 表示通过、1 表示失败。
+    读取受控文本文件并写 stdout/stderr；不修改文件、不联网、不 yield。
     """
 
     root = parse_args().root.resolve()

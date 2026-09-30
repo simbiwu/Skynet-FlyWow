@@ -13,10 +13,10 @@ local function assert_command_id(value)
            "gateway command id must be an integer in [1, 0xffffffff]")
 end
 
--- 加载生成 registry，并拒绝重复 command、缺失类型名和非法 Envelope 配置。
--- 参数 definitions：包含 envelope_type 与 commands 的生成 table；所有权在调用方，函数只读。
--- 返回值：独立索引 table；调用方拥有返回值，后续不得修改。
--- 失败：结构、类型名或 command id 非法时抛出异常；不执行 I/O、yield 或分配外部资源。
+-- 加载构建期生成的 registry，并拒绝重复 command、缺失类型名和非法 Envelope 配置。
+-- definitions.envelope_type 是完整 Protobuf 类型名；commands 以 uint32 command id 为键，值含 name/request_type/response_type；输入归调用方且只读。
+-- 返回独立索引，调用方拥有并应视为只读；空 commands、重复 id、字段缺失或格式错误时抛异常。
+-- 仅分配与 command 数量成正比的 Lua table；不执行 I/O、yield 或外部资源分配。
 function M.load(definitions)
     assert(type(definitions) == "table", "gateway registry must be a table")
     assert(type(definitions.envelope_type) == "string" and definitions.envelope_type ~= "",
@@ -52,9 +52,9 @@ function M.load(definitions)
     }
 end
 
--- 根据 Envelope command 查找生成的 request/response 类型。
--- 参数 registry：M.load 返回的只读索引；command_id：Envelope uint32 command。
--- 返回值：命令定义或 nil；不执行 I/O、yield 或修改 registry。
+-- 根据 Envelope 中的 uint32 command 查找 request/response 类型定义。
+-- registry 是 M.load 返回且由调用方持有的只读索引；command_id 合法范围为 1..0xffffffff。
+-- 返回只读定义；未知 id 返回 nil。O(1) table 查询，不执行 I/O、yield 或修改 registry。
 function M.find(registry, command_id)
     return registry.by_id[command_id]
 end

@@ -31,21 +31,24 @@ function M.new(options)
 
     local codec = {}
 
-    -- 解码一条完整 Envelope；bytes 所有权属于本次调用，返回 table 由当前 Service 拥有。
-    -- 失败：Protobuf bytes 非法时抛错；不执行 I/O、yield 或跨 Service 调用。
+    -- 解码一条完整 Envelope；payload 是 framing 后的 Protobuf bytes，由调用方借用且本函数不保留。
+    -- 返回新 Lua table，由当前 Service 拥有；payload 格式错误或类型不匹配时抛错。
+    -- 不执行 I/O、yield 或跨 Service 调用。
     function codec.decode_envelope(payload)
         return assert(pb.decode(options.registry.envelope_type, payload))
     end
 
-    -- 根据 command definition 解码 body；body 是 Envelope 内部 bytes，不保存 borrowed buffer。
-    -- 失败：command 类型缺失或 body 非法时抛错。
+    -- 根据已校验 registry definition 解码 Envelope.body；body 是单条 request 的 Protobuf bytes。
+    -- definition 由同一 codec 的 registry 提供且只读；body 由调用方借用，本函数不保存 borrowed buffer。
+    -- 返回当前 Service 拥有的新 request table；消息类型缺失或 body 非法时抛错，不执行 I/O/yield。
     function codec.decode_request(definition, body)
         return assert(pb.decode(definition.request_type, body))
     end
 
-    -- 将业务 response 编码为 registry 指定的 response message，再封装为 Envelope。
-    -- 参数 definition：M.registry.find 返回的只读定义；request_id/version：Envelope 元数据。
-    -- 返回值：新 Lua string；失败时抛错；不执行 I/O、yield 或修改业务 response。
+    -- 将业务 response 编码为 registry 指定的 response message，再封装为完整 Envelope。
+    -- definition 是只读 command 定义；request_id 原样关联请求；version 是已协商的协议版本整数。
+    -- response 是 handler 返回的业务 table，调用方拥有且本函数只读。返回新 Lua bytes string；
+    -- Protobuf 编码失败时抛错；不执行 I/O、yield 或修改业务 response。
     function codec.encode_response(definition, request_id, version, response)
         local body = assert(pb.encode(definition.response_type, response))
         return assert(pb.encode(options.registry.envelope_type, {

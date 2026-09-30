@@ -45,6 +45,17 @@ local function merge_config(defaults, overrides)
     return merged
 end
 
+-- 把配置项校验为有界整数，避免字符串数字、小数或 NaN 进入端口和资源上限。
+-- value 是候选数值，name 仅用于错误诊断，minimum/maximum 是含端点的合法范围；参数只读。
+-- 返回 Lua integer；类型不符或越界时抛错。不执行 I/O、分配外部资源或 yield。
+local function require_integer(value, name, minimum, maximum)
+    assert(type(value) == "number" and math.type(value) == "integer",
+           name .. " must be an integer")
+    assert(value >= minimum and value <= maximum,
+           name .. " must be in [" .. minimum .. ", " .. maximum .. "]")
+    return value
+end
+
 -- 校验并复制 start 配置，避免运行过程中读取宿主可能修改的 table。
 -- 参数 input：可省略的启动覆盖 table；业务通常只传 handler_service，其他字段来自 config.gateway。
 -- 返回值：当前 Service 私有的不可再变更配置；失败抛错，不执行 I/O、yield 或启动资源。
@@ -53,40 +64,49 @@ local function normalize_config(input)
     local transport = merged.transport or "tcp"
     assert(transport == "tcp" or transport == "websocket", "unsupported gateway transport: " .. tostring(transport))
     if transport == "websocket" then
-        assert(merged.websocket_protocol == nil or merged.websocket_protocol == "ws" or merged.websocket_protocol == "wss",
-               "websocket_protocol must be ws or wss")
+        -- pinned Skynet 的 wss server 会从进程环境/当前目录隐式读证书。
+        -- 当前合同没有 TLS 证书注入和轮换能力，因此明确只允许 ws。
+        assert(merged.websocket_protocol == nil or merged.websocket_protocol == "ws",
+               "websocket_protocol currently supports ws only; terminate TLS outside Gateway")
     end
-    local max_frame_bytes = merged.max_frame_bytes or 65535
-    assert(max_frame_bytes >= 1 and max_frame_bytes <= 0xffff, "max_frame_bytes must fit the TCP Envelope uint16")
-    assert(max_frame_bytes <= 256 * 1024, "WebSocket transport is limited by pinned Skynet http.websocket")
-    local max_clients = merged.max_clients or 1024
-    local warning_kb = merged.write_warning_close_kb or 1024
-    assert(max_clients >= 1 and warning_kb >= 1, "gateway resource limits must be positive")
-    assert(tonumber(merged.port) and merged.port >= 1 and merged.port <= 65535, "port must be in [1, 65535]")
-    assert(merged.backlog == nil or (merged.backlog >= 1 and merged.backlog <= 65535), "backlog must be positive")
-    assert(merged.handler_service and merged.handler_service > 0, "handler_service is required")
+    local max_frame_bytes = require_integer(merged.max_frame_bytes or 65535,
+                                            "max_frame_bytes", 1, 0xffff)
+    local max_clients = require_integer(merged.max_clients or 1024,
+                                        "max_clients", 1, 1000000)
+    local warning_kb = require_integer(merged.write_warning_close_kb or 1024,
+                                       "write_warning_close_kb", 1, 0x7fffffff)
+    local port = require_integer(merged.port, "port", 1, 65535)
+    local backlog = require_integer(merged.backlog or 128, "backlog", 1, 65535)
+    local protocol_version = require_integer(merged.protocol_version,
+                                             "protocol_version", 1, 0xffffffff)
+    local handler_service = require_integer(merged.handler_service,
+                                            "handler_service", 1, math.maxinteger)
+    local observer_service = merged.observer_service
+    if observer_service ~= nil then
+        observer_service = require_integer(observer_service, "observer_service", 1, math.maxinteger)
+    end
     assert(type(merged.descriptor_path) == "string" and merged.descriptor_path ~= "", "descriptor_path is required")
     assert(type(merged.registry_module) == "string" and merged.registry_module ~= "", "registry_module is required")
     return {
         host = merged.host or "127.0.0.1", -- 监听地址；只影响当前 Gateway。
-        port = assert(tonumber(merged.port), "port is required"), -- TCP/WS 监听端口，1..65535。
-        backlog = merged.backlog or 128, -- OS accept backlog，不等于 max_clients。
+        port = port, -- TCP/WS 监听端口，1..65535。
+        backlog = backlog, -- OS accept backlog，不等于 max_clients。
         transport = transport, -- tcp 或 websocket；运行期不可切换。
-        websocket_protocol = merged.websocket_protocol or "ws", -- websocket 时为 ws/wss。
-        handler_service = merged.handler_service, -- 已创建的业务 Service handle；不通过全局名字发现。
-        observer_service = merged.observer_service, -- 可选观测 Service handle；只接收异步事件。
+        websocket_protocol = "ws", -- TLS 由宿主前置终止；Gateway 不隐式读取证书。
+        handler_service = handler_service, -- 已创建的业务 Service handle；不通过全局名字发现。
+        observer_service = observer_service, -- 可选观测 Service handle；只接收异步事件。
         descriptor_path = merged.descriptor_path, -- 运行目录下的 descriptor 文件路径。
         registry_module = merged.registry_module, -- 生成 registry 的 require 名称。
-        protocol_version = assert(tonumber(merged.protocol_version), "protocol_version is required"), -- Envelope 版本。
+        protocol_version = protocol_version, -- Envelope uint32 兼容版本。
         max_frame_bytes = max_frame_bytes, -- 单个 Envelope body 上限，单位 byte。
         max_clients = max_clients, -- 当前 Gateway 最大在线连接数。
         write_warning_close_kb = warning_kb, -- 写缓冲 warning 达到此 KB 时关闭连接。
     }
 end
 
--- 向可选 observer Service 投递结构化 Gateway 事件；observer 故障不能影响业务请求。
--- 参数 event：包含 kind、connection_id、transport、peer、request_id、command 等字段的普通 table。
--- 返回值：无；使用 skynet.send，不 yield，不等待 observer 响应，不持有 event 的外部引用。
+-- 记录并向可选 observer Service 投递结构化 Gateway 事件；observer 故障不能影响业务请求。
+-- event 是本次事件的只读普通 table，常见字段为 kind/code/message 和连接、请求上下文；敏感 payload 不得放入。
+-- 返回值：无。skynet.send 异步投递且不 yield；日志只写标识和诊断字段，不保留 event 引用。
 local function emit(event)
     skynet.error("FLYWOW_GATEWAY_" .. string.upper(event.kind),
                  " connection_id=", tostring(event.connection_id or "-"),
@@ -99,8 +119,9 @@ local function emit(event)
 end
 
 -- 为新连接创建唯一上下文；上下文不暴露底层 fd 给业务 Service。
--- 参数 fd/peer/transport：当前连接的底层标识、对端地址和协议类型；fd 仅由 Gateway 自己保存。
--- 返回值：连接上下文；调用方拥有并负责在关闭时从 state.connections 移除。
+-- fd 是 Skynet 接受的连接句柄，peer 是诊断用地址，transport 为 tcp/websocket；fd 始终由本 Service 独占。
+-- 容量达到 max_clients 时返回 nil 且不接管连接关闭责任；成功时返回由 Gateway 状态表持有的 context。
+-- connection_id 单调递增，避免 fd 被 OS 复用后旧连接身份与新连接混淆。
 local function create_connection(fd, peer, transport)
     if state.client_count >= state.config.max_clients then
         emit({ kind = "warning", code = "MAX_CONNECTIONS", message = "connection limit reached", peer = peer, transport = transport })
@@ -123,8 +144,9 @@ local function create_connection(fd, peer, transport)
 end
 
 -- 从连接表中移除连接并发出一次 close 事件；重复调用不会重复递减计数。
--- 参数 connection：当前 Gateway 拥有的 connection context；reason 为不含敏感数据的关闭原因。
--- 返回值：首次关闭 true，重复关闭 false；不执行网络 close，避免递归和 yield。
+-- connection 是本 Gateway 状态表中的 context，reason 是不含敏感数据的诊断原因。
+-- 先设置 closed 再摘除两个索引，使重入/迟到回调只能观察到已关闭状态；不关闭 fd、不执行 I/O/yield。
+-- 返回首次 detach 为 true，nil 或重复关闭为 false。
 local function detach(connection, reason)
     if connection == nil or connection.closed then
         return false
@@ -138,9 +160,9 @@ local function detach(connection, reason)
     return true
 end
 
--- 将业务 handler 的结果标准化为 response table。
--- 参数 result：handler Service 返回的 `{ ok=true, response=<table> }` record；禁止返回 nil/字符串状态。
--- 返回值：业务 response table；失败抛错，由上层转换为 handler_error 并关闭连接。
+-- 将业务 handler 的返回合同校验为 response table。
+-- result 由注入的 handler Service 返回，必须是 `{ ok=true, response=<table> }`；错误时可用 `{ ok=false, error={code,message} }`。
+-- 返回 handler 拥有的 response table，供编码器只读使用；nil、未知状态或拒绝结果转为异常，由调用方映射成显式事件。
 local function require_response(result)
     assert(type(result) == "table", "handler must return a result table")
     if result.ok == false then
@@ -152,15 +174,16 @@ local function require_response(result)
     return result.response
 end
 
--- 解码、调用业务 Service、编码并发送一条完整 Envelope。
--- 参数 connection：当前连接；payload：已由 TCP/WebSocket transport 完成 framing 的 bytes；send：发送函数。
--- 返回值：成功 true；失败 false。函数执行 Protobuf、跨 Service skynet.call 并可能 yield。
--- yield 后会重新检查 connection.closed；不保存 payload 的 borrowed 引用。
+-- 校验并处理一条已完成 framing 的 Envelope：解码、调用业务 handler、编码 response 并交给 transport 发送。
+-- connection 是本 Service 持有的连接 context；payload 是单帧 Protobuf bytes，长度单位 byte；send(encoded) 由当前 transport 提供。
+-- 返回 true 表示发送函数接受了完整响应，false 表示调用方应关闭连接；协议、业务和写入失败均发出结构化事件。
+-- Protobuf 会分配临时 Lua 对象，skynet.call 会跨 Service 且可能 yield；yield 后先检查 closed，payload 不跨调用保存。
 local function dispatch_payload(connection, payload, send)
     if connection.closed or #payload == 0 or #payload > state.config.max_frame_bytes then
         emit({ kind = "error", code = "FRAME_LIMIT", message = "payload exceeds configured limit", connection_id = connection.id })
         return false
     end
+    -- pcall 把不可信网络字节导致的解码异常限制在当前请求，便于统一发事件并关闭连接。
     local envelope_ok, envelope = pcall(state.codec.decode_envelope, payload)
     if not envelope_ok then
         emit({ kind = "error", code = "ENVELOPE_DECODE", message = tostring(envelope), connection_id = connection.id })
@@ -182,6 +205,7 @@ local function dispatch_payload(connection, payload, send)
     end
 
     connection.request_count = connection.request_count + 1
+    -- handler 调用是唯一可能 yield 的请求步骤；下面必须再次检查连接身份/生命周期。
     local call_ok, result = pcall(skynet.call, state.config.handler_service, "lua", "gateway_dispatch", {
         connection_id = connection.id,
         peer = connection.peer,
@@ -203,6 +227,7 @@ local function dispatch_payload(connection, payload, send)
         emit({ kind = "error", code = "HANDLER_RESULT", message = tostring(response), connection_id = connection.id, command = definition.name })
         return false
     end
+    -- 在交给 transport 前再次限制完整 Envelope 大小，防止合法请求触发无界响应写入。
     local encode_ok, encoded = pcall(state.codec.encode_response, definition, envelope.request_id,
                                      state.config.protocol_version, response)
     if not encode_ok or #encoded > state.config.max_frame_bytes then
@@ -217,9 +242,9 @@ local function dispatch_payload(connection, payload, send)
     return true
 end
 
--- 从 TCP 流读取指定字节数；Socket 关闭、短读或底层错误返回 nil 和原因。
--- 参数 fd：当前 TCP fd；size：正整数 byte 数；返回值由 skynet.socket.read 所有。
--- 函数执行 I/O 并 yield；返回后调用方不能假设连接仍然有效。
+-- 从 TCP 字节流读取指定数量的字节；TCP 不保留消息边界，因此 header/body 必须分别读满。
+-- fd 是当前 Gateway 持有的 TCP fd；size 是正整数 byte 数。成功返回新 bytes string，失败返回 nil 与原因。
+-- socket.read 执行 I/O 并可能 yield；调用方在返回后需检查连接状态，不得依赖 fd 未被关闭。
 local function read_exact(fd, size)
     local data, remainder = socket.read(fd, size)
     if not data then
@@ -231,9 +256,10 @@ local function read_exact(fd, size)
     return data
 end
 
--- 运行一个 TCP 连接。协议 framing 是 uint16 big-endian length + Envelope bytes。
--- 参数 connection：已登记连接；函数拥有当前读取协程直到 close，顺序处理同一连接请求。
--- 失败：frame、协议或业务错误后关闭连接；执行 Socket I/O、跨 Service call 和 yield。
+-- 运行一个已登记 TCP 连接；本协程串行处理该连接上的请求直到 EOF、错误或 Service 停止。
+-- connection 由 Gateway 状态表持有并提供 fd；frame 为 2 byte uint16 big-endian 长度头 + Envelope bytes，长度不含头。
+-- 先检查长度再读取 body，防止按不可信长度分配/缓存过量数据；限制 socket 缓冲区以施加背压。
+-- 执行 Socket I/O、跨 Service call 和 yield；所有退出路径都 detach 并关闭 fd。
 local function run_tcp(connection)
     local fd = connection.fd
     socket.start(fd)
@@ -247,6 +273,7 @@ local function run_tcp(connection)
     while not connection.closed and state.phase == "running" do
         local header, err = read_exact(fd, 2)
         if not header then break end
+        -- >I2 表示网络字节序 uint16；先拒绝 0 或超限长度，再按该值读取 body。
         local size = string.unpack(">I2", header)
         if size < 1 or size > state.config.max_frame_bytes then
             emit({ kind = "error", code = "FRAME_LIMIT", message = "invalid TCP frame length", connection_id = connection.id })
@@ -266,9 +293,9 @@ end
 
 local ws_handler = {}
 
--- 处理 WebSocket binary message；Skynet 的 http.websocket 已负责 Upgrade、mask、fragment 和 ping/pong。
--- 参数 id/payload/opcode：Skynet WebSocket connection id、完整 payload、文本或 binary opcode。
--- 返回值：无；业务失败会关闭当前连接并发出结构化 error 事件。
+-- 处理已由 Skynet 完成拼帧的 WebSocket message；底层库负责 Upgrade、mask、fragment 与 ping/pong。
+-- id 是 Skynet connection id，payload 是单条完整消息 bytes，opcode 标识文本或 binary；payload 不跨回调保存。
+-- 仅接受 binary 且受 max_frame_bytes 限制；函数无返回值，失败时发事件并关闭当前连接。
 function ws_handler.message(id, payload, opcode)
     local connection = state.connections_by_fd[id]
     if not connection or connection.closed then return end
@@ -285,30 +312,30 @@ function ws_handler.message(id, payload, opcode)
     end
 end
 
--- WebSocket 握手完成后登记连接；Skynet 已在 accept 内完成 HTTP Upgrade 校验。
--- 参数 id/header/url：Skynet connection id、握手 header 和请求路径；当前 Gateway 只记录生命周期。
--- 返回值：无；连接容量不足时关闭当前 WebSocket，不执行跨 Service 调用。
+-- WebSocket 握手完成后登记连接；HTTP Upgrade 和握手校验由 Skynet 完成。
+-- id 是 Skynet connection id，header 是只读握手字段，url 是请求路径；仅使用 x-real-ip 作为诊断 peer，不据此授权。
+-- 无返回值；超过 max_clients 时关闭该连接，不执行跨 Service 调用或 yield。
 function ws_handler.handshake(id, header, url)
     local connection = create_connection(id, header["x-real-ip"] or "unknown", "websocket")
     if not connection then websocket.close(id, 1013, "server busy") end
 end
 
--- WebSocket 关闭时移除连接；底层库已经负责释放 Socket。
--- 参数 id：Skynet WebSocket connection id；返回值：无；不执行 I/O 或 yield。
+-- WebSocket 关闭回调中移除连接；底层库负责释放 Socket，本函数只清理 Gateway 索引。
+-- id 是 Skynet WebSocket connection id；迟到或重复回调由 detach 的幂等性处理。无返回值，不执行 I/O/yield。
 function ws_handler.close(id)
     detach(state.connections_by_fd[id], "websocket closed")
 end
 
--- WebSocket 传输错误转成统一 Gateway error 事件。
--- 参数 id/message：连接 id 和底层错误文字；返回值：无；只修改本 Service 的连接表。
+-- 将 WebSocket 底层传输错误转为统一 Gateway error 事件并摘除连接。
+-- id 是 Skynet connection id，message 是底层诊断文本；不包含业务 payload。无返回值，只修改本 Service 的连接索引。
 function ws_handler.error(id, message)
     local connection = state.connections_by_fd[id]
     emit({ kind = "error", code = "WEBSOCKET_ERROR", message = tostring(message), connection_id = connection and connection.id or id })
     detach(connection, "websocket error")
 end
 
--- WebSocket 写缓冲达到 Skynet warning 阈值时发出 warning，并在配置阈值处主动关闭。
--- 参数 ws_object/size：Skynet websocket 对象和待写 byte 数；返回值：无；必要时执行一次 WebSocket close。
+-- 处理 WebSocket 写队列增长通知；size 是待写字节数，按 Skynet warning 回调的单位比较关闭阈值（KB）。
+-- ws_object 提供底层 connection id；只对仍登记的连接发事件，达到 write_warning_close_kb 时关闭以限制队列增长。无返回值。
 function ws_handler.warning(ws_object, size)
     local connection = state.connections_by_fd[ws_object.id]
     if connection then
@@ -317,8 +344,9 @@ function ws_handler.warning(ws_object, size)
     end
 end
 
--- 新 TCP/WebSocket 客户端进入监听回调；只创建有限连接，不让业务 Service 接触 fd。
--- 参数 fd/peer：Skynet accepted fd 和对端地址；函数在 Gateway Service 内执行并 fork 会话。
+-- 新 TCP/WebSocket 客户端进入监听回调；只登记有界连接，不把 fd 交给业务 Service。
+-- fd 是 Skynet accept 的句柄且由 Gateway 接管关闭，peer 是对端地址诊断字符串。
+-- WebSocket accept 与 TCP 会话分别由 Gateway fork 协程驱动；超限时立即关闭 fd，不入表。
 local function accept_client(fd, peer)
     if state.config.transport == "websocket" then
         if state.client_count >= state.config.max_clients then
@@ -342,10 +370,10 @@ local function accept_client(fd, peer)
     end
 end
 
--- 启动监听、加载 descriptor/registry 并发布可用状态。
--- 参数 input：可选启动覆盖 table；通常只包含 handler_service，网络和协议配置来自 config.gateway。
--- 返回值：{ address, port, transport, command_count }；函数执行 I/O、加载文件并在 socket.listen yield。
--- 失败：配置、descriptor、registry 或 bind 失败时抛错，Service 不进入 running。
+-- 校验启动配置、加载协议 descriptor/registry 并开始监听，最后才发布 running 状态。
+-- input 是宿主传入的可选覆盖 table；handler_service 必须是已启动 handler 的显式 Service handle。
+-- 成功返回实际 address/port、transport 与 command_count；配置、文件、协议或 bind 失败时抛错，不宣告就绪。
+-- 执行文件 I/O、创建 codec 和监听 Socket，socket.listen 可能 yield；只允许从 created 启动一次。
 local function start(input)
     assert(state.phase == "created", "gateway can only start once")
     local config = normalize_config(input)
@@ -363,14 +391,20 @@ local function start(input)
     return { address = address, port = port, transport = config.transport, command_count = registry.count }
 end
 
--- 停止监听、关闭所有连接并释放 Service 私有状态。
--- 返回值：{ closed_connections = number }；函数执行 Socket I/O 并可能 yield，不能在业务 handler 内调用。
+-- 幂等地停止监听并关闭所有 Gateway 拥有的连接。
+-- 返回本次主动关闭的连接数；执行 Socket I/O，关闭操作可能 yield，不应在业务请求 handler 中同步调用。
+-- 连接数受 max_clients 限制；先快照索引再 detach，避免遍历期间删 key 漏关或重复关闭。
 local function stop()
     if state.phase == "stopped" then return { closed_connections = 0 } end
     state.phase = "stopping"
     if state.listen_fd then socket.close(state.listen_fd); state.listen_fd = nil end
     local closed = 0
+    local snapshot = {}
     for _, connection in pairs(state.connections) do
+        snapshot[#snapshot + 1] = connection
+    end
+    for index = 1, #snapshot do
+        local connection = snapshot[index]
         if not connection.closed then
             closed = closed + 1
             if connection.transport == "websocket" then websocket.close(connection.fd, 1001, "server shutdown") else socket.close(connection.fd) end
@@ -381,23 +415,32 @@ local function stop()
     return { closed_connections = closed }
 end
 
--- 暴露 Service 命令；配置和 handler handle 通过 skynet.call 显式传入，不使用全局服务名。
--- 参数 command/start：start 的参数是启动合同；stop 不接受额外参数。
-skynet.start(function()
-    skynet.dispatch("lua", function(_, _, command, argument)
-        if command == "start" then
-            skynet.retpack(start(argument))
-            return
-        end
-        if command == "stop" then
-            assert(argument == nil, "stop does not accept an argument")
-            skynet.retpack(stop())
-            return
-        end
-        if command == "stats" then
-            skynet.retpack({ phase = state.phase, clients = state.client_count, command_count = state.registry and state.registry.count or 0 })
-            return
-        end
-        error("unknown flywow.gateway command: " .. tostring(command))
-    end)
-end)
+-- 分发 Gateway Service 的固定 Lua 命令；启动配置和业务 handler handle 通过调用参数显式传入。
+-- session/source 是 Skynet 消息头字段，command/argument 是消息体固定位置参数；argument 仅 start 可使用。
+-- start、stop、stats 通过 retpack 返回各自 record；未知命令或非法参数抛错，交由 skynet.call 报给调用方。
+-- start/stop 的 Socket 操作可能 yield；消息头和参数只在本次 dispatch 使用，不跨调用保存。
+local function dispatch_command(_session, _source, command, argument)
+    if command == "start" then
+        skynet.retpack(start(argument))
+        return
+    end
+    if command == "stop" then
+        assert(argument == nil, "stop does not accept an argument")
+        skynet.retpack(stop())
+        return
+    end
+    if command == "stats" then
+        skynet.retpack({ phase = state.phase, clients = state.client_count,
+                         command_count = state.registry and state.registry.count or 0 })
+        return
+    end
+    error("unknown flywow.gateway command: " .. tostring(command))
+end
+
+-- 在 Service 初始化协程中注册固定 Lua dispatch；不创建第二个 Service。
+-- 无参数和返回值；skynet.start 控制 Service 就绪时机。
+local function initialize_service()
+    skynet.dispatch("lua", dispatch_command)
+end
+
+skynet.start(initialize_service)
