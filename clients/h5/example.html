@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>FlyWow H5 握手验收</title>
+<h1>FlyWow H5 握手验收</h1>
+<p id="result">正在连接本机验收服务…</p>
+<script type="module">
+// 验收页只使用公开SDK示例；服务由宿主测试夹具启动，不保存secret。
+import { queryExample } from "./example.mjs";
+const result = document.getElementById("result");
+try
+{
+    await queryExample("ws://localhost:19022");
+    result.textContent = "H5_BROWSER_WEBCRYPTO_SKYNET_OK：握手、QueryCell回包、关闭成功";
+}
+catch (error)
+{
+    result.textContent = "验收失败：" + error.message;
+}
+</script>
+</html>

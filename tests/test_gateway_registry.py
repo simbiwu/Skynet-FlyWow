@@ -25,10 +25,14 @@ class GatewayRegistryTest(unittest.TestCase):
         """返回最小合法 proto3 Gateway 合同；不执行 I/O。"""
         return """syntax = "proto3";
 package demo.v1;
-message Envelope {}
-message EchoRequest {}
-message EchoResponse {}
-service Demo {
+message Envelope
+{}
+message EchoRequest
+{}
+message EchoResponse
+{}
+service Demo
+{
   // command_id=42
   rpc Echo(EchoRequest) returns (EchoResponse);
 }
@@ -38,7 +42,8 @@ service Demo {
         """合法 RPC 必须生成确定 command id 和完整类型名。"""
         package, commands = MODULE.parse_proto(self.valid_proto())
         output = MODULE.render(package, commands)
-        self.assertIn('[42] = {', output)
+        self.assertIn('return\n{', output)
+        self.assertIn('[42] =\n        {', output)
         self.assertIn('.demo.v1.EchoRequest', output)
 
     def test_missing_command_id_fails(self) -> None:
@@ -52,14 +57,22 @@ service Demo {
             MODULE.parse_proto(
                 """syntax = "proto3";
                 package demo.v1;
-                message Envelope {}
-                message ARequest {} message AResponse {}
-                message BRequest {} message BResponse {}
-                service Demo {
-                // command_id=42
-                rpc A(ARequest) returns (AResponse);
-                // command_id=42
-                rpc B(BRequest) returns (BResponse);
+                message Envelope
+                {}
+                message ARequest
+                {}
+                message AResponse
+                {}
+                message BRequest
+                {}
+                message BResponse
+                {}
+                service Demo
+                {
+                  // command_id=42
+                  rpc A(ARequest) returns (AResponse);
+                  // command_id=42
+                  rpc B(BRequest) returns (BResponse);
                 }"""
             )
 
@@ -68,9 +81,9 @@ service Demo {
         with self.assertRaisesRegex(ValueError, "unbalanced"):
             MODULE.parse_proto(self.valid_proto() + "}\n")
         with self.assertRaisesRegex(ValueError, "Envelope"):
-            MODULE.parse_proto(self.valid_proto().replace("message Envelope {}\n", ""))
+            MODULE.parse_proto(self.valid_proto().replace("message Envelope\n{}\n", ""))
         with self.assertRaisesRegex(ValueError, "same proto"):
-            MODULE.parse_proto(self.valid_proto().replace("message EchoResponse {}\n", ""))
+            MODULE.parse_proto(self.valid_proto().replace("message EchoResponse\n{}\n", ""))
 
     def test_write_if_changed_is_stable_and_complete(self) -> None:
         """相同内容不改 mtime，变化内容只暴露完整最终文件。"""

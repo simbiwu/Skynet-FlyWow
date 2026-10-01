@@ -8,12 +8,14 @@ local socket = require "skynet.socket"
 local websocket = require "http.websocket"
 local registry_loader = require "flywow.gateway.registry"
 local codec_factory = require "flywow.gateway.codec"
+local handshake_factory = require "flywow.gateway.handshake"
 
 local state =
 {
     phase              = "created", -- Service 生命周期；created/starting/running/stopping/stopped。
     config             = nil, -- 通过 start 校验后的只读配置；owner 是当前 Lua State。
     registry           = nil, -- 生成 registry 的只读索引；生命周期覆盖整个运行期。
+    handshake          = nil, -- 独立握手manager；Gateway只调用，不解析密码协议。
     codec              = nil, -- 当前 Lua State 独占的 descriptor codec。
     listen_fd          = nil, -- 监听 Socket fd；关闭后清空。
     connections        = {}, -- connection_id -> connection context；只由 Gateway 修改。
@@ -110,6 +112,8 @@ local function normalize_config(input)
         idle_timeout_ticks            = require_integer(merged.idle_timeout_ticks or 30000, "idle_timeout_ticks", 1, 360000), -- WS 完整消息空闲上限，单位 10 ms。
         max_requests_per_second       = require_integer(merged.max_requests_per_second or 200, "max_requests_per_second", 1, 100000), -- 每连接每秒入站上限；超限关闭。
         max_total_requests_per_second = require_integer(merged.max_total_requests_per_second or 10000, "max_total_requests_per_second", 1, 1000000), -- 当前实例每秒投递上限；超限关闭来源连接。
+        max_pending_handshakes        = require_integer(merged.max_pending_handshakes or math.min(128, max_clients), "max_pending_handshakes", 1, max_clients), -- 含TCP与WS的应用握手并发上限。
+        handshake_timeout_ticks       = require_integer(merged.handshake_timeout_ticks or 1000, "handshake_timeout_ticks", 1, 360000), -- 总握手期限，10ms tick。
         max_clients                   = max_clients, -- 当前 Gateway 最大在线连接数。
         write_warning_close_kb        = warning_kb, -- 写缓冲 warning 达到此 KB 时关闭连接。
     }
@@ -156,9 +160,21 @@ local function create_connection(fd, peer, transport)
         )
         return nil
     end
+    local handshake, handshake_error = state.handshake.accept()
+    if not handshake then
+        emit(
+        {
+            kind    = "error",
+            code    = handshake_error,
+            message = "handshake capacity reached",
+        }
+        )
+        return nil
+    end
     state.next_connection_id = state.next_connection_id + 1
     local connection =
     {
+        handshake       = handshake, -- 握手模块拥有内部状态；连接关闭时释放。
         id              = state.next_connection_id, -- Gateway 内部连接标识，不暴露底层 fd。
         fd              = fd, -- Gateway 私有底层 fd；业务 Service 不接收。
         peer            = peer, -- 对端地址字符串；只用于日志和业务上下文。
@@ -194,6 +210,7 @@ local function detach(connection, reason)
         return false
     end
     connection.closed = true
+    state.handshake.close(connection.handshake)
     state.connections[connection.id] = nil
     state.connections_by_fd[connection.fd] = nil
     state.client_count = state.client_count - 1
@@ -371,7 +388,7 @@ local function deliver_response(source, message)
         return false
     end
     local connection = state.connections[message.connection_id]
-    if not connection or connection.closed then
+    if not connection or connection.closed or not state.handshake.ready(connection.handshake) then
         state.responses_dropped = state.responses_dropped + 1
         return false
     end
@@ -462,6 +479,47 @@ local function read_exact(connection, size)
     return data
 end
 
+-- 将当前握手消息交给独立模块并发送其输出；Gateway不解析握手字段。
+-- connection/bytes只在本调用借用；返回boolean，失败由调用方关闭；写失败不提交ready。
+-- pinned TCP/WS写不yield；完成后只保留ready标记，不持有secret。
+local function process_handshake(connection, bytes)
+    local response, code, confirm = state.handshake.receive(
+    {
+        context = connection.handshake, -- 本连接独占的握手状态。
+        bytes   = bytes, -- 当前完整网络帧，只读借用。
+    }
+    )
+    if not response then
+        emit(
+        {
+            kind          = "error",
+            code          = code,
+            message       = "handshake rejected",
+            connection_id = connection.id,
+        }
+        )
+        return false
+    end
+    local ok, result
+    if connection.transport == "tcp" then
+        ok, result = pcall(socket.write, connection.fd, string.pack(">I2", #response) .. response)
+    else
+        ok, result = pcall(websocket.write, connection.fd, response, "binary")
+    end
+    if not ok or result == false or connection.closed then return false end
+    if confirm then
+        if not state.handshake.confirm(connection.handshake) then return false end
+        emit(
+        {
+            kind          = "ready",
+            connection_id = connection.id,
+            message       = "handshake complete",
+        }
+        )
+    end
+    return true
+end
+
 -- 运行一个已登记 TCP 连接；本协程串行读取和投递，直到 EOF、错误或 Service 停止。
 -- connection 由 Gateway 状态表持有并提供 fd；frame 为 2 byte uint16 big-endian 长度头 + Envelope bytes，长度不含头。
 -- 先检查长度再读取 body，防止按不可信长度分配/缓存过量数据；限制 socket 缓冲区以施加背压。
@@ -494,7 +552,9 @@ local function run_tcp(connection)
         if not header then break end
         -- >I2 表示网络字节序 uint16；先拒绝 0 或超限长度，再按该值读取 body。
         local size = string.unpack(">I2", header)
-        if size < 1 or size > state.config.max_frame_bytes then
+        local ready = state.handshake.ready(connection.handshake)
+        if (not ready and size ~= state.handshake.expected_size(connection.handshake)) or
+            (ready and (size < 1 or size > state.config.max_frame_bytes)) then
             emit(
             {
                 kind          = "error",
@@ -508,7 +568,9 @@ local function run_tcp(connection)
         local payload
         payload, err = read_exact(connection, size)
         if not payload then break end
-        if not dispatch_payload(connection, payload) then break end
+        if ready then
+            if not dispatch_payload(connection, payload) then break end
+        elseif not process_handshake(connection, payload) then break end
     end
     detach(connection, "tcp session ended")
     close_transport(connection, 1001, "tcp session ended")
@@ -535,7 +597,13 @@ function ws_handler.message(id, payload, opcode)
         close_transport(connection, 1003, "binary messages required")
         return
     end
-    if not dispatch_payload(connection, payload) then
+    local ok
+    if state.handshake.ready(connection.handshake) then
+        ok = dispatch_payload(connection, payload)
+    else
+        ok = process_handshake(connection, payload)
+    end
+    if not ok then
         detach(connection, "protocol rejected")
         close_transport(connection, 1008, "gateway request rejected")
     end
@@ -651,7 +719,7 @@ local function timeout_loop()
         for _, connection in pairs(state.connections) do
             local since = connection.read_started or connection.last_message
             local limit = connection.read_started and state.config.read_timeout_ticks or state.config.idle_timeout_ticks
-            if (now - since) % 0x100000000 >= limit then
+            if state.handshake.expired(connection.handshake) or (now - since) % 0x100000000 >= limit then
                 expired[#expired + 1] = connection
             end
         end
@@ -680,6 +748,14 @@ local function start(input)
         }
     )
     state.epoch = tostring(skynet.self()) .. ":" .. tostring(skynet.hpc())
+    state.handshake = handshake_factory.new(
+    {
+        crypto        = require "flywow_gateway_crypto", -- 固定native绑定，缺少时启动失败。
+        now           = skynet.now, -- 显式时钟，不创建额外协程。
+        max_pending   = config.max_pending_handshakes, -- 待握手连接数量。
+        timeout_ticks = config.handshake_timeout_ticks, -- 绝对期限。
+    }
+    )
     state.rate_started, state.rate_count = skynet.now(), 0
     state.phase = "starting"
     local listen_fd, address, port = socket.listen(config.host, config.port, config.backlog)

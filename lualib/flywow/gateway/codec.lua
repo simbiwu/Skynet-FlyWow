@@ -51,12 +51,14 @@ function M.new(options)
     -- Protobuf 编码失败时抛错；不执行 I/O、yield 或修改业务 response。
     function codec.encode_response(definition, request_id, version, response)
         local body = assert(pb.encode(definition.response_type, response))
-        return assert(pb.encode(options.registry.envelope_type, {
+        local envelope =
+        {
             protocol_version = version,
-            command = definition.id,
-            request_id = request_id,
-            body = body,
-        }))
+            command          = definition.id,
+            request_id       = request_id,
+            body             = body,
+        }
+        return assert(pb.encode(options.registry.envelope_type, envelope))
     end
 
     return codec

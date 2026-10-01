@@ -35,20 +35,22 @@ function M.load(definitions)
         assert(type(definition.response_type) == "string" and definition.response_type ~= "",
                "gateway response_type is required for " .. definition.name)
         assert(by_id[command_id] == nil, "duplicate gateway command id: " .. command_id)
-        by_id[command_id] = {
-            id = command_id,
-            name = definition.name,
-            request_type = definition.request_type,
-            response_type = definition.response_type,
+        by_id[command_id] =
+        {
+            id              = command_id,
+            name            = definition.name,
+            request_type    = definition.request_type,
+            response_type   = definition.response_type,
         }
         count = count + 1
     end
     assert(count > 0, "gateway registry must contain at least one command")
 
-    return {
+    return
+    {
         envelope_type = definitions.envelope_type,
-        by_id = by_id,
-        count = count,
+        by_id         = by_id,
+        count         = count,
     }
 end
 

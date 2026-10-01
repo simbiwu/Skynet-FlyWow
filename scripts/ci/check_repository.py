@@ -30,10 +30,12 @@ REQUIRED_FILES = (
 )
 
 # 只扫描应当保持 UTF-8/LF 的人类可读文件；未来二进制资产不会被误解码。
-TEXT_SUFFIXES = {
-    ".c", ".cc", ".cmake", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
-    ".lua", ".md", ".proto", ".py", ".sh", ".txt", ".yaml", ".yml",
-}
+TEXT_SUFFIXES = (
+    {
+        ".c", ".cc", ".cmake", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+        ".lua", ".md", ".proto", ".py", ".sh", ".txt", ".yaml", ".yml",
+    }
+)
 TEXT_NAMES = {".editorconfig", ".gitattributes", ".gitignore", "CMakeLists.txt", "Makefile"}
 CHINESE_PATTERN = re.compile(r"[\u3400-\u9fff]")
 

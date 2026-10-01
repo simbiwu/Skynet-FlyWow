@@ -1,5 +1,16 @@
 # FlyWow Gateway
 
+## 文档入口
+
+- 第一次接入：[完整接入指南](INTEGRATION.md)，按依赖、协议、配置、启动、Unity/H5、关闭和验收逐步操作。
+- 当前文件：模块边界、Service/endpoint公开合同、资源限制与运维。
+- [握手详细合同](HANDSHAKE.md)：四条消息的字节布局、动态secret派生、状态机和SDK接口。
+
+
+## 接入握手
+
+连接必须先完成框架内置P-256随机挑战握手，业务只收到ready后的请求。无需登录、宿主会话表或Watchdog；握手状态机在独立模块，详见[合同与SDK](HANDSHAKE.md)。宿主构建OpenSSL 3 EVP绑定并配置lua_cpath，客户端与Server同步升级。没有旧客户端绕过开关，不增加CRC或包头加密。
+
 ## 解决的问题
 
 `flywow_gateway` 是业务无关的 Skynet 接入 Service。它把 TCP 或 Skynet 内置 `http.websocket` transport 统一转换成：
@@ -8,9 +19,9 @@
 Envelope bytes
 -> descriptor/registry 校验
 -> command + 已解码 request
--> handler Service
--> response table
--> response Envelope bytes
+-> send(handler Service)，立即继续读取
+
+handler完成 -> send(gateway_response) -> response Envelope bytes
 ```
 
 宿主不需要注册 command，也不接触 `fd`、`netpack`、WebSocket frame、Protobuf body 或写缓冲区。
@@ -191,6 +202,8 @@ warning: MAX_CONNECTIONS / WRITE_BACKPRESSURE / INGRESS_RATE_LIMIT
 
 | 配置 | 默认值 | 边界 |
 | --- | --- | --- |
+| max_pending_handshakes | min(128,max_clients) | 应用握手并发上限，包含TCP/WS，不能大于max_clients |
+| handshake_timeout_ticks | 1000 | 总握手10秒，从连接登记开始，包含WS Upgrade |
 | max_clients | 1024 | 包含尚未完成 WS 握手的连接 |
 | max_frame_bytes | 65535 | 完整 Envelope 编解码上限；WS 底层另有 pinned 库的256KiB帧限制 |
 | read_timeout_ticks | 3000 | 每次 TCP 定长读取和 WS 握手最多30秒，单位10ms |

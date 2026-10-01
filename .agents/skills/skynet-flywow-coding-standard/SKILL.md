@@ -21,6 +21,43 @@ description: 实现或评审 Skynet-FlyWow 的 Lua、C、C++、Shell、Proto、C
 
 没有当前调用者和可测试合同时，不创建推测性的接口、空模块树、通用 Manager 或公共抽象。
 
+## P0 全仓库排版
+
+FlyWow 中所有使用花括号的语言都必须采用 Allman 排版：多行代码块、Lua table、Python dict、C/C++ 类型与控制块、Proto message/service 等的左右花括号各自独占一行，左花括号位于所属声明或表达式的下一行。短小的空容器或简单字面量可保持单行。
+
+具名 record/table/dict 的字段名（或键）及分隔符按列对齐，值从同一列开始；Lua/C++/Proto 对齐等号，Python dict 对齐冒号。连续且属于同一逻辑组的变量赋值也对齐变量名、等号和值列；不跨不相关语句强行对齐。嵌套结构按层级缩进，并在各自 record 内单独对齐。此要求适用于生产源码、生成器输出、测试、工程文档和可复制示例，也适用于未来加入的 Native C++ 源码。
+
+示例：
+
+~~~lua
+return
+{
+    envelope_type = definitions.envelope_type,
+    by_id         = by_id,
+    count         = count,
+}
+~~~
+
+Native C++ 示例：
+
+~~~cpp
+class NativeRuntime
+{
+public:
+    void start()
+    {
+        port    = requested_port;
+        running = false;
+    }
+
+private:
+    int  port    = 0;
+    bool running = false;
+};
+~~~
+
+不为了对齐数组式 positional entries 增加无意义空格。该排版要求属于 P0；格式不符合时，代码评审与发布门禁视为未完成。C++ 控制结构、类型和函数均使用 Allman 花括号，相关成员赋值与具名初始化字段遵守列对齐规则。
+
 ## P0 源码要求
 
 每个源码、脚本、协议和构建文件必须在文件头用中文说明：

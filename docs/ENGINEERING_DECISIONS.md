@@ -43,3 +43,9 @@ Gateway 按连接顺序读取、解码并 skynet.send 到显式 handler，投递
 ## D009 - 业务侧主动断开采用异步控制消息
 
 endpoint context:close 单向投递 gateway_close；关闭 record 只有 Gateway 启动身份和连接编号。Gateway 只接受绑定 handler 来源，先摘除并发出一次断线通知，再关闭 transport；重复/失效请求幂等忽略，不建立等待或 token 表。跨进程返回函数由宿主显式注入，FlyWow 不依赖 Cluster。关闭后当前 context 不再回复；投递成功不代表网络关闭帧或最后响应已经到达对端。
+
+## D010 - Gateway 内置独立连接握手
+
+Gateway与客户端SDK完成P-256 ECDH、32字节随机挑战、HKDF-SHA256及双向HMAC-SHA256，验证后ready。合法协议客户端仅指完成握手，无登录/账号授权前提；宿主不管理secret或会话，不要求Watchdog。独立handshake模块管理状态、并发及期限，不写Socket。Native仅链接OpenSSL 3的libcrypto EVP（不链接libssl、不启用SSL/TLS），拥有敏感状态，无共享可变scratch。成功/失败均释放。
+
+业务协议和D008异步链路保持现状，不增加包头加密、CRC、逐包校验。握手使用现有TCP framing或WS binary，按连接状态区分控制/业务消息。固定字节、公开SDK、依赖与回滚见docs/gateway/HANDSHAKE.md。连接协议不兼容旧客户端，双端同时升级，不降级。

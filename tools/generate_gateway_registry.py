@@ -75,9 +75,9 @@ def parse_proto(source: str) -> tuple[str, list[dict[str, str | int]]]:
             )
         commands.append(
             {
-                "id": command_id,
-                "name": match.group("name"),
-                "request": f".{package}.{request_name}",
+                "id"      : command_id,
+                "name"    : match.group("name"),
+                "request" : f".{package}.{request_name}",
                 "response": f".{package}.{response_name}",
             }
         )
@@ -99,17 +99,20 @@ def render(package: str, commands: list[dict[str, str | int]]) -> str:
         "-- 输入/输出：.proto -> Envelope command 到 request/response 类型的映射。",
         "-- 生命周期：协议生成后随 Server 产物发布；Gateway 启动时加载并校验。",
         "-- 不负责：不实现业务 handler、不读取 Socket、不动态解析 .proto。",
-        "return {",
+        "return",
+        "{",
         f'    envelope_type = ".{package}.Envelope",',
-        "    commands = {",
+        "    commands      =",
+        "    {",
     ]
     # 生成物按数值 id 排序，保证相同协议无论 rpc 声明顺序如何都得到稳定 diff。
     for command in sorted(commands, key=lambda item: int(item["id"])):
         lines.extend(
             [
-                f'        [{command["id"]}] = {{',
-                f'            name = "{command["name"]}",',
-                f'            request_type = "{command["request"]}",',
+                f'        [{command["id"]}] =',
+                "        {",
+                f'            name          = "{command["name"]}",',
+                f'            request_type  = "{command["request"]}",',
                 f'            response_type = "{command["response"]}",',
                 "        },",
             ]

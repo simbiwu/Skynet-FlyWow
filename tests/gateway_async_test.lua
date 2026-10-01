@@ -147,6 +147,19 @@ local function scenario(overrides)
     {
         new = function() return codec end,
     }
+    package.loaded["flywow_gateway_crypto"] = {}
+    package.loaded["flywow.gateway.handshake"] =
+    {
+        new = function()
+            return
+            {
+                accept = function() return {} end,
+                close = function() end,
+                ready = function() return true end,
+                expired = function() return false end,
+            }
+        end,
+    }
     package.loaded["flywow.gateway.endpoint"] = nil
     dofile(root .. "/service/flywow_gateway.lua")
     e.dispatch(1, 8, "start",

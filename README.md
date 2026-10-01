@@ -52,6 +52,10 @@ side-view 2D：重力、跳跃和平台层，属于不同运动模型
 
 ## 当前文档
 
+- [全部文档与模块索引](docs/README.md)
+- [Gateway 完整前后端接入流程](docs/gateway/INTEGRATION.md)
+- [Gateway 握手字节与SDK合同](docs/gateway/HANDSHAKE.md)
+
 - [工程架构](docs/ARCHITECTURE.md)
 - [模块准入与完成标准](docs/MODULE_STANDARD.md)
 - [商业项目接入原则](docs/ADOPTION.md)
