@@ -30,44 +30,82 @@ composition root 通常只注入业务 handler：
 
 ```lua
 local gateway = skynet.newservice("flywow_gateway")
-skynet.call(gateway, "lua", "start", {
+skynet.call(gateway, "lua", "start",
+{
     handler_service = query_service,
-})
+}
+)
 ```
 
 测试或多实例部署可以覆盖少量顶层配置；未覆盖字段继续使用 `config.gateway`：
 
 ```lua
-skynet.call(gateway, "lua", "start", {
+skynet.call(gateway, "lua", "start",
+{
     handler_service = query_service,
-    transport = "websocket",
-    port = 19002,
-})
+    transport       = "websocket",
+    port            = 19002,
+}
+)
 ```
 
 `handler_service` 必须显式传入，因为它是业务 Service handle，不能通过全局名字或协议文件推导。
 
-`handler_service` 必须实现：
+`handler_service` 接收单向 `gateway_dispatch` 和 `gateway_disconnect`。处理完成后单向发送 `gateway_response`；数据平面不使用 `retpack`，业务可通过 `context:close()` 主动断开连接。这是相对于旧同步 handler 的不兼容 API 变更，宿主必须同时迁移。
+
+业务可以在自己已有的 dispatch 中使用薄接入模块：
 
 ```lua
-skynet.dispatch("lua", function(_, _, command, payload)
-    assert(command == "gateway_dispatch")
-    -- payload.command、payload.request、payload.request_id、payload.connection_id
-    -- 已经通过 registry 和 Protobuf 校验。
-    skynet.retpack({ ok = true, response = business_response })
+local endpoint = require "flywow.gateway.endpoint"
+
+-- 接收本地 Gateway 解码请求；query(request) 是宿主实际业务函数。
+-- source 是 Gateway handle；query 可以 yield，Gateway 的读取不会等待它。
+skynet.dispatch("lua", function(session, source, command, payload)
+    if command == "gateway_disconnect" then return end
+    assert(command == "gateway_dispatch" and session == 0)
+    local context = endpoint.new(
+    {
+        gateway_service = source,
+        request         = payload,
+    }
+    )
+    local response = query(payload.request)
+    assert(context:reply(response))
 end)
 ```
 
-业务拒绝使用：
+真实可运行例子见宿主的 `service/battle/navigation_query.lua` 和 `service/tests/gateway_async_smoke.lua`。`endpoint.new` 不保存业务 body，只快照路由字段；context 归调用方，可保留到业务异步完成。每个 context 最多回复一次，重复回复返回 `false, "DUPLICATE_REPLY"`，发送失败返回 `false, "SEND_FAILED"`。默认本地 send 不 yield；自定义 `send(message)` 是否 yield 由宿主负责，返回 false/抛错视为失败、其他返回视为成功。调用方修改 options 不改变已构造的上下文。
+
+辅助模块不接管 dispatch、不创建业务协程、不包含 Cluster、不保存全局请求表。业务拒绝应形成宿主 `.proto` 定义的 response table；Gateway 不解释业务错误码。处理异常也由宿主 handler 收敛为其响应类型。
+
+### 内部消息合同
+
+`gateway_dispatch` 携带 `gateway_epoch`、`connection_id`、`peer`、`transport`、`request_id`、`command_id`、`command`、`request`。`source` 是实际本地 Gateway handle；跨进程路由由宿主适配器显式保存/传递，不由框架发现。
+
+`gateway_response` 的参数为：
 
 ```lua
-skynet.retpack({
-    ok = false,
-    error = { code = "AUTH_REQUIRED", message = "authentication required" },
-})
+{
+    gateway_epoch = payload.gateway_epoch, -- 必须匹配当前 Gateway 启动身份。
+    connection_id = payload.connection_id, -- 当前连接；fd 从不暴露。
+    command_id    = payload.command_id, -- 使用 registry 的 response_type。
+    request_id    = payload.request_id, -- 不在 Gateway 查询或保存等待记录。
+    response      = response, -- 业务产生的 Protobuf table。
+}
 ```
 
-Gateway 不把 `fd` 传给业务。业务看到的是 `connection_id`、`peer`、`transport`、`request_id`、`command_id`、`command` 和已解码 `request`。
+Gateway 只接受配置的 handler 发来的结果。实例身份不同、连接已关闭或 Service 已停止的响应丢弃；编码错误只产生事件，不关闭健康连接；写失败摘除并关闭连接。`gateway_disconnect` 携带实例身份与连接编号，用于宿主释放自己的会话/路由，不等于取消已接纳业务。
+
+请求编号保留 .proto 的 uint64 位模式，0保留给主动消息；高位在 pinned Lua 中表现为负整数，也必须原样回复，不能按正负过滤。主动消息可以复用已登记的 response_type：构造请求上下文时把 `request_id` 设为0，再使用相同回复入口。当前不支持未登记的独立推送类型，不新增 Envelope kind/endpoint/Cluster 等字段。
+
+### 入站与出站互不等待
+
+```text
+客户端 A -> 完整帧 -> 解码 -> skynet.send(handler) -> 继续读取 B
+handler 完成 A -> skynet.send(gateway_response) -> 编码 -> 写当前连接
+```
+
+响应允许 B、A 顺序，客户端按请求编号匹配；业务顺序归业务 Service。send 只表示本地投递/写队列接纳，不表示远端执行或客户端收到；可靠性、重试与去重不属于 Gateway。
 
 ## 多实例与端口
 
@@ -80,7 +118,8 @@ Gateway 不把 `fd` 传给业务。业务看到的是 `connection_id`、`peer`�
 RPC 前的注释声明 command id：
 
 ```proto
-service NavigationService {
+service NavigationService
+{
   // command_id=1001
   rpc QueryCell(QueryCellRequest) returns (QueryCellResponse);
 }
@@ -107,7 +146,7 @@ uint16 big-endian payload length
 Envelope protobuf bytes
 ```
 
-每条连接顺序处理请求，跨连接可以并行；单连接不会无限积压业务调用。frame、Socket buffer、在线连接和写缓冲均有上限。
+每条连接顺序读取和投递，立即继续读下一帧，不等待 handler 或业务结果。frame、Socket buffer、在线连接和入站速率受配置限制；超限关闭来源连接。
 
 ### WebSocket
 
@@ -129,8 +168,8 @@ Gateway 统一记录并可选投递 `observer_service`：
 open
 close
 error: ENVELOPE_DECODE / PROTOCOL_VERSION / UNKNOWN_COMMAND / REQUEST_DECODE /
-       HANDLER_CALL / HANDLER_RESULT / RESPONSE_ENCODE / WRITE_FAILED / WEBSOCKET_ERROR
-warning: MAX_CONNECTIONS / WRITE_BACKPRESSURE
+       REQUEST_ID / HANDLER_SEND / RESPONSE_ARGUMENT / RESPONSE_ENCODE / WRITE_FAILED / WEBSOCKET_ERROR
+warning: MAX_CONNECTIONS / WRITE_BACKPRESSURE / INGRESS_RATE_LIMIT
 ```
 
 事件包含 `kind`、`code`、`message`、`connection_id`、`transport`、`peer`、`command` 等字段。Observer 使用 `skynet.send`，观察系统故障不能阻塞业务请求。
@@ -147,3 +186,41 @@ warning: MAX_CONNECTIONS / WRITE_BACKPRESSURE
 - handler 抛错、业务拒绝、Server stop 后资源释放。
 
 升级时必须同时检查 Skynet 版本、`http.websocket` 行为、descriptor、registry 和协议版本；不能静默替换任一运行时依赖。
+
+## 配置、容量与退出
+
+| 配置 | 默认值 | 边界 |
+| --- | --- | --- |
+| max_clients | 1024 | 包含尚未完成 WS 握手的连接 |
+| max_frame_bytes | 65535 | 完整 Envelope 编解码上限；WS 底层另有 pinned 库的256KiB帧限制 |
+| read_timeout_ticks | 3000 | 每次 TCP 定长读取和 WS 握手最多30秒，单位10ms |
+| idle_timeout_ticks | 30000 | WS 完整消息空闲最多300秒 |
+| max_requests_per_second | 200 | 每连接一秒窗口接纳帧数 |
+| max_total_requests_per_second | 10000 | 当前 Gateway 一秒窗口总接纳帧数 |
+| write_warning_close_kb | 1024 | pinned Socket 写缓冲 warning 达到该KB阈值后关闭 |
+
+读超时由一个有界扫描协程检查，扫描间隔100ms；不是业务请求超时。入站采用固定一秒窗口，边界处可能形成突发，不把它宣称为平滑限流。限流不能保证任意下游 Skynet mailbox 有硬容量；宿主 handler 应快速消费消息，并限制业务在途和自建队列，避免无限 fork 或重试。Observer 也必须快速消费，框架不保证任意观察服务的队列容量。
+
+连接编号单调递增且不复用，耗尽后拒绝接入；Gateway 启动身份隔离重启前的响应。TCP 完整 frame 一次 socket.write；pinned `ws` 写入由同一 Service 无 yield 调用保证帧之间不交叉，不能把这个假设迁移到未经验证的 TLS/其他 transport。
+
+## 开发验证与升级
+
+```bash
+SKYNET_LUA=/path/to/pinned-skynet/3rd/lua/lua \
+  python3 -m unittest discover -s tests -p 'test_*.py'
+python3 scripts/ci/check_repository.py
+```
+
+Lua 合同测试加载真实 Gateway/endpoint 源码，但 transport/codec 是替身；没有显式 SKYNET_LUA 时会明确跳过。宿主真实集成测试负责 pinned Skynet、真实 Protobuf、TCP、WS、单进程和 Cluster 路径。测试覆盖 A 延迟期间 B 完成、乱序结果、编码失败不关连接、主动消息、断线迟到回包、协议失败和网络上限。
+
+升级必须同时迁移旧 handler 的 call/retpack 合同为双向 send，并让 handler 接受 disconnect 通知。Envelope 和协议版本不变。正常发布固定已验证的 submodule 提交；开发阶段只通过显式 FLYWOW_ROOT 指向独立工作区。回滚时同步回滚框架与 handler，不能混用同步/异步 API。
+
+## 业务主动断开
+
+业务可在处理请求时或响应后调用 `context:close()`，默认本地 send `gateway_close`。关闭 record 只包含原 `gateway_epoch` 和 `connection_id`，不需要 request_id/token/fd，也不要求请求尚在等待。
+
+Gateway 只接纳配置 handler 的命令；核对当前实例和连接后先 detach，向 handler 发送一次 gateway_disconnect，再异步关闭 TCP/WS。WS 使用1008和固定有限文案。重复、旧实例、已断开或未授权关闭不影响新连接。disconnect 表示 Gateway 已移除连接路由，不承诺对端收到关闭帧。
+
+context:close 成功 true 只表示发送接纳；重复 false/DUPLICATE_CLOSE；失败 false/SEND_FAILED，可显式重试。自定义响应 sender 且未注入本地 Gateway handle 或 options.close 时返回 false/CLOSE_UNAVAILABLE。close 投递后 reply 返回 false/CONNECTION_CLOSING；reply 后 close 允许，但发送队列接纳不等于客户端已收到最后响应。
+
+跨进程由宿主注入 options.close(message) 转发到项目 Proxy；框架不加载 Cluster。Proxy 再发送本地 gateway_close，并负责自己的返回路由清理。框架不自动向独立 Battle 进程传播 disconnect。测试覆盖 TCP/WS 关闭、重复/旧实例/来源保护、发送失败重试和独立业务进程 Cluster 路径。

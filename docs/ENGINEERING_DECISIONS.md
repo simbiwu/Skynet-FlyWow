@@ -31,3 +31,15 @@ FlyWow 后续可以承载静态地图、导航查询和确定性战斗，但不�
 当前真实调用者是 2.5D Ground Grid。未来 H5 俯视角 2D 可以复用 Grid A*、动态占位、BattleWorker 和 Replay，Unity 与 H5 只替换离线资产导入器及表现层 Adapter。横版平台的重力、跳跃和多层平台是不同运动模型，必须有独立实现和测试。
 
 网络、地图、寻路和战斗模块形成单向依赖：Gateway 不依赖地图，地图/寻路不依赖网络，战斗核心不依赖客户端协议。只有第二个真实消费者或第二种空间实现出现后，才从共同调用面提取公开扩展点，不提前创建空接口。
+
+
+## D008 - Gateway 数据平面采用双向异步本地消息
+
+Gateway 按连接顺序读取、解码并 skynet.send 到显式 handler，投递后继续读下一帧。handler 完成后另 send gateway_response；Gateway 根据消息携带的实例、连接、命令和请求编号编码发送，不保存业务等待表，不依赖 Cluster，不负责业务路由或可靠性。endpoint 是薄的可选辅助模块；handler 自己负责业务错误和有界执行。
+
+旧 call/retpack handler 必须连同宿主一起迁移。既有 Envelope 和 .proto RPC 定义不变；编号0保留给已登记响应类型的主动消息。连接身份不复用，Gateway 启动身份隔离重启前结果。公开合同、配置、资源限制和升级/回滚说明见 docs/gateway/README.md。速率限制不等于对任意下游 mailbox 的硬容量保证，未经容量/soak 验证不宣称商业部署规模。
+
+
+## D009 - 业务侧主动断开采用异步控制消息
+
+endpoint context:close 单向投递 gateway_close；关闭 record 只有 Gateway 启动身份和连接编号。Gateway 只接受绑定 handler 来源，先摘除并发出一次断线通知，再关闭 transport；重复/失效请求幂等忽略，不建立等待或 token 表。跨进程返回函数由宿主显式注入，FlyWow 不依赖 Cluster。关闭后当前 context 不再回复；投递成功不代表网络关闭帧或最后响应已经到达对端。
