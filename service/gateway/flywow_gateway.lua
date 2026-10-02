@@ -377,9 +377,10 @@ local function dispatch_payload(connection, payload)
         peer          = connection.peer,
         transport     = connection.transport,
         request_id    = envelope.request_id,
-        command_id    = definition.id,
-        command       = definition.name,
-        request       = request,
+        command_id       = definition.id,
+        command           = definition.name,
+        expects_response  = definition.response_type ~= nil,
+        request           = request,
     }
     )
     if not sent or err == nil then
@@ -415,13 +416,15 @@ local function deliver_response(source, message)
         return false
     end
     local definition = registry_loader.find(state.registry, message.command_id)
-    if not definition or type(message.response) ~= "table" or
-        math.type(message.request_id) ~= "integer" then
+    if not definition or definition.response_type == nil or
+        type(message.response) ~= "table" or math.type(message.request_id) ~= "integer" then
         emit(
         {
             kind          = "error",
-            code          = "RESPONSE_ARGUMENT",
-            message       = "invalid response record",
+            code          = definition and definition.response_type == nil
+                and "RESPONSE_NOT_SUPPORTED" or "RESPONSE_ARGUMENT",
+            message       = definition and definition.response_type == nil
+                and "command does not define a response" or "invalid response record",
             connection_id = connection.id,
         }
         )

@@ -7,7 +7,7 @@ local skynet = require "skynet"
 local M = {}
 
 ---@class GatewayEndpointOptions
----@field request GatewayDispatch 已解码的 Gateway request record。
+---@field request GatewayDispatch 已解码的 Gateway request record；单向命令的 expects_response 为 false。
 ---@field gateway_service ServiceHandle 当前本地 Gateway handle；使用 send 时可省略。
 ---@field send fun(message: GatewayResponseMessage): any|nil 可选的项目自定义响应投递函数。
 ---@field close fun(message: GatewayDisconnect): any|nil 可选的项目自定义关闭投递函数。
@@ -22,7 +22,8 @@ function M.new(options)
     assert(type(options) == "table" and type(options.request) == "table", "endpoint request is required")
     local request = options.request
     assert(type(request.gateway_epoch) == "string" and math.type(request.connection_id) == "integer" and
-           math.type(request.command_id) == "integer" and math.type(request.request_id) == "integer",
+           math.type(request.command_id) == "integer" and math.type(request.request_id) == "integer" and
+           type(request.expects_response) == "boolean",
            "endpoint route metadata is required")
     local gateway = options.gateway_service
     local close = options.close -- 可选项目关闭函数，不由框架选择 Cluster。
@@ -36,18 +37,21 @@ function M.new(options)
         connection_id = request.connection_id, -- 当前连接身份，不是 fd。
         command_id    = request.command_id, -- registry 定义的响应类型。
         request_id    = request.request_id, -- 客户端请求编号；0 用于主动推送。
+        expects_response = request.expects_response, -- 是否存在 XxxResponse。
     }
     local closing = false -- 只保护本上下文的关闭投递；不是 Gateway 连接状态。
     local replied = false -- 调用方拥有的单次回复保护，不是 Gateway 等待状态。
     local context = {}
 
     --- 发送本次请求的业务响应；response 为协议定义对应的 table，调用方拥有。
+--- 单向命令没有 XxxResponse，调用会返回 false/RESPONSE_NOT_SUPPORTED。
     --- 成功返回 true；关闭投递后返回 false/CONNECTION_CLOSING，重复回复返回 false/DUPLICATE_REPLY；发送失败返回 false/SEND_FAILED，可由调用方决定重试。
     --- 默认 skynet.send 不 yield；自定义 send 可 yield，但保护位在调用前设置，避免并发重复回复。
     ---@param response GatewayResponseMessage|table 当前 command 对应的业务响应。
     ---@return boolean, string|nil 是否成功投递；失败返回稳定错误码。
     function context:reply(response)
         assert(type(response) == "table", "response must be a table")
+        if not route.expects_response then return false, "RESPONSE_NOT_SUPPORTED" end
         if closing then return false, "CONNECTION_CLOSING" end
         if replied then return false, "DUPLICATE_REPLY" end
         replied = true

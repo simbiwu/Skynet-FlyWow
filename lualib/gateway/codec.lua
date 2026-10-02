@@ -46,10 +46,13 @@ function M.new(options)
     end
 
     -- 将业务 response 编码为 registry 指定的 response message，再封装为完整 Envelope。
+    -- 单向命令的 response_type 为 nil；调用此函数会立即失败，防止伪造业务响应。
     -- definition 是只读 command 定义；request_id 原样关联请求；version 是已协商的协议版本整数。
     -- response 是 handler 返回的业务 table，调用方拥有且本函数只读。返回新 Lua bytes string；
     -- Protobuf 编码失败时抛错；不执行 I/O、yield 或修改业务 response。
     function codec.encode_response(definition, request_id, version, response)
+        assert(definition.response_type ~= nil,
+               "gateway command does not define a response: " .. definition.name)
         local body = assert(pb.encode(definition.response_type, response))
         local envelope =
         {

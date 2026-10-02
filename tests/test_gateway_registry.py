@@ -27,63 +27,53 @@ class GatewayRegistryTest(unittest.TestCase):
 package demo.v1;
 message Envelope
 {}
+enum CommandId
+{
+  COMMAND_UNSPECIFIED = 0;
+  ECHO = 42;
+}
 message EchoRequest
 {}
 message EchoResponse
 {}
-service Demo
-{
-  // command_id=42
-  rpc Echo(EchoRequest) returns (EchoResponse);
-}
 """
 
-    def test_render_rpc_registry(self) -> None:
-        """合法 RPC 必须生成确定 command id 和完整类型名。"""
+    def test_render_command_registry(self) -> None:
+        """合法 CommandId 必须生成确定 command id 和完整类型名。"""
         package, commands = MODULE.parse_proto(self.valid_proto())
         output = MODULE.render(package, commands)
-        self.assertIn('return\n{', output)
-        self.assertIn('[42] =\n        {', output)
-        self.assertIn('.demo.v1.EchoRequest', output)
+        self.assertIn("return\n{", output)
+        self.assertIn("[42] =\n        {", output)
+        self.assertIn(".demo.v1.EchoRequest", output)
 
-    def test_missing_command_id_fails(self) -> None:
-        """缺失 command_id 的 RPC 必须在构建期失败。"""
+    def test_missing_request_fails(self) -> None:
+        """缺失 XxxRequest 的命令必须在构建期失败。"""
         with self.assertRaises(ValueError):
-            MODULE.parse_proto(self.valid_proto().replace("  // command_id=42\n", ""))
+            MODULE.parse_proto(self.valid_proto().replace("message EchoRequest\n{}\n", ""))
 
     def test_duplicate_command_id_fails(self) -> None:
-        """两个 RPC 使用同一 command_id 必须失败。"""
+        """两个命令使用同一 command id 必须失败。"""
         with self.assertRaises(ValueError):
             MODULE.parse_proto(
-                """syntax = "proto3";
-                package demo.v1;
-                message Envelope
-                {}
-                message ARequest
-                {}
-                message AResponse
-                {}
-                message BRequest
-                {}
-                message BResponse
-                {}
-                service Demo
-                {
-                  // command_id=42
-                  rpc A(ARequest) returns (AResponse);
-                  // command_id=42
-                  rpc B(BRequest) returns (BResponse);
-                }"""
+                self.valid_proto().replace(
+                    "  ECHO = 42;\n",
+                    "  ECHO = 42;\n  OTHER = 42;\n",
+                )
             )
 
+    def test_one_way_command_is_supported(self) -> None:
+        """没有 XxxResponse 的命令必须生成 nil response_type。"""
+        proto = self.valid_proto().replace("message EchoResponse\n{}\n", "")
+        _, commands = MODULE.parse_proto(proto)
+        self.assertIsNone(commands[0]["response"])
+        self.assertIn("response_type = nil", MODULE.render("demo.v1", commands))
+
     def test_invalid_structure_or_message_fails(self) -> None:
-        """失衡花括号、缺失 Envelope 或 RPC 消息时必须失败。"""
-        with self.assertRaisesRegex(ValueError, "unbalanced"):
-            MODULE.parse_proto(self.valid_proto() + "}\n")
+        """缺失 Envelope 或 CommandId 时必须失败。"""
         with self.assertRaisesRegex(ValueError, "Envelope"):
             MODULE.parse_proto(self.valid_proto().replace("message Envelope\n{}\n", ""))
-        with self.assertRaisesRegex(ValueError, "same proto"):
-            MODULE.parse_proto(self.valid_proto().replace("message EchoResponse\n{}\n", ""))
+        with self.assertRaisesRegex(ValueError, "CommandId"):
+            MODULE.parse_proto(self.valid_proto().replace("enum CommandId", "enum OtherId"))
 
     def test_write_if_changed_is_stable_and_complete(self) -> None:
         """相同内容不改 mtime，变化内容只暴露完整最终文件。"""
