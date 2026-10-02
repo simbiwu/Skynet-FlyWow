@@ -43,7 +43,8 @@ message EchoResponse
         package, commands = MODULE.parse_proto(self.valid_proto())
         output = MODULE.render(package, commands)
         self.assertIn("return\n{", output)
-        self.assertIn("[42] =\n        {", output)
+        self.assertIn("ECHO = 42", output)
+        self.assertIn("[command_ids.ECHO] =\n        {", output)
         self.assertIn(".demo.v1.EchoRequest", output)
 
     def test_push_command_without_request_is_supported(self) -> None:

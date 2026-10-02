@@ -111,6 +111,7 @@ def parse_proto(source: str) -> tuple[str, list[dict[str, str | int | None]]]:
         commands.append(
             {
                 "id": command_id,
+                "enum_name": enum_name,
                 "name": method_name,
                 "request": request_type,
                 "response": response_type,
@@ -134,12 +135,26 @@ def render(
         "-- 输入/输出：CommandId + 可选 XxxRequest/XxxResponse -> Envelope command 映射。",
         "-- 生命周期：协议生成后随 Server 产物发布；Gateway 启动时加载并校验。",
         "-- 不负责：不实现业务 handler、不读取 Socket、不动态解析 .proto。",
-        "return",
-        "{",
-        f'    envelope_type = ".{package}.Envelope",',
-        "    commands      =",
+        "local command_ids =",
         "    {",
     ]
+
+    for command in sorted(commands, key=lambda item: str(item["enum_name"])):
+        lines.append(
+            f'        {command["enum_name"]} = {command["id"]},'
+        )
+
+    lines.extend(
+        [
+            "    }",
+            "return",
+            "{",
+            f'    envelope_type = ".{package}.Envelope",',
+            "    command_ids   = command_ids,",
+            "    commands      =",
+            "    {",
+        ]
+    )
 
     for command in sorted(commands, key=lambda item: int(item["id"])):
         request = (
@@ -154,7 +169,7 @@ def render(
         )
         lines.extend(
             [
-                f'        [{command["id"]}] =',
+                f'        [command_ids.{command["enum_name"]}] =',
                 "        {",
                 f'            name          = "{command["name"]}",',
                 f"            request_type  = {request},",
