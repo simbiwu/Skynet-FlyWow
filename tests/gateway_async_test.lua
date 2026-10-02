@@ -142,13 +142,13 @@ local function scenario(overrides)
     package.loaded["http.websocket"] = websocket
     package.loaded["config.gateway"] = config
     package.loaded["test.registry"] = {}
-    package.loaded["flywow.gateway.registry"] = registry
-    package.loaded["flywow.gateway.codec"] =
+    package.loaded["gateway.registry"] = registry
+    package.loaded["gateway.codec"] =
     {
         new = function() return codec end,
     }
     package.loaded["flywow_gateway_crypto"] = {}
-    package.loaded["flywow.gateway.handshake"] =
+    package.loaded["gateway.handshake"] =
     {
         new = function()
             return
@@ -160,8 +160,8 @@ local function scenario(overrides)
             }
         end,
     }
-    package.loaded["flywow.gateway.endpoint"] = nil
-    dofile(root .. "/service/flywow_gateway.lua")
+    package.loaded["gateway.endpoint"] = nil
+    dofile(root .. "/service/gateway/flywow_gateway.lua")
     e.dispatch(1, 8, "start",
     {
         handler_service = 7,
@@ -188,7 +188,7 @@ e.accept(10, "peer")
 resume(e.forks[2])
 assert(#e.sends == 2 and e.sends[1][2] == "gateway_dispatch" and e.sends[2][3].request_id == 2)
 assert(#e.writes == 0, "B must be read before any response")
-local endpoint = require "flywow.gateway.endpoint"
+local endpoint = require "gateway.endpoint"
 local a = endpoint.new(
 {
     gateway_service = 99,
@@ -278,7 +278,7 @@ e = scenario()
 e.streams[10] = frame(1)
 e.accept(10, "peer")
 resume(e.forks[2])
-endpoint = require "flywow.gateway.endpoint"
+endpoint = require "gateway.endpoint"
 local context = endpoint.new(
 {
     gateway_service = 99,
@@ -318,7 +318,7 @@ e = scenario()
 e.streams[10] = frame(1)
 e.accept(10, "peer")
 resume(e.forks[2])
-endpoint = require "flywow.gateway.endpoint"
+endpoint = require "gateway.endpoint"
 local fail, calls = true, 0
 local options =
 {
@@ -369,7 +369,7 @@ for _, transport in ipairs({ "tcp", "websocket" }) do
     e.streams[10] = frame(1)
     e.accept(10, "peer")
     resume(e.forks[2])
-    endpoint = require "flywow.gateway.endpoint"
+    endpoint = require "gateway.endpoint"
     context = endpoint.new(
     {
         gateway_service = 99,
@@ -413,7 +413,7 @@ e = scenario()
 e.streams[10] = frame(1)
 e.accept(10, "peer")
 resume(e.forks[2])
-endpoint = require "flywow.gateway.endpoint"
+endpoint = require "gateway.endpoint"
 options =
 {
     request = e.sends[1][3],

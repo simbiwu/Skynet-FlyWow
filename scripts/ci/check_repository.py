@@ -20,13 +20,13 @@ REQUIRED_FILES = (
     ".agents/skills/skynet-flywow-coding-standard/SKILL.md",
     "AGENTS.md",
     "README.md",
-    "docs/ADOPTION.md",
-    "docs/ARCHITECTURE.md",
-    "docs/ENGINEERING_DECISIONS.md",
-    "docs/MODULE_STANDARD.md",
-    "docs/QUALITY_GATES.md",
-    "docs/ROADMAP.md",
-    "docs/VERSIONING.md",
+    "docs/采用指南.md",
+    "docs/架构说明.md",
+    "docs/工程决策.md",
+    "docs/模块标准.md",
+    "docs/质量门禁.md",
+    "docs/路线图.md",
+    "docs/版本管理.md",
 )
 
 # 只扫描应当保持 UTF-8/LF 的人类可读文件；未来二进制资产不会被误解码。

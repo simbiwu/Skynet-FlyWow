@@ -79,6 +79,13 @@ private:
 - 是否执行 I/O、分配内存、加锁、yield 或修改共享状态；
 - 适用时的前置条件、复杂度和调用时机。
 
+### LuaDoc 与编辑器可读性
+
+- Lua 源码中的函数、字段和 Service 消息合同统一使用 LuaDoc：说明行使用 `---`，结构化类型使用标准 `---@param`、`---@return`、`---@class`、`---@field`、`---@alias` 标签；同一合同不同时维护普通 `--` 注释和 LuaDoc。
+- Gateway、endpoint、handshake 和 registry 的跨 Service record 必须有 Lua Language Server 可识别的字段类型，并说明来源、owner、生命周期、nil 语义以及是否跨进程/网络边界。
+- 动态 Skynet API 的稳定调用必须标注 Service handle、command、payload、返回值和 yield 边界；框架 API 的提示放入 `---@meta` stub，不把 stub 当作运行时代码。
+- WHY、ownership、I/O、yield、失败和不变量写在同一 LuaDoc 块的中文说明中；不使用编辑器无法理解的自定义标签承载唯一类型语义。
+
 每个字段和配置项都要说明用途、单位/范围、owner、生命周期，以及是否跨越存储、资产或网络边界。紧凑 record 优先使用简短同行尾注释；ownership、不变量和多步推理使用相邻上方注释。
 
 注释按读者理解代码的顺序组织：先用直白的一句话说明函数或代码块要解决什么问题、产生什么结果；再说明参数/状态的意义、单位、前置条件和 ownership；最后解释关键算法步骤及必须保持的不变量。不要先堆实现细节，让读者猜代码用途。

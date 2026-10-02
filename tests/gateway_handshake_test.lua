@@ -4,7 +4,7 @@
 -- 不负责：真实Native互通由另一个测试执行。
 local root = assert(arg[1])
 package.path = root .. "/lualib/?.lua;" .. package.path
-local factory = require "flywow.gateway.handshake"
+local factory = require "gateway.handshake"
 local now, closed = 0, 0
 local crypto = {}
 -- 替身保持Native对象合同，失败可控；不执行I/O。

@@ -53,16 +53,16 @@ side-view 2D：重力、跳跃和平台层，属于不同运动模型
 ## 当前文档
 
 - [全部文档与模块索引](docs/README.md)
-- [Gateway 完整前后端接入流程](docs/gateway/INTEGRATION.md)
-- [Gateway 握手字节与SDK合同](docs/gateway/HANDSHAKE.md)
+- [Gateway 完整前后端接入流程](docs/gateway/接入指南.md)
+- [Gateway 握手字节与SDK合同](docs/gateway/握手合同.md)
 
-- [工程架构](docs/ARCHITECTURE.md)
-- [模块准入与完成标准](docs/MODULE_STANDARD.md)
-- [商业项目接入原则](docs/ADOPTION.md)
-- [质量门禁](docs/QUALITY_GATES.md)
-- [版本与兼容策略](docs/VERSIONING.md)
-- [演进路线](docs/ROADMAP.md)
-- [工程决策](docs/ENGINEERING_DECISIONS.md)
+- [工程架构](docs/架构说明.md)
+- [模块准入与完成标准](docs/模块标准.md)
+- [商业项目接入原则](docs/采用指南.md)
+- [质量门禁](docs/质量门禁.md)
+- [版本与兼容策略](docs/版本管理.md)
+- [演进路线](docs/路线图.md)
+- [工程决策](docs/工程决策.md)
 - [P0 编码规范 Skill](.agents/skills/skynet-flywow-coding-standard/SKILL.md)
 - [Gateway 模块接入与合同](docs/gateway/README.md)
 

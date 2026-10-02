@@ -1,15 +1,23 @@
--- 职责：为业务 Service 提供薄的异步响应上下文，避免重复拼接网络返回元数据。
--- 边界：FlyWow Runtime Library；只依赖 skynet，不包含 Cluster、协议 codec 或业务路由。
--- 输入/输出：request + 显式 gateway_service/可选 send 函数 -> context:reply(response) / context:close()。
--- 生命周期：上下文由调用方拥有，可保存到业务异步完成；每个上下文最多回复一次。
--- 不负责：不注册 dispatch、不 fork 业务协程、不保存全局请求表、不做超时或业务错误映射。
+--- 职责：为业务 Service 提供薄的异步响应上下文，避免重复拼接网络返回元数据。
+--- 边界：FlyWow Runtime Library；只依赖 skynet，不包含 Cluster、协议 codec 或业务路由。
+--- 输入/输出：request + 显式 gateway_service/可选 send 函数 -> context:reply(response) / context:close()。
+--- 生命周期：上下文由调用方拥有，可保存到业务异步完成；每个上下文最多回复一次。
+--- 不负责：不注册 dispatch、不 fork 业务协程、不保存全局请求表、不做超时或业务错误映射。
 local skynet = require "skynet"
 local M = {}
 
--- 构造一次请求的响应上下文；只快照路由字段，不保存 request body。
--- options.request 是已解码请求；gateway_service 是当前本地 Gateway handle。
--- options.send/close 可替换本地响应/关闭发送，接收对应 record；其 I/O/yield 与失败合同归项目适配器。
--- 返回调用方独占 context；参数非法抛错，构造不 yield；默认回复是本地 skynet.send，不等待业务结果。
+---@class GatewayEndpointOptions
+---@field request GatewayDispatch 已解码的 Gateway request record。
+---@field gateway_service ServiceHandle 当前本地 Gateway handle；使用 send 时可省略。
+---@field send fun(message: GatewayResponseMessage): any|nil 可选的项目自定义响应投递函数。
+---@field close fun(message: GatewayDisconnect): any|nil 可选的项目自定义关闭投递函数。
+
+--- 构造一次请求的响应上下文；只快照路由字段，不保存 request body。
+--- options.request 是已解码请求；gateway_service 是当前本地 Gateway handle。
+--- options.send/close 可替换本地响应/关闭发送，接收对应 record；其 I/O/yield 与失败合同归项目适配器。
+--- 返回调用方独占 context；参数非法抛错，构造不 yield；默认回复是本地 skynet.send，不等待业务结果。
+---@param options GatewayEndpointOptions 请求路由和可选响应/关闭投递器。
+---@return table 调用方独占的单次 reply/close context；不保存业务 body。
 function M.new(options)
     assert(type(options) == "table" and type(options.request) == "table", "endpoint request is required")
     local request = options.request
@@ -33,9 +41,11 @@ function M.new(options)
     local replied = false -- 调用方拥有的单次回复保护，不是 Gateway 等待状态。
     local context = {}
 
-    -- 发送本次请求的业务响应；response 为协议定义对应的 table，调用方拥有。
-    -- 成功返回 true；关闭投递后返回 false/CONNECTION_CLOSING，重复回复返回 false/DUPLICATE_REPLY；发送失败返回 false/SEND_FAILED，可由调用方决定重试。
-    -- 默认 skynet.send 不 yield；自定义 send 可 yield，但保护位在调用前设置，避免并发重复回复。
+    --- 发送本次请求的业务响应；response 为协议定义对应的 table，调用方拥有。
+    --- 成功返回 true；关闭投递后返回 false/CONNECTION_CLOSING，重复回复返回 false/DUPLICATE_REPLY；发送失败返回 false/SEND_FAILED，可由调用方决定重试。
+    --- 默认 skynet.send 不 yield；自定义 send 可 yield，但保护位在调用前设置，避免并发重复回复。
+    ---@param response GatewayResponseMessage|table 当前 command 对应的业务响应。
+    ---@return boolean, string|nil 是否成功投递；失败返回稳定错误码。
     function context:reply(response)
         assert(type(response) == "table", "response must be a table")
         if closing then return false, "CONNECTION_CLOSING" end
@@ -58,10 +68,11 @@ function M.new(options)
         end
         return true
     end
-    -- 请求断开该上下文对应的连接；可在 reply 前或后使用，不需要尚在等待的请求。
-    -- 无参数；成功 true 仅表示投递成功，实际断开由 gateway_disconnect 通知，重复 false/DUPLICATE_CLOSE。
-    -- 自定义响应路径若没有 close 或本地 Gateway handle，返回 false/CLOSE_UNAVAILABLE。
-    -- 默认 send 不 yield；自定义 close 可 yield。失败 false/SEND_FAILED，允许调用方显式重试。
+    --- 请求断开该上下文对应的连接；可在 reply 前或后使用，不需要尚在等待的请求。
+    --- 无参数；成功 true 仅表示投递成功，实际断开由 gateway_disconnect 通知，重复 false/DUPLICATE_CLOSE。
+    --- 自定义响应路径若没有 close 或本地 Gateway handle，返回 false/CLOSE_UNAVAILABLE。
+    --- 默认 send 不 yield；自定义 close 可 yield。失败 false/SEND_FAILED，允许调用方显式重试。
+    ---@return boolean, string|nil 是否成功投递关闭请求；失败返回稳定错误码。
     function context:close()
         if closing then return false, "DUPLICATE_CLOSE" end
         if not close and not (math.type(gateway) == "integer" and gateway > 0) then
