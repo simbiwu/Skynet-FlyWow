@@ -57,8 +57,8 @@ export async function queryExample(url)
     const timer = setTimeout(() => fail(new Error("RESPONSE_TIMEOUT")), 3000);
     try
     {
-        // version=3, command=1001, request_id=2, QueryCell(map_id=1001,map_version=1)。
-        connection.send(new Uint8Array([8,3,16,233,7,24,2,34,5,8,233,7,16,1]));
+        // version=3, command=1001, QueryCell(map_id=1001,map_version=1)。
+        connection.send(new Uint8Array([8,3,16,233,7,26,5,8,233,7,16,1]));
         await result;
     }
     finally

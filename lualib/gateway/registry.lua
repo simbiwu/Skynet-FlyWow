@@ -17,7 +17,7 @@ end
 
 --- 加载构建期生成的 registry，并拒绝重复 command、缺失类型名和非法 Envelope 配置。
 --- definitions.envelope_type 是完整 Protobuf 类型名；commands 以 uint32 command id 为键，值含 name/request_type/可选 response_type；输入归调用方且只读。
---- response_type 为 nil 表示单向命令，Gateway 只解码并投递请求，不接受该命令的业务响应。
+--- request_type/response_type 可分别为空；两者都存在是请求-响应，只有 request_type 是单向请求，只有 response_type 是主动下发。
 --- 返回独立索引，调用方拥有并应视为只读；空 commands、重复 id、字段缺失或格式错误时抛异常。
 --- 仅分配与 command 数量成正比的 Lua table；不执行 I/O、yield 或外部资源分配。
 ---@param definitions table 构建阶段生成的 registry；调用方拥有且只读。
@@ -35,8 +35,11 @@ function M.load(definitions)
         assert(type(definition) == "table", "gateway command definition must be a table")
         assert(type(definition.name) == "string" and definition.name ~= "",
                "gateway command name is required")
-        assert(type(definition.request_type) == "string" and definition.request_type ~= "",
-               "gateway request_type is required for " .. definition.name)
+        if definition.request_type ~= nil then
+            assert(type(definition.request_type) == "string" and
+                definition.request_type ~= "",
+                "gateway request_type must be a non-empty string for " .. definition.name)
+        end
         if definition.response_type ~= nil then
             assert(type(definition.response_type) == "string" and definition.response_type ~= "",
                    "gateway response_type must be a non-empty string for " .. definition.name)

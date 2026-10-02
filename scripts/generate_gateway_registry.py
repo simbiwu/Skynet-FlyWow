@@ -6,7 +6,7 @@
 命令规则：
 1. .proto 必须声明 enum CommandId；每个非零枚举项是一个业务命令。
 2. 枚举名按 QUERY_CELL -> QueryCell 转换为消息前缀。
-3. 每个命令必须有 XxxRequest；有 XxxResponse 就生成响应类型，没有则生成单向命令。
+3. XxxRequest 和 XxxResponse 都可选；两者都有是请求-响应，只有 Request 是单向请求，只有 Response 是主动下发。
 4. 不读取 service/rpc，不解析注释，不引入自定义 Protobuf option。
 生命周期/所有权：每次构建独立运行；原子替换输出，不保存跨运行状态。
 不负责：不参与 Server Runtime，不替代 protoc，不生成业务 handler。
@@ -94,11 +94,11 @@ def parse_proto(source: str) -> tuple[str, list[dict[str, str | int | None]]]:
         request_name = f"{method_name}Request"
         response_name = f"{method_name}Response"
 
-        if request_name not in message_names:
-            raise ValueError(
-                f"{enum_name}={command_id} requires message {request_name}"
-            )
-
+        request_type = (
+            f".{package}.{request_name}"
+            if request_name in message_names
+            else None
+        )
         response_type = (
             f".{package}.{response_name}"
             if response_name in message_names
@@ -112,7 +112,7 @@ def parse_proto(source: str) -> tuple[str, list[dict[str, str | int | None]]]:
             {
                 "id": command_id,
                 "name": method_name,
-                "request": f".{package}.{request_name}",
+                "request": request_type,
                 "response": response_type,
             }
         )
@@ -131,7 +131,7 @@ def render(
     lines = [
         "-- 职责：由 proto CommandId 和 Request/Response 消息生成的 FlyWow Gateway command registry。",
         "-- 边界：Build Artifact；运行时只读加载，不手工注册 command。",
-        "-- 输入/输出：CommandId + XxxRequest + 可选 XxxResponse -> Envelope command 映射。",
+        "-- 输入/输出：CommandId + 可选 XxxRequest/XxxResponse -> Envelope command 映射。",
         "-- 生命周期：协议生成后随 Server 产物发布；Gateway 启动时加载并校验。",
         "-- 不负责：不实现业务 handler、不读取 Socket、不动态解析 .proto。",
         "return",
@@ -142,6 +142,11 @@ def render(
     ]
 
     for command in sorted(commands, key=lambda item: int(item["id"])):
+        request = (
+            f'"{command["request"]}"'
+            if command["request"] is not None
+            else "nil"
+        )
         response = (
             f'"{command["response"]}"'
             if command["response"] is not None
@@ -152,7 +157,7 @@ def render(
                 f'        [{command["id"]}] =',
                 "        {",
                 f'            name          = "{command["name"]}",',
-                f'            request_type  = "{command["request"]}",',
+                f"            request_type  = {request},",
                 f"            response_type = {response},",
                 "        },",
             ]

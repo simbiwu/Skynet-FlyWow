@@ -418,20 +418,6 @@ local function dispatch_payload(connection, payload)
         return false
     end
 
-    --- uint64 的高位在 pinned Lua 中表现为负整数；保持原始位模式，不能按正负过滤。
-    if math.type(envelope.request_id) ~= "integer" or envelope.request_id == 0 then
-        emit(
-        {
-            kind          = "error",
-            code          = "REQUEST_ID",
-            message       = "request_id must be a nonzero uint64 bit pattern",
-            connection_id = connection.id,
-        }
-        )
-
-        return false
-    end
-
     -- 核心计算：根据 CommandId 查找定义并解码 Request。
     local definition = registry_loader.find(state.registry, envelope.command)
     if definition == nil then
@@ -459,7 +445,6 @@ local function dispatch_payload(connection, payload)
             code          = "REQUEST_DECODE",
             message       = tostring(request),
             connection_id = connection.id,
-            command       = definition.name,
         }
         )
 
@@ -498,22 +483,19 @@ local function dispatch_payload(connection, payload)
     connection.last_message = now
 
     -- 持久化/消息发送：把已解码请求和路由元数据投递给业务层。
-    --- 元数据随消息传递；Gateway 不建立 request_id/token 等待表，也不暴露 fd。
+    --- 只传递连接身份、command_id 和已解码数据；Gateway 不缓存业务请求。
     local sent, err = pcall(
         skynet.send,
         state.config.handler_service,
         "lua",
-        "gateway_dispatch",
+        "send_data",
         {
             gateway_epoch    = state.epoch,
             connection_id    = connection.id,
             peer             = connection.peer,
             transport        = connection.transport,
-            request_id       = envelope.request_id,
             command_id       = definition.id,
-            command          = definition.name,
-            expects_response = definition.response_type ~= nil,
-            request          = request,
+            data             = request,
         }
     )
 
@@ -534,70 +516,15 @@ local function dispatch_payload(connection, payload)
 end
 
 
---- 异步响应/推送入口：使用消息携带的路由元数据编码并发送，不查找业务请求记录。
---- source 必须是配置的 handler handle；message 包含 epoch/connection_id/command_id/request_id/response。
---- request_id=0 是已登记响应类型的主动推送；非零编号由客户端关联。返回 boolean，不返回给 send 调用者。
---- 编码和 ws/TCP 写入在 pinned Skynet ws 实现中不 yield；写失败先 detach，再 fork 关闭，阻止 fd 复用误投。
----@param source ServiceHandle 发送 response 的已配置 handler handle。
----@param message GatewayResponseMessage 带有完整路由身份的业务 response。
----@return boolean 是否已接纳编码和 transport 写入。
-local function deliver_response(source, message)
-    -- 参数/状态检查：校验来源、Gateway 实例和连接身份。
-    if not state.config or source ~= state.config.handler_service or
-        type(message) ~= "table" or message.gateway_epoch ~= state.epoch or
-        state.phase ~= "running" then
-        state.responses_dropped = state.responses_dropped + 1
-        return false
-    end
-
-    local connection = state.connections[message.connection_id]
-    if not connection or connection.closed or
-        not state.handshake.ready(connection.handshake) then
-        state.responses_dropped = state.responses_dropped + 1
-        return false
-    end
-
-    -- 核心计算：根据 CommandId 选择 Response 类型并完成编码。
-    local definition = registry_loader.find(state.registry, message.command_id)
-    if not definition or definition.response_type == nil or
-        type(message.response) ~= "table" or
-        math.type(message.request_id) ~= "integer" then
-        emit(
-        {
-            kind          = "error",
-            code          = definition and definition.response_type == nil
-                and "RESPONSE_NOT_SUPPORTED" or "RESPONSE_ARGUMENT",
-            message       = definition and definition.response_type == nil
-                and "command does not define a response" or "invalid response record",
-            connection_id = connection.id,
-        }
-        )
-
-        return false
-    end
-
-    local ok, encoded = pcall(
-        state.codec.encode_response,
-        definition,
-        message.request_id,
-        state.config.protocol_version,
-        message.response
-    )
-    if not ok or #encoded > state.config.max_frame_bytes then
-        emit(
-        {
-            kind          = "error",
-            code          = "RESPONSE_ENCODE",
-            message       = ok and "response exceeds frame limit" or tostring(encoded),
-            connection_id = connection.id,
-        }
-        )
-
-        return false
-    end
-
-    -- 持久化/消息发送：按传输类型写回客户端。
+--- 发送入口：编码后发送给指定连接，或发送给当前所有已握手连接。
+--- source 必须是配置的 handler；message 包含 epoch/connection_id/command_id/data。
+--- connection_id=0 表示广播；Gateway 不保存业务请求状态，也不判断业务结果。
+---@param source ServiceHandle 发送 data 的已配置 handler handle。
+---@param message GatewayDataMessage 带有目标连接和响应数据。
+---@return boolean 是否至少接纳了一次传输写入。
+local function write_connection(connection, encoded)
     local sent, err
+
     if connection.transport == "tcp" then
         sent, err = pcall(
             socket.write,
@@ -614,7 +541,6 @@ local function deliver_response(source, message)
         )
     end
 
-    -- 收尾：写失败时摘除连接并异步关闭底层传输。
     if not sent then
         emit(
         {
@@ -629,20 +555,86 @@ local function deliver_response(source, message)
         skynet.fork(function()
             close_transport(connection, 1011, "write failed")
         end)
+        return false
     end
 
-    if sent then
-        state.responses_sent = state.responses_sent + 1
-    end
-
-    return sent
+    state.responses_sent = state.responses_sent + 1
+    return true
 end
 
+local function deliver_data(source, message)
+    -- 参数/状态检查：只接受当前 Gateway handler 发来的当前实例消息。
+    if not state.config or source ~= state.config.handler_service or
+        type(message) ~= "table" or
+        message.gateway_epoch ~= state.epoch or
+        state.phase ~= "running" then
+        state.responses_dropped = state.responses_dropped + 1
+        return false
+    end
+
+    if math.type(message.connection_id) ~= "integer" or
+        message.connection_id < 0 or
+        math.type(message.command_id) ~= "integer" or
+        message.command_id <= 0 or
+        type(message.data) ~= "table" then
+        state.responses_dropped = state.responses_dropped + 1
+        return false
+    end
+
+    -- 数据准备：根据 command_id 找到 response 类型并完成一次编码。
+    local definition = registry_loader.find(state.registry, message.command_id)
+    if not definition or definition.response_type == nil then
+        state.responses_dropped = state.responses_dropped + 1
+        return false
+    end
+
+    local ok, encoded = pcall(
+        state.codec.encode_response,
+        definition,
+        state.config.protocol_version,
+        message.data
+    )
+    if not ok or #encoded > state.config.max_frame_bytes then
+        emit(
+        {
+            kind          = "error",
+            code          = "RESPONSE_ENCODE",
+            message       = ok and "response exceeds frame limit" or tostring(encoded),
+            connection_id = message.connection_id,
+        }
+        )
+
+        return false
+    end
+
+    -- 持久化/消息发送：指定连接或广播到当前已握手连接。
+    if message.connection_id == 0 then
+        local sent_any = false
+
+        for _, connection in pairs(state.connections) do
+            if not connection.closed and
+                state.handshake.ready(connection.handshake) then
+                sent_any = write_connection(connection, encoded) or sent_any
+            end
+        end
+
+        return sent_any
+    end
+
+    local connection = state.connections[message.connection_id]
+    if not connection or connection.closed or
+        not state.handshake.ready(connection.handshake) then
+        state.responses_dropped = state.responses_dropped + 1
+        return false
+    end
+
+    return write_connection(connection, encoded)
+end
 
 --- 接收 handler 的主动断开命令；只按当前实例与连接身份关闭，不查业务请求记录。
 --- source 必须是配置的 handler；message.gateway_epoch/connection_id 来自原请求或项目会话。
 --- 返回是否首次接纳；未授权、旧实例、失效连接或重复关闭返回 false，不影响新连接。
---- 先 detach 并发出一次 disconnect，再 fork transport 关闭；消息入口不 yield，关闭任务可能 yield。
+--- 先摘除连接，再 fork transport 关闭；消息入口不 yield，关闭任务可能 yield。
 local function request_close(source, message)
     -- 参数/状态检查：只接受当前 Gateway handler 发来的当前实例请求。
     if not state.config or state.phase ~= "running" or
@@ -1174,13 +1166,13 @@ skynet.start(function()
     luapanda_debug.start(8820)
 
     skynet.dispatch("lua", function(_session, source, command, argument)
-        if command == "gateway_close" then
+        if command == "close" then
             request_close(source, argument)
             return
         end
 
-        if command == "gateway_response" then
-            deliver_response(source, argument)
+        if command == "send_data" then
+            deliver_data(source, argument)
             return
         end
 

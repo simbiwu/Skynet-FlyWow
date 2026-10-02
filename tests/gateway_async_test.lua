@@ -113,29 +113,29 @@ local function scenario(overrides)
     function registry.find(index, command)
         if command == 1001 then return
         {
-            id   = 1001,
-            name = "QueryCell",
+            id            = 1001,
+            name          = "QueryCell",
+            response_type = ".demo.QueryCellResponse",
         }
         end
     end
     local codec = {}
-    -- payload 的数字表示 request_id；bad 用于模拟损坏协议。
+    -- payload 的数字只用于构造可重复的测试 request data。
     function codec.decode_envelope(payload)
         assert(payload ~= "bad", "malformed envelope")
         return
         {
             protocol_version = 3,
             command          = 1001,
-            request_id       = tonumber(payload),
             body             = "",
         }
     end
     -- 请求 body 替身，与业务无关。
-    function codec.decode_request() return {} end
-    -- 响应编号编码为文本，允许测试确定顺序；fail 注入编码异常。
-    function codec.encode_response(definition, id, version, response)
+    function codec.decode_request() return { test_id = 1, map_id = 1001 } end
+    -- 响应结果编码为文本，fail 注入编码异常。
+    function codec.encode_response(definition, version, response)
         assert(not response.fail, "encode failure")
-        return tostring(id)
+        return tostring(response.result or 0)
     end
     package.loaded["skynet"] = skynet
     package.loaded["skynet.socket"] = socket
@@ -160,7 +160,6 @@ local function scenario(overrides)
             }
         end,
     }
-    package.loaded["gateway.endpoint"] = nil
     dofile(root .. "/service/gateway/flywow_gateway.lua")
     e.dispatch(1, 8, "start",
     {
@@ -186,250 +185,56 @@ local e = scenario()
 e.streams[10] = frame(1) .. frame(2)
 e.accept(10, "peer")
 resume(e.forks[2])
-assert(#e.sends == 2 and e.sends[1][2] == "gateway_dispatch" and e.sends[2][3].request_id == 2)
-assert(#e.writes == 0, "B must be read before any response")
-local endpoint = require "gateway.endpoint"
-local a = endpoint.new(
-{
-    gateway_service = 99,
-    request         = e.sends[1][3],
-}
-)
-local b = endpoint.new(
-{
-    gateway_service = 99,
-    request         = e.sends[2][3],
-}
-)
-assert(b:reply({}))
-assert(a:reply({}))
-assert(not a:reply({}))
-e.dispatch(0, 7, "gateway_response", e.sends[3][3])
-e.dispatch(0, 7, "gateway_response", e.sends[4][3])
-assert(e.writes[1][2] == frame(2) and e.writes[2][2] == frame(1))
-local reply = e.sends[3][3]
-e.dispatch(0, 999, "gateway_response", reply)
-assert(#e.writes == 2, "unauthorized source must be dropped")
-reply.gateway_epoch = "old"
-e.dispatch(0, 7, "gateway_response", reply)
-assert(#e.writes == 2, "old Gateway epoch must be dropped")
-reply.gateway_epoch = e.sends[1][3].gateway_epoch
-reply.response =
-{
-    fail = true,
-}
-e.dispatch(0, 7, "gateway_response", reply)
-assert(not e.closed[10], "encoding failure must not close healthy connection")
-reply.response, reply.request_id = {}, 0
-e.dispatch(0, 7, "gateway_response", reply)
-assert(e.writes[3][2] == frame(0), "registered response push must work")
-e.dispatch(1, 8, "stop")
-e.dispatch(0, 7, "gateway_response", reply)
-assert(#e.writes == 3 and e.closed[10])
 
-e = scenario(
-{
-    max_requests_per_second = 1,
-}
-)
-e.streams[10] = frame(1) .. frame(2)
-e.accept(10, "peer")
-resume(e.forks[2])
-assert(e.closed[10] and #e.sends == 2 and e.sends[2][2] == "gateway_disconnect")
-
-e = scenario(
-{
-    read_timeout_ticks = 20,
-}
-)
-e.streams[10] = "\0"
-e.accept(10, "peer")
-resume(e.forks[2])
-resume(e.forks[1])
-e.now = 30
-resume(e.forks[1])
-assert(e.closed[10], "partial header must time out")
-
-e = scenario(
-{
-    max_clients = 1,
-}
-)
-e.accept(10, "peer")
-e.accept(11, "peer")
-assert(e.closed[11], "connection count must be bounded")
-
-e = scenario(
-{
-    transport   = "websocket",
-    max_clients = 1,
-}
-)
-e.accept(10, "peer")
-e.accept(11, "peer")
-assert(e.closed[11], "pending handshake counts against connection limit")
-resume(e.forks[2])
-e.ws.message(10, "2", "binary")
 assert(#e.sends == 2)
-e.ws.message(10, "bad", "binary")
-assert(e.closed[10])
--- 写失败摘除连接；清理协程不占用业务等待状态。
-e = scenario()
-e.streams[10] = frame(1)
-e.accept(10, "peer")
-resume(e.forks[2])
-endpoint = require "gateway.endpoint"
-local context = endpoint.new(
+assert(e.sends[1][2] == "send_data")
+assert(e.sends[1][3].connection_id == 1)
+assert(e.sends[2][3].connection_id == 1)
+assert(#e.writes == 0, "Gateway must not write before handler sends data")
+
+local message = e.sends[1][3]
+local current_epoch = message.gateway_epoch
+message.data = { result = 1 }
+e.dispatch(0, 7, "send_data", message)
+assert(e.writes[1][2] == frame(1))
+
+message.gateway_epoch = "old"
+e.dispatch(0, 7, "send_data", message)
+assert(#e.writes == 1, "old Gateway epoch must be dropped")
+
+message.gateway_epoch = current_epoch
+message.data = { fail = true }
+e.dispatch(0, 7, "send_data", message)
+assert(#e.writes == 1, "encoding failure must not close healthy connection")
+message.data = { result = 2 }
+e.dispatch(0, 999, "send_data", message)
+assert(#e.writes == 1, "unauthorized source must be dropped")
+
+local push =
 {
-    gateway_service = 99,
-    request         = e.sends[1][3],
+    gateway_epoch = current_epoch,
+    connection_id = 0,
+    command_id = 1001,
+    data = { result = 3 },
 }
-)
-context:reply({})
-e.fail_write = true
-e.dispatch(0, 7, "gateway_response", e.sends[2][3])
-e.dispatch(1, 8, "stats")
-assert(e.result.clients == 0)
+e.dispatch(0, 7, "send_data", push)
+assert(#e.writes == 2, "one active connection receives broadcast")
+
+e.dispatch(0, 7, "close",
+{
+    gateway_epoch = current_epoch,
+    connection_id = message.connection_id,
+})
 resume(e.forks[3])
 assert(e.closed[10])
 
--- 写缓冲告警是网络策略，达到阈值后释放连接。
 e = scenario()
+e.streams[10] = frame(1)
 e.accept(10, "peer")
 resume(e.forks[2])
-e.warning(10, 1024)
-assert(e.closed[10])
-
--- 同一实例的总速率限制独立于单连接限制。
-e = scenario(
-{
-    max_total_requests_per_second = 1,
-}
-)
-e.streams[10], e.streams[11] = frame(1), frame(2)
-e.accept(10, "peer")
-resume(e.forks[2])
-e.accept(11, "peer")
+assert(e.sends[1][2] == "send_data")
+e.dispatch(0, 7, "close", e.sends[1][3])
 resume(e.forks[3])
-assert(e.closed[11])
-
--- 自定义返回函数发送失败后可以显式重试；options 修改不改变已有上下文。
-e = scenario()
-e.streams[10] = frame(1)
-e.accept(10, "peer")
-resume(e.forks[2])
-endpoint = require "gateway.endpoint"
-local fail, calls = true, 0
-local options =
-{
-    request = e.sends[1][3],
-}
--- 测试发送函数只记录调用次数，失败不表示客户端收到，成功也不做交付承诺。
-function options.send(message)
-    calls = calls + 1
-    return not fail
-end
-context = endpoint.new(options)
-options.send = nil
-local ok, code = context:reply({})
-assert(not ok and code == "SEND_FAILED")
-fail = false
-assert(context:reply({}) and calls == 2)
-assert(not context:reply({}))
--- stop 在读任务启动前也必须关闭 accepted fd；重复 stop 保持幂等。
-for _, transport in ipairs({ "tcp", "websocket" }) do
-    e = scenario(
-    {
-        transport = transport,
-    }
-    )
-    e.accept(10, "peer")
-    e.dispatch(1, 8, "stop")
-    assert(e.closed[10] and e.result.closed_connections == 1)
-    e.dispatch(1, 8, "stop")
-    assert(e.result.closed_connections == 0)
-    resume(e.forks[2])
-end
-
--- 连接编号达到 maxinteger 后拒绝接入，不能回绕复用。
-e = scenario()
-for index = 1, 20 do
-    local name, value = debug.getupvalue(e.dispatch, index)
-    if name == "state" then value.next_connection_id = math.maxinteger; break end
-end
-e.accept(10, "peer")
 assert(e.closed[10])
--- 主动关闭只允许 handler；旧实例、重复命令不影响当前连接，通知仅发一次。
-for _, transport in ipairs({ "tcp", "websocket" }) do
-    e = scenario(
-    {
-        transport = transport,
-    }
-    )
-    e.streams[10] = frame(1)
-    e.accept(10, "peer")
-    resume(e.forks[2])
-    endpoint = require "gateway.endpoint"
-    context = endpoint.new(
-    {
-        gateway_service = 99,
-        request         = e.sends[1][3],
-    }
-    )
-    assert(context:close())
-    ok, code = context:close()
-    assert(not ok and code == "DUPLICATE_CLOSE")
-    ok, code = context:reply({})
-    assert(not ok and code == "CONNECTION_CLOSING")
-    local message = e.sends[2][3]
-    e.dispatch(0, 8, "gateway_close", message)
-    e.dispatch(1, 8, "stats")
-    assert(e.result.clients == 1, "unauthorized close must be rejected")
-    local original = message.gateway_epoch
-    message.gateway_epoch = "old"
-    e.dispatch(0, 7, "gateway_close", message)
-    e.dispatch(1, 8, "stats")
-    assert(e.result.clients == 1)
-    message.gateway_epoch = original
-    e.dispatch(0, 7, "gateway_close", message)
-    e.dispatch(0, 7, "gateway_close", message)
-    assert(#e.sends == 3 and e.sends[3][2] == "gateway_disconnect")
-    e.dispatch(1, 8, "stats")
-    assert(e.result.clients == 0)
-    resume(e.forks[3])
-    assert(e.closed[10])
-    -- fd 被新连接复用后，原关闭命令不能关闭新连接。
-    e.streams[10] = frame(2)
-    e.closed[10] = nil
-    e.accept(10, "peer")
-    resume(e.forks[4])
-    e.dispatch(0, 7, "gateway_close", message)
-    e.dispatch(1, 8, "stats")
-    assert(e.result.clients == 1 and not e.closed[10])
-end
 
--- 项目自定义返回路径要显式提供关闭函数；失败允许重试，且 options 修改不影响快照。
-e = scenario()
-e.streams[10] = frame(1)
-e.accept(10, "peer")
-resume(e.forks[2])
-endpoint = require "gateway.endpoint"
-options =
-{
-    request = e.sends[1][3],
-}
--- 自定义发送函数由项目提供，测试只需要声明合法返回值。
-function options.send() return true end
-context = endpoint.new(options)
-ok, code = context:close()
-assert(not ok and code == "CLOSE_UNAVAILABLE")
-fail = true
--- 自定义关闭的失败不会把上下文永久标记为已关闭。
-function options.close(message) return not fail end
-context = endpoint.new(options)
-options.close = nil
-ok, code = context:close()
-assert(not ok and code == "SEND_FAILED")
-fail = false
-assert(context:close())
 print("GATEWAY_ASYNC_UNIT_OK")

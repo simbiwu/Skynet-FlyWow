@@ -46,10 +46,13 @@ message EchoResponse
         self.assertIn("[42] =\n        {", output)
         self.assertIn(".demo.v1.EchoRequest", output)
 
-    def test_missing_request_fails(self) -> None:
-        """缺失 XxxRequest 的命令必须在构建期失败。"""
-        with self.assertRaises(ValueError):
-            MODULE.parse_proto(self.valid_proto().replace("message EchoRequest\n{}\n", ""))
+    def test_push_command_without_request_is_supported(self) -> None:
+        """只有 XxxResponse 的命令必须生成 nil request_type。"""
+        _, commands = MODULE.parse_proto(
+            self.valid_proto().replace("message EchoRequest\n{}\n", "")
+        )
+        self.assertIsNone(commands[0]["request"])
+        self.assertIn("request_type  = nil", MODULE.render("demo.v1", commands))
 
     def test_duplicate_command_id_fails(self) -> None:
         """两个命令使用同一 command id 必须失败。"""

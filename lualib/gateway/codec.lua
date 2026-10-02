@@ -44,15 +44,17 @@ function M.new(options)
     -- definition 由同一 codec 的 registry 提供且只读；body 由调用方借用，本函数不保存 borrowed buffer。
     -- 返回当前 Service 拥有的新 request table；消息类型缺失或 body 非法时抛错，不执行 I/O/yield。
     function codec.decode_request(definition, body)
+        assert(definition.request_type ~= nil,
+               "gateway command does not define a request: " .. definition.name)
         return assert(pb.decode(definition.request_type, body))
     end
 
     -- 将业务 response 编码为 registry 指定的 response message，再封装为完整 Envelope。
     -- 单向命令的 response_type 为 nil；调用此函数会立即失败，防止伪造业务响应。
-    -- definition 是只读 command 定义；request_id 原样关联请求；version 是已协商的协议版本整数。
+    -- definition 是只读 command 定义；version 是已协商的协议版本整数。
     -- response 是 handler 返回的业务 table，调用方拥有且本函数只读。返回新 Lua bytes string；
     -- Protobuf 编码失败时抛错；不执行 I/O、yield 或修改业务 response。
-    function codec.encode_response(definition, request_id, version, response)
+    function codec.encode_response(definition, version, response)
         assert(definition.response_type ~= nil,
                "gateway command does not define a response: " .. definition.name)
         local body = assert(pb.encode(definition.response_type, response))
@@ -60,7 +62,6 @@ function M.new(options)
         {
             protocol_version = version,
             command          = definition.id,
-            request_id       = request_id,
             body             = body,
         }
 
