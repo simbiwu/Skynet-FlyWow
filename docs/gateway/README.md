@@ -140,7 +140,7 @@ service NavigationService
 构建阶段由宿主的 Server build 调用 FlyWow 生成器：
 
 ```bash
-python3 "$FLYWOW_ROOT/tools/generate_gateway_registry.py" \
+python3 server/third_party/skynet-flywow/tools/generate_gateway_registry.py \
   --proto shared/protocol/navigation_query.proto \
   --output server/lualib/protocol/navigation_registry.lua
 ```
@@ -227,7 +227,7 @@ python3 scripts/ci/check_repository.py
 
 Lua 合同测试加载真实 Gateway/endpoint 源码，但 transport/codec 是替身；没有显式 SKYNET_LUA 时会明确跳过。宿主真实集成测试负责 pinned Skynet、真实 Protobuf、TCP、WS、单进程和 Cluster 路径。测试覆盖 A 延迟期间 B 完成、乱序结果、编码失败不关连接、主动消息、断线迟到回包、协议失败和网络上限。
 
-升级必须同时迁移旧 handler 的 call/retpack 合同为双向 send，并让 handler 接受 disconnect 通知。Envelope 和协议版本不变。正常发布固定已验证的 submodule 提交；开发阶段只通过显式 FLYWOW_ROOT 指向独立工作区。回滚时同步回滚框架与 handler，不能混用同步/异步 API。
+升级必须同时迁移旧 handler 的 call/retpack 合同为双向 send，并让 handler 接受 disconnect 通知。Envelope 和协议版本不变。正常发布固定已验证的 submodule 提交；开发阶段直接使用仓库内固定的 FlyWow submodule。回滚时同步回滚框架与 handler，不能混用同步/异步 API。
 
 ## 业务主动断开
 
