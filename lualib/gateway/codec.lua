@@ -14,6 +14,7 @@ local function read_file(path)
     local file = assert(io.open(path, "rb"))
     local bytes = file:read("*a")
     file:close()
+
     return bytes
 end
 
@@ -26,8 +27,9 @@ function M.new(options)
     assert(type(options.descriptor_path) == "string" and options.descriptor_path ~= "",
            "gateway descriptor_path is required")
     assert(type(options.registry) == "table", "gateway registry is required")
-    local bytes = read_file(options.descriptor_path)
-    assert(pb.load(bytes), "cannot load protobuf descriptor: " .. options.descriptor_path)
+    local descriptor_bytes = read_file(options.descriptor_path)
+    assert(pb.load(descriptor_bytes),
+           "cannot load protobuf descriptor: " .. options.descriptor_path)
 
     local codec = {}
 
@@ -61,6 +63,7 @@ function M.new(options)
             request_id       = request_id,
             body             = body,
         }
+
         return assert(pb.encode(options.registry.envelope_type, envelope))
     end
 

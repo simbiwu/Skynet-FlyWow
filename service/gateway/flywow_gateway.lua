@@ -38,15 +38,6 @@ local state =
     client_count       = 0, -- 当前已完成接入的连接数。
 }
 
---- 读取宿主工程的标准 Gateway 默认配置；配置文件归宿主维护，框架只读取不修改。
---- 参数：无；固定 require 名称为 config.gateway，必须返回普通 Lua table。
---- 返回值：默认配置 table；失败抛出配置加载异常，不执行 Socket I/O、不 yield。
-local function load_default_config()
-    local defaults = require "config.gateway"
-    assert(type(defaults) == "table", "config.gateway must return a table")
-    return defaults
-end
-
 --- 将启动时覆盖项浅合并到默认配置；handler_service 等运行期 handle 不写入静态配置。
 --- 参数 defaults/overrides：默认配置和可选覆盖 table；调用方拥有输入，函数不修改它们。
 --- 返回值：Gateway 私有候选配置；不执行 I/O、不 yield；同名顶层字段由 overrides 覆盖。
@@ -77,7 +68,10 @@ end
 --- 参数 input：可省略的启动覆盖 table；业务通常只传 handler_service，其他字段来自 config.gateway。
 --- 返回值：当前 Service 私有的不可再变更配置；失败抛错，不执行 I/O、yield 或启动资源。
 local function normalize_config(input)
-    local merged = merge_config(load_default_config(), input)
+    local defaults = require "config.gateway"
+    assert(type(defaults) == "table", "config.gateway must return a table")
+
+    local merged = merge_config(defaults, input)
     local transport = merged.transport or "tcp"
     assert(transport == "tcp" or transport == "websocket", "unsupported gateway transport: " .. tostring(transport))
     if transport == "websocket" then
@@ -155,12 +149,13 @@ local function create_connection(fd, peer, transport)
         emit(
         {
             kind      = "warning",
-            code      = "MAX_CONNECTIONS",
-            message   = "connection limit reached",
-            peer      = peer,
-            transport = transport,
+            code        = "MAX_CONNECTIONS",
+            message     = "connection limit reached",
+            peer        = peer,
+            transport   = transport,
         }
         )
+
         return nil
     end
     if state.next_connection_id == math.maxinteger then
@@ -171,6 +166,7 @@ local function create_connection(fd, peer, transport)
             message = "connection identity exhausted",
         }
         )
+
         return nil
     end
     local handshake, handshake_error = state.handshake.accept()
@@ -203,6 +199,7 @@ local function create_connection(fd, peer, transport)
     state.connections[connection.id] = connection
     state.connections_by_fd[fd] = connection
     state.client_count = state.client_count + 1
+
     emit(
     {
         kind          = "open",
@@ -252,9 +249,15 @@ end
 --- connection 由 Gateway 拥有；code 为 WS 状态码，reason 为有限诊断文本，不含业务数据。
 --- 返回是否首次提交关闭；Socket/WS close 可能 yield。先标记 close_requested，并拒绝已被新连接占用的 fd。
 local function close_transport(connection, code, reason)
-    if connection.close_requested then return false end
+    if connection.close_requested then
+        return false
+    end
+
     local current = state.connections_by_fd[connection.fd]
-    if current and current ~= connection then return false end
+    if current and current ~= connection then
+        return false
+    end
+
     connection.close_requested = true
     if connection.transport == "websocket" and not websocket.is_close(connection.fd) then
         websocket.close(connection.fd, code or 1001, reason or "closed")
@@ -282,8 +285,10 @@ local function dispatch_payload(connection, payload)
             connection_id = connection.id,
         }
         )
+
         return false
     end
+
     --- pcall 把不可信网络字节导致的解码异常限制在当前请求，便于统一发事件并关闭连接。
     local envelope_ok, envelope = pcall(state.codec.decode_envelope, payload)
     if not envelope_ok then
@@ -295,8 +300,10 @@ local function dispatch_payload(connection, payload)
             connection_id = connection.id,
         }
         )
+
         return false
     end
+
     if envelope.protocol_version ~= state.config.protocol_version then
         emit(
         {
@@ -306,8 +313,10 @@ local function dispatch_payload(connection, payload)
             connection_id = connection.id,
         }
         )
+
         return false
     end
+
     --- uint64 的高位在 pinned Lua 中表现为负整数；保持原始位模式，不能按正负过滤。
     if math.type(envelope.request_id) ~= "integer" or envelope.request_id == 0 then
         emit(
@@ -318,8 +327,10 @@ local function dispatch_payload(connection, payload)
             connection_id = connection.id,
         }
         )
+
         return false
     end
+
     local definition = registry_loader.find(state.registry, envelope.command)
     if definition == nil then
         emit(
@@ -330,9 +341,15 @@ local function dispatch_payload(connection, payload)
             connection_id = connection.id,
         }
         )
+
         return false
     end
-    local request_ok, request = pcall(state.codec.decode_request, definition, envelope.body)
+
+    local request_ok, request = pcall(
+        state.codec.decode_request,
+        definition,
+        envelope.body
+    )
     if not request_ok then
         emit(
         {
@@ -343,16 +360,20 @@ local function dispatch_payload(connection, payload)
             command       = definition.name,
         }
         )
+
         return false
     end
 
     local now = skynet.now()
+
     if (now - connection.rate_started) % 0x100000000 >= 100 then
         connection.rate_started, connection.rate_count = now, 0
     end
+
     if (now - state.rate_started) % 0x100000000 >= 100 then
         state.rate_started, state.rate_count = now, 0
     end
+
     if connection.rate_count >= state.config.max_requests_per_second or
         state.rate_count >= state.config.max_total_requests_per_second then
         emit(
@@ -363,26 +384,34 @@ local function dispatch_payload(connection, payload)
             connection_id = connection.id,
         }
         )
+
         return false
     end
+
     connection.rate_count = connection.rate_count + 1
     state.rate_count = state.rate_count + 1
     connection.request_count = connection.request_count + 1
     connection.last_message = now
+
     --- 元数据随消息传递；Gateway 不建立 request_id/token 等待表，也不暴露 fd。
-    local sent, err = pcall(skynet.send, state.config.handler_service, "lua", "gateway_dispatch",
-    {
-        gateway_epoch = state.epoch,
-        connection_id = connection.id,
-        peer          = connection.peer,
-        transport     = connection.transport,
-        request_id    = envelope.request_id,
-        command_id       = definition.id,
-        command           = definition.name,
-        expects_response  = definition.response_type ~= nil,
-        request           = request,
-    }
+    local sent, err = pcall(
+        skynet.send,
+        state.config.handler_service,
+        "lua",
+        "gateway_dispatch",
+        {
+            gateway_epoch    = state.epoch,
+            connection_id    = connection.id,
+            peer             = connection.peer,
+            transport        = connection.transport,
+            request_id       = envelope.request_id,
+            command_id       = definition.id,
+            command          = definition.name,
+            expects_response = definition.response_type ~= nil,
+            request          = request,
+        }
     )
+
     if not sent or err == nil then
         emit(
         {
@@ -392,10 +421,13 @@ local function dispatch_payload(connection, payload)
             connection_id = connection.id,
         }
         )
+
         return false
     end
+
     return true
 end
+
 
 --- 异步响应/推送入口：使用消息携带的路由元数据编码并发送，不查找业务请求记录。
 --- source 必须是配置的 handler handle；message 包含 epoch/connection_id/command_id/request_id/response。
@@ -405,19 +437,24 @@ end
 ---@param message GatewayResponseMessage 带有完整路由身份的业务 response。
 ---@return boolean 是否已接纳编码和 transport 写入。
 local function deliver_response(source, message)
-    if not state.config or source ~= state.config.handler_service or type(message) ~= "table" or
-        message.gateway_epoch ~= state.epoch or state.phase ~= "running" then
+    if not state.config or source ~= state.config.handler_service or
+        type(message) ~= "table" or message.gateway_epoch ~= state.epoch or
+        state.phase ~= "running" then
         state.responses_dropped = state.responses_dropped + 1
         return false
     end
+
     local connection = state.connections[message.connection_id]
-    if not connection or connection.closed or not state.handshake.ready(connection.handshake) then
+    if not connection or connection.closed or
+        not state.handshake.ready(connection.handshake) then
         state.responses_dropped = state.responses_dropped + 1
         return false
     end
+
     local definition = registry_loader.find(state.registry, message.command_id)
     if not definition or definition.response_type == nil or
-        type(message.response) ~= "table" or math.type(message.request_id) ~= "integer" then
+        type(message.response) ~= "table" or
+        math.type(message.request_id) ~= "integer" then
         emit(
         {
             kind          = "error",
@@ -428,10 +465,17 @@ local function deliver_response(source, message)
             connection_id = connection.id,
         }
         )
+
         return false
     end
-    local ok, encoded = pcall(state.codec.encode_response, definition, message.request_id,
-                             state.config.protocol_version, message.response)
+
+    local ok, encoded = pcall(
+        state.codec.encode_response,
+        definition,
+        message.request_id,
+        state.config.protocol_version,
+        message.response
+    )
     if not ok or #encoded > state.config.max_frame_bytes then
         emit(
         {
@@ -441,15 +485,27 @@ local function deliver_response(source, message)
             connection_id = connection.id,
         }
         )
+
         return false
     end
+
     local sent, err
     if connection.transport == "tcp" then
-        sent, err = pcall(socket.write, connection.fd, string.pack(">I2", #encoded) .. encoded)
+        sent, err = pcall(
+            socket.write,
+            connection.fd,
+            string.pack(">I2", #encoded) .. encoded
+        )
         sent = sent and err ~= false
     else
-        sent, err = pcall(websocket.write, connection.fd, encoded, "binary")
+        sent, err = pcall(
+            websocket.write,
+            connection.fd,
+            encoded,
+            "binary"
+        )
     end
+
     if not sent then
         emit(
         {
@@ -459,33 +515,46 @@ local function deliver_response(source, message)
             connection_id = connection.id,
         }
         )
+
         detach(connection, "write failed")
         skynet.fork(function()
             close_transport(connection, 1011, "write failed")
         end)
     end
-    if sent then state.responses_sent = state.responses_sent + 1 end
+
+    if sent then
+        state.responses_sent = state.responses_sent + 1
+    end
+
     return sent
 end
+
 
 --- 接收 handler 的主动断开命令；只按当前实例与连接身份关闭，不查业务请求记录。
 --- source 必须是配置的 handler；message.gateway_epoch/connection_id 来自原请求或项目会话。
 --- 返回是否首次接纳；未授权、旧实例、失效连接或重复关闭返回 false，不影响新连接。
 --- 先 detach 并发出一次 disconnect，再 fork transport 关闭；消息入口不 yield，关闭任务可能 yield。
 local function request_close(source, message)
-    if not state.config or state.phase ~= "running" or source ~= state.config.handler_service or
+    if not state.config or state.phase ~= "running" or
+        source ~= state.config.handler_service or
         type(message) ~= "table" or message.gateway_epoch ~= state.epoch or
         math.type(message.connection_id) ~= "integer" then
         return false
     end
+
     local connection = state.connections[message.connection_id]
-    if not connection or not detach(connection, "closed by handler") then return false end
+    if not connection or not detach(connection, "closed by handler") then
+        return false
+    end
+
     --- 关闭前已摘除索引，随后到达的 response/close 不会再使用该连接；fd 不暴露给业务。
     skynet.fork(function()
         close_transport(connection, 1008, "closed by server")
     end)
+
     return true
 end
+
 
 --- 从 TCP 字节流读取指定数量的字节；TCP 不保留消息边界，因此 header/body 必须分别读满。
 --- connection 是当前 Gateway 持有的 TCP 上下文；size 是正整数 byte 数。成功返回新 bytes string，失败返回 nil 与原因。
@@ -495,17 +564,26 @@ end
 ---@return string|nil, string|nil 完整 bytes，或失败原因；返回后需重新检查 connection.closed。
 local function read_exact(connection, size)
     connection.read_started = skynet.now()
+
     local data, remainder = socket.read(connection.fd, size)
+
     connection.read_started = nil
-    if connection.closed then return nil, "connection closed" end
+
+    if connection.closed then
+        return nil, "connection closed"
+    end
+
     if not data then
         return nil, remainder or "socket closed"
     end
+
     if #data ~= size then
         return nil, "short read"
     end
+
     return data
 end
+
 
 --- 将当前握手消息交给独立模块并发送其输出；Gateway不解析握手字段。
 --- connection/bytes只在本调用借用；返回boolean，失败由调用方关闭；写失败不提交ready。
@@ -520,6 +598,7 @@ local function process_handshake(connection, bytes)
         bytes   = bytes, -- 当前完整网络帧，只读借用。
     }
     )
+
     if not response then
         emit(
         {
@@ -529,17 +608,35 @@ local function process_handshake(connection, bytes)
             connection_id = connection.id,
         }
         )
+
         return false
     end
+
     local ok, result
     if connection.transport == "tcp" then
-        ok, result = pcall(socket.write, connection.fd, string.pack(">I2", #response) .. response)
+        ok, result = pcall(
+            socket.write,
+            connection.fd,
+            string.pack(">I2", #response) .. response
+        )
     else
-        ok, result = pcall(websocket.write, connection.fd, response, "binary")
+        ok, result = pcall(
+            websocket.write,
+            connection.fd,
+            response,
+            "binary"
+        )
     end
-    if not ok or result == false or connection.closed then return false end
+
+    if not ok or result == false or connection.closed then
+        return false
+    end
+
     if confirm then
-        if not state.handshake.confirm(connection.handshake) then return false end
+        if not state.handshake.confirm(connection.handshake) then
+            return false
+        end
+
         emit(
         {
             kind          = "ready",
@@ -548,8 +645,10 @@ local function process_handshake(connection, bytes)
         }
         )
     end
+
     return true
 end
+
 
 --- 运行一个已登记 TCP 连接；本协程串行读取和投递，直到 EOF、错误或 Service 停止。
 --- connection 由 Gateway 状态表持有并提供 fd；frame 为 2 byte uint16 big-endian 长度头 + Envelope bytes，长度不含头。
@@ -558,12 +657,20 @@ end
 ---@param connection GatewayConnection Gateway 独占的 TCP 连接。
 ---@return nil 直到 EOF、协议错误、超时或 Server 停止后退出并清理连接。
 local function run_tcp(connection)
-    if connection.closed then return end
+    if connection.closed then
+        return
+    end
+
     local fd = connection.fd
     local opened, open_error = socket.start(fd)
-    if connection.closed then return end
+
+    if connection.closed then
+        return
+    end
+
     --- pinned socket.start 成功无返回值；错误返回 false，不能依赖它返回 true。
     assert(opened ~= false, tostring(open_error))
+
     socket.limit(fd, state.config.max_frame_bytes + 2)
     socket.warning(fd, function(_, size)
         emit(
@@ -575,17 +682,23 @@ local function run_tcp(connection)
             pending_kb    = size,
         }
         )
+
         if size >= state.config.write_warning_close_kb then
             detach(connection, "write backpressure")
             close_transport(connection, 1013, "write backpressure")
         end
     end)
+
     while not connection.closed and state.phase == "running" do
         local header, err = read_exact(connection, 2)
-        if not header then break end
+        if not header then
+            break
+        end
+
         --- >I2 表示网络字节序 uint16；先拒绝 0 或超限长度，再按该值读取 body。
         local size = string.unpack(">I2", header)
         local ready = state.handshake.ready(connection.handshake)
+
         if (not ready and size ~= state.handshake.expected_size(connection.handshake)) or
             (ready and (size < 1 or size > state.config.max_frame_bytes)) then
             emit(
@@ -596,18 +709,29 @@ local function run_tcp(connection)
                 connection_id = connection.id,
             }
             )
+
             break
         end
+
         local payload
         payload, err = read_exact(connection, size)
-        if not payload then break end
+        if not payload then
+            break
+        end
+
         if ready then
-            if not dispatch_payload(connection, payload) then break end
-        elseif not process_handshake(connection, payload) then break end
+            if not dispatch_payload(connection, payload) then
+                break
+            end
+        elseif not process_handshake(connection, payload) then
+            break
+        end
     end
+
     detach(connection, "tcp session ended")
     close_transport(connection, 1001, "tcp session ended")
 end
+
 
 local ws_handler = {}
 
@@ -616,7 +740,9 @@ local ws_handler = {}
 --- 仅接受 binary 且受 max_frame_bytes 限制；函数无返回值，失败时发事件并关闭当前连接。
 function ws_handler.message(id, payload, opcode)
     local connection = state.connections_by_fd[id]
-    if not connection or connection.closed then return end
+    if not connection or connection.closed then
+        return
+    end
     if opcode ~= "binary" then
         emit(
         {
@@ -630,12 +756,14 @@ function ws_handler.message(id, payload, opcode)
         close_transport(connection, 1003, "binary messages required")
         return
     end
+
     local ok
     if state.handshake.ready(connection.handshake) then
         ok = dispatch_payload(connection, payload)
     else
         ok = process_handshake(connection, payload)
     end
+
     if not ok then
         detach(connection, "protocol rejected")
         close_transport(connection, 1008, "gateway request rejected")
@@ -647,7 +775,10 @@ end
 --- 无返回值，不执行跨 Service 调用或 yield；超过 max_clients 的连接在握手前拒绝。
 function ws_handler.handshake(id, header, url)
     local connection = state.connections_by_fd[id]
-    if not connection or connection.closed then return end
+    if not connection or connection.closed then
+        return
+    end
+
     connection.read_started = nil
     connection.last_message = skynet.now()
 end
@@ -662,6 +793,7 @@ end
 --- id 是 Skynet connection id，message 是底层诊断文本；不包含业务 payload。无返回值，只修改本 Service 的连接索引。
 function ws_handler.error(id, message)
     local connection = state.connections_by_fd[id]
+
     emit(
     {
         kind          = "error",
@@ -703,62 +835,90 @@ end
 local function accept_client(fd, peer)
     if state.config.transport == "websocket" then
         local accepted = create_connection(fd, peer, "websocket")
-        if not accepted then socket.close_fd(fd); return end
-        accepted.read_started = skynet.now()
-        skynet.fork(function()
-            if accepted.closed then return end
-            local ok, err = websocket.accept(fd, ws_handler, state.config.websocket_protocol, peer)
-            local connection = state.connections_by_fd[fd]
-            if not ok and err then emit(
-            {
-                kind          = "error",
-                code          = "WEBSOCKET_ACCEPT",
-                message       = tostring(err),
-                connection_id = connection and connection.id or fd,
-            }
-            ) end
-            detach(connection, "websocket session ended")
-        end)
-    else
-        local connection = create_connection(fd, peer, "tcp")
-        if not connection then
-            --- accepted fd 尚未进入 Lua socket_pool，必须用 close_fd 关闭。
+        if not accepted then
             socket.close_fd(fd)
             return
         end
-        --- 捕获 start/read/driver 异常，保证异常退出也释放连接；清理不向业务发送错误响应。
+
+        accepted.read_started = skynet.now()
         skynet.fork(function()
-            local ok, err = pcall(run_tcp, connection)
-            if not ok then
+            if accepted.closed then
+                return
+            end
+
+            local ok, err = websocket.accept(
+                fd,
+                ws_handler,
+                state.config.websocket_protocol,
+                peer
+            )
+            local connection = state.connections_by_fd[fd]
+
+            if not ok and err then
                 emit(
                 {
                     kind          = "error",
-                    code          = "TCP_SESSION",
+                    code          = "WEBSOCKET_ACCEPT",
                     message       = tostring(err),
-                    connection_id = connection.id,
+                    connection_id = connection and connection.id or fd,
                 }
                 )
-                detach(connection, "tcp session failed")
-                pcall(close_transport, connection, 1011, "tcp session failed")
             end
+
+            detach(connection, "websocket session ended")
         end)
+
+        return
     end
+
+    local connection = create_connection(fd, peer, "tcp")
+    if not connection then
+        --- accepted fd 尚未进入 Lua socket_pool，必须用 close_fd 关闭。
+        socket.close_fd(fd)
+        return
+    end
+
+    --- 捕获 start/read/driver 异常，保证异常退出也释放连接；清理不向业务发送错误响应。
+    skynet.fork(function()
+        local ok, err = pcall(run_tcp, connection)
+        if not ok then
+            emit(
+            {
+                kind          = "error",
+                code          = "TCP_SESSION",
+                message       = tostring(err),
+                connection_id = connection.id,
+            }
+            )
+
+            detach(connection, "tcp session failed")
+            pcall(close_transport, connection, 1011, "tcp session failed")
+        end
+    end)
 end
+
 
 --- 一个扫描协程限制 TCP 半包/空闲读与 WS 握手/空闲占用；不按请求创建 timer。
 --- 无参数；最多扫描 max_clients 个连接，tick 回绕用模运算；detach 后关闭会 yield。
 local function timeout_loop()
     while state.phase == "running" do
         skynet.sleep(10)
+
         local now = skynet.now()
         local expired = {}
+
         for _, connection in pairs(state.connections) do
             local since = connection.read_started or connection.last_message
-            local limit = connection.read_started and state.config.read_timeout_ticks or state.config.idle_timeout_ticks
-            if state.handshake.expired(connection.handshake) or (now - since) % 0x100000000 >= limit then
+            local limit = connection.read_started
+                and state.config.read_timeout_ticks
+                or state.config.idle_timeout_ticks
+
+            if state.handshake.expired(connection.handshake) or
+                (now - since) % 0x100000000 >= limit then
                 expired[#expired + 1] = connection
             end
         end
+
         for _, connection in ipairs(expired) do
             if detach(connection, "network read timeout") then
                 close_transport(connection, 1001, "network timeout")
@@ -766,6 +926,7 @@ local function timeout_loop()
         end
     end
 end
+
 
 --- 校验启动配置、加载协议 descriptor/registry 并开始监听，最后才发布 running 状态。
 --- input 是宿主传入的可选覆盖 table；handler_service 必须是已启动 handler 的显式 Service handle。
@@ -775,16 +936,23 @@ end
 ---@return table 实际监听地址、端口、transport 和 registry command_count；失败抛错，可能 yield。
 local function start(input)
     assert(state.phase == "created", "gateway can only start once")
+
     local config = normalize_config(input)
-    local generated = assert(require(config.registry_module), "cannot load gateway registry module")
+    local generated = assert(
+        require(config.registry_module),
+        "cannot load gateway registry module"
+    )
     local registry = registry_loader.load(generated)
-    state.config, state.registry = config, registry
+
+    state.config = config
+    state.registry = registry
     state.codec = codec_factory.new(
         {
             descriptor_path = config.descriptor_path,
             registry        = registry,
         }
     )
+
     state.epoch = tostring(skynet.self()) .. ":" .. tostring(skynet.hpc())
     state.handshake = handshake_factory.new(
     {
@@ -794,15 +962,34 @@ local function start(input)
         timeout_ticks = config.handshake_timeout_ticks, -- 绝对期限。
     }
     )
-    state.rate_started, state.rate_count = skynet.now(), 0
+
+    state.rate_started = skynet.now()
+    state.rate_count = 0
     state.phase = "starting"
-    local listen_fd, address, port = socket.listen(config.host, config.port, config.backlog)
+
+    local listen_fd, address, port = socket.listen(
+        config.host,
+        config.port,
+        config.backlog
+    )
     state.listen_fd = listen_fd
+
     socket.start(listen_fd, accept_client)
+
     state.phase = "running"
     skynet.fork(timeout_loop)
-    skynet.error("FLYWOW_GATEWAY_READY transport=", config.transport,
-                 " address=", address, ":", port, " commands=", registry.count)
+
+    skynet.error(
+        "FLYWOW_GATEWAY_READY transport=",
+        config.transport,
+        " address=",
+        address,
+        ":",
+        port,
+        " commands=",
+        registry.count
+    )
+
     return
     {
         address       = address,
@@ -811,6 +998,7 @@ local function start(input)
         command_count = registry.count,
     }
 end
+
 
 --- 幂等地停止监听并关闭所有 Gateway 拥有的连接。
 --- 返回本次主动关闭的连接数；执行 Socket I/O，关闭操作可能 yield，不应在业务请求 handler 中同步调用。
@@ -822,13 +1010,21 @@ local function stop()
             closed_connections = 0,
         }
     end
+
     state.phase = "stopping"
-    if state.listen_fd then socket.close(state.listen_fd); state.listen_fd = nil end
+
+    if state.listen_fd then
+        socket.close(state.listen_fd)
+        state.listen_fd = nil
+    end
+
     local closed = 0
     local snapshot = {}
+
     for _, connection in pairs(state.connections) do
         snapshot[#snapshot + 1] = connection
     end
+
     for index = 1, #snapshot do
         local connection = snapshot[index]
         if not connection.closed then
@@ -837,47 +1033,55 @@ local function stop()
             close_transport(connection, 1001, "server shutdown")
         end
     end
+
     state.phase = "stopped"
+
     return
     {
         closed_connections = closed,
     }
 end
 
+
 skynet.start(function()
     --- LuaPanda 只连接当前 FlyWow Lua State；8820 不与 Proxy/Query/Battle Service 复用。
     luapanda_debug.start(8820)
+
     skynet.dispatch("lua", function(_session, source, command, argument)
-    if command == "gateway_close" then
-        request_close(source, argument)
-        return
-    end
-    if command == "gateway_response" then
-        deliver_response(source, argument)
-        return
-    end
-    if command == "start" then
-        skynet.retpack(start(argument))
-        return
-    end
-    if command == "stop" then
-        assert(argument == nil, "stop does not accept an argument")
-        skynet.retpack(stop())
-        return
-    end
-    if command == "stats" then
-        skynet.retpack(
-            {
-                phase             = state.phase,
-                clients           = state.client_count,
-                responses_sent    = state.responses_sent,
-                responses_dropped = state.responses_dropped,
-                command_count     = state.registry and state.registry.count or 0,
-            }
-        )
-        return
-    end
-    error("unknown flywow.gateway command: " .. tostring(command))
+        if command == "gateway_close" then
+            request_close(source, argument)
+            return
+        end
+
+        if command == "gateway_response" then
+            deliver_response(source, argument)
+            return
+        end
+
+        if command == "start" then
+            skynet.retpack(start(argument))
+            return
+        end
+
+        if command == "stop" then
+            assert(argument == nil, "stop does not accept an argument")
+            skynet.retpack(stop())
+            return
+        end
+
+        if command == "stats" then
+            skynet.retpack(
+                {
+                    phase             = state.phase,
+                    clients           = state.client_count,
+                    responses_sent    = state.responses_sent,
+                    responses_dropped = state.responses_dropped,
+                    command_count     = state.registry and state.registry.count or 0,
+                }
+            )
+            return
+        end
+
+        error("unknown flywow.gateway command: " .. tostring(command))
     end)
-end
-)
+end)

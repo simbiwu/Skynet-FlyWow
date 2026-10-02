@@ -37,17 +37,30 @@ function M.new(options)
     ---@param context HandshakeContext 当前连接的握手上下文；manager 独占。
     ---@return nil 幂等释放 pending 名额和 native crypto。
     function manager.close(context)
-        if not context or not context.held then return end
+        if not context or not context.held then
+            return
+        end
+
         context.held = false
         pending = pending - 1
-        if context.crypto then context.crypto:close(); context.crypto = nil end
-        if context.phase ~= "ready" then context.phase = "closed" end
+
+        if context.crypto then
+            context.crypto:close()
+            context.crypto = nil
+        end
+
+        if context.phase ~= "ready" then
+            context.phase = "closed"
+        end
     end
 
     --- 接纳一个待握手连接；返回context或nil/容量错误，不分配密钥，不执行I/O/yield。
     ---@return HandshakeContext|nil context 或容量错误；成功时占用一个 pending 名额。
     function manager.accept()
-        if pending >= max_pending then return nil, "HANDSHAKE_CAPACITY" end
+        if pending >= max_pending then
+            return nil, "HANDSHAKE_CAPACITY"
+        end
+
         pending = pending + 1
         return
         {
@@ -70,8 +83,14 @@ function M.new(options)
     ---@param context HandshakeContext 当前握手阶段。
     ---@return integer 当前阶段允许读取的精确帧长度；未知阶段返回0。
     function manager.expected_size(context)
-        if context.phase == "hello" then return 67 end
-        if context.phase == "proof" then return 33 end
+        if context.phase == "hello" then
+            return 67
+        end
+
+        if context.phase == "proof" then
+            return 33
+        end
+
         return 0
     end
 
@@ -83,23 +102,36 @@ function M.new(options)
     function manager.receive(input)
         local context = input.context
         local bytes   = input.bytes
-        if manager.expired(context) then manager.close(context); return nil, "HANDSHAKE_TIMEOUT" end
+        if manager.expired(context) then
+            manager.close(context)
+            return nil, "HANDSHAKE_TIMEOUT"
+        end
+
         if type(bytes) ~= "string" or #bytes ~= manager.expected_size(context) then
-            manager.close(context); return nil, "HANDSHAKE_FRAME"
+            manager.close(context)
+            return nil, "HANDSHAKE_FRAME"
         end
         if context.phase == "hello" then
             if bytes:byte(1) ~= 1 or bytes:byte(2) ~= 1 then
-                manager.close(context); return nil, "HANDSHAKE_VERSION"
+                manager.close(context)
+                return nil, "HANDSHAKE_VERSION"
             end
+
             local ok, native, response = pcall(crypto.new, bytes)
-            if not ok then manager.close(context); return nil, "HANDSHAKE_CRYPTO" end
+            if not ok then
+                manager.close(context)
+                return nil, "HANDSHAKE_CRYPTO"
+            end
             context.crypto = native
             context.phase = "proof"
             return response
         end
         if context.phase == "proof" then
             local ok, response = pcall(context.crypto.verify, context.crypto, bytes)
-            if not ok then manager.close(context); return nil, "HANDSHAKE_PROOF" end
+            if not ok then
+                manager.close(context)
+                return nil, "HANDSHAKE_PROOF"
+            end
             context.phase = "confirm"
             return response, nil, true
         end
@@ -111,7 +143,10 @@ function M.new(options)
     ---@param context HandshakeContext 已进入 confirm 阶段的上下文。
     ---@return boolean 是否提交为 ready；成功后释放 pending 名额。
     function manager.confirm(context)
-        if context.phase ~= "confirm" or manager.expired(context) then return false end
+        if context.phase ~= "confirm" or manager.expired(context) then
+            return false
+        end
+
         context.phase = "ready"
         manager.close(context)
         return true
