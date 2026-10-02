@@ -31,7 +31,7 @@ handler完成 -> send(gateway_response) -> response Envelope bytes
 
 - 需要宿主提供 pinned Skynet；WebSocket 使用 `http.websocket`，不重复实现握手和 frame parser。
 - 需要宿主提供 `lua-protobuf` 与生成 descriptor。
-- `.proto` 是唯一协议源；框架自带 `tools/generate_gateway_registry.py` 在构建阶段生成 Lua registry，业务仓库不复制也不手工维护生成器。
+- `.proto` 是唯一协议源；框架自带 `scripts/generate_gateway_registry.py` 在构建阶段生成 Lua registry，业务仓库不复制也不手工维护生成器。
 - Gateway 只负责接入、协议、资源上限和跨 Service 调用；不包含 Battle、SLG、玩家或地图业务。
 
 ## Service 合同
@@ -140,7 +140,7 @@ service NavigationService
 构建阶段由宿主的 Server build 调用 FlyWow 生成器：
 
 ```bash
-python3 server/third_party/skynet-flywow/tools/generate_gateway_registry.py \
+python3 server/third_party/skynet-flywow/scripts/generate_gateway_registry.py \
   --proto shared/protocol/navigation_query.proto \
   --output server/lualib/protocol/navigation_registry.lua
 ```

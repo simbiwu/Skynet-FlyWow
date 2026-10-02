@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 
-TOOL = Path(__file__).resolve().parents[1] / "tools" / "generate_gateway_registry.py"
+TOOL = Path(__file__).resolve().parents[1] / "scripts" / "generate_gateway_registry.py"
 SPEC = importlib.util.spec_from_file_location("generate_gateway_registry", TOOL)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
