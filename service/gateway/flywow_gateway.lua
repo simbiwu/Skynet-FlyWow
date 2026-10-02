@@ -68,36 +68,92 @@ end
 --- 参数 input：可省略的启动覆盖 table；业务通常只传 handler_service，其他字段来自 config.gateway。
 --- 返回值：当前 Service 私有的不可再变更配置；失败抛错，不执行 I/O、yield 或启动资源。
 local function normalize_config(input)
+    -- 数据准备：读取宿主默认配置，再合并本次 start 的覆盖项。
     local defaults = require "config.gateway"
     assert(type(defaults) == "table", "config.gateway must return a table")
 
     local merged = merge_config(defaults, input)
+
+    -- 参数检查：先校验传输类型，再校验网络和资源上限。
     local transport = merged.transport or "tcp"
-    assert(transport == "tcp" or transport == "websocket", "unsupported gateway transport: " .. tostring(transport))
+    assert(
+        transport == "tcp" or transport == "websocket",
+        "unsupported gateway transport: " .. tostring(transport)
+    )
+
     if transport == "websocket" then
         --- pinned Skynet 的 wss server 会从进程环境/当前目录隐式读证书。
         --- 当前合同没有 TLS 证书注入和轮换能力，因此明确只允许 ws。
-        assert(merged.websocket_protocol == nil or merged.websocket_protocol == "ws",
-               "websocket_protocol currently supports ws only; terminate TLS outside Gateway")
+        assert(
+            merged.websocket_protocol == nil or
+            merged.websocket_protocol == "ws",
+            "websocket_protocol currently supports ws only; " ..
+            "terminate TLS outside Gateway"
+        )
     end
-    local max_frame_bytes = require_integer(merged.max_frame_bytes or 65535,
-                                            "max_frame_bytes", 1, 0xffff)
-    local max_clients = require_integer(merged.max_clients or 1024,
-                                        "max_clients", 1, 1000000)
-    local warning_kb = require_integer(merged.write_warning_close_kb or 1024,
-                                       "write_warning_close_kb", 1, 0x7fffffff)
+
+    local max_frame_bytes = require_integer(
+        merged.max_frame_bytes or 65535,
+        "max_frame_bytes",
+        1,
+        0xffff
+    )
+    local max_clients = require_integer(
+        merged.max_clients or 1024,
+        "max_clients",
+        1,
+        1000000
+    )
+    local warning_kb = require_integer(
+        merged.write_warning_close_kb or 1024,
+        "write_warning_close_kb",
+        1,
+        0x7fffffff
+    )
+
     local port = require_integer(merged.port, "port", 1, 65535)
-    local backlog = require_integer(merged.backlog or 128, "backlog", 1, 65535)
-    local protocol_version = require_integer(merged.protocol_version,
-                                             "protocol_version", 1, 0xffffffff)
-    local handler_service = require_integer(merged.handler_service,
-                                            "handler_service", 1, math.maxinteger)
+    local backlog = require_integer(
+        merged.backlog or 128,
+        "backlog",
+        1,
+        65535
+    )
+    local protocol_version = require_integer(
+        merged.protocol_version,
+        "protocol_version",
+        1,
+        0xffffffff
+    )
+
+    -- 参数检查：Service handle 和构建产物路径必须来自显式配置。
+    local handler_service = require_integer(
+        merged.handler_service,
+        "handler_service",
+        1,
+        math.maxinteger
+    )
     local observer_service = merged.observer_service
     if observer_service ~= nil then
-        observer_service = require_integer(observer_service, "observer_service", 1, math.maxinteger)
+        observer_service = require_integer(
+            observer_service,
+            "observer_service",
+            1,
+            math.maxinteger
+        )
     end
-    assert(type(merged.descriptor_path) == "string" and merged.descriptor_path ~= "", "descriptor_path is required")
-    assert(type(merged.registry_module) == "string" and merged.registry_module ~= "", "registry_module is required")
+
+    assert(
+        type(merged.descriptor_path) == "string" and
+        merged.descriptor_path ~= "",
+        "descriptor_path is required"
+    )
+    assert(
+        type(merged.registry_module) == "string" and
+        merged.registry_module ~= "",
+        "registry_module is required"
+    )
+
+    -- 结果组装：返回当前 Gateway Lua State 独占的规范化配置。
     return
     {
         host                          = merged.host or "127.0.0.1", -- 监听地址；只影响当前 Gateway。
@@ -111,16 +167,47 @@ local function normalize_config(input)
         registry_module               = merged.registry_module, -- 生成 registry 的 require 名称。
         protocol_version              = protocol_version, -- Envelope uint32 兼容版本。
         max_frame_bytes               = max_frame_bytes, -- 单个 Envelope body 上限，单位 byte。
-        read_timeout_ticks            = require_integer(merged.read_timeout_ticks or 3000, "read_timeout_ticks", 1, 360000), -- TCP 每次定长读取/WS 握手上限，单位 10 ms。
-        idle_timeout_ticks            = require_integer(merged.idle_timeout_ticks or 30000, "idle_timeout_ticks", 1, 360000), -- WS 完整消息空闲上限，单位 10 ms。
-        max_requests_per_second       = require_integer(merged.max_requests_per_second or 200, "max_requests_per_second", 1, 100000), -- 每连接每秒入站上限；超限关闭。
-        max_total_requests_per_second = require_integer(merged.max_total_requests_per_second or 10000, "max_total_requests_per_second", 1, 1000000), -- 当前实例每秒投递上限；超限关闭来源连接。
-        max_pending_handshakes        = require_integer(merged.max_pending_handshakes or math.min(128, max_clients), "max_pending_handshakes", 1, max_clients), -- 含TCP与WS的应用握手并发上限。
-        handshake_timeout_ticks       = require_integer(merged.handshake_timeout_ticks or 1000, "handshake_timeout_ticks", 1, 360000), -- 总握手期限，10ms tick。
+        read_timeout_ticks            = require_integer(
+            merged.read_timeout_ticks or 3000,
+            "read_timeout_ticks",
+            1,
+            360000
+        ), -- TCP 每次定长读取/WS 握手上限，单位 10 ms。
+        idle_timeout_ticks            = require_integer(
+            merged.idle_timeout_ticks or 30000,
+            "idle_timeout_ticks",
+            1,
+            360000
+        ), -- WS 完整消息空闲上限，单位 10 ms。
+        max_requests_per_second       = require_integer(
+            merged.max_requests_per_second or 200,
+            "max_requests_per_second",
+            1,
+            100000
+        ), -- 每连接每秒入站上限；超限关闭。
+        max_total_requests_per_second = require_integer(
+            merged.max_total_requests_per_second or 10000,
+            "max_total_requests_per_second",
+            1,
+            1000000
+        ), -- 当前实例每秒投递上限；超限关闭来源连接。
+        max_pending_handshakes        = require_integer(
+            merged.max_pending_handshakes or math.min(128, max_clients),
+            "max_pending_handshakes",
+            1,
+            max_clients
+        ), -- 含TCP与WS的应用握手并发上限。
+        handshake_timeout_ticks       = require_integer(
+            merged.handshake_timeout_ticks or 1000,
+            "handshake_timeout_ticks",
+            1,
+            360000
+        ), -- 总握手期限，10ms tick。
         max_clients                   = max_clients, -- 当前 Gateway 最大在线连接数。
         write_warning_close_kb        = warning_kb, -- 写缓冲 warning 达到此 KB 时关闭连接。
     }
 end
+
 
 --- 记录并向可选 observer Service 投递结构化 Gateway 事件；observer 故障不能影响业务请求。
 --- event 是本次事件的只读普通 table，常见字段为 kind/code/message 和连接、请求上下文；敏感 payload 不得放入。
@@ -145,19 +232,21 @@ end
 ---@param transport GatewayTransport 当前 TCP/WebSocket 传输。
 ---@return GatewayConnection|nil connection，或容量/身份/握手资源不足。
 local function create_connection(fd, peer, transport)
+    -- 参数检查：容量、连接身份和握手名额必须可用。
     if state.client_count >= state.config.max_clients then
         emit(
         {
             kind      = "warning",
-            code        = "MAX_CONNECTIONS",
-            message     = "connection limit reached",
-            peer        = peer,
-            transport   = transport,
+            code      = "MAX_CONNECTIONS",
+            message   = "connection limit reached",
+            peer      = peer,
+            transport = transport,
         }
         )
 
         return nil
     end
+
     if state.next_connection_id == math.maxinteger then
         emit(
         {
@@ -169,6 +258,7 @@ local function create_connection(fd, peer, transport)
 
         return nil
     end
+
     local handshake, handshake_error = state.handshake.accept()
     if not handshake then
         emit(
@@ -178,9 +268,13 @@ local function create_connection(fd, peer, transport)
             message = "handshake capacity reached",
         }
         )
+
         return nil
     end
+
+    -- 数据准备：创建当前连接独占的上下文。
     state.next_connection_id = state.next_connection_id + 1
+
     local connection =
     {
         handshake       = handshake, -- 握手模块拥有内部状态；连接关闭时释放。
@@ -196,10 +290,13 @@ local function create_connection(fd, peer, transport)
         rate_count      = 0, -- 当前一秒已接纳帧数；不是业务 in-flight。
         request_count   = 0, -- 已完成 dispatch 次数；诊断统计字段。
     }
+
+    -- 状态修改：连接同时登记到两个索引，再增加在线计数。
     state.connections[connection.id] = connection
     state.connections_by_fd[fd] = connection
     state.client_count = state.client_count + 1
 
+    -- 消息发送：通知观测方连接已建立。
     emit(
     {
         kind          = "open",
@@ -208,8 +305,10 @@ local function create_connection(fd, peer, transport)
         transport     = transport,
     }
     )
+
     return connection
 end
+
 
 --- 从连接表中移除连接并发出一次 close 事件；重复调用不会重复递减计数。
 --- connection 是本 Gateway 状态表中的 context，reason 是不含敏感数据的诊断原因。
