@@ -58,11 +58,20 @@ FlyWow 根目录不直接放模块运行时的 `lualib/`、`native/`、`service/
 
 模块可以只创建实际需要的子目录，不为未来能力预建空目录。跨模块的组装工具必须明确标注为仓库级工具，不能偷偷归入某个功能模块。
 
+## Lua 与 Native 模块命名
+
+- Lua 模块入口使用 `flywow_<module>.lua`，例如 `flywow_navigation.lua`。
+- 业务侧通过 `require "flywow_<module>"` 加载 Lua 外部入口。
+- Native Lua 模块使用 `flywow_<module>_native.so`，并提供 `luaopen_flywow_<module>_native` 入口。
+- Lua Wrapper 与 Native 使用不同模块名，避免 `package.path` 优先命中 Wrapper 后递归加载自身。
+- FlyWow 所有最终 Lua Native `.so` 统一输出到 `build/native/`，CMake 中间文件统一位于 `build/cmake/<module>/`。
+- 模块内部 C/C++ 类型、命名空间和测试标识使用 `flywow_` 前缀。
+
 ## Gateway 协议生成边界
 
 - `.proto` 是宿主项目维护的唯一协议源；`tools/generate_gateway_registry.py` 是 FlyWow 框架实现，业务仓库不得复制。
 - `*_registry.lua` 是构建生成物，运行时只加载生成结果，不在 Service 启动时解析 `.proto`。
-- 宿主通过 `FLYWOW_ROOT` 或固定 vendored framework 调用生成器；宿主的 `run_server.sh` 只做 orchestration 和输出路径选择。
+- 宿主从固定 FlyWow submodule 调用框架工具；运行时路径直接写在 Skynet process config 中，禁止为路径增加环境变量、路径生成器或生成配置文件。宿主 run_server.sh build 负责调用统一构建入口。
 - `config/gateway.lua` 是宿主默认配置；Gateway Service 只要求显式注入业务 handler handle，特殊部署才覆盖 transport、协议 bundle 或资源上限。
 
 ## 配置示例规则
@@ -132,3 +141,7 @@ python3 scripts/ci/check_repository.py
 具体模块进入仓库时，必须在同一次变更中增加自己的 build、运行、成功/边界/失败测试。通用仓库检查不能替代模块验证。
 
 没有用户明确的“开始、修改、执行、更新、同步”等指令时，只讨论，不修改文件。`origin` 固定为 `https://github.com/simbiwu/Skynet-FlyWow.git`；只有用户明确要求提交或同步时才 Push。不要自行选择开源许可证。
+
+## Logger 接入边界
+
+统一使用 skynet.error，只配置 log_path 与 level；每日追加，不清理旧日志，不添加 instance。Native Service 通过 cpath 加载，最终 .so 统一归 build/native/；与 Lua Binding 的 package.cpath 不同。Lua preload、SDK 与 Native 按固定提交发布，未配置时 SDK 回退官方 Logger。详情见框架 docs/logger/README.md。

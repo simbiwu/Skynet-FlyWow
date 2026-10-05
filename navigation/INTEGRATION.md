@@ -56,24 +56,39 @@ python3 navigation/tools/verify_asset.py \
 
 发布系统把验证通过的完整目录交给 Server，并锁定 ID、版本和 SHA-256。不要分别替换 BMAP 与 Manifest，不从 Server 读取 Unity 工程。当前 Native Reader 校验 BMAP 格式、长度与 CRC；SHA-256 和空间合同由此发布门禁校验。未经门禁的单独 `load_map` 不构成内容身份验证。
 
-## 4. 构建 Native 并选择模块
+## 4. 构建 Native 并配置运行时路径
 
-宿主指定固定 Skynet 源与独立输出目录：
+从 Server 根目录执行唯一公开构建命令：
 
-```bash
-bash navigation/scripts/build_navigation.sh "$SKYNET_ROOT" "$BUILD_DIR"
-python3 scripts/module_paths.py --root "$FLYWOW_ROOT" \
-    --modules navigation --native "$BUILD_DIR/lua" \
-    --output "$PATHS_CONFIG"
-```
+~~~bash
+./scripts/linux/run_server.sh build
+~~~
 
-Gateway 与 Navigation 同时使用时，改为 `--modules gateway navigation`。宿主初始配置先提供自己的 `lua_path`、`luaservice`、`lua_cpath`，再 include 生成文件；生成器只追加路径。模块数量增加不需要手工复制每条路径，也不自动启动 Service。
+该命令调用 third_party/skynet-flywow/scripts/build_flywow.sh third_party/skynet，生成：
+third_party/skynet-flywow/build/native/*.so。Navigation、Gateway Crypto 和 Logger 共用该目录；CMake 中间文件位于 FlyWow build/cmake/<module>/。不需要生成另一个路径配置文件。
 
-Skynet 配置环境不是普通业务 Lua，不用 `require` 读取路径辅助模块。部署时生成自己的路径，不把开发机路径写进受版本管理的配置。
+Skynet 配置本身以 server/ 为当前工作目录，直接列出真实模块目录。例如 Battle 配置中：
 
+~~~lua
+lua_path = "./third_party/skynet-flywow/navigation/lualib/?.lua;" ..
+           "./third_party/skynet-flywow/logger/lualib/?.lua"
+lua_cpath = "./third_party/skynet-flywow/build/native/?.so"
+cpath = "./third_party/skynet-flywow/build/native/?.so"
+~~~
+
+lua_path 查找 Lua Wrapper，lua_cpath 查找 require 加载的 Lua Native Binding，cpath 查找 Skynet Native Service。Gateway 进程另外列出 Gateway 的 lualib 和 service 目录；Battle 不加入 Gateway 搜索路径。Logger 的 logservice、logger 输出目录、等级与 preload 也直接配置在各进程配置中。这样从配置即可看出模块由谁使用、从哪里加载，不需要环境变量或生成器间接拼接。
+
+路径相对 Server 根目录，因此启动配置时工作目录必须为 server/；run_server.sh 已固定满足该条件。独立新项目按自己的 third_party/skynet-flywow 相对目录填写相同字段，无需改模块代码。
+
+~~~bash
+cd /path/to/project/server
+./scripts/linux/run_server.sh build
+~~~
+
+~~~
 ## 5. Lua 使用及清理
 
-普通模块使用 `require "flywow.navigation"`。它不创建 Skynet Service；地图加载放在进程启动阶段，地图只读共享。Battle 自己创建 `new_context`，管理动态占位；具体参数、返回值和错误分支见 [公开合同](CONTRACT.md) 与 C++ Binding 注释。
+普通模块使用 `require "flywow_navigation"`。它不创建 Skynet Service；地图加载放在进程启动阶段，地图只读共享。Battle 自己创建 `new_context`，管理动态占位；具体参数、返回值和错误分支见 [公开合同](CONTRACT.md) 与 C++ Binding 注释。
 
 先检查 `load_map` 返回身份，再按指定 ID/版本查询。资源退出时显式 `context:close()`；GC 负责遗漏清理兜底。Path 已计算出来，不代表下一 Tick 仍可走，移动前由 `move_unit` / `advance_path` 重新验证动态占位。
 

@@ -65,7 +65,15 @@
 ---@field query_cell fun(map_id:integer,map_version:integer,position:FlyWowNavigationPosition):FlyWowNavigationCell?,FlyWowNavigationError? 只读同步查询；Registry 查找短锁。
 ---@field new_context fun(map_id:integer,map_version:integer,profiles:FlyWowNavigationProfile[]):FlyWowNavigationContext?,FlyWowNavigationError? 分配私有 scratch/occupancy，返回调用方独占 userdata。
 
---- Lua 模块入口转交真实 Native API；没有第二份算法或包装状态。
+--- Lua 对外入口：把稳定的 FlyWow Navigation 合同转交给 Native 实现。
+---
+--- 业务代码通过 require "flywow_navigation" 加载本文件。
+--- 本文件不重复实现 BMAP、Grid、A*、smoothing 或动态占用。
+---
+--- 在 Server 根目录执行 ./scripts/linux/run_server.sh build 后生成：
+---   third_party/skynet-flywow/build/native/flywow_navigation_native.so
+--- 宿主 process config 直接把该目录写入 lua_cpath；无需生成路径配置文件。
+--- require 先命中本 Lua Wrapper，再由不同模块名加载 C++ Native。
 ---@type FlyWowNavigationModule
-local navigation = require "flywow_navigation"
+local navigation = require "flywow_navigation_native"
 return navigation

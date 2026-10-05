@@ -50,7 +50,7 @@ def iter_text_files(root: Path) -> Iterable[Path]:
     """
 
     for path in sorted(root.rglob("*")):
-        if ".git" in path.parts or not path.is_file():
+        if ".git" in path.parts or path.relative_to(root).parts[0] == "build" or not path.is_file():
             continue
         if path.suffix.lower() in TEXT_SUFFIXES or path.name in TEXT_NAMES:
             yield path

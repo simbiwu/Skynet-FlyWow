@@ -9,14 +9,14 @@
 | `native/gateway_crypto` | `gateway/native/gateway_crypto` |
 | `clients/unity` / `clients/h5` | `gateway/clients/unity` / `gateway/clients/h5` |
 | Gateway registry 生成工具 | `gateway/tools/generate_gateway_registry.py` |
-| Gateway crypto 构建脚本 | `gateway/scripts/build_gateway_crypto.sh` |
+| Gateway crypto 构建脚本 | `scripts/build_flywow.sh` |
 | 宿主 `native/grid_map` 源码 | `navigation/native/grid_map` |
 | 宿主 `native/lua_battle_nav` 源码 | `navigation/native/lua` |
-| `require "battle_nav"` | `require "flywow.navigation"` |
-| `battle_nav.so` / `luaopen_battle_nav` | `flywow_navigation.so` / `luaopen_flywow_navigation` |
+| `require "battle_nav"` | `require "flywow_navigation"` |
+| `battle_nav.so` / `luaopen_battle_nav` | `flywow_navigation_native.so` / `luaopen_flywow_navigation_native` |
 | Unity `BattleMap*` 通用组件 | `FlyWow.Navigation.NavigationMap*`，原脚本 GUID 保留 |
 
-宿主旧 Native make 入口可以保留为薄适配器；它们委托 FlyWow 构建，不保留第二份算法。UPM 包、Native 模块、Lua 调用方和路径配置必须成套更新。已有 Scene 保留参数；课程 SceneBuilder 要显式设置课程 ID/原点，不能依赖通用包默认值。
+宿主旧 Native make 入口可以保留为薄适配器；它们委托 FlyWow 构建，不保留第二份算法。UPM 包、Native 模块、Lua 调用方和相对搜索路径必须成套更新。已有 Scene 保留参数；课程 SceneBuilder 要显式设置课程 ID/原点，不能依赖通用包默认值。
 
 Gateway 采用宿主已验证的当前合同：Envelope 只有 version/command/body，CommandId 生成 registry，双向 `send_data`，`close` 控制消息。早期 sibling 开发版本的 `gateway_dispatch/gateway_response`、request_id、rpc 生成规则以及 endpoint helper 不再与现行实现混放。该兼容变化由 D011 记录，旧消费者需按 Gateway 接入指南迁移双方协议，不能只更换目录。
 

@@ -21,7 +21,6 @@ def load(name, path):
 
 
 asset = load('verify_navigation_asset', ROOT / 'navigation/tools/verify_asset.py')
-paths = load('flywow_module_paths', ROOT / 'scripts/module_paths.py')
 
 
 class NavigationToolsTests(unittest.TestCase):
@@ -92,18 +91,6 @@ class NavigationToolsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'MANIFEST_MISMATCH: origin_mm'):
             asset.verify(self.bmap, self.manifest)
 
-    def test_navigation_only_does_not_load_gateway_paths(self):
-        (self.root / 'navigation/lualib').mkdir(parents=True)
-        text = paths.generate(self.root, ['navigation'], self.root / 'build')
-        self.assertIn('navigation/lualib/?.lua', text)
-        self.assertNotIn('gateway', text)
-        self.assertNotIn('luaservice =', text)
-        self.assertIn('lua_cpath =', text)
-
-    def test_invalid_module_selection_fails_before_output(self):
-        for selection in [['unknown'], ['navigation', 'navigation'], ['gateway']]:
-            with self.assertRaises(ValueError):
-                paths.generate(self.root, selection, None)
 
 
 if __name__ == '__main__':

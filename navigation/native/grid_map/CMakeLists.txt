@@ -1,7 +1,7 @@
 # 职责：构建 grid_map_core 和独立 Native 导航回归测试。
 # 边界：Server Native Build；不下载依赖，不构建 Skynet 本体。
 # 输入/输出：本目录 C++ 源码 -> 静态库、测试可执行文件和 CTest 用例。
-# 运行时机：Native 代码变化后，由 navigation/scripts/build_navigation.sh 驱动。
+# 运行时机：Native 代码变化后，由 scripts/build_flywow.sh 驱动。
 # 不负责：不下载依赖、不加载 Unity Scene、不启动 BattleWorker、不生成 BMAP。
 cmake_minimum_required(VERSION 3.16)
 project(flywow_grid_map LANGUAGES CXX C)

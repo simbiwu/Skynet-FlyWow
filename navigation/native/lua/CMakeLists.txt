@@ -1,7 +1,7 @@
-# 职责：构建 Skynet Lua 可加载的 flywow_navigation_lua Native 模块。
-# 边界：Server Native Build；复用 grid_map_core 和 Skynet 自带的 Lua 头文件。
-# 输入/输出：Binding C++ 源码 -> 无 lib 前缀的共享模块。
-# 运行时机：独立配置本目录时，同时引入 grid_map_core 的构建定义。
+# 职责：构建 Skynet Lua 可加载的 FlyWow Navigation Native 模块。
+# 边界：FlyWow Native Build；复用 grid_map_core 和 Skynet 自带的 Lua 头文件。
+# 输入/输出：Binding C++ 源码 -> build/native/flywow_navigation_native.so。
+# 运行时机：由 scripts/build_flywow.sh 调用。
 # 不负责：不安装系统 Lua，不构建或启动 Skynet，不加载 BMAP。
 cmake_minimum_required(VERSION 3.16)
 project(flywow_navigation_lua LANGUAGES CXX)
@@ -30,5 +30,14 @@ target_include_directories(flywow_navigation_lua PRIVATE
 )
 target_link_libraries(flywow_navigation_lua PRIVATE grid_map_core)
 target_compile_options(flywow_navigation_lua PRIVATE -Wall -Wextra -Wpedantic)
-# Lua 的 require "flywow_navigation" 按约定查找 flywow_navigation.so 和 luaopen_flywow_navigation。
-set_target_properties(flywow_navigation_lua PROPERTIES PREFIX "" OUTPUT_NAME "flywow_navigation")
+# Lua Wrapper 使用 flywow_navigation；Native 使用独立名称，避免同名模块递归加载。
+# Lua 的 require "flywow_navigation_native" 会查找 .so 并调用 luaopen_flywow_navigation_native。
+set_target_properties(flywow_navigation_lua PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "flywow_navigation_native"
+)
+if(FLYWOW_NATIVE_OUTPUT_DIR)
+    set_target_properties(flywow_navigation_lua PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${FLYWOW_NATIVE_OUTPUT_DIR}"
+    )
+endif()

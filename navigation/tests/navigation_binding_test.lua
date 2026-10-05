@@ -3,7 +3,7 @@
 --- 输入：框架根、Native 目录、BMAP 路径；输出：断言通过标记，失败退出非零。
 package.path = arg[1] .. "/navigation/lualib/?.lua;" .. package.path
 package.cpath = arg[2] .. "/?.so;" .. package.cpath
-local navigation = require "flywow.navigation"
+local navigation = require "flywow_navigation"
 --- 超限文件在分配文件缓冲前拒绝；这里只读 sparse 文件的长度，不消费 128 MiB。
 local oversized, size_error = navigation.load_map(arg[4])
 assert(oversized == nil and size_error.code == "BMAP_SIZE_OVERFLOW")

@@ -467,7 +467,7 @@ int l_query_cell(lua_State *L)
     return 1;
 }
 
-// Lua flywow_navigation.new_context(map_id, map_version, profiles_array)
+// Lua flywow_navigation_native.new_context(map_id, map_version, profiles_array)
 // 成功返回 context userdata；地图查找只持有Registry 查找短锁，不 yield。
 int l_new_context(lua_State *L)
 {
@@ -1022,7 +1022,7 @@ void register_context_meta(lua_State *L)
 // 指针绑定到三个函数的 closure。Registry 由 C++ 单例持有，Lua 只保存 non-owning
 // lightuserdata；本函数不执行文件 I/O、不分配跨调用 scratch、不 yield。
 // 返回 1 表示把栈顶模块 table 交给 require 缓存并返回。
-extern "C" int luaopen_flywow_navigation(lua_State *L)
+extern "C" int luaopen_flywow_navigation_native(lua_State *L)
 {
     // 检查宿主 Lua 版本及数值 ABI，避免不同 Lua 构建的模块进入当前 State。
     // 正常情况下不改变参数栈。

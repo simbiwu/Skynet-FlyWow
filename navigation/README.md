@@ -10,9 +10,9 @@
 | `unity/Editor` | Bake 编排、单层采样、Clearance、校验、Overlay、候选包导出 |
 | `unity/Tests/Editor` | 二进制、Clearance、坐标以及新场景 Bake/发布测试 |
 | `native/grid_map` | BMAP Reader、只读地图、Registry、A*、smoothing、动态占位、Context |
-| `native/lua` | Skynet 自带 Lua ABI 绑定，产出 `flywow_navigation.so` |
-| `lualib/flywow/navigation.lua` | 宿主 `require "flywow.navigation"` 的稳定入口 |
-| `scripts/build_navigation.sh` | 指定 Skynet 源和输出目录，独立编译及 CTest |
+| `native/lua` | Skynet 自带 Lua ABI 绑定，产出 `flywow_navigation_native.so` |
+| `lualib/flywow_navigation.lua` | 宿主 `require "flywow_navigation"` 的稳定入口 |
+| scripts/build_flywow.sh (FlyWow 根目录) | 唯一公开构建入口；构建全部 FlyWow Native 模块并执行各自 CTest |
 | `tools` | 资产门禁、可复现离线 UPM 安装包构建 |
 
 Battle_1001 场景、出生点、战斗 Tick、技能、协议及 Replay 留在宿主。新增普通导航场景无需课程出生点组件。Unity 原脚本 `.meta` GUID 保留，既有 Scene 的序列化配置通过同一 GUID 绑定到包中的组件。
@@ -33,12 +33,12 @@ C++14、CMake/Linux/WSL2、Skynet v1.8.0 自带修改版 Lua 5.4.7；团结引�
 
 ## 独立验证
 
-从框架根目录执行；下面的路径变量由调用方设置，产物不写入框架源码目录：
+从 Server 根目录执行；命令中的两个相对路径分别指向固定 Skynet 与 FlyWow submodule：
 
 ```bash
-bash navigation/scripts/build_navigation.sh "$SKYNET_ROOT" "$BUILD_DIR"
-python3 -m unittest discover -s navigation/tests -p 'test_navigation_tools.py'
-python3 scripts/ci/check_repository.py
+bash third_party/skynet-flywow/scripts/build_flywow.sh third_party/skynet
+python3 -m unittest discover -s third_party/skynet-flywow/navigation/tests -p 'test_navigation_tools.py'
+python3 third_party/skynet-flywow/scripts/ci/check_repository.py
 ```
 
 Unity 工程在 manifest 的 `testables` 中加入 `com.flywow.navigation`，在 Test Runner 执行 `FlyWow.Navigation.EditorTests`。测试应在隔离工程运行，避免加载其它 Scene 的 NavMesh。
