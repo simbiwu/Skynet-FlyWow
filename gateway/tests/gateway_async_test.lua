@@ -142,13 +142,13 @@ local function scenario(overrides)
     package.loaded["http.websocket"] = websocket
     package.loaded["config.gateway"] = config
     package.loaded["test.registry"] = {}
-    package.loaded["gateway.registry"] = registry
-    package.loaded["gateway.codec"] =
+    package.loaded["flywow.gateway.registry"] = registry
+    package.loaded["flywow.gateway.codec"] =
     {
         new = function() return codec end,
     }
     package.loaded["flywow_gateway_crypto"] = {}
-    package.loaded["gateway.handshake"] =
+    package.loaded["flywow.gateway.handshake"] =
     {
         new = function()
             return

@@ -7,8 +7,8 @@ local skynet = require "skynet"
 local luapanda_debug = require "shared.debug.luapanda_debug"
 local socket = require "skynet.socket"
 local websocket = require "http.websocket"
-local registry_loader = require "gateway.registry"
-local codec_factory = require "gateway.codec"
+local registry_loader = require "flywow.gateway.registry"
+local codec_factory = require "flywow.gateway.codec"
 
 ---@class GatewayConnection
 ---@field handshake HandshakeContext 当前连接独占的握手状态。
@@ -17,7 +17,7 @@ local codec_factory = require "gateway.codec"
 ---@field peer string 对端地址诊断字符串。
 ---@field transport GatewayTransport 当前传输类型。
 ---@field closed boolean 是否已从连接表摘除。
-local handshake_factory = require "gateway.handshake"
+local handshake_factory = require "flywow.gateway.handshake"
 
 local state =
 {
