@@ -1,0 +1,23 @@
+{
+  "name": "FlyWow.Navigation.EditorTests",
+  "rootNamespace": "FlyWow.Navigation.Tests",
+  "references": [
+    "FlyWow.Navigation.Runtime",
+    "FlyWow.Navigation.Editor",
+    "Unity.AI.Navigation"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "autoReferenced": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "optionalUnityReferences": [
+    "TestAssemblies"
+  ],
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

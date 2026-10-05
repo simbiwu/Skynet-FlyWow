@@ -1,0 +1,10 @@
+{
+  "name": "com.flywow.navigation",
+  "version": "0.1.0",
+  "displayName": "FlyWow Navigation",
+  "description": "单层 2.5D Grid 导航地图制作、校验与 BMAP V1 导出工具。",
+  "unity": "2022.3",
+  "dependencies": {
+    "com.unity.ai.navigation": "1.1.7"
+  }
+}
