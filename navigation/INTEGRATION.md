@@ -61,7 +61,7 @@ python3 navigation/tools/verify_asset.py \
 宿主指定固定 Skynet 源与独立输出目录：
 
 ```bash
-bash navigation/scripts/build.sh "$SKYNET_ROOT" "$BUILD_DIR"
+bash navigation/scripts/build_navigation.sh "$SKYNET_ROOT" "$BUILD_DIR"
 python3 scripts/module_paths.py --root "$FLYWOW_ROOT" \
     --modules navigation --native "$BUILD_DIR/lua" \
     --output "$PATHS_CONFIG"

@@ -4,7 +4,7 @@
 # 生命周期：短命构建进程；失败立即停止，不启动 Server、不下载依赖。
 set -euo pipefail
 MODULE_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-SKYNET_ROOT="${1:?用法: build.sh SKYNET_ROOT BUILD_DIR}"
+SKYNET_ROOT="${1:?用法: build_navigation.sh SKYNET_ROOT BUILD_DIR}"
 BUILD_DIR="${2:?缺少 BUILD_DIR}"
 # 宿主可以显式覆盖；默认 Debug 保留 Native 测试的 assert 检查。
 BUILD_TYPE="${BUILD_TYPE:-Debug}"

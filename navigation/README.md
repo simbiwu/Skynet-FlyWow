@@ -12,7 +12,7 @@
 | `native/grid_map` | BMAP Reader、只读地图、Registry、A*、smoothing、动态占位、Context |
 | `native/lua` | Skynet 自带 Lua ABI 绑定，产出 `flywow_navigation.so` |
 | `lualib/flywow/navigation.lua` | 宿主 `require "flywow.navigation"` 的稳定入口 |
-| `scripts/build.sh` | 指定 Skynet 源和输出目录，独立编译及 CTest |
+| `scripts/build_navigation.sh` | 指定 Skynet 源和输出目录，独立编译及 CTest |
 | `tools` | 资产门禁、可复现离线 UPM 安装包构建 |
 
 Battle_1001 场景、出生点、战斗 Tick、技能、协议及 Replay 留在宿主。新增普通导航场景无需课程出生点组件。Unity 原脚本 `.meta` GUID 保留，既有 Scene 的序列化配置通过同一 GUID 绑定到包中的组件。
@@ -36,7 +36,7 @@ C++14、CMake/Linux/WSL2、Skynet v1.8.0 自带修改版 Lua 5.4.7；团结引�
 从框架根目录执行；下面的路径变量由调用方设置，产物不写入框架源码目录：
 
 ```bash
-bash navigation/scripts/build.sh "$SKYNET_ROOT" "$BUILD_DIR"
+bash navigation/scripts/build_navigation.sh "$SKYNET_ROOT" "$BUILD_DIR"
 python3 -m unittest discover -s navigation/tests -p 'test_navigation_tools.py'
 python3 scripts/ci/check_repository.py
 ```
