@@ -62,7 +62,7 @@ python3 navigation/tools/verify_asset.py \
 
 ```bash
 bash navigation/scripts/build.sh "$SKYNET_ROOT" "$BUILD_DIR"
-python3 tools/module_paths.py --root "$FLYWOW_ROOT" \
+python3 scripts/module_paths.py --root "$FLYWOW_ROOT" \
     --modules navigation --native "$BUILD_DIR/lua" \
     --output "$PATHS_CONFIG"
 ```

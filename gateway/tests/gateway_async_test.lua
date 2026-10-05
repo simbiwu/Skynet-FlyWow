@@ -4,7 +4,7 @@
 -- 生命周期：每场景重建 Lua State 模块状态；不启动网络，不冒充真实集成验证。
 -- 不负责：不验证 Protobuf 字节或真实 Skynet 调度，它们由宿主集成测试覆盖。
 local root = assert(arg[1])
-package.path = root .. "/lualib/?.lua;" .. package.path
+package.path = root .. "/gateway/lualib/?.lua;" .. package.path
 
 -- 创建独立的可控场景；overrides 为配置覆盖，无 I/O；返回由测试拥有的控制对象。
 local function scenario(overrides)
@@ -160,7 +160,7 @@ local function scenario(overrides)
             }
         end,
     }
-    dofile(root .. "/service/gateway/flywow_gateway.lua")
+    dofile(root .. "/gateway/service/gateway/flywow_gateway.lua")
     e.dispatch(1, 8, "start",
     {
         handler_service = 7,

@@ -3,7 +3,7 @@
 -- 生命周期：测试独占manager/context；计数证明资源释放，不冒充密码算法验证。
 -- 不负责：真实Native互通由另一个测试执行。
 local root = assert(arg[1])
-package.path = root .. "/lualib/?.lua;" .. package.path
+package.path = root .. "/gateway/lualib/?.lua;" .. package.path
 local factory = require "gateway.handshake"
 local now, closed = 0, 0
 local crypto = {}

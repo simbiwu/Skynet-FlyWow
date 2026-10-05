@@ -32,7 +32,7 @@
 --      bash server/protocol/build_server_descriptor.sh
 --      输出：shared/protocol/generated/server/navigation_query.pb
 --   3. 生成 Gateway command registry：
---      python3 server/third_party/skynet-flywow/scripts/generate_gateway_registry.py \
+--      python3 server/third_party/skynet-flywow/gateway/tools/generate_gateway_registry.py \
 --          --proto shared/protocol/navigation_query.proto \
 --          --output server/lualib/gateway/protocol/navigation_registry.lua
 --   4. 运行时只加载第 2、3 步的生成物，不解析 .proto，不在 Service 启动时生成协议文件。

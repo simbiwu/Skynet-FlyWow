@@ -15,7 +15,7 @@ class NavigationBindingTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('SKYNET_LUA') and os.environ.get('NAVIGATION_NATIVE_DIR'),
                          '需要 SKYNET_LUA 和 NAVIGATION_NATIVE_DIR 运行真实绑定测试')
     def test_real_binding_context_isolation_and_close(self):
-        root = Path(__file__).resolve().parents[1]
+        root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:
             bmap = Path(directory) / 'map.bmap'
             oversized = Path(directory) / 'oversized.bmap'
@@ -31,7 +31,7 @@ class NavigationBindingTests(unittest.TestCase):
             struct.pack_into('<I', header, 52, zlib.crc32(header))
             bmap.write_bytes(header + payload)
             result = subprocess.run([os.environ['SKYNET_LUA'],
-                                     str(root / 'tests/navigation_binding_test.lua'), str(root),
+                                     str(root / 'navigation/tests/navigation_binding_test.lua'), str(root),
                                      os.environ['NAVIGATION_NATIVE_DIR'], str(bmap), str(oversized)],
                                     text=True, capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

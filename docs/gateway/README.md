@@ -83,4 +83,4 @@ connection_id=0 的广播只作用于当前 Gateway 实例。多 Gateway 节点�
 
 ## 生成与验证
 
-运行时不读取 proto。构建阶段使用固定 protoc 生成 descriptor，使用 scripts/generate_gateway_registry.py 生成 registry。协议源、descriptor、registry 和客户端生成物必须来自同一提交。
+运行时不读取 proto。构建阶段使用固定 protoc 生成 descriptor，使用 gateway/tools/generate_gateway_registry.py 生成 registry。协议源、descriptor、registry 和客户端生成物必须来自同一提交。

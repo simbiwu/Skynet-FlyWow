@@ -2,7 +2,7 @@
 
 `skynet-flywow` 是面向商业游戏项目的模块化 Skynet Server 基础框架。它沉淀多个项目都能复用的基础能力，不承载某个游戏的 Battle、SLG 规则或业务数据。
 
-Gateway 模块已从学习项目形成真实调用者和可运行实现，当前提供 TCP 与 Skynet 内置 WebSocket transport、构建期协议 registry、统一错误/告警和资源上限。协议 registry 生成器归框架所有，业务仓库只维护 `.proto` 并在构建时调用 FlyWow 工具。其它模块仍按真实调用者和独立测试逐步进入；不会用空目录和占位接口伪装框架完整度。商业项目建议通过 Git submodule 固定 FlyWow 提交，开发时才用 FLYWOW_ROOT 覆盖到 sibling 工作区。
+Gateway 模块已从学习项目形成真实调用者和可运行实现，当前提供 TCP 与 Skynet 内置 WebSocket transport、构建期协议 registry、统一错误/告警和资源上限。协议 registry 生成器归框架所有，业务仓库只维护 `.proto` 并在构建时调用 FlyWow 工具。其它模块仍按真实调用者和独立测试逐步进入；不会用空目录和占位接口伪装框架完整度。商业项目建议通过 Git submodule 固定 FlyWow 提交；本项目统一在主仓库内的 `server/third_party/skynet-flywow` 子模块开发和验证。
 
 ## 目标
 
@@ -20,6 +20,32 @@ Gateway 模块已从学习项目形成真实调用者和可运行实现，当前
 - 不一次实现“完整 MMO 框架”。
 - 不用大量抽象层、空 Service 和目录数量证明商业级。
 - 不隐藏 Skynet 的 Service、Lua State、消息、yield 和 ownership 合同。
+
+## 目录结构
+
+FlyWow 根目录按功能模块组织，当前模块与模块内部边界为：
+
+```text
+gateway/
+├── clients/   # H5、Unity 等 Gateway 客户端握手 SDK
+├── lualib/    # Gateway 普通 Lua 模块
+├── luaclib/   # Gateway Native Lua 动态库产物
+├── native/    # Gateway Native 实现
+├── scripts/   # Gateway 构建脚本
+├── service/   # Gateway Service 入口
+├── tests/     # Gateway 独立测试
+└── tools/     # Gateway 协议生成工具
+
+navigation/
+├── lualib/
+├── native/
+├── scripts/
+├── tests/
+├── tools/
+└── unity/
+```
+
+根目录的 `scripts/ci/` 是仓库级质量门禁；它不承载 Gateway 或 Navigation 运行时代码。根目录不再直接放 `lualib/`、`native/`、`service/`、`unity/`、`clients/`、`tools/` 或模块测试目录。
 
 ## 预期模块方向
 
@@ -73,6 +99,8 @@ side-view 2D：重力、跳跃和平台层，属于不同运动模型
 当前仓库基线验证：
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_*.py'
+python3 -m unittest discover -s gateway/tests -p 'test_*.py'
+python3 -m unittest discover -s navigation/tests -p 'test_*.py'
+python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 python3 scripts/ci/check_repository.py
 ```

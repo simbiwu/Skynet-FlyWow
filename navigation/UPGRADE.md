@@ -4,10 +4,10 @@
 
 | 旧入口 | 新入口 |
 | --- | --- |
-| FlyWow `lualib/...` | `gateway/lualib/flywow/gateway/...` |
-| FlyWow `service/flywow_gateway.lua` 或 `service/gateway/flywow_gateway.lua` | `gateway/service/flywow_gateway.lua` |
+| FlyWow `lualib/...` | `gateway/lualib/...` |
+| FlyWow `service/flywow_gateway.lua` 或 `service/gateway/flywow_gateway.lua` | `gateway/service/gateway/flywow_gateway.lua` |
 | `native/gateway_crypto` | `gateway/native/gateway_crypto` |
-| `clients/unity` / `clients/h5` | `gateway/unity` / `gateway/h5` |
+| `clients/unity` / `clients/h5` | `gateway/clients/unity` / `gateway/clients/h5` |
 | Gateway registry 生成工具 | `gateway/tools/generate_gateway_registry.py` |
 | Gateway crypto 构建脚本 | `gateway/scripts/build_gateway_crypto.sh` |
 | 宿主 `native/grid_map` 源码 | `navigation/native/grid_map` |

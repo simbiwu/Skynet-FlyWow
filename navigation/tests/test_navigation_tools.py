@@ -9,7 +9,7 @@ import tempfile
 import unittest
 import zlib
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def load(name, path):
@@ -21,7 +21,7 @@ def load(name, path):
 
 
 asset = load('verify_navigation_asset', ROOT / 'navigation/tools/verify_asset.py')
-paths = load('flywow_module_paths', ROOT / 'tools/module_paths.py')
+paths = load('flywow_module_paths', ROOT / 'scripts/module_paths.py')
 
 
 class NavigationToolsTests(unittest.TestCase):

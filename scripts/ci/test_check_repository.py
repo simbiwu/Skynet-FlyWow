@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 # 测试通过文件路径加载工具，避免为了一个 CI 脚本提前建立 Python package 层级。
-CHECKER_PATH = Path(__file__).resolve().parents[1] / "scripts/ci/check_repository.py"
+CHECKER_PATH = Path(__file__).resolve().parent / "check_repository.py"
 SPEC = importlib.util.spec_from_file_location("check_repository", CHECKER_PATH)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"无法加载仓库自检工具：{CHECKER_PATH}")

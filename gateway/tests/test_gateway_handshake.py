@@ -18,8 +18,8 @@ class HandshakeTests(unittest.TestCase):
         node = shutil.which("node")
         if not node:
             self.skipTest("需要Node 22/Web Crypto")
-        root = Path(__file__).resolve().parents[1]
-        result = subprocess.run([node, str(root / "tests/gateway_handshake_sdk_test.mjs")], capture_output=True, text=True, timeout=10)
+        root = Path(__file__).resolve().parents[2]
+        result = subprocess.run([node, str(root / "gateway/tests/gateway_handshake_sdk_test.mjs")], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("H5_HANDSHAKE_SDK_FAILURES_OK", result.stdout)
 
@@ -28,8 +28,8 @@ class HandshakeTests(unittest.TestCase):
         lua = os.environ.get("SKYNET_LUA")
         if not lua:
             self.skipTest("需要SKYNET_LUA")
-        root = Path(__file__).resolve().parents[1]
-        result = subprocess.run([lua, str(root / "tests/gateway_handshake_test.lua"), str(root)], capture_output=True, text=True, timeout=10)
+        root = Path(__file__).resolve().parents[2]
+        result = subprocess.run([lua, str(root / "gateway/tests/gateway_handshake_test.lua"), str(root)], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("GATEWAY_HANDSHAKE_UNIT_OK", result.stdout)
 
@@ -42,10 +42,10 @@ class HandshakeTests(unittest.TestCase):
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-        root = Path(__file__).resolve().parents[1]
+        root = Path(__file__).resolve().parents[2]
         private = ec.generate_private_key(ec.SECP256R1())
         hello = b"\x01\x01" + private.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
-        child = subprocess.Popen([lua, str(root / "tests/gateway_crypto_driver.lua"), lib], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        child = subprocess.Popen([lua, str(root / "gateway/tests/gateway_crypto_driver.lua"), lib], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             child.stdin.write(hello.hex() + "\n")
             child.stdin.flush()

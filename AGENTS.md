@@ -32,6 +32,32 @@ FlyWow 的默认语言是中文。新增或修改的注释、提交日志、工�
 - 所有资源增长有上限，过载、超时、重试和关闭行为显式。
 - 公开协议、配置、资产和持久状态有版本以及兼容/迁移/回滚策略。
 
+## 功能模块目录合同
+
+FlyWow 根目录按功能模块组织。每个可独立接入的模块使用自己的一级目录，例如：
+
+```text
+gateway/
+navigation/
+```
+
+模块内部拥有自己的实现边界：
+
+```text
+<module>/lualib/
+<module>/native/
+<module>/service/
+<module>/unity/
+<module>/clients/
+<module>/tools/
+<module>/scripts/
+<module>/tests/
+```
+
+FlyWow 根目录不直接放模块运行时的 `lualib/`、`native/`、`service/`、`unity/`、`clients/`、`tools/` 或模块测试目录。根目录只保留仓库级元数据、公共文档、CI 入口和仓库级脚本；仓库级 `scripts/ci/` 不属于任何运行时模块。
+
+模块可以只创建实际需要的子目录，不为未来能力预建空目录。跨模块的组装工具必须明确标注为仓库级工具，不能偷偷归入某个功能模块。
+
 ## Gateway 协议生成边界
 
 - `.proto` 是宿主项目维护的唯一协议源；`tools/generate_gateway_registry.py` 是 FlyWow 框架实现，业务仓库不得复制。
@@ -73,7 +99,7 @@ FlyWow 的默认语言是中文。新增或修改的注释、提交日志、工�
 
 ## Skynet 规则
 
-- `service/` 只放由 `newservice/uniqueservice` 启动的入口；普通模块放 `lualib/`。
+- `<module>/service/` 只放由 `newservice/uniqueservice` 启动的入口；普通模块放对应的 `<module>/lualib/`。
 - 启动者保存并显式传递 Service handle；只有真实跨启动树发现需求才注册名字。
 - 稳定 Lua 接口使用命名参数或 request/result record，不使用 `...`。
 - 任何可能 yield 的入口必须声明，并在 yield 后重新验证可能失效的身份。

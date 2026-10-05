@@ -15,8 +15,8 @@ class GatewayAsyncTests(unittest.TestCase):
         lua = os.environ.get("SKYNET_LUA")
         if not lua:
             self.skipTest("需要显式设置 SKYNET_LUA 为 pinned Skynet 的 Lua")
-        root = Path(__file__).resolve().parents[1]
-        result = subprocess.run([lua, str(root / "tests/gateway_async_test.lua"), str(root)],
+        root = Path(__file__).resolve().parents[2]
+        result = subprocess.run([lua, str(root / "gateway/tests/gateway_async_test.lua"), str(root)],
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("GATEWAY_ASYNC_UNIT_OK", result.stdout)

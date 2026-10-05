@@ -37,7 +37,7 @@ C++14、CMake/Linux/WSL2、Skynet v1.8.0 自带修改版 Lua 5.4.7；团结引�
 
 ```bash
 bash navigation/scripts/build.sh "$SKYNET_ROOT" "$BUILD_DIR"
-python3 -m unittest discover -s tests -p 'test_navigation_tools.py'
+python3 -m unittest discover -s navigation/tests -p 'test_navigation_tools.py'
 python3 scripts/ci/check_repository.py
 ```
 
