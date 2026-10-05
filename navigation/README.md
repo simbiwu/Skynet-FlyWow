@@ -25,7 +25,7 @@ C++14、CMake/Linux/WSL2、Skynet v1.8.0 自带修改版 Lua 5.4.7；团结引�
 
 ## 接入与阅读
 
-- [新 Unity 工程及 Server 接入](INTEGRATION.md)：安装、场景配置、Bake、导出、发布和加载。
+- [新 Unity 工程及 Server 接入](导航接入指南.md)：安装、场景配置、Bake、导出、发布和加载。
 - [公开合同与生命周期](CONTRACT.md)：坐标、资产、Lua 返回值、状态归属和失败处理。
 - [迁移与回滚](UPGRADE.md)：旧路径、旧模块名以及成套升级范围。
 

@@ -1037,7 +1037,19 @@ extern "C" int luaopen_flywow_navigation_native(lua_State *L)
     // pushcclosure 消耗 1 个值并保存为 upvalue，得到 [S, module, function]；
     // setfield 消耗 function，恢复 [S, module]。三个模块入口使用同样步骤。
     lua_pushlightuserdata(L, &MapRegistry::Instance());
+
+    // 创建一个 Lua 可以调用的 C 函数 l_load_map，并且从当前 Lua 栈顶拿走 1 个值，保存到这个函数自己的 upvalue 里面。
+    //closure
+    //{
+    //       function = l_load_map,
+    //       upvalue1 = registry_ptr
+    //}
+    //然后把这个 closure 压回 Lua 栈顶
+    //[S, module] -> [S, module, registry_ptr]->[S, module, closure]
     lua_pushcclosure(L, l_load_map, 1);
+
+    // module.load_map = function
+    //lua_setfield 会把栈顶的 function 消耗掉，所以又恢复：S, module]
     lua_setfield(L, -2, "load_map");
 
     lua_pushlightuserdata(L, &MapRegistry::Instance());

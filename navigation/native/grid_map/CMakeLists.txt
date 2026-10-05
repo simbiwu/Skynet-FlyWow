@@ -29,10 +29,11 @@ target_compile_options(grid_map_core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(grid_map_test tests/grid_map_test.cpp)
 target_link_libraries(grid_map_test PRIVATE grid_map_core pthread)
+target_compile_options(grid_map_test PRIVATE -UNDEBUG)
 
 add_executable(navigation_test tests/navigation_test.cpp)
 target_link_libraries(navigation_test PRIVATE grid_map_core pthread)
-target_compile_options(navigation_test PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(navigation_test PRIVATE -Wall -Wextra -Wpedantic -UNDEBUG)
 
 # 独立记录性能，不混入 CTest 正确性门禁；运行条件由操作者随结果保存。
 add_executable(navigation_benchmark benchmark/navigation_benchmark.cpp)

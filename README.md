@@ -105,6 +105,11 @@ python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 python3 scripts/ci/check_repository.py
 ```
 
+## WordFilter
+
+WordFilter 提供 UTF-8 词库匹配与替换，核心从 FCLib FCKeywordFilter 移植。
+入口 require "flywow_word_filter"，接入见 [WordFilter 指南](docs/word_filter/README.md)。
+
 ## Logger
 
 Logger 模块提供 C++ Native 分级日志和每日文件，接入见 [Logger 指南](docs/logger/README.md)。源码归 logger/，最终 Native .so 归 build/native/，中间文件归 build/cmake/logger/。只配置 log_path 与 level。
