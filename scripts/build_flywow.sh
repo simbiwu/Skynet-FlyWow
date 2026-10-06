@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 职责：按选择构建 FlyWow 的 Gateway、Navigation、Logger 或 WordFilter Native 模块。
+# 职责：按选择构建 FlyWow 的 Gateway、Navigation、Logger、WordFilter 或 HotUpgrade Native 模块。
 # 边界：只编译和测试指定模块；不启动 Server、不安装依赖、不生成运行时配置。
 # 调用者：宿主构建脚本或 FlyWow 开发者。
-# 参数：$1=Skynet 根目录；$2=模块名，可选 gateway/navigation/logger/word_filter/all，省略时为 all。
+# 参数：$1=Skynet 根目录；$2=模块名，可选 gateway/navigation/logger/word_filter/hotupgrade/all，省略时为 all。
 # 环境变量：BUILD_TYPE 可选，默认 RelWithDebInfo；CXX 可选，仅用于 Gateway 编译。
 # 输入：指定模块源码、Skynet 头文件及该模块需要的系统开发库。
 # 产物：build/native/*.so；CMake 中间文件位于 build/cmake/<module>/。
@@ -14,16 +14,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 FRAMEWORK_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-SKYNET_ROOT="$(realpath -- "${1:?用法: build_flywow.sh SKYNET_ROOT [gateway|navigation|logger|word_filter|all]}")"
+SKYNET_ROOT="$(realpath -- "${1:?用法: build_flywow.sh SKYNET_ROOT [gateway|navigation|logger|word_filter|hotupgrade|all]}")"
 MODULE="${2:-all}"
 BUILD_ROOT="$FRAMEWORK_DIR/build"
 NATIVE_DIR="$BUILD_ROOT/native"
 BUILD_TYPE="${BUILD_TYPE:-RelWithDebInfo}"
 
 case "$MODULE" in
-    gateway|navigation|logger|word_filter|all) ;;
+    gateway|navigation|logger|word_filter|hotupgrade|all) ;;
     *)
-        printf '不支持的模块: %s（可选 gateway、navigation、logger、word_filter、all）\n' "$MODULE" >&2
+        printf '不支持的模块: %s（可选 gateway、navigation、logger、word_filter、hotupgrade、all）\n' "$MODULE" >&2
         exit 1
         ;;
 esac
@@ -104,6 +104,15 @@ if [[ "$MODULE" == word_filter || "$MODULE" == all ]]; then
     cmake --build "$BUILD_ROOT/cmake/word_filter" -j"$(nproc)"
     ctest --test-dir "$BUILD_ROOT/cmake/word_filter" --output-on-failure
     test -s "$NATIVE_DIR/flywow_word_filter_native.so"
+fi
+
+if [[ "$MODULE" == hotupgrade || "$MODULE" == all ]]; then
+    # 仅构建 Native；真实 Service 测试由模块测试入口显式启动。
+    cmake -S "$FRAMEWORK_DIR/hotupgrade/native" -B "$BUILD_ROOT/cmake/hotupgrade" \
+        -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DSKYNET_ROOT="$SKYNET_ROOT" \
+        -DFLYWOW_NATIVE_OUTPUT_DIR="$NATIVE_DIR"
+    cmake --build "$BUILD_ROOT/cmake/hotupgrade" -j"$(nproc)"
+    test -s "$NATIVE_DIR/flywow_hotupgrade_native.so"
 fi
 
 printf 'FLYWOW_BUILD_OK module=%s native_dir=%s build_type=%s\n' "$MODULE" "$NATIVE_DIR" "$BUILD_TYPE"
