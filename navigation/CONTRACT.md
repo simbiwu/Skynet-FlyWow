@@ -23,7 +23,7 @@ Native/Lua 使用整数毫米世界坐标 `{x_mm,y_mm,z_mm}`。X/Z 决定归格�
 | `context:close()` | 无返回值 | 幂等释放 Context；后续访问返回关闭错误 |
 | `path:count()` / `world_point(index)` / `length_mm()` | 点数/位置/整数长度 | Path 独占世界点和推进 cursor；不能跨单位共享推进状态 |
 
-参数 record、稳定错误码和边界检查以 `native/lua/src/lua_navigation.cpp` 为实现合同。地图未加载、越界、不可达、动态占用、Context 已关闭等预期失败返回 `nil, {code,message}`；参数类型错误通过 Lua 错误机制抛出。业务按 `code` 分支，`message` 只用于诊断。Native 查询不执行 Skynet yield；动态规则回调也必须同步且不能 yield。
+参数 record、稳定错误码和边界检查以 `native/lua/src/lua_navigation.cpp` 为实现合同。所有公开 Binding API 的失败——包括参数类型/范围错误、地图未加载、越界、不可达、动态占用和 Context 已关闭——统一返回 `nil, {code,message}`，不通过 Lua 错误机制抛出。调用方必须检查第一个返回值，并按稳定 `code` 处理；`message` 只用于诊断。Native 查询不执行 Skynet yield；动态规则回调也必须同步且不能 yield。
 
 ## 状态归属
 

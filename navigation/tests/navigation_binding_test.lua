@@ -21,6 +21,8 @@ local profiles =
         max_slope_permille = 1000,
     },
 }
+-- 稠密性校验只统计正整数下标；命名字段不应被当作 profile 或拒绝。
+profiles.source = false
 local first = assert(navigation.new_context(17, 2, profiles))
 local second = assert(navigation.new_context(17, 2, profiles))
 local start = { x_mm = 750, y_mm = 0, z_mm = 750 }
@@ -33,7 +35,41 @@ local path, path_error = first:find_path(1, start, goal, 1)
 assert(path, path_error and path_error.message)
 assert(path:count() >= 2 and path:length_mm() > 0)
 assert(path:world_point(1).x_mm == start.x_mm)
-assert(not pcall(function() path:world_point(0) end))
+local invalid_point, point_error = path:world_point(0)
+assert(invalid_point == nil)
+assert(point_error.code == "INVALID_ARGUMENT")
+
+local ok, invalid_map, map_error = pcall(function() return navigation.load_map(123) end)
+assert(ok)
+assert(invalid_map == nil)
+assert(map_error.code == "INVALID_ARGUMENT")
+
+local invalid_context, context_error = navigation.new_context(17, 2, {})
+assert(invalid_context == nil)
+assert(context_error.code == "INVALID_ARGUMENT")
+
+local sparse_ok, sparse_context, sparse_error = pcall(function()
+    return navigation.new_context(17, 2, { [1] = profiles[1], [3] = profiles[1] })
+end)
+assert(sparse_ok)
+assert(sparse_context == nil)
+assert(sparse_error.code == "INVALID_ARGUMENT")
+
+local id_ok, invalid_map_id, map_id_error = pcall(function()
+    return navigation.new_context(0, 2, profiles)
+end)
+assert(id_ok)
+assert(invalid_map_id == nil)
+assert(map_id_error.code == "INVALID_ARGUMENT")
+
+local profile_ok, invalid_profile, profile_error = pcall(function()
+    return navigation.new_context(17, 2, {
+        { id = 1, radius_mm = "invalid", max_step_mm = 1000, max_slope_permille = 1000 },
+    })
+end)
+assert(profile_ok)
+assert(invalid_profile == nil)
+assert(profile_error.code == "INVALID_ARGUMENT")
 first:close()
 first:close()
 local closed, closed_error = first:find_path(1, start, goal, 1)
