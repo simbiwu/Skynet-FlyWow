@@ -127,15 +127,16 @@ local function scenario(overrides)
         {
             protocol_version = 3,
             command          = 1001,
+            request_id       = assert(tonumber(payload)),
             body             = "",
         }
     end
     -- 请求 body 替身，与业务无关。
     function codec.decode_request() return { test_id = 1, map_id = 1001 } end
     -- 响应结果编码为文本，fail 注入编码异常。
-    function codec.encode_response(definition, version, response)
+    function codec.encode_response(definition, version, request_id, response)
         assert(not response.fail, "encode failure")
-        return tostring(response.result or 0)
+        return tostring(request_id)
     end
     package.loaded["skynet"] = skynet
     package.loaded["skynet.socket"] = socket
@@ -190,6 +191,7 @@ assert(#e.sends == 2)
 assert(e.sends[1][2] == "send_data")
 assert(e.sends[1][3].connection_id == 1)
 assert(e.sends[2][3].connection_id == 1)
+assert(e.sends[1][3].request_id == 1 and e.sends[2][3].request_id == 2)
 assert(#e.writes == 0, "Gateway must not write before handler sends data")
 
 local message = e.sends[1][3]
@@ -215,6 +217,7 @@ local push =
     gateway_epoch = current_epoch,
     connection_id = 0,
     command_id = 1001,
+    request_id = 0,
     data = { result = 3 },
 }
 e.dispatch(0, 7, "send_data", push)

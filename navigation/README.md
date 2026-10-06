@@ -10,7 +10,7 @@
 | `unity/Editor` | Bake 编排、单层采样、Clearance、校验、Overlay、候选包导出 |
 | `unity/Tests/Editor` | 二进制、Clearance、坐标以及新场景 Bake/发布测试 |
 | `native/grid_map` | BMAP Reader、只读地图、Registry、A*、smoothing、动态占位、Context |
-| `native/lua` | Skynet 自带 Lua ABI 绑定，产出 `flywow_navigation_native.so` |
+| `native/lua` | 使用根模块 lua-binding/ 封装的 Skynet Lua ABI 绑定，产出 `flywow_navigation_native.so` |
 | `lualib/flywow_navigation.lua` | 宿主 `require "flywow_navigation"` 的稳定入口 |
 | scripts/build_flywow.sh (FlyWow 根目录) | 唯一公开构建入口；构建全部 FlyWow Native 模块并执行各自 CTest |
 | `tools` | 资产门禁、可复现离线 UPM 安装包构建 |

@@ -33,8 +33,10 @@ Registry 的地图以 `shared_ptr<const GridMap>` 共享；注册受锁保护，
 
 Context 构造按 Cell 数分配 dense scratch，地图变大和同时 Battle 增加都会增长内存。Registry 生命周期是 OS 进程；本版没有地图卸载 API。热更不是就地修改只读地图，宿主使用新版本并决定旧 Battle 何时退出。
 
-## Lua 栈阅读约定
+## Native Binding 实现边界
 
-Binding 注释中的 `[参数, value, meta]` 按栈底到栈顶排列。`luaL_newmetatable` 在当前 Lua State 注册类型表，首次创建时填写方法与 `__gc`；已经存在时仍把表压到栈顶。`lua_pop(L,1)` 仅移除这次注册的临时栈引用，Registry 仍保存类型表。
+导航通过 `lua-binding/` 的 LuaBinding/LuaTable 读取参数、创建结果和管理 userdata，不直接维护 Lua 栈。Lua API、坐标与领域错误码保持上述合同。C++ 入口只交给初始化适配器；普通失败正常返回，C++ exception 在统一入口转为 INTERNAL_ERROR。
 
-C 函数 `return 1` 表示交给 Lua 一个栈顶结果，**不是返回数字 1**；`return 2` 常对应 `nil,error`。`lua_setfield(L,-2,...)` 把栈顶值写进其下面的表并消费该值。每个相关步骤的栈变化、userdata 所有权及 GC 兜底在 Binding 源码中就地说明。
+Context/Path 使用统一类型核验与 GC。close 幂等释放 Context 大块内存，profiles/vector 外壳由最终 GC 析构；已关闭的 Context 返回 CONTEXT_CLOSED。重复 GC 不重复析构，不匹配或已经析构的 userdata 返回 INVALID_ARGUMENT。
+
+封装内部注释按栈底到栈顶用 `[S, table, value]` 说明 Lua C API；S 是进入操作前已有内容。栈、registry 引用、closure/upvalue 和 GC 的详细合同见 [Lua Binding 使用说明](../lua-binding/使用说明.md)及对应实现，不在导航业务函数中重复 Lua 栈教程。

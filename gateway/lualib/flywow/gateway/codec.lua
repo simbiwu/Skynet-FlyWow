@@ -54,7 +54,7 @@ function M.new(options)
     -- definition 是只读 command 定义；version 是已协商的协议版本整数。
     -- response 是 handler 返回的业务 table，调用方拥有且本函数只读。返回新 Lua bytes string；
     -- Protobuf 编码失败时抛错；不执行 I/O、yield 或修改业务 response。
-    function codec.encode_response(definition, version, response)
+    function codec.encode_response(definition, version, request_id, response)
         assert(definition.response_type ~= nil,
                "gateway command does not define a response: " .. definition.name)
         local body = assert(pb.encode(definition.response_type, response))
@@ -62,6 +62,7 @@ function M.new(options)
         {
             protocol_version = version,
             command          = definition.id,
+            request_id       = request_id,
             body             = body,
         }
 

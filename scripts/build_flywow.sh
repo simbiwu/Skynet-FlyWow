@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 职责：按选择构建 FlyWow 的 Gateway、Navigation、Logger、WordFilter 或 HotUpgrade Native 模块。
+# 职责：按选择构建 FlyWow Native 模块与 Lua Binding 静态库，并执行对应测试。
 # 边界：只编译和测试指定模块；不启动 Server、不安装依赖、不生成运行时配置。
 # 调用者：宿主构建脚本或 FlyWow 开发者。
-# 参数：$1=Skynet 根目录；$2=模块名，可选 gateway/navigation/logger/word_filter/hotupgrade/all，省略时为 all。
+# 参数：$1=Skynet 根目录；$2=gateway/navigation/logger/word_filter/hotupgrade/lua_binding/all，省略时为 all。
 # 环境变量：BUILD_TYPE 可选，默认 RelWithDebInfo；CXX 可选，仅用于 Gateway 编译。
 # 输入：指定模块源码、Skynet 头文件及该模块需要的系统开发库。
 # 产物：build/native/*.so；CMake 中间文件位于 build/cmake/<module>/。
@@ -14,16 +14,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 FRAMEWORK_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-SKYNET_ROOT="$(realpath -- "${1:?用法: build_flywow.sh SKYNET_ROOT [gateway|navigation|logger|word_filter|hotupgrade|all]}")"
+SKYNET_ROOT="$(realpath -- "${1:?用法: build_flywow.sh SKYNET_ROOT [gateway|navigation|logger|word_filter|hotupgrade|lua_binding|all]}")"
 MODULE="${2:-all}"
 BUILD_ROOT="$FRAMEWORK_DIR/build"
 NATIVE_DIR="$BUILD_ROOT/native"
 BUILD_TYPE="${BUILD_TYPE:-RelWithDebInfo}"
 
 case "$MODULE" in
-    gateway|navigation|logger|word_filter|hotupgrade|all) ;;
+    gateway|navigation|logger|word_filter|hotupgrade|lua_binding|all) ;;
     *)
-        printf '不支持的模块: %s（可选 gateway、navigation、logger、word_filter、hotupgrade、all）\n' "$MODULE" >&2
+        printf '不支持的模块: %s（可选 gateway、navigation、logger、word_filter、hotupgrade、lua_binding、all）\n' "$MODULE" >&2
         exit 1
         ;;
 esac
@@ -62,6 +62,20 @@ if [[ "$MODULE" == logger || "$MODULE" == all ]]; then
 fi
 
 mkdir -p "$NATIVE_DIR"
+
+if [[ "$MODULE" == lua_binding || "$MODULE" == navigation || "$MODULE" == all ]]; then
+    # 使用已经构建的宿主 Lua 静态库运行真实 ABI 测试；静态封装不生成独立 .so。
+    [[ -f "$SKYNET_ROOT/3rd/lua/liblua.a" ]] || {
+        printf '%s\n' 'Lua Binding 测试需要先构建宿主 Skynet 的 liblua.a' >&2
+        exit 1
+    }
+    cmake -S "$FRAMEWORK_DIR/lua-binding" -B "$BUILD_ROOT/cmake/lua-binding" \
+        -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DFLYWOW_LUA_BINDING_TESTS=ON \
+        -DSKYNET_LUA_DIR="$SKYNET_ROOT/3rd/lua" \
+        -DSKYNET_LUA_LIBRARY="$SKYNET_ROOT/3rd/lua/liblua.a"
+    cmake --build "$BUILD_ROOT/cmake/lua-binding" -j"$(nproc)"
+    ctest --test-dir "$BUILD_ROOT/cmake/lua-binding" --output-on-failure
+fi
 
 if [[ "$MODULE" == gateway || "$MODULE" == all ]]; then
     # Gateway Crypto 直接生成临时文件，成功后再替换正式产物。

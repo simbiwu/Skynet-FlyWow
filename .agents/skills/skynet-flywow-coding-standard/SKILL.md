@@ -104,6 +104,38 @@ WHY
 
 不直观的公式、坐标换算、插值、索引映射可以给一个短例子；简单代码不要硬加例子。
 
+变量定义处要注释不能仅从名称和类型看出的业务含义，尤其是来源、单位、owner/生命周期、默认值的原因、哨兵值和状态变化。显而易见的短期循环计数器或只在几行内使用的临时值不写重复注释；禁止用注释复述变量名或类型。
+
+同一逻辑组的变量声明按列对齐变量名、赋值符和行尾注释；Lua 多行具名 table 按列对齐字段名和赋值符。只对齐同一组连续声明，不跨空行或无关逻辑维持空格。
+
+## 命名规则
+
+- C++ 类型（class、struct、enum、type alias）使用 PascalCase；自由函数和成员函数使用 lowerCamelCase；命名空间、局部变量、参数和普通变量使用 snake_case；类私有成员使用 snake_case_；具有固定程序期值的常量及枚举项使用 kPascalCase；宏使用带项目名前缀的 UPPER_SNAKE_CASE；C++ 源文件使用小写 snake_case。
+- Lua 脚本中的函数、局部变量、参数、模块字段和普通 record 字段使用 snake_case；常量使用 UPPER_SNAKE_CASE；LuaDoc 类型名使用 PascalCase。Lua 对外模块入口、Service 名和文件名遵守 FlyWow 已有命名合同。
+- Lua 可见的公开字段和函数名使用 snake_case。Native C++ 内部函数名遵守 C++ 规则；注册到 Lua 时显式映射到 Lua 名称，不强求跨语言内部标识符拼写一致。
+- luaopen_* 等 C ABI 符号遵守 Lua 加载合同。稳定协议字段、配置键或历史公开合同按其格式约定，不为统一代码风格而擅自重命名。
+- 新代码统一按以上规则编写；修改旧代码时只整理当前任务涉及的标识符，并同步受影响的调用点，不借规则进行全仓批量改名。
+
+```cpp
+std::uint32_t map_id      = 0; // 请求指定的地图 ID；0 由上层合同判为无效。
+std::uint32_t map_version = 0; // 与 map_id 配对的不可变地图版本。
+```
+
+```lua
+local state =
+{
+    map_id      = map_id,
+    map_version = map_version,
+}
+```
+
+## IDE 可读的注释
+
+- C++ 公开类型和 API 使用 Doxygen 兼容的 /// 注释及 @param、@return、@note 等标准标签，使 clangd、Visual Studio 等 IDE 能在悬浮提示中显示合同。中文说明写清语义、失败与 ownership；不要求额外引入 Doxygen 文档生成器。
+- C++ 实现内部使用普通 // 或块注释解释局部 WHY、栈变化和资源边界；这些注释贴近对应操作，不用 @param 等 API 标签，也不重复公开声明中的合同。
+- Lua 源码使用 Lua Language Server 可识别的 LuaDoc/EmmyLua 标准标签；注释与结构化类型只维护一份，避免 IDE 看不到的自定义标签及重复普通注释。
+- 注释要适配 IDE 的源码解析：标签写在其所描述的声明之前，避免把 API 合同只写在调用点、Markdown 或无法识别的自定义格式中。
+
 ## 文件头
 
 公开模块入口、复杂 Runtime 文件、跨语言 Binding、重要 Build/Test 脚本可以在文件头简要说明职责和边界。
@@ -129,6 +161,8 @@ WHY
 - 不为了“线程安全”给确定为单 owner 的状态额外加锁。
 - C ABI / Lua C API 边界不得让 C++ exception 穿出。
 - Lua C API 中涉及 userdata、GC、longjmp、栈平衡时，必须说明非显然的资源边界。
+- Lua C API 封装内部对关键栈操作写详细中文注释：说明操作前后栈形态、正/负索引、压入/消耗/保留的值、raw 访问与元方法的区别、lua_next 迭代时 key/value 的处理，以及错误和异常路径如何恢复栈。
+- 涉及 luaL_ref/luaL_unref、closure/upvalue、metatable、placement-new 和 __gc 时，注释说明引用 owner、释放时机、构造/析构状态与内存责任。集中实现处解释机制，调用点只解释特定业务约束，不逐行翻译 API。
 - 高频路径避免无必要的临时分配、全局锁和跨 Service 同步等待。
 
 ## API 与实现

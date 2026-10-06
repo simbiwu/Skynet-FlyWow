@@ -76,4 +76,55 @@ local closed, closed_error = first:find_path(1, start, goal, 1)
 assert(closed == nil and closed_error.code == "CONTEXT_CLOSED")
 assert(second:release_unit(1))
 second:close()
+-- 真实调用覆盖 record 中的 Path userdata、推进结果和 Range 查询，确保迁移保持合同。
+local third = assert(navigation.new_context(17, 2, {
+    {
+        id                 = 1,
+        radius_mm          = 0,
+        max_step_mm        = 1000,
+        max_slope_permille = 1000,
+        area_cost_permille = { [0] = 2000 },
+        area_allowed       = { [0] = 0 }, -- 数字 0 按原 Lua 真值规则为允许。
+    },
+}))
+assert(third:cell_size_mm() == 500)
+assert(navigation.query_cell(17, 2, start).walkable)
+assert(third:place_unit(1, 7, start))
+local third_path = assert(third:find_path(1, start, goal, 7))
+local paused = assert(third:advance_path({
+    profile_id  = 1,
+    unit_id     = 7,
+    distance_mm = 0,
+    path        = third_path,
+    from_world  = start,
+}))
+assert(paused.status == "moving" and not paused.moved and paused.consumed_mm == 0)
+local advanced = assert(third:advance_path({
+    profile_id  = 1,
+    unit_id     = 7,
+    distance_mm = 5000,
+    path        = third_path,
+    from_world  = start,
+}))
+assert(advanced.status == "reached" and advanced.moved)
+assert(advanced.position.x_mm == goal.x_mm and advanced.position.y_mm == 0)
+assert(third:move_unit(1, 7, goal, goal))
+assert(third:find_path_to_range(1, goal, start, 500, 7):count() > 0)
+local wrong_path, wrong_path_error = third:advance_path({
+    profile_id  = 1,
+    unit_id     = 7,
+    distance_mm = 10,
+    path        = third,
+    from_world  = goal,
+})
+assert(wrong_path == nil and wrong_path_error.code == "INVALID_ARGUMENT")
+assert(third:release_unit(7))
+third:close()
+assert(third_path:count() > 0) -- immutable Path 不依赖 Context 的动态内存。
+local path_meta = getmetatable(third_path)
+path_meta.__gc(third_path)
+path_meta.__gc(third_path) -- 重复 GC 不允许二次析构 Native Path。
+local dead_path, dead_path_error = third_path:count()
+assert(dead_path == nil and dead_path_error.code == "INVALID_ARGUMENT")
+collectgarbage("collect")
 print("FLYWOW_NAVIGATION_BINDING_OK")

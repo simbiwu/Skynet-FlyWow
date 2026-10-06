@@ -105,6 +105,10 @@ python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 python3 scripts/ci/check_repository.py
 ```
 
+## Lua Binding
+
+Lua Binding 将 Native 的 Lua 操作集中到 C++ 对象，导航已接入。源码位于 lua-binding/，提供静态 target，使用见 [Lua Binding 指南](docs/lua-binding/README.md)。
+
 ## WordFilter
 
 WordFilter 提供 UTF-8 词库匹配与替换，核心从 FCLib FCKeywordFilter 移植。

@@ -8,6 +8,7 @@ project(flywow_navigation_lua LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Binding 必须使用当前 Skynet 源码树中的 Lua ABI，不能偶然链接系统 Lua。
 set(SKYNET_ROOT "" CACHE PATH "宿主固定版本 Skynet 源码目录")
@@ -22,13 +23,18 @@ if(NOT TARGET grid_map_core)
                      "${CMAKE_BINARY_DIR}/grid_map" EXCLUDE_FROM_ALL)
 endif()
 
+if(NOT TARGET flywow_lua_binding)
+    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../../lua-binding"
+                     "${CMAKE_BINARY_DIR}/lua-binding" EXCLUDE_FROM_ALL)
+endif()
+
 add_library(flywow_navigation_lua MODULE src/lua_navigation.cpp)
 target_include_directories(flywow_navigation_lua PRIVATE
     include
     ../grid_map/include
     "${SKYNET_LUA_DIR}"
 )
-target_link_libraries(flywow_navigation_lua PRIVATE grid_map_core)
+target_link_libraries(flywow_navigation_lua PRIVATE grid_map_core flywow_lua_binding)
 target_compile_options(flywow_navigation_lua PRIVATE -Wall -Wextra -Wpedantic)
 # Lua Wrapper 使用 flywow_navigation；Native 使用独立名称，避免同名模块递归加载。
 # Lua 的 require "flywow_navigation_native" 会查找 .so 并调用 luaopen_flywow_navigation_native。

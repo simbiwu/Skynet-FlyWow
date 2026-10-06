@@ -418,6 +418,20 @@ local function dispatch_payload(connection, payload)
         return false
     end
 
+    -- 当前所有客户端 Request 都要求响应；0 只留给 Server 主动消息。
+    if math.type(envelope.request_id) ~= "integer" or envelope.request_id == 0 then
+        emit(
+        {
+            kind          = "error",
+            code          = "REQUEST_ID",
+            message       = "request_id must be non-zero",
+            connection_id = connection.id,
+        }
+        )
+
+        return false
+    end
+
     -- 核心计算：根据 CommandId 查找定义并解码 Request。
     local definition = registry_loader.find(state.registry, envelope.command)
     if definition == nil then
@@ -495,6 +509,7 @@ local function dispatch_payload(connection, payload)
             peer             = connection.peer,
             transport        = connection.transport,
             command_id       = definition.id,
+            request_id       = envelope.request_id,
             data             = request,
         }
     )
@@ -576,6 +591,9 @@ local function deliver_data(source, message)
         message.connection_id < 0 or
         math.type(message.command_id) ~= "integer" or
         message.command_id <= 0 or
+        math.type(message.request_id) ~= "integer" or
+        (message.connection_id == 0 and message.request_id ~= 0) or
+        (message.connection_id > 0 and message.request_id == 0) or
         type(message.data) ~= "table" then
         state.responses_dropped = state.responses_dropped + 1
         return false
@@ -592,6 +610,7 @@ local function deliver_data(source, message)
         state.codec.encode_response,
         definition,
         state.config.protocol_version,
+        message.request_id,
         message.data
     )
     if not ok or #encoded > state.config.max_frame_bytes then
