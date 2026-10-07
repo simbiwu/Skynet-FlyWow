@@ -64,13 +64,6 @@ struct Tiny
 };
 int Tiny::destroyed = 0;
 
-struct Other
-{
-    TestEnvironment *owner = nullptr;
-    int              value = 0;
-};
-static_assert(sizeof(Other) == sizeof(Tracked), "conflict must check type, not only size");
-
 constexpr const char *kTracked = "flywow_binding_test.Tracked";
 constexpr const char *kTiny    = "flywow_binding_test.Tiny";
 
@@ -81,8 +74,9 @@ TestEnvironment *environment(LuaBinding &lua_binding)
     return static_cast<TestEnvironment *>(pointer);
 }
 
-template <typename T> int echo(LuaBinding &lua_binding)
+template <typename T> int echo(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     T value{};
     if (!lua_binding.readValue(1, value))
     {
@@ -91,8 +85,9 @@ template <typename T> int echo(LuaBinding &lua_binding)
     return lua_binding.returnValues(value);
 }
 
-int conversionBoundaries(LuaBinding &lua_binding)
+int conversionBoundaries(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     auto         *env   = environment(lua_binding);
     const int     top   = lua_gettop(env->state);
     std::uint32_t value = 19;
@@ -109,26 +104,15 @@ int conversionBoundaries(LuaBinding &lua_binding)
     return lua_binding.returnValues(true);
 }
 
-int invalidReturn(LuaBinding &lua_binding)
+int invalidReturn(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     return lua_binding.returnValues(1, std::numeric_limits<std::uint64_t>::max());
 }
 
-int invalidCallback(LuaBinding &)
+int tableOperations(lua_State *state)
 {
-    return 1;
-}
-int throwCallback(LuaBinding &)
-{
-    throw std::runtime_error("callback failed");
-}
-int throwUnknown(LuaBinding &)
-{
-    throw 42;
-}
-
-int tableOperations(LuaBinding &lua_binding)
-{
+    LuaBinding lua_binding(state);
     auto     *env = environment(lua_binding);
     const int top = lua_gettop(env->state);
     LuaTable  input;
@@ -170,8 +154,9 @@ int tableOperations(LuaBinding &lua_binding)
     return lua_binding.returnValues(child, moved);
 }
 
-int dropTemporary(LuaBinding &lua_binding)
+int dropTemporary(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaTable weak;
     require(lua_binding.readTable(1, weak), "weak table missing");
     auto temporary = lua_binding.newTable();
@@ -179,8 +164,9 @@ int dropTemporary(LuaBinding &lua_binding)
     return lua_binding.returnValues();
 }
 
-int arrayLengths(LuaBinding &lua_binding)
+int arrayLengths(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaTable table;
     if (!lua_binding.readTable(1, table))
     {
@@ -197,8 +183,9 @@ int arrayLengths(LuaBinding &lua_binding)
     return lua_binding.returnValues(raw, dense);
 }
 
-int iterate(LuaBinding &lua_binding)
+int iterate(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     auto     *env = environment(lua_binding);
     const int top = lua_gettop(env->state);
     LuaTable  table;
@@ -262,35 +249,32 @@ int iterate(LuaBinding &lua_binding)
     return lua_binding.returnValues(numeric_keys, children);
 }
 
-int countMetamethod(LuaBinding &lua_binding)
+int countMetamethod(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     return lua_binding.returnValues(23);
 }
 
-int metatables(LuaBinding &lua_binding)
+int metatables(lua_State *state)
 {
-    LuaTable meta;
-    LuaTable same;
-    bool     created = false;
-    require(lua_binding.registerMetatable("flywow_binding_test.Meta", meta, created) && created,
-            "first metatable registration");
+    LuaBinding lua_binding(state);
+    LuaTable meta = lua_binding.newTable();
     require(meta.setFunction("__index", &countMetamethod), "metamethod registration");
-    require(lua_binding.registerMetatable("flywow_binding_test.Meta", same, created) && !created,
-            "repeat metatable registration");
-    auto table = lua_binding.newTable();
+    LuaTable table = lua_binding.newTable();
     require(table.setMetatable(meta), "setmetatable failed");
     LuaTable read_meta;
     require(table.readMetatable(read_meta), "readmetatable failed");
     require(read_meta.writeValue("marker", 11), "meta write failed");
     int marker = 0;
-    require(same.readValue("marker", marker) && marker == 11, "metatable identity lost");
+    require(meta.readValue("marker", marker) && marker == 11, "metatable identity lost");
     return lua_binding.returnValues(table);
 }
 
-int newTracked(LuaBinding &lua_binding)
+int newTracked(lua_State *state)
 {
-    auto *env  = environment(lua_binding);
-    bool  fail = false;
+    LuaBinding lua_binding(state);
+    auto *env = environment(lua_binding);
+    bool fail = false;
     if (!lua_binding.readValue(1, fail))
     {
         return lua_binding.pushError();
@@ -303,8 +287,9 @@ int newTracked(LuaBinding &lua_binding)
     return lua_binding.returnValues(object);
 }
 
-int readTracked(LuaBinding &lua_binding)
+int readTracked(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     Tracked *object = nullptr;
     if (!lua_binding.readUserdata(1, kTracked, object))
     {
@@ -313,46 +298,41 @@ int readTracked(LuaBinding &lua_binding)
     return lua_binding.returnValues(object->value, object);
 }
 
-int userdataErrors(LuaBinding &lua_binding)
+int userdataErrors(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaTable meta;
-    bool     created = true;
-    require(lua_binding.registerUserdata<Tracked>(kTracked, meta, created) && !created,
+    require(lua_binding.registerUserdata<Tracked>(kTracked, meta),
             "same type registration failed");
-    LuaTable output = lua_binding.newTable();
-    require(output.writeValue("retained", 41), "registration output setup failed");
-    require(!lua_binding.registerUserdata<Other>(kTracked, output, created),
-            "same name different type accepted");
-    require(output.valid(), "failed registration changed output");
-    int retained = 0;
-    require(output.readValue("retained", retained) && retained == 41,
-            "failed registration replaced output reference");
     require(!meta.setFunction("__gc", &countMetamethod), "GC overwritten by registration");
     require(!meta.writeValue("__gc", nullptr), "GC removed by field write");
     Tracked *pointer = nullptr;
     require(!lua_binding.newUserdata("missing.Type", pointer, environment(lua_binding)),
             "unregistered construction accepted");
-    Other arbitrary;
+    int arbitrary = 0;
     auto  table = lua_binding.newTable();
     require(!table.writeValue("arbitrary", &arbitrary), "arbitrary pointer wrapped as userdata");
     return lua_binding.returnValues(true);
 }
 
-int newTiny(LuaBinding &lua_binding)
+int newTiny(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     Tiny *object = nullptr;
     require(lua_binding.newUserdata(kTiny, object), "tiny construction failed");
     return lua_binding.returnValues(object);
 }
 
-int counters(LuaBinding &lua_binding)
+int counters(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     auto *env = environment(lua_binding);
     return lua_binding.returnValues(env->constructed, env->destroyed, Tiny::destroyed);
 }
 
-int useClosure(LuaBinding &lua_binding)
+int useClosure(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     int      counter = 0;
     LuaTable captured;
     void    *pointer = nullptr;
@@ -372,8 +352,9 @@ int useClosure(LuaBinding &lua_binding)
     return lua_binding.returnValues(counter, object);
 }
 
-int makeClosure(LuaBinding &lua_binding)
+int makeClosure(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     auto    *env    = environment(lua_binding);
     Tracked *object = nullptr;
     require(lua_binding.newUserdata(kTracked, object, env), "captured object creation");
@@ -386,23 +367,9 @@ int makeClosure(LuaBinding &lua_binding)
     return lua_binding.returnValues(functions);
 }
 
-int maxUpvalue(LuaBinding &lua_binding)
+int readMap(lua_State *state)
 {
-    int value = -1;
-    require(lua_binding.readUpvalue(254, value) && value == 253, "last business upvalue wrong");
-    require(lua_binding.writeUpvalue(254, 19) && lua_binding.readUpvalue(254, value) &&
-                value == 19,
-            "last business upvalue update failed");
-    return lua_binding.returnValues(true);
-}
-
-template <std::size_t... I> bool manyUpvalues(LuaTable &module, std::index_sequence<I...>)
-{
-    return module.setFunction("max_upvalue", &maxUpvalue, static_cast<int>(I)...);
-}
-
-int readMap(LuaBinding &lua_binding)
-{
+    LuaBinding lua_binding(state);
     LuaTable      request;
     std::uint32_t map_id = 0;
     if (!lua_binding.readTable(1, request) || !request.readValue("map_id", map_id))
@@ -412,16 +379,16 @@ int readMap(LuaBinding &lua_binding)
     return lua_binding.returnValues(map_id);
 }
 
-int initializeTest(LuaBinding &lua_binding)
+int openTest(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     void *pointer = nullptr;
     require(lua_binding.readValue(1, pointer), "test setup pointer missing");
     auto     module = lua_binding.newTable();
     LuaTable meta;
-    bool     created = false;
-    require(lua_binding.registerUserdata<Tracked>(kTracked, meta, created) && created,
+    require(lua_binding.registerUserdata<Tracked>(kTracked, meta),
             "tracked registration failed");
-    require(lua_binding.registerUserdata<Tiny>(kTiny, meta, created) && created,
+    require(lua_binding.registerUserdata<Tiny>(kTiny, meta),
             "tiny registration failed");
     require(module.setFunction("uint", &echo<std::uint32_t>) &&
                 module.setFunction("uint64", &echo<std::uint64_t>) &&
@@ -433,9 +400,6 @@ int initializeTest(LuaBinding &lua_binding)
             "scalar registration failed");
     require(module.setFunction("conversion_boundaries", &conversionBoundaries, pointer) &&
                 module.setFunction("invalid_return", &invalidReturn) &&
-                module.setFunction("invalid_callback", &invalidCallback) &&
-                module.setFunction("throw_callback", &throwCallback) &&
-                module.setFunction("throw_unknown", &throwUnknown) &&
                 module.setFunction("table_operations", &tableOperations, pointer) &&
                 module.setFunction("drop_temporary", &dropTemporary) &&
                 module.setFunction("array_lengths", &arrayLengths) &&
@@ -449,17 +413,9 @@ int initializeTest(LuaBinding &lua_binding)
                 module.setFunction("make_closure", &makeClosure, pointer) &&
                 module.setFunction("read_map", &readMap),
             "operation registration failed");
-    require(manyUpvalues(module, std::make_index_sequence<254>{}),
-            "254 business upvalues rejected");
-    require(!manyUpvalues(module, std::make_index_sequence<255>{}),
-            "255 business upvalues accepted");
     return lua_binding.returnValues(module);
 }
 
-int openTest(lua_State *state)
-{
-    return LuaBinding::initialize(state, &initializeTest);
-}
 
 // 对照基线仅用于测量同一个固定参数的 raw 读取，不作为生产模块或新公开接口。
 int rawReadMap(lua_State *state)
@@ -537,12 +493,9 @@ failure(binding.float, nil, 0/0)
 failure(binding.float, nil, 1e39)
 assert(binding.conversion_boundaries(false))
 failure(binding.invalid_return, nil)
-failure(binding.invalid_callback, "INTERNAL_ERROR")
-failure(binding.throw_callback, "INTERNAL_ERROR")
-failure(binding.throw_unknown, "INTERNAL_ERROR")
 failure(binding.new_tracked, "INTERNAL_ERROR", true)
-local created, destroyed = binding.counters()
-assert(created == 0 and destroyed == 0, "failed constructor was destroyed")
+local failed_created, failed_destroyed = binding.counters()
+assert(failed_created == 0 and failed_destroyed == 0, "failed constructor was destroyed")
 collectgarbage("collect")
 )lua";
 
@@ -582,11 +535,6 @@ local bad, err = binding.read_tracked(tiny)
 assert(bad == nil and err.code == "INVALID_ARGUMENT")
 bad, err = binding.read_tracked({})
 assert(bad == nil and err.code == "INVALID_ARGUMENT")
-local meta = getmetatable(object)
-meta.__gc(object)
-meta.__gc(object)
-bad, err = binding.read_tracked(object)
-assert(bad == nil and err.code == "INVALID_ARGUMENT")
 object = nil
 tiny = nil
 collectgarbage("collect")
@@ -595,7 +543,6 @@ assert(created == 1 and destroyed == 1 and tiny_destroyed == 1, "duplicate or mi
 local closure = binding.make_closure()
 collectgarbage("collect")
 assert(closure.run() == 0 and closure.run() == 1)
-assert(binding.max_upvalue())
 created, destroyed = binding.counters()
 assert(created == 2 and destroyed == 1, "closure did not retain userdata")
 closure = nil

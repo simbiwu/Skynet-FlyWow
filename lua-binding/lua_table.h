@@ -108,8 +108,13 @@ class LuaTable
     /// @return 成功完成检查时返回 true。
     bool denseArrayLength(std::size_t &output) const;
 
-    /// 普通函数和闭包统一注册；最多 254 个业务 upvalue。
+    /// 将 Lua C 回调直接注册为函数或闭包；upvalue 按 Lua 原生编号读取。
     /// @note void* 为借用指针；Table/本封装管理的 userdata 由闭包强引用。
+    /// Values... 与 upvalues... 一一对应；实参顺序就是 closure 的 upvalue 顺序，允许零个。
+    /// @param name 写入此 LuaTable 的字段名。
+    /// @param callback Lua C 回调；通过标准 int(lua_State *) 签名接收参数和返回值。
+    /// @param upvalues 按顺序捕获到闭包的值；可为空，编号从 1 开始。
+    /// @return 注册成功返回 true；失败记录错误并在作用域结束时恢复临时栈。
     template <typename... Values>
     bool setFunction(const std::string &name, Callback callback, const Values &...upvalues)
     {
@@ -117,33 +122,28 @@ class LuaTable
         {
             return false;
         }
+        // 记录当前栈高；函数退出时清掉本次压入的临时值，不撤销已经完成的 table 写入。
         detail::StackRestore stack(binding_->state_);
-        if (callback == nullptr || sizeof...(Values) > 254)
-        {
-            binding_->setError("INVALID_ARGUMENT", "invalid callback or too many upvalues");
-            return false;
-        }
-        // Lua C 回调只保证少量可用槽。closure 可有 255 个 upvalue，必须提前扩容，
-        // 不能依赖未检查的连续 push；table/key/descriptor 另外占 3 个槽。
-        if (!binding_->reserveStack(3 + static_cast<int>(sizeof...(Values))))
+
+        // 压入目标 table 和字段名，再按顺序压入调用方提供的 upvalue：
+        // [S] -> [S, table, key, upvalue1, ..., upvalueN]。
+        // 任一步失败都提前返回，由 StackRestore 清理已压入的临时值。
+        if (!pushWriteKey(name) || !binding_->pushValues(upvalues...))
         {
             return false;
         }
-        if (!pushWriteKey(name))
-        {
-            return false;
-        }
-        pushCallback(callback);
-        if (!binding_->pushValues(upvalues...))
-        {
-            return false;
-        }
-        // [S, table, key, descriptor, uv...] -> [S, table, key, closure]。
-        // closure 消耗全部 upvalue；descriptor 保存真正函数指针，不转成 void*。
-        // lua_pushcclosure：把栈顶指定数量的值作为 upvalue 消耗并压入 C 闭包；内部 descriptor 位于槽 1，业务 upvalue 从槽 2 开始。
-        lua_pushcclosure(binding_->state_, &LuaBinding::dispatch, 1 + sizeof...(Values));
-        // lua_rawset：消耗栈顶 key/value 并写入目标 table：[S, key, value] -> [S]；不调用 __newindex，写 nil 等价于删除字段。
+
+        // sizeof...(Values) 在编译期计算 upvalue 数量；零个参数时传 0。
+        // lua_pushcclosure 消耗栈顶 N 个 upvalue 并压入闭包函数，不消耗 table/key：
+        // [S, table, key, upvalue1, ..., upvalueN] -> [S, table, key, function]。
+        // 闭包按传入顺序保存 upvalue，读取时从 lua_upvalueindex(1) 开始。
+        lua_pushcclosure(binding_->state_, callback, sizeof...(Values));
+
+        // 此时 -3 指向目标 table；lua_rawset 消耗 key 和 function，直接写 table[key]，不触发 __newindex：
+        // [S, table, key, function] -> [S, table]。
         lua_rawset(binding_->state_, -3);
+
+        // 返回时 StackRestore 再移除临时 table，栈恢复为 [S]；table[key] 的写入保留。
         return true;
     }
 
@@ -214,7 +214,6 @@ class LuaTable
         return binding_->pushValue(key);
     }
     bool pushWriteKey(const std::string &key) const;
-    void pushCallback(Callback callback);
     bool visitEntries(int                                                            table_index,
                       const std::function<bool(const LuaValue &, const LuaValue &)> &visitor) const;
     void reset() noexcept;

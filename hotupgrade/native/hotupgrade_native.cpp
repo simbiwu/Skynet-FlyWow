@@ -240,7 +240,9 @@ bool appendSynchronized(const std::string &path, const std::string &bytes) {
   return synced == 0 && closed == 0 && syncParent(path) == 0;
 }
 
-int digestCallback(LuaBinding &binding) {
+int digestCallback(lua_State *state)
+{
+  LuaBinding binding(state);
   std::string input;
   if (!binding.readValue(1, input)) {
     return binding.pushError();
@@ -253,7 +255,9 @@ int digestCallback(LuaBinding &binding) {
   return binding.returnValues(output);
 }
 
-int nonceCallback(LuaBinding &binding) {
+int nonceCallback(lua_State *state)
+{
+  LuaBinding binding(state);
   std::string output;
   if (!makeNonce(output)) {
     return binding.pushError("HU_IDENTITY_FAILED",
@@ -262,7 +266,9 @@ int nonceCallback(LuaBinding &binding) {
   return binding.returnValues(output);
 }
 
-int resolveCallback(LuaBinding &binding) {
+int resolveCallback(lua_State *state)
+{
+  LuaBinding binding(state);
   std::string input;
   if (!binding.readValue(1, input)) {
     return binding.pushError();
@@ -276,7 +282,9 @@ int resolveCallback(LuaBinding &binding) {
   return binding.returnValues(output);
 }
 
-int listLuaCallback(LuaBinding &binding) {
+int listLuaCallback(lua_State *state)
+{
+  LuaBinding binding(state);
   std::string root;
   std::string relative;
   std::string category;
@@ -304,7 +312,9 @@ int listLuaCallback(LuaBinding &binding) {
   return binding.returnValues(output);
 }
 
-int appendCallback(LuaBinding &binding) {
+int appendCallback(lua_State *state)
+{
+  LuaBinding binding(state);
   std::string path;
   std::string bytes;
   if (!binding.readValue(1, path) || !binding.readValue(2, bytes)) {
@@ -318,7 +328,11 @@ int appendCallback(LuaBinding &binding) {
   return binding.returnValues(true);
 }
 
-int initializeModule(LuaBinding &binding) {
+} // namespace
+
+extern "C" int luaopen_flywow_hotupgrade_native(lua_State *state)
+{
+  LuaBinding binding(state);
   LuaTable module = binding.newTable();
   if (!module.valid() || !module.setFunction("sha256", digestCallback) ||
       !module.setFunction("nonce", nonceCallback) ||
@@ -328,9 +342,4 @@ int initializeModule(LuaBinding &binding) {
     return binding.pushError();
   }
   return binding.returnValues(module);
-}
-} // namespace
-
-extern "C" int luaopen_flywow_hotupgrade_native(lua_State *state) {
-  return LuaBinding::initialize(state, initializeModule);
 }

@@ -1,5 +1,5 @@
 // 职责：使用 OpenSSL 3 EVP 执行 Gateway P-256/HKDF/HMAC 握手，不实现自有密码算法。
-// 边界：FlyWow Native Lua Binding；输入固定握手字节，输出 challenge/ready 或 Lua 异常。
+// 边界：FlyWow Native Lua Binding；输入固定握手字节，输出 challenge/ready 或 nil,error。
 // 生命周期：每个 Lua userdata 独占临时密钥和派生密钥；close/__gc 擦除并释放，不共享可变 scratch。
 // 不负责：不访问 Socket、Skynet、业务、登录或文件；私钥和 secret 不返回 Lua 字符串。
 #include "lua_binding.h"
@@ -31,7 +31,7 @@ struct Context
 };
 template<class T, void(*Free)(T*)> using Handle = std::unique_ptr<T, decltype(Free)>;
 
-// 检查 EVP 的显式返回；失败抛内部异常，由 Lua 入口统一转换为稳定错误码。
+// 检查 EVP 的显式返回；失败由当前 Lua 回调转为稳定错误结果。
 void check(bool ok, const char* code)
 {
     if (!ok) throw std::runtime_error(code);
@@ -148,9 +148,10 @@ std::string challenge(Context* c, const char* hello)
     return response;
 }
 
-// 创建独占userdata和challenge；参数hello为67字节。非法输入抛稳定错误，不执行I/O/yield。
-int create(LuaBinding &lua_binding)
+// 创建独占 userdata 和 challenge；参数 hello 为 67 字节。失败返回稳定 Lua 错误，不执行 I/O/yield。
+int create(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     std::string hello;
     if (!lua_binding.readValue(1, hello)) return lua_binding.pushError();
     if (hello.size() != 67 || hello[0] != 1 || hello[1] != 1 ||
@@ -161,13 +162,24 @@ int create(LuaBinding &lua_binding)
     }
     Context *context = nullptr;
     if (!lua_binding.newUserdata(TYPE, context)) return lua_binding.pushError();
-    const std::string response = challenge(context, hello.data());
+    std::string response;
+    try
+    {
+        response = challenge(context, hello.data());
+    }
+    catch (const std::runtime_error &error)
+    {
+        clear(context);
+        lua_binding.setError(error.what(), error.what());
+        return lua_binding.pushError();
+    }
     return lua_binding.returnValues(context, response);
 }
 
 // 验证33字节客户端证明并返回33字节服务端证明；常量时间比较，成功即擦除secret。
-int proof(LuaBinding &lua_binding)
+int proof(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     Context *context = nullptr;
     std::string bytes;
     if (!lua_binding.readUserdata(1, TYPE, context) || !lua_binding.readValue(2, bytes))
@@ -193,16 +205,18 @@ int proof(LuaBinding &lua_binding)
         clear(context);
         return lua_binding.returnValues(response);
     }
-    catch (...)
+    catch (const std::runtime_error &error)
     {
         clear(context);
-        throw;
+        lua_binding.setError(error.what(), error.what());
+        return lua_binding.pushError();
     }
 }
 
-// close/__gc幂等释放本userdata；无返回、无yield，不能释放其他连接。
-int close(LuaBinding &lua_binding)
+// close 幂等清理 Context 持有的资源；Lua GC 随后自动调用 Context 析构。
+int close(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     Context *context = nullptr;
     if (!lua_binding.readUserdata(1, TYPE, context)) return lua_binding.pushError();
     clear(context);
@@ -211,20 +225,15 @@ int close(LuaBinding &lua_binding)
 }
 
 // 注册本Lua State的模块及userdata方法；无全局可变context，不接触Skynet服务。
-int initializeCrypto(LuaBinding &lua_binding)
+extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaTable metatable;
-    bool created = false;
-    if (!lua_binding.registerUserdata<Context>(TYPE, metatable, created)) return lua_binding.pushError();
+    if (!lua_binding.registerUserdata<Context>(TYPE, metatable)) return lua_binding.pushError();
     LuaTable methods = lua_binding.newTable();
     if (!methods.setFunction("verify", proof) || !methods.setFunction("close", close) ||
         !metatable.writeValue("__index", methods)) return lua_binding.pushError();
     LuaTable module = lua_binding.newTable();
     if (!module.setFunction("new", create)) return lua_binding.pushError();
     return lua_binding.returnValues(module);
-}
-
-extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
-{
-    return LuaBinding::initialize(state, initializeCrypto);
 }

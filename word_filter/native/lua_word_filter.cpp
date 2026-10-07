@@ -34,7 +34,9 @@ bool readFilter(LuaBinding &lua_binding, LuaFilter *&output) {
   return lua_binding.readUserdata(1, kFilterMeta, output);
 }
 
-int createFilter(LuaBinding &lua_binding) {
+int createFilter(lua_State *state)
+{
+  LuaBinding lua_binding(state);
   LuaTable keywords;
   if (!lua_binding.readTable(1, keywords)) {
     return lua_binding.pushError();
@@ -92,7 +94,9 @@ int createFilter(LuaBinding &lua_binding) {
   return lua_binding.returnValues(filter);
 }
 
-int findMatches(LuaBinding &lua_binding) {
+int findMatches(lua_State *state)
+{
+  LuaBinding lua_binding(state);
   LuaFilter *filter = nullptr;
   if (!readFilter(lua_binding, filter)) {
     return lua_binding.pushError();
@@ -148,11 +152,13 @@ int findMatches(LuaBinding &lua_binding) {
   return lua_binding.returnValues(matches);
 }
 
-int initializeModule(LuaBinding &lua_binding) {
+} // namespace
+
+extern "C" int luaopen_flywow_word_filter_native(lua_State *state)
+{
+  LuaBinding lua_binding(state);
   LuaTable metatable;
-  bool created = false;
-  if (!lua_binding.registerUserdata<LuaFilter>(kFilterMeta, metatable,
-                                               created)) {
+  if (!lua_binding.registerUserdata<LuaFilter>(kFilterMeta, metatable)) {
     return lua_binding.pushError();
   }
 
@@ -168,9 +174,4 @@ int initializeModule(LuaBinding &lua_binding) {
     return lua_binding.pushError();
   }
   return lua_binding.returnValues(module);
-}
-} // namespace
-
-extern "C" int luaopen_flywow_word_filter_native(lua_State *state) {
-  return LuaBinding::initialize(state, initializeModule);
 }

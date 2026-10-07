@@ -69,10 +69,6 @@ bool LuaTable::requireValid() const
 
 bool LuaTable::push() const
 {
-    if (!binding_->reserveStack(4))
-    {
-        return false;
-    }
     // reference_ 是 registry 引用编号，不是业务数组 key。
     // rawgeti 压入同一 table：[S] -> [S, table]，不触发 __index。
     // 句柄继续持有 registry 引用；外层保护器只弹掉这份临时栈引用。
@@ -102,22 +98,10 @@ bool LuaTable::pushWriteKey(const std::string &key) const
     {
         return false;
     }
-    // 已注册 userdata 类型的 GC 和类型标记不能被普通写字段/注册方法覆盖。
-    if (key == "__gc" || key == "__flywow_userdata_type" || key == "__flywow_userdata_size")
+    if (key == "__gc")
     {
-        // lua_pushliteral：压入编译期字符串字面量：[S] -> [S, string]；Lua 持有该字符串，用作原始字段 key。
-        lua_pushliteral(binding_->state_, "__flywow_userdata_type");
-        // lua_rawget：消耗栈顶 key 并压入原始字段值：[S, key] -> [S, value]；不触发 __index，目标 table 不弹出。
-        lua_rawget(binding_->state_, -2);
-        // lua_type：读取指定槽的类型标记，不转换值、不改变栈；无效槽返回 LUA_TNONE，而不是 LUA_TNIL。
-        const bool managed = lua_type(binding_->state_, -1) == LUA_TLIGHTUSERDATA;
-        // lua_pop：移除指定数量的栈顶临时值；不会直接销毁仍被 registry/字段/闭包引用的对象，遍历时必须保留下一轮所需 key。
-        lua_pop(binding_->state_, 1);
-        if (managed)
-        {
-            binding_->setError("INVALID_ARGUMENT", "managed userdata metadata is reserved");
-            return false;
-        }
+        binding_->setError("INVALID_ARGUMENT", "__gc is managed by userdata registration");
+        return false;
     }
     // lua_pushlstring：按显式长度复制字节为 Lua 字符串并压栈：[S] -> [S, string]；保留内嵌零字节，不借用 C++ 缓冲区。
     lua_pushlstring(binding_->state_, key.data(), key.size());

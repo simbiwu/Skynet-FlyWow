@@ -271,8 +271,9 @@ bool exclusiveDynamicRule(void *, const flywow_navigation::DynamicNavigationQuer
 }
 
 /// load_map(path)：启动阶段读取、校验并注册 BMAP；执行文件 I/O，返回地图身份或 nil,error。
-int loadMap(LuaBinding &lua_binding)
+int loadMap(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     void       *registry_pointer = nullptr; // 闭包借用的 Registry，Native 单例覆盖 State 生命周期。
     std::string path;
     if (!lua_binding.readUpvalue(1, registry_pointer) || !lua_binding.readValue(1, path))
@@ -313,8 +314,9 @@ LuaTable cellResultTable(LuaBinding &lua_binding, const flywow_navigation::GridP
 }
 
 /// query_cell(id,version,position)：只读查询，不 yield，不保存请求状态。
-int queryCell(LuaBinding &lua_binding)
+int queryCell(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     void         *registry_pointer = nullptr;
     std::uint32_t map_id           = 0; // 必填地图身份，由正数业务检查拒绝默认 0。
     std::uint32_t map_version      = 0;
@@ -347,8 +349,9 @@ int queryCell(LuaBinding &lua_binding)
 }
 
 /// new_context(id,version,profiles)：每场 Battle 独占动态状态；Registry 查找只持短锁。
-int newContext(LuaBinding &lua_binding)
+int newContext(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     void         *registry_pointer = nullptr;
     std::uint32_t map_id           = 0;
     std::uint32_t map_version      = 0;
@@ -407,8 +410,9 @@ bool readPathQuery(LuaBinding &lua_binding, PathQuery &query)
 }
 
 /// find_path(profile_id,start,end,self_id)：同步规划，返回独占 Path/cursor。
-int findPath(LuaBinding &lua_binding)
+int findPath(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     PathQuery     query;
     std::uint32_t self_id = 0;
     if (!readPathQuery(lua_binding, query) ||
@@ -434,8 +438,9 @@ int findPath(LuaBinding &lua_binding)
 }
 
 /// find_path_to_range：搜索可站立的攻击位置；不忽略目标占位。
-int findPathToRange(LuaBinding &lua_binding)
+int findPathToRange(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     PathQuery     query;
     std::uint32_t range_mm = 0; // uint32 毫米距离，0 合法，不作为实体 ID 检查。
     std::uint32_t self_id  = 0;
@@ -514,8 +519,9 @@ int commitMove(LuaBinding &lua_binding, LuaNavigationContext &owner, const Navig
 }
 
 /// place_unit：出生也是一次正常占位提交；失败不改变现有动态事实。
-int placeUnit(LuaBinding &lua_binding)
+int placeUnit(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaNavigationContext *owner = nullptr;
     NavigationAgent       agent;
     WorldPosition         world;
@@ -527,8 +533,9 @@ int placeUnit(LuaBinding &lua_binding)
 }
 
 /// move_unit：复验当前子步并提交占位，成功返回 Server 地表 Y 归一的世界位置。
-int moveUnit(LuaBinding &lua_binding)
+int moveUnit(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaNavigationContext *owner = nullptr;
     NavigationAgent       agent;
     WorldPosition         from;
@@ -600,8 +607,9 @@ LuaTable advanceResultTable(LuaBinding                                 &lua_bind
 
 /// advance_path(request)：消费 fixed-tick 距离预算；blocked 是成功 result 状态。
 /// request 的 path/from_world 本次同步借用；失败返回 nil,error。
-int advancePath(LuaBinding &lua_binding)
+int advancePath(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaNavigationContext *owner = nullptr;
     AdvanceRequest        request;
     if (!readContext(lua_binding, owner) || !readAdvanceRequest(lua_binding, request))
@@ -629,8 +637,9 @@ int advancePath(LuaBinding &lua_binding)
 }
 
 /// cell_size_mm：只读地图边长，单位毫米。
-int cellSizeMm(LuaBinding &lua_binding)
+int cellSizeMm(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaNavigationContext *owner = nullptr;
     if (!readContext(lua_binding, owner))
     {
@@ -640,8 +649,9 @@ int cellSizeMm(LuaBinding &lua_binding)
 }
 
 /// release_unit：释放该 handle 当前 footprint，成功返回 true。
-int releaseUnit(LuaBinding &lua_binding)
+int releaseUnit(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaNavigationContext *owner   = nullptr;
     std::uint32_t         unit_id = 0;
     if (!readContext(lua_binding, owner) || !readPositiveId(lua_binding, 2, "unit_id", unit_id))
@@ -658,8 +668,9 @@ int releaseUnit(LuaBinding &lua_binding)
 }
 
 /// close：幂等释放大块 Context 内存；profiles/vector 外壳由统一 GC 最终析构。
-int closeContext(LuaBinding &lua_binding)
+int closeContext(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaNavigationContext *owner = nullptr;
     if (!lua_binding.readUserdata(1, kContextMeta, owner))
     {
@@ -674,8 +685,9 @@ int closeContext(LuaBinding &lua_binding)
 }
 
 /// count：返回 Path 世界点数量，不修改 Path。
-int pathCount(LuaBinding &lua_binding)
+int pathCount(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaPath *path = nullptr;
     if (!lua_binding.readUserdata(1, kPathMeta, path))
     {
@@ -685,8 +697,9 @@ int pathCount(LuaBinding &lua_binding)
 }
 
 /// world_point：Lua 1-based index 对应的毫米 WorldPosition；越界返回 nil,error。
-int pathWorldPoint(LuaBinding &lua_binding)
+int pathWorldPoint(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaPath     *path  = nullptr;
     std::int64_t index = 0; // Lua 下标先保留有符号值，验证后转为 Native 0-based。
     if (!lua_binding.readUserdata(1, kPathMeta, path) || !lua_binding.readValue(2, index))
@@ -703,8 +716,9 @@ int pathWorldPoint(LuaBinding &lua_binding)
 }
 
 /// length_mm：XZ 折线总长度，单位毫米。
-int pathLengthMm(LuaBinding &lua_binding)
+int pathLengthMm(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     LuaPath *path = nullptr;
     if (!lua_binding.readUserdata(1, kPathMeta, path))
     {
@@ -717,14 +731,9 @@ int pathLengthMm(LuaBinding &lua_binding)
 bool registerPath(LuaBinding &lua_binding)
 {
     LuaTable meta;
-    bool     created = false;
-    if (!lua_binding.registerUserdata<LuaPath>(kPathMeta, meta, created))
+    if (!lua_binding.registerUserdata<LuaPath>(kPathMeta, meta))
     {
         return false;
-    }
-    if (!created)
-    {
-        return true;
     }
     auto methods = lua_binding.newTable();
     return methods.setFunction("count", &pathCount) &&
@@ -735,14 +744,9 @@ bool registerPath(LuaBinding &lua_binding)
 bool registerContext(LuaBinding &lua_binding)
 {
     LuaTable meta;
-    bool     created = false;
-    if (!lua_binding.registerUserdata<LuaNavigationContext>(kContextMeta, meta, created))
+    if (!lua_binding.registerUserdata<LuaNavigationContext>(kContextMeta, meta))
     {
         return false;
-    }
-    if (!created)
-    {
-        return true;
     }
     auto methods = lua_binding.newTable();
     return methods.setFunction("find_path", &findPath) &&
@@ -756,8 +760,11 @@ bool registerContext(LuaBinding &lua_binding)
 }
 
 // Registry 是进程级只读地图集合；可变 context/scratch 不共享。
-int initializeNavigation(LuaBinding &lua_binding)
+} // namespace
+
+extern "C" int luaopen_flywow_navigation_native(lua_State *state)
 {
+    LuaBinding lua_binding(state);
     if (!registerContext(lua_binding) || !registerPath(lua_binding))
     {
         return lua_binding.pushError();
@@ -771,11 +778,4 @@ int initializeNavigation(LuaBinding &lua_binding)
         return lua_binding.pushError();
     }
     return lua_binding.returnValues(module);
-}
-} // namespace
-
-// Lua ABI 固定入口只交给适配器；业务层无需接触 lua_State 的栈。
-extern "C" int luaopen_flywow_navigation_native(lua_State *state)
-{
-    return LuaBinding::initialize(state, &initializeNavigation);
 }
