@@ -1,6 +1,7 @@
 --- 单 owner 的同步追加审计；写入 fsync 完成才返回，重启保留事务决定。
 local result = require "flywow_hotupgrade_error"
 local native = require "flywow_hotupgrade_native"
+local native_error = require "flywow_hotupgrade_native_error"
 local snapshot = require "flywow_hotupgrade_snapshot"
 local M = {}
 local History = {}
@@ -69,7 +70,7 @@ function History:append(record)
         return result.failure("HU_HISTORY_LIMIT", "审计容量耗尽")
     end
     local ok, code = native.append_sync(self.path, line)
-    if not ok then return result.failure(code, self.path) end
+    if not ok then return result.failure(native_error.code(code), self.path) end
     self.size = self.size + #line
     self.records[record.txn_id] = cloned.value
     return result.success()

@@ -1,9 +1,10 @@
-# 职责：构建 C++14 Skynet Native Logger 与可注入时钟的文件测试；不启动业务进程。
+# 职责：构建 C++17 Skynet Native Logger 与可注入时钟的文件测试；不启动业务进程。
 # 输入固定 SKYNET_ROOT 与 FLYWOW_NATIVE_OUTPUT_DIR；中间产物归调用者指定构建目录。
 cmake_minimum_required(VERSION 3.10)
 project(flywow_logger LANGUAGES CXX)
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT EXISTS "${SKYNET_ROOT}/skynet-src/skynet.h")
     message(FATAL_ERROR "缺少固定版本 Skynet 头文件")
 endif()

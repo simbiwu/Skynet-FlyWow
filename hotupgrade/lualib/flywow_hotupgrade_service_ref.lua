@@ -3,6 +3,7 @@ local skynet = require "skynet"
 local rpc = require "flywow_hotupgrade_rpc"
 local result = require "flywow_hotupgrade_error"
 local native = require "flywow_hotupgrade_native"
+local native_error = require "flywow_hotupgrade_native_error"
 local M = {}
 local Ref = {}
 Ref.__index = Ref
@@ -11,7 +12,7 @@ Ref.__index = Ref
 ---@return flywow_hotupgrade_result
 function M.new(options)
     local ref_id, code = native.nonce()
-    if not ref_id then return result.failure(code, "引用身份生成失败") end
+    if not ref_id then return result.failure(native_error.code(code), "引用身份生成失败") end
     local resolved = rpc.call(options.controller, "resolve",
         {target = options.target, ref_id = ref_id}, options.timeout_ms or 10000)
     if not resolved.ok then return resolved end

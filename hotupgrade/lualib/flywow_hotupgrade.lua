@@ -4,6 +4,7 @@ local runtime_module = require "flywow_hotupgrade_runtime"
 local rpc = require "flywow_hotupgrade_rpc"
 local registry = require "flywow_hotupgrade_registry"
 local result = require "flywow_hotupgrade_error"
+local native_error = require "flywow_hotupgrade_native_error"
 local M = {}
 local runtime
 local managed_modules = {}
@@ -60,7 +61,11 @@ function M.register_service(options)
         or math.type(options.code_version) ~= "integer" or type(options.adapter) ~= "table" then
         return result.failure("HU_INVALID_OPTIONS", "注册参数不满足合同")
     end
-    options.instance_id = options.instance_id or assert(require("flywow_hotupgrade_native").nonce())
+    if not options.instance_id then
+        local instance_id, identity_error = require("flywow_hotupgrade_native").nonce()
+        if not instance_id then return result.failure(native_error.code(identity_error), "实例身份生成失败") end
+        options.instance_id = instance_id
+    end
     options.modules = {}
     for name in pairs(managed_modules) do options.modules[#options.modules + 1] = name end
     table.sort(options.modules)

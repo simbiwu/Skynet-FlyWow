@@ -150,7 +150,15 @@ bool LuaTable::forEach(const std::function<bool(const LuaValue &, const LuaValue
 bool LuaTable::visitEntries(
     int table_index, const std::function<bool(const LuaValue &, const LuaValue &)> &visitor) const
 {
-    // lua_pushnil：压入 nil：[S] -> [S, nil]；作为错误首返回值或 table 遍历起始 key，具体用途由当前操作决定。
+    /*
+        `lua_next` 要求调用时栈顶有一个 key。第一次遍历还没有上一轮的 key，所以先压入 `nil`：
+        [S, table]
+        压入 nil：[S, table, nil]
+        然后：
+        lua_next(state, table_index);
+        Lua 会把这个 `nil` 当作“从头开始”，并在有条目时把它替换为第一对 key/value：
+        [S, table, nil] → [S, table, key, value]
+    */
     lua_pushnil(binding_->state_);
     // lua_next 消耗旧 key，成功时压入新 key/value；结束时不压值。
     // [S, table, nil/key] -> [S, table, key, value]，第一轮 nil 表示开始。
@@ -181,15 +189,10 @@ bool LuaTable::visitEntries(
     return true;
 }
 
-bool LuaTable::arrayLength(std::size_t *output) const
+bool LuaTable::arrayLength(std::size_t &output) const
 {
     if (!requireValid())
     {
-        return false;
-    }
-    if (output == nullptr)
-    {
-        binding_->setError("INVALID_ARGUMENT", "array length output must not be null");
         return false;
     }
     detail::StackRestore stack(binding_->state_);
@@ -200,19 +203,14 @@ bool LuaTable::arrayLength(std::size_t *output) const
     // 不改变 [S, table]，不调用 __len；返回数组边界，不证明数组无空洞。
     // 稀疏表可能有多个合法边界；出口由保护器移除临时 table，恢复 [S]。
     // lua_rawlen：读取原始长度，不调用 __len、不改变栈；table 为数组边界，full userdata 为分配字节数，不能混淆。
-    *output = lua_rawlen(binding_->state_, -1);
+    output = lua_rawlen(binding_->state_, -1);
     return true;
 }
 
-bool LuaTable::denseArrayLength(std::size_t *output) const
+bool LuaTable::denseArrayLength(std::size_t &output) const
 {
     if (!requireValid())
     {
-        return false;
-    }
-    if (output == nullptr)
-    {
-        binding_->setError("INVALID_ARGUMENT", "array length output must not be null");
         return false;
     }
     detail::StackRestore stack(binding_->state_);
@@ -252,7 +250,7 @@ bool LuaTable::denseArrayLength(std::size_t *output) const
                            "positive integer keys must form a dense 1-based array");
         return false;
     }
-    *output = entries; // 空表 max_index/entries 均为 0，是否允许空由业务决定。
+    output = entries; // 空表 max_index/entries 均为 0，是否允许空由业务决定。
     return true;
 }
 
@@ -277,7 +275,7 @@ bool LuaTable::setMetatable(const LuaTable &meta)
     return true;
 }
 
-bool LuaTable::readMetatable(LuaTable *output) const
+bool LuaTable::readMetatable(LuaTable &output) const
 {
     if (!requireValid())
     {
@@ -330,11 +328,11 @@ bool LuaValue::isNil() const
     // lua_isnil：检查该槽是否恰为 nil，不改变栈；缺失字段由 rawget 产生 nil，无效槽则不是 nil。
     return lua_isnil(binding_->state_, index_);
 }
-bool LuaValue::readTable(LuaTable *output) const
+bool LuaValue::readTable(LuaTable &output) const
 {
     return binding_->readTableAt(index_, output);
 }
-bool LuaValue::readTruth(bool *output) const
+bool LuaValue::readTruth(bool &output) const
 {
     return binding_->readTruthAt(index_, output);
 }

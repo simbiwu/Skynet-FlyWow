@@ -3,6 +3,17 @@
 package.path = arg[1] .. "/?.lua;" .. package.path
 package.cpath = arg[2] .. "/?.so;" .. package.cpath
 local word_filter = require "flywow_word_filter"
+local dictionary_path = os.tmpname()
+local dictionary_file = assert(io.open(dictionary_path, "wb"))
+dictionary_file:write("外挂\r\nhe\n\nshe\n")
+assert(dictionary_file:close())
+local file_filter, file_error = word_filter.new({file = dictionary_path})
+os.remove(dictionary_path)
+assert(file_filter and not file_error)
+assert(file_filter:contains("SHE"))
+local missing_filter, missing_error = word_filter.new({file = dictionary_path})
+assert(missing_filter == nil and missing_error == "dictionary_io")
+
 local filter = assert(word_filter.new(
 {
     keywords = {"外挂", "he", "she", "bad"},

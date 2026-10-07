@@ -62,7 +62,7 @@ bool typeMatches(lua_State *state, int index, const void *type, std::size_t size
 
 namespace detail
 {
-bool ValueCodec<bool>::read(lua_State *state, int index, bool *output, std::string *reason)
+bool ValueCodec<bool>::read(lua_State *state, int index, bool &output, std::string *reason)
 {
     // type 只检查原槽；toboolean 本来接受任意类型，这里先限定为真正的 bool。
     // 不改变栈，false 是有效结果，不能用输出值本身判断读取是否成功。
@@ -73,7 +73,7 @@ bool ValueCodec<bool>::read(lua_State *state, int index, bool *output, std::stri
         return false;
     }
     // lua_toboolean：按 Lua 真值规则读取该槽：只有 nil/false 为假，0 和空串为真；不转换原值、不改变栈。
-    *output = lua_toboolean(state, index) != 0;
+    output = lua_toboolean(state, index) != 0;
     return true;
 }
 
@@ -85,7 +85,7 @@ bool ValueCodec<bool>::push(lua_State *state, bool value, std::string *)
     return true;
 }
 
-bool ValueCodec<std::string>::read(lua_State *state, int index, std::string *output,
+bool ValueCodec<std::string>::read(lua_State *state, int index, std::string &output,
                                    std::string *reason)
 {
     // 不允许数字到字符串的隐式转换。尤其 lua_next 的数字 key 不能被原位 tostring，
@@ -102,7 +102,7 @@ bool ValueCodec<std::string>::read(lua_State *state, int index, std::string *out
     // lua_tolstring：取得字符串地址及字节长度；地址由 Lua 持有。这里已检查字符串类型，不触发数字转字符串，不改变栈。
     const char *bytes  = lua_tolstring(state, index, &length);
     std::string value(bytes, length);
-    *output = std::move(value);
+    output = std::move(value);
     return true;
 }
 
@@ -114,7 +114,7 @@ bool ValueCodec<std::string>::push(lua_State *state, const std::string &value, s
     return true;
 }
 
-bool ValueCodec<void *>::read(lua_State *state, int index, void **output, std::string *reason)
+bool ValueCodec<void *>::read(lua_State *state, int index, void *&output, std::string *reason)
 {
     // lightuserdata 是外部借用地址，不归 Lua 释放；读取不压栈、不注册 GC。
     // full userdata 必须走另一条类型/大小/metatable/存活状态校验路径。
@@ -125,7 +125,7 @@ bool ValueCodec<void *>::read(lua_State *state, int index, void **output, std::s
         return false;
     }
     // lua_touserdata：取得该槽携带的地址，不改变栈；lightuserdata 是外部地址，full userdata 是 Lua 分配区，不能混用 ownership。
-    *output = lua_touserdata(state, index);
+    output = lua_touserdata(state, index);
     return true;
 }
 } // namespace detail
@@ -148,9 +148,6 @@ LuaBinding::~LuaBinding()
 
 bool LuaBinding::reserveStack(int slots)
 {
-    // 保证还有 slots 个可压入的槽，但不实际压值、不改变高度。
-    // 大量 upvalue/返回值按实际数量扩容；失败记录错误，不跳过 C++ 栈析构。
-    // lua_checkstack：保证还可压入指定数量的槽，不实际压入值、不改变高度；返回 0 表示扩容失败。
     if (!lua_checkstack(state_, slots))
     {
         setError("INTERNAL_ERROR", "cannot reserve Lua stack slots");
@@ -323,12 +320,12 @@ int LuaBinding::pushError(const std::string &code, const std::string &message)
     return result_count_;
 }
 
-bool LuaBinding::readTableAt(int index, LuaTable *output)
+bool LuaBinding::readTableAt(int index, LuaTable &output)
 {
     // lua_istable：检查指定槽是否为 table，不转换值、不改变栈；非零表示符合，失败由封装返回普通错误。
-    if (output == nullptr || !lua_istable(state_, index))
+    if (!lua_istable(state_, index))
     {
-        setError("INVALID_ARGUMENT", "value must be a table and output must not be null");
+        setError("INVALID_ARGUMENT", "value must be a table");
         return false;
     }
     if (!reserveStack(1))
@@ -347,16 +344,16 @@ bool LuaBinding::readTableAt(int index, LuaTable *output)
     const int reference =
         // luaL_ref：将栈顶值保存到 registry 并弹出，返回引用编号；编号由对应句柄/回调持有并最终 unref，持有期间防止对象被 GC。
         luaL_ref(state_, LUA_REGISTRYINDEX); // output 句柄拥有的 registry 引用编号。
-    *output = LuaTable(this, reference);
+    output = LuaTable(this, reference);
     return true;
 }
 
-bool LuaBinding::readTable(int index, LuaTable *output)
+bool LuaBinding::readTable(int index, LuaTable &output)
 {
     return validIndex(index) && readTableAt(index, output);
 }
 
-bool LuaBinding::readTable(LuaTable *output)
+bool LuaBinding::readTable(LuaTable &output)
 {
     return readTable(-1, output);
 }
@@ -375,22 +372,17 @@ LuaTable LuaBinding::newTable()
     return LuaTable(this, luaL_ref(state_, LUA_REGISTRYINDEX));
 }
 
-bool LuaBinding::readUpvalueTable(int index, LuaTable *output)
+bool LuaBinding::readUpvalueTable(int index, LuaTable &output)
 {
     const int actual = upvalueIndex(index);
     return actual != 0 && readTableAt(actual, output);
 }
 
-bool LuaBinding::readTruthAt(int index, bool *output)
+bool LuaBinding::readTruthAt(int index, bool &output)
 {
-    if (output == nullptr)
-    {
-        setError("INVALID_ARGUMENT", "truth output must not be null");
-        return false;
-    }
-    // 显式读取 Lua 真值：只有 nil/false 为假，0/空串为真；不转换或弹出原槽。
+        // 显式读取 Lua 真值：只有 nil/false 为假，0/空串为真；不转换或弹出原槽。
     // lua_toboolean：按 Lua 真值规则读取该槽：只有 nil/false 为假，0 和空串为真；不转换原值、不改变栈。
-    *output = lua_toboolean(state_, index) != 0;
+    output = lua_toboolean(state_, index) != 0;
     return true;
 }
 
@@ -434,12 +426,12 @@ bool LuaBinding::pushValue(void *value)
     return true;
 }
 
-bool LuaBinding::registerMetatable(const std::string &name, LuaTable *output, bool *created)
+bool LuaBinding::registerMetatable(const std::string &name, LuaTable &output, bool &created)
 {
-    if (output == nullptr || created == nullptr || name.empty() ||
+    if (name.empty() ||
         name.find('\0') != std::string::npos)
     {
-        setError("INVALID_ARGUMENT", "metatable needs nonempty name and outputs");
+        setError("INVALID_ARGUMENT", "metatable needs a nonempty name");
         return false;
     }
     detail::StackRestore stack(state_);
@@ -452,26 +444,21 @@ bool LuaBinding::registerMetatable(const std::string &name, LuaTable *output, bo
     // luaL_newmetatable：按名称查询或创建 registry 中的 metatable 并压栈；新建返回 1，已有返回 0，两条路径都留下 table。
     const bool first = luaL_newmetatable(state_, name.c_str()) != 0;
     LuaTable   meta;
-    if (!readTableAt(-1, &meta))
+    if (!readTableAt(-1, meta))
     {
         return false;
     }
-    *output  = std::move(meta);
-    *created = first;
+    output = std::move(meta);
+    created = first;
     return true;
 }
 
 bool LuaBinding::registerType(const std::string &name, const void *type, std::size_t size,
-                              LuaTable *output, bool *created)
+                              LuaTable &output, bool &created)
 {
-    if (output == nullptr || created == nullptr)
-    {
-        setError("INVALID_ARGUMENT", "userdata registration outputs must not be null");
-        return false;
-    }
-    LuaTable meta;
+        LuaTable meta;
     bool     first = false;
-    if (!registerMetatable(name, &meta, &first))
+    if (!registerMetatable(name, meta, first))
     {
         return false;
     }
@@ -504,8 +491,8 @@ bool LuaBinding::registerType(const std::string &name, const void *type, std::si
         // lua_setfield：把栈顶值写入指定 table 的具名字段并弹出该值；目标 table 保留。此处目标为封装创建的无写入元方法表。
         lua_setfield(state_, -2, "__gc");
     }
-    *output  = std::move(meta);
-    *created = first;
+    output = std::move(meta);
+    created = first;
     return true;
 }
 
@@ -538,7 +525,7 @@ bool LuaBinding::holdUserdata(int index, detail::UserdataHeader *header)
 }
 
 bool LuaBinding::allocateUserdata(const std::string &name, const void *type, std::size_t size,
-                                  void (*destroy)(void *), detail::UserdataHeader **output)
+                                  void (*destroy)(void *), detail::UserdataHeader *&output)
 {
     detail::StackRestore stack(state_);
     if (!reserveStack(5))
@@ -569,7 +556,7 @@ bool LuaBinding::allocateUserdata(const std::string &name, const void *type, std
     // lua_setmetatable：把栈顶 table/nil 设置为指定对象的 metatable，然后弹出栈顶值；对象本身保留，不销毁 metatable。
     lua_setmetatable(state_, -2);
     holdUserdata(-1, header);
-    *output = header;
+    output = header;
     return true;
 }
 

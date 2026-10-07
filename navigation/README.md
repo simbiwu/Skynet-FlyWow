@@ -19,7 +19,7 @@ Battle_1001 场景、出生点、战斗 Tick、技能、协议及 Replay 留在�
 
 ## 固定基线
 
-C++14、CMake/Linux/WSL2、Skynet v1.8.0 自带修改版 Lua 5.4.7；团结引擎 1.10.0（Unity 2022.3 LTS）、AI Navigation 1.1.7。当前空间是 `ground_2_5d`：XZ 导航平面、Y 地表高度，每个 Cell 只能表达一个高度层。
+C++17、CMake/Linux/WSL2、Skynet v1.8.0 自带修改版 Lua 5.4.7；团结引擎 1.10.0（Unity 2022.3 LTS）、AI Navigation 1.1.7。当前空间是 `ground_2_5d`：XZ 导航平面、Y 地表高度，每个 Cell 只能表达一个高度层。
 
 不要把修改版 Lua 绑定链接到系统 Lua；不要将同 XZ 的两层道路混成一张 Grid。包会明确拒绝多层歧义。本模块未提供飞行、跳跃、Crowd 或 Recast 实现。
 

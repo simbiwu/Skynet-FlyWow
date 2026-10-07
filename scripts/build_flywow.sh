@@ -82,9 +82,12 @@ if [[ "$MODULE" == gateway || "$MODULE" == all ]]; then
     read -r -a CRYPTO_FLAGS <<< "$(pkg-config --cflags --libs libcrypto)"
     TEMP_OUTPUT="$(mktemp "$NATIVE_DIR/.gateway_crypto.XXXXXX")"
     trap 'rm -f -- "$TEMP_OUTPUT"' EXIT
-    "${CXX:-c++}" -std=c++14 -O2 -Wall -Wextra -Werror -fPIC -shared \
+    "${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Werror -fPIC -shared \
         -I"$SKYNET_ROOT/3rd/lua" \
+        -I"$FRAMEWORK_DIR/lua-binding" \
         "$FRAMEWORK_DIR/gateway/native/gateway_crypto/gateway_crypto.cpp" \
+        "$FRAMEWORK_DIR/lua-binding/lua_binding.cpp" \
+        "$FRAMEWORK_DIR/lua-binding/lua_table.cpp" \
         "${CRYPTO_FLAGS[@]}" -o "$TEMP_OUTPUT"
     chmod 755 "$TEMP_OUTPUT"
     mv -f "$TEMP_OUTPUT" "$NATIVE_DIR/flywow_gateway_crypto.so"
@@ -103,6 +106,7 @@ fi
 if [[ "$MODULE" == logger || "$MODULE" == all ]]; then
     cmake -S "$FRAMEWORK_DIR/logger/native" -B "$BUILD_ROOT/cmake/logger" \
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DSKYNET_ROOT="$SKYNET_ROOT" \
+        -DSKYNET_LUA_DIR="$SKYNET_ROOT/3rd/lua" \
         -DFLYWOW_NATIVE_OUTPUT_DIR="$NATIVE_DIR"
     cmake --build "$BUILD_ROOT/cmake/logger" -j"$(nproc)"
     ctest --test-dir "$BUILD_ROOT/cmake/logger" --output-on-failure
@@ -114,6 +118,7 @@ if [[ "$MODULE" == word_filter || "$MODULE" == all ]]; then
     # CTest 验证核心及已有 Lua/Skynet 运行器；模块缺失运行器时不宣称集成已验证。
     cmake -S "$FRAMEWORK_DIR/word_filter/native" -B "$BUILD_ROOT/cmake/word_filter" \
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DSKYNET_ROOT="$SKYNET_ROOT" \
+        -DSKYNET_LUA_DIR="$SKYNET_ROOT/3rd/lua" \
         -DFLYWOW_NATIVE_OUTPUT_DIR="$NATIVE_DIR"
     cmake --build "$BUILD_ROOT/cmake/word_filter" -j"$(nproc)"
     ctest --test-dir "$BUILD_ROOT/cmake/word_filter" --output-on-failure

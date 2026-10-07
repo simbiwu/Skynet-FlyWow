@@ -12,6 +12,7 @@ local transaction = require "flywow_hotupgrade_transaction"
 local metrics = require "flywow_hotupgrade_metrics"
 local rpc = require "flywow_hotupgrade_rpc"
 local native = require "flywow_hotupgrade_native"
+local native_error = require "flywow_hotupgrade_native_error"
 local M = {}
 local Controller = {}
 Controller.__index = Controller
@@ -320,7 +321,7 @@ function Controller:create_candidate(txn, target)
     if not source then return result.failure("HU_INVALID_MANIFEST", "候选入口未校验") end
     local generation = target.old.generation + 1
     local token, identity_error = native.nonce()
-    if not token then return result.failure(identity_error, "候选身份生成失败") end
+    if not token then return result.failure(native_error.code(identity_error), "候选身份生成失败") end
     self.bootstraps[token] =
     {
         source = source,

@@ -77,14 +77,14 @@ constexpr const char *kTiny    = "flywow_binding_test.Tiny";
 TestEnvironment *environment(LuaBinding &lua_binding)
 {
     void *pointer = nullptr;
-    require(lua_binding.readUpvalue(1, &pointer), "missing test environment");
+    require(lua_binding.readUpvalue(1, pointer), "missing test environment");
     return static_cast<TestEnvironment *>(pointer);
 }
 
 template <typename T> int echo(LuaBinding &lua_binding)
 {
     T value{};
-    if (!lua_binding.readValue(1, &value))
+    if (!lua_binding.readValue(1, value))
     {
         return lua_binding.pushError();
     }
@@ -96,16 +96,15 @@ int conversionBoundaries(LuaBinding &lua_binding)
     auto         *env   = environment(lua_binding);
     const int     top   = lua_gettop(env->state);
     std::uint32_t value = 19;
-    require(!lua_binding.readValue(0, &value) && value == 19, "zero index changed output");
-    require(!lua_binding.readValue(top + 1, &value), "positive overflow accepted");
-    require(!lua_binding.readValue(-top - 1, &value), "negative overflow accepted");
-    require(!lua_binding.readValue(1, static_cast<int *>(nullptr)), "null output accepted");
+    require(!lua_binding.readValue(0, value) && value == 19, "zero index changed output");
+    require(!lua_binding.readValue(top + 1, value), "positive overflow accepted");
+    require(!lua_binding.readValue(-top - 1, value), "negative overflow accepted");
 
     LuaTable original = lua_binding.newTable();
     require(original.writeValue("retained", 1), "initial table write failed");
-    require(!lua_binding.readTable(1, &original), "non-table accepted");
+    require(!lua_binding.readTable(1, original), "non-table accepted");
     int retained = 0;
-    require(original.readValue("retained", &retained) && retained == 1, "table output replaced");
+    require(original.readValue("retained", retained) && retained == 1, "table output replaced");
     require(lua_gettop(env->state) == top, "conversion changed stack");
     return lua_binding.returnValues(true);
 }
@@ -134,39 +133,39 @@ int tableOperations(LuaBinding &lua_binding)
     const int top = lua_gettop(env->state);
     LuaTable  input;
     LuaTable  child;
-    require(lua_binding.readTable(&input), "implicit top table read failed");
-    require(input.readTable("child", &child), "child read failed");
+    require(lua_binding.readTable(input), "implicit top table read failed");
+    require(input.readTable("child", child), "child read failed");
     std::uint32_t map_id = 0;
-    require(child.readValue("map_id", &map_id) && map_id == 17, "nested field read failed");
-    require(!input.readValue("missing", &map_id) && map_id == 17, "missing changed output");
+    require(child.readValue("map_id", map_id) && map_id == 17, "nested field read failed");
+    require(!input.readValue("missing", map_id) && map_id == 17, "missing changed output");
 
     auto moved = std::move(input);
     require(!input.valid() && moved.valid(), "table move failed");
     require(!moved.writeValue("kept", std::numeric_limits<std::uint64_t>::max()), "overflow write");
     require(!moved.writeValue(std::numeric_limits<std::uint64_t>::max(), 1),
             "overflow key accepted");
-    require(!moved.readValue(std::numeric_limits<std::uint64_t>::max(), &map_id),
+    require(!moved.readValue(std::numeric_limits<std::uint64_t>::max(), map_id),
             "overflow key read");
     int kept = 0;
-    require(moved.readValue("kept", &kept) && kept == 9, "failed write changed field");
+    require(moved.readValue("kept", kept) && kept == 9, "failed write changed field");
     require(moved.writeValue("fresh", 11), "raw write invoked input __newindex");
 
     // key/value 内嵌零字节都按完整长度保存；nullptr 删除字段。
     const std::string key("k\0z", 3);
     const std::string text("v\0z", 3);
     std::string       result;
-    require(child.writeValue(key, text) && child.readValue(key, &result) && result == text,
+    require(child.writeValue(key, text) && child.readValue(key, result) && result == text,
             "binary string lost");
     require(child.writeValue(key, nullptr) && child.isNil(key), "nil delete failed");
     require(child.writeValue(0, false) && child.writeValue(-1, 0), "integer keys rejected");
     bool truth = false;
-    require(child.readTruth(-1, &truth) && truth, "zero truth changed");
-    require(child.readTruth(0, &truth) && !truth, "false truth changed");
+    require(child.readTruth(-1, truth) && truth, "zero truth changed");
+    require(child.readTruth(0, truth) && !truth, "false truth changed");
 
     auto parent = lua_binding.newTable();
     require(parent.writeValue("child", child), "parent child write failed");
     parent = LuaTable{}; // 子表独立 registry 引用，父表先销毁不影响子表。
-    require(child.readValue("map_id", &map_id), "child did not survive parent");
+    require(child.readValue("map_id", map_id), "child did not survive parent");
     require(lua_gettop(env->state) == top, "table operations changed stack");
     return lua_binding.returnValues(child, moved);
 }
@@ -174,7 +173,7 @@ int tableOperations(LuaBinding &lua_binding)
 int dropTemporary(LuaBinding &lua_binding)
 {
     LuaTable weak;
-    require(lua_binding.readTable(1, &weak), "weak table missing");
+    require(lua_binding.readTable(1, weak), "weak table missing");
     auto temporary = lua_binding.newTable();
     require(weak.writeValue(1, temporary), "weak write failed");
     return lua_binding.returnValues();
@@ -183,14 +182,14 @@ int dropTemporary(LuaBinding &lua_binding)
 int arrayLengths(LuaBinding &lua_binding)
 {
     LuaTable table;
-    if (!lua_binding.readTable(1, &table))
+    if (!lua_binding.readTable(1, table))
     {
         return lua_binding.pushError();
     }
     std::size_t raw   = 0;
     std::size_t dense = 99; // 失败后必须仍为此哨兵值。
-    require(table.arrayLength(&raw), "raw length failed");
-    if (!table.denseArrayLength(&dense))
+    require(table.arrayLength(raw), "raw length failed");
+    if (!table.denseArrayLength(dense))
     {
         require(dense == 99, "dense length changed on failure");
         return lua_binding.pushError();
@@ -203,7 +202,7 @@ int iterate(LuaBinding &lua_binding)
     auto     *env = environment(lua_binding);
     const int top = lua_gettop(env->state);
     LuaTable  table;
-    require(lua_binding.readTable(1, &table), "iterate input missing");
+    require(lua_binding.readTable(1, table), "iterate input missing");
     int numeric_keys = 0;
     int children     = 0;
     require(table.forEach(
@@ -212,15 +211,15 @@ int iterate(LuaBinding &lua_binding)
                     if (key.type() == LuaType::kNumber)
                     {
                         std::int64_t integer = 0;
-                        require(key.readValue(&integer), "numeric key lost");
+                        require(key.readValue(integer), "numeric key lost");
                         std::string unchanged = "unchanged";
-                        require(!key.readValue(&unchanged) && unchanged == "unchanged",
+                        require(!key.readValue(unchanged) && unchanged == "unchanged",
                                 "numeric key mutated");
                     }
                     if (value.type() == LuaType::kTable)
                     {
                         LuaTable child;
-                        require(value.readTable(&child), "visitor table read failed");
+                        require(value.readTable(child), "visitor table read failed");
                         require(child.forEach(
                                     [&](const LuaValue &, const LuaValue &)
                                     {
@@ -273,18 +272,18 @@ int metatables(LuaBinding &lua_binding)
     LuaTable meta;
     LuaTable same;
     bool     created = false;
-    require(lua_binding.registerMetatable("flywow_binding_test.Meta", &meta, &created) && created,
+    require(lua_binding.registerMetatable("flywow_binding_test.Meta", meta, created) && created,
             "first metatable registration");
     require(meta.setFunction("__index", &countMetamethod), "metamethod registration");
-    require(lua_binding.registerMetatable("flywow_binding_test.Meta", &same, &created) && !created,
+    require(lua_binding.registerMetatable("flywow_binding_test.Meta", same, created) && !created,
             "repeat metatable registration");
     auto table = lua_binding.newTable();
     require(table.setMetatable(meta), "setmetatable failed");
     LuaTable read_meta;
-    require(table.readMetatable(&read_meta), "readmetatable failed");
+    require(table.readMetatable(read_meta), "readmetatable failed");
     require(read_meta.writeValue("marker", 11), "meta write failed");
     int marker = 0;
-    require(same.readValue("marker", &marker) && marker == 11, "metatable identity lost");
+    require(same.readValue("marker", marker) && marker == 11, "metatable identity lost");
     return lua_binding.returnValues(table);
 }
 
@@ -292,12 +291,12 @@ int newTracked(LuaBinding &lua_binding)
 {
     auto *env  = environment(lua_binding);
     bool  fail = false;
-    if (!lua_binding.readValue(1, &fail))
+    if (!lua_binding.readValue(1, fail))
     {
         return lua_binding.pushError();
     }
     Tracked *object = nullptr;
-    if (!lua_binding.newUserdata(kTracked, &object, env, fail))
+    if (!lua_binding.newUserdata(kTracked, object, env, fail))
     {
         return lua_binding.pushError();
     }
@@ -307,7 +306,7 @@ int newTracked(LuaBinding &lua_binding)
 int readTracked(LuaBinding &lua_binding)
 {
     Tracked *object = nullptr;
-    if (!lua_binding.readUserdata(1, kTracked, &object))
+    if (!lua_binding.readUserdata(1, kTracked, object))
     {
         return lua_binding.pushError();
     }
@@ -318,20 +317,20 @@ int userdataErrors(LuaBinding &lua_binding)
 {
     LuaTable meta;
     bool     created = true;
-    require(lua_binding.registerUserdata<Tracked>(kTracked, &meta, &created) && !created,
+    require(lua_binding.registerUserdata<Tracked>(kTracked, meta, created) && !created,
             "same type registration failed");
     LuaTable output = lua_binding.newTable();
     require(output.writeValue("retained", 41), "registration output setup failed");
-    require(!lua_binding.registerUserdata<Other>(kTracked, &output, &created),
+    require(!lua_binding.registerUserdata<Other>(kTracked, output, created),
             "same name different type accepted");
     require(output.valid(), "failed registration changed output");
     int retained = 0;
-    require(output.readValue("retained", &retained) && retained == 41,
+    require(output.readValue("retained", retained) && retained == 41,
             "failed registration replaced output reference");
     require(!meta.setFunction("__gc", &countMetamethod), "GC overwritten by registration");
     require(!meta.writeValue("__gc", nullptr), "GC removed by field write");
     Tracked *pointer = nullptr;
-    require(!lua_binding.newUserdata("missing.Type", &pointer, environment(lua_binding)),
+    require(!lua_binding.newUserdata("missing.Type", pointer, environment(lua_binding)),
             "unregistered construction accepted");
     Other arbitrary;
     auto  table = lua_binding.newTable();
@@ -342,7 +341,7 @@ int userdataErrors(LuaBinding &lua_binding)
 int newTiny(LuaBinding &lua_binding)
 {
     Tiny *object = nullptr;
-    require(lua_binding.newUserdata(kTiny, &object), "tiny construction failed");
+    require(lua_binding.newUserdata(kTiny, object), "tiny construction failed");
     return lua_binding.returnValues(object);
 }
 
@@ -358,17 +357,17 @@ int useClosure(LuaBinding &lua_binding)
     LuaTable captured;
     void    *pointer = nullptr;
     Tracked *object  = nullptr;
-    if (!lua_binding.readUpvalue(1, &counter) || !lua_binding.readUpvalueTable(2, &captured) ||
-        !lua_binding.readUpvalue(3, &pointer) ||
-        !lua_binding.readUpvalueUserdata(4, kTracked, &object))
+    if (!lua_binding.readUpvalue(1, counter) || !lua_binding.readUpvalueTable(2, captured) ||
+        !lua_binding.readUpvalue(3, pointer) ||
+        !lua_binding.readUpvalueUserdata(4, kTracked, object))
     {
         return lua_binding.pushError();
     }
     int marker = 0;
-    require(captured.readValue("marker", &marker) && marker == 17, "captured table lost");
+    require(captured.readValue("marker", marker) && marker == 17, "captured table lost");
     require(object->owner == pointer, "borrowed pointer changed");
     require(lua_binding.writeUpvalue(1, counter + 1), "upvalue update failed");
-    require(!lua_binding.readUpvalue(0, &marker) && !lua_binding.readUpvalue(5, &marker),
+    require(!lua_binding.readUpvalue(0, marker) && !lua_binding.readUpvalue(5, marker),
             "invalid business upvalue accepted");
     return lua_binding.returnValues(counter, object);
 }
@@ -377,7 +376,7 @@ int makeClosure(LuaBinding &lua_binding)
 {
     auto    *env    = environment(lua_binding);
     Tracked *object = nullptr;
-    require(lua_binding.newUserdata(kTracked, &object, env), "captured object creation");
+    require(lua_binding.newUserdata(kTracked, object, env), "captured object creation");
     auto captured = lua_binding.newTable();
     require(captured.writeValue("marker", 17), "captured table setup");
     auto functions = lua_binding.newTable();
@@ -390,8 +389,8 @@ int makeClosure(LuaBinding &lua_binding)
 int maxUpvalue(LuaBinding &lua_binding)
 {
     int value = -1;
-    require(lua_binding.readUpvalue(254, &value) && value == 253, "last business upvalue wrong");
-    require(lua_binding.writeUpvalue(254, 19) && lua_binding.readUpvalue(254, &value) &&
+    require(lua_binding.readUpvalue(254, value) && value == 253, "last business upvalue wrong");
+    require(lua_binding.writeUpvalue(254, 19) && lua_binding.readUpvalue(254, value) &&
                 value == 19,
             "last business upvalue update failed");
     return lua_binding.returnValues(true);
@@ -406,7 +405,7 @@ int readMap(LuaBinding &lua_binding)
 {
     LuaTable      request;
     std::uint32_t map_id = 0;
-    if (!lua_binding.readTable(1, &request) || !request.readValue("map_id", &map_id))
+    if (!lua_binding.readTable(1, request) || !request.readValue("map_id", map_id))
     {
         return lua_binding.pushError();
     }
@@ -416,13 +415,13 @@ int readMap(LuaBinding &lua_binding)
 int initializeTest(LuaBinding &lua_binding)
 {
     void *pointer = nullptr;
-    require(lua_binding.readValue(1, &pointer), "test setup pointer missing");
+    require(lua_binding.readValue(1, pointer), "test setup pointer missing");
     auto     module = lua_binding.newTable();
     LuaTable meta;
     bool     created = false;
-    require(lua_binding.registerUserdata<Tracked>(kTracked, &meta, &created) && created,
+    require(lua_binding.registerUserdata<Tracked>(kTracked, meta, created) && created,
             "tracked registration failed");
-    require(lua_binding.registerUserdata<Tiny>(kTiny, &meta, &created) && created,
+    require(lua_binding.registerUserdata<Tiny>(kTiny, meta, created) && created,
             "tiny registration failed");
     require(module.setFunction("uint", &echo<std::uint32_t>) &&
                 module.setFunction("uint64", &echo<std::uint64_t>) &&

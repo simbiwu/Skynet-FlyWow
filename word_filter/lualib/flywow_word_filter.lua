@@ -1,11 +1,12 @@
 --- 职责：宿主通过此入口创建 UTF-8 词库，查询命中或替换文本；聊天处置由业务决定。
---- 所有调用同步、无 I/O、无 yield；对象和返回数据属于当前 Lua State，查询会分配内存。
+--- 查询同步、无 I/O、无 yield；创建 file 词库时会同步读取文件。对象和返回数据属于当前 Lua State。
 --- Native 来源 word_filter/native/；构建：bash scripts/build_flywow.sh SKYNET_ROOT word_filter。
 --- package.path 加载本文件，package.cpath 加载 build/native/flywow_word_filter_native.so。
 local native = require "flywow_word_filter_native"
 
-local MAX_KEYWORDS          = 16384
-local MAX_REPLACEMENT_BYTES = 256
+local MAX_KEYWORDS              = 16384
+local MAX_REPLACEMENT_BYTES     = 256
+local MAX_DICTIONARY_FILE_BYTES = 2097152
 local M = {}
 
 ---@alias flywow_word_filter_error
@@ -14,6 +15,7 @@ local M = {}
 ---| '"invalid_text"' # 查询输入不是字符串
 ---| '"invalid_utf8"' # 查询文本存在非法 UTF-8，未返回部分结果
 ---| '"invalid_replacement"' # 替换文本类型、编码或长度不合法
+---| '"dictionary_io"' # 外部词库无法打开或读取
 ---| '"dictionary_limit"' # 词数、词长度、总字节、节点或后缀输出超限
 ---| '"text_limit"' # 输入文本超过固定字节上限
 ---| '"match_limit"' # 命中项数超过固定上限，未返回部分结果
@@ -28,6 +30,7 @@ local M = {}
 
 ---@class flywow_word_filter_options
 ---@field keywords string[] 宿主提供的连续数组，创建时复制；空词库合法
+---@field file? string UTF-8 外部词库路径；每行一个词，空行忽略；与 keywords 二选一
 ---@field compact? boolean 默认 false；true 时忽略固定类别分隔符，可能增加误报
 
 ---@class flywow_word_filter
@@ -35,40 +38,84 @@ local M = {}
 local Filter = {}
 Filter.__index = Filter
 
---- 创建只读词库；统一做 ASCII 小写、全角 ASCII 折叠和开头 BOM 去除。
+local function native_error_code(error_value)
+    if type(error_value) == "table" then
+        return error_value.code or "internal_error"
+    end
+    return error_value
+end
+
+--- 从内存数组或 UTF-8 外部文本文件创建只读词库；文件每行一个词，空行忽略。
+--- 统一做 ASCII 小写、全角 ASCII 折叠和开头 BOM 去除。
 --- 原词库在成功创建后可由宿主修改，不影响此对象；更新词库需创建新对象。
 --- 容量和编码错误返回 nil,error；Lua 分配错误仍遵循 Lua 自身异常语义。
 ---@param options flywow_word_filter_options
 ---@return flywow_word_filter? filter
 ---@return flywow_word_filter_error? error
 function M.new(options)
-    if type(options) ~= "table" or type(options.keywords) ~= "table"
+    if type(options) ~= "table" then
+        return nil, "invalid_options"
+    end
+    if options.keywords ~= nil and type(options.keywords) ~= "table"
+        or options.file ~= nil and type(options.file) ~= "string"
         or (options.compact ~= nil and type(options.compact) ~= "boolean") then
         return nil, "invalid_options"
     end
 
     for key in pairs(options) do
-        if key ~= "keywords" and key ~= "compact" then
+        if key ~= "keywords" and key ~= "file" and key ~= "compact" then
             return nil, "invalid_options"
         end
     end
 
-    local keyword_count = #options.keywords
+    if options.keywords ~= nil and options.file ~= nil then
+        return nil, "invalid_options"
+    end
+    if options.keywords == nil and options.file == nil then
+        return nil, "invalid_options"
+    end
+
+    local keywords = options.keywords
+    if options.file ~= nil then
+        local file = io.open(options.file, "rb")
+        if not file then
+            return nil, "dictionary_io"
+        end
+        local content = file:read(MAX_DICTIONARY_FILE_BYTES + 1)
+        local close_ok = file:close()
+        if not content or not close_ok then
+            return nil, "dictionary_io"
+        end
+        if #content > MAX_DICTIONARY_FILE_BYTES then
+            return nil, "dictionary_limit"
+        end
+        keywords = {}
+        for line in (content .. "\n"):gmatch("(.-)\n") do
+            if line:sub(-1) == "\r" then
+                line = line:sub(1, -2)
+            end
+            if #line > 0 then
+                keywords[#keywords + 1] = line
+            end
+        end
+    end
+
+    local keyword_count = #keywords
     if keyword_count > MAX_KEYWORDS then
         return nil, "dictionary_limit"
     end
 
     --- 此处检查键和类型；Native 逐项 rawgeti，继续检查数组中间的空洞。
-    for key, keyword in pairs(options.keywords) do
+    for key, keyword in pairs(keywords) do
         if type(key) ~= "number" or math.type(key) ~= "integer"
             or key < 1 or key > keyword_count or type(keyword) ~= "string" then
             return nil, "invalid_keyword"
         end
     end
 
-    local native_handle, error_code = native.new(options.keywords, options.compact == true)
+    local native_handle, error_value = native.new(keywords, options.compact == true)
     if not native_handle then
-        return nil, error_code
+        return nil, native_error_code(error_value)
     end
 
     return setmetatable(
@@ -83,9 +130,9 @@ end
 ---@return flywow_word_filter_match[]? matches
 ---@return flywow_word_filter_error? error
 function Filter:find(text)
-    local matches, error_code = native.find(self.native_handle, text)
+    local matches, error_value = native.find(self.native_handle, text)
     if not matches then
-        return nil, error_code
+        return nil, native_error_code(error_value)
     end
 
     table.sort(matches, function(left, right)

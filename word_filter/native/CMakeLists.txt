@@ -5,7 +5,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(flywow_word_filter LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 enable_testing()
@@ -21,10 +21,15 @@ target_compile_options(flywow_word_filter_core PRIVATE -Wall -Wextra -Werror)
 if(NOT EXISTS "${SKYNET_ROOT}/3rd/lua/lua.h")
     message(FATAL_ERROR "word_filter 需要 Skynet 自带 Lua 头文件")
 endif()
+set(SKYNET_LUA_DIR "${SKYNET_ROOT}/3rd/lua")
 
 add_library(flywow_word_filter_native MODULE lua_word_filter.cpp)
 target_include_directories(flywow_word_filter_native PRIVATE "${SKYNET_ROOT}/3rd/lua")
-target_link_libraries(flywow_word_filter_native PRIVATE flywow_word_filter_core)
+if(NOT TARGET flywow_lua_binding)
+    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../lua-binding"
+                     "${CMAKE_BINARY_DIR}/lua-binding" EXCLUDE_FROM_ALL)
+endif()
+target_link_libraries(flywow_word_filter_native PRIVATE flywow_word_filter_core flywow_lua_binding)
 target_compile_options(flywow_word_filter_native PRIVATE -Wall -Wextra -Werror)
 set_target_properties(flywow_word_filter_native PROPERTIES
     PREFIX ""

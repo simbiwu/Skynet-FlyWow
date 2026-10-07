@@ -49,13 +49,13 @@ struct LuaPath
 };
 
 // 读取正 uint32 业务 ID；0 对通用 readValue 合法，但对当前地图/实体身份不合法。
-bool readPositiveId(LuaBinding &lua_binding, int index, const char *name, std::uint32_t *output)
+bool readPositiveId(LuaBinding &lua_binding, int index, const char *name, std::uint32_t &output)
 {
     if (!lua_binding.readValue(index, output))
     {
         return false;
     }
-    if (*output == 0)
+    if (output == 0)
     {
         lua_binding.setError(kInvalidArgument, std::string(name) + " must be positive uint32");
         return false;
@@ -64,13 +64,13 @@ bool readPositiveId(LuaBinding &lua_binding, int index, const char *name, std::u
 }
 
 bool readPositiveId(LuaBinding &lua_binding, const LuaTable &table, const char *name,
-                    std::uint32_t *output)
+                    std::uint32_t &output)
 {
     if (!table.readValue(name, output))
     {
         return false;
     }
-    if (*output == 0)
+    if (output == 0)
     {
         lua_binding.setError(kInvalidArgument, std::string(name) + " must be positive uint32");
         return false;
@@ -79,13 +79,13 @@ bool readPositiveId(LuaBinding &lua_binding, const LuaTable &table, const char *
 }
 
 // 验证 self 类型与关闭状态；只借用 userdata，不转移 Native Context 的所有权。
-bool readContext(LuaBinding &lua_binding, LuaNavigationContext **output)
+bool readContext(LuaBinding &lua_binding, LuaNavigationContext *&output)
 {
     if (!lua_binding.readUserdata(1, kContextMeta, output))
     {
         return false;
     }
-    if ((*output)->closed || (*output)->context == nullptr)
+    if (output->closed || output->context == nullptr)
     {
         lua_binding.setError("CONTEXT_CLOSED", "context is closed");
         return false;
@@ -111,26 +111,26 @@ findProfile(LuaBinding &lua_binding, const LuaNavigationContext &owner, std::uin
 }
 
 // Lua WorldPosition 是有符号 64 位毫米字段，不包含客户端轴转换。
-bool readWorldPosition(const LuaTable &table, WorldPosition *output)
+bool readWorldPosition(const LuaTable &table, WorldPosition &output)
 {
     WorldPosition position;
-    if (!table.readValue("x_mm", &position.x_mm) || !table.readValue("y_mm", &position.y_mm) ||
-        !table.readValue("z_mm", &position.z_mm))
+    if (!table.readValue("x_mm", position.x_mm) || !table.readValue("y_mm", position.y_mm) ||
+        !table.readValue("z_mm", position.z_mm))
     {
         return false;
     }
-    *output = position;
+    output = position;
     return true;
 }
 
-bool readWorldPosition(LuaBinding &lua_binding, int index, WorldPosition *output)
+bool readWorldPosition(LuaBinding &lua_binding, int index, WorldPosition &output)
 {
     LuaTable table;
-    return lua_binding.readTable(index, &table) && readWorldPosition(table, output);
+    return lua_binding.readTable(index, table) && readWorldPosition(table, output);
 }
 
 // 位置结果复制为新 record；Table 析构只释放临时引用，returnValues 可继续持有结果。
-LuaTable worldPositionTable(LuaBinding &lua_binding, const WorldPosition &position)
+LuaTable worldPositionTable(LuaBinding &lua_binding, const WorldPosition position)
 {
     auto table = lua_binding.newTable();
     if (!table.writeValue("x_mm", position.x_mm) || !table.writeValue("y_mm", position.y_mm) ||
@@ -142,20 +142,20 @@ LuaTable worldPositionTable(LuaBinding &lua_binding, const WorldPosition &positi
 }
 
 // area_cost_permille 使用业务 key=0..255；未配置保持默认 1000，不按 profiles 的 1-based 处理。
-bool readAreaCosts(const LuaTable &table, flywow_navigation::AgentProfile *profile)
+bool readAreaCosts(const LuaTable &table, flywow_navigation::AgentProfile &profile)
 {
     if (table.isNil("area_cost_permille"))
     {
         return true;
     }
     LuaTable costs;
-    if (!table.readTable("area_cost_permille", &costs))
+    if (!table.readTable("area_cost_permille", costs))
     {
         return false;
     }
     for (int area = 0; area < 256; ++area)
     {
-        if (!costs.isNil(area) && !costs.readValue(area, &profile->area_cost_permille[area]))
+        if (!costs.isNil(area) && !costs.readValue(area, profile.area_cost_permille[area]))
         {
             return false;
         }
@@ -163,14 +163,14 @@ bool readAreaCosts(const LuaTable &table, flywow_navigation::AgentProfile *profi
     return true;
 }
 
-bool readAreaAllowed(const LuaTable &table, flywow_navigation::AgentProfile *profile)
+bool readAreaAllowed(const LuaTable &table, flywow_navigation::AgentProfile &profile)
 {
     if (table.isNil("area_allowed"))
     {
         return true;
     }
     LuaTable allowed;
-    if (!table.readTable("area_allowed", &allowed))
+    if (!table.readTable("area_allowed", allowed))
     {
         return false;
     }
@@ -180,11 +180,11 @@ bool readAreaAllowed(const LuaTable &table, flywow_navigation::AgentProfile *pro
         {
             // 保留既有 Lua 真值合同：只有 nil/false 为假，数字 0 也为真。
             bool value = false;
-            if (!allowed.readTruth(area, &value))
+            if (!allowed.readTruth(area, value))
             {
                 return false;
             }
-            profile->area_allowed[area] = value ? 1 : 0;
+            profile.area_allowed[area] = value ? 1 : 0;
         }
     }
     return true;
@@ -192,14 +192,14 @@ bool readAreaAllowed(const LuaTable &table, flywow_navigation::AgentProfile *pro
 
 // 将单项 Profile 解析为按值快照；默认 ID=1 仅初始化容器，随后由必填 id 覆盖。
 bool parseProfile(LuaBinding &lua_binding, const LuaTable &table,
-                  flywow_navigation::AgentProfile *output)
+                  flywow_navigation::AgentProfile &output)
 {
     auto profile = flywow_navigation::MakeDefaultAgentProfile(1);
-    if (!readPositiveId(lua_binding, table, "id", &profile.id) ||
-        !table.readValue("radius_mm", &profile.radius_mm) ||
-        !table.readValue("max_step_mm", &profile.max_step_mm) ||
-        !table.readValue("max_slope_permille", &profile.max_slope_permille) ||
-        !readAreaCosts(table, &profile) || !readAreaAllowed(table, &profile))
+    if (!readPositiveId(lua_binding, table, "id", profile.id) ||
+        !table.readValue("radius_mm", profile.radius_mm) ||
+        !table.readValue("max_step_mm", profile.max_step_mm) ||
+        !table.readValue("max_slope_permille", profile.max_slope_permille) ||
+        !readAreaCosts(table, profile) || !readAreaAllowed(table, profile))
     {
         return false;
     }
@@ -210,25 +210,25 @@ bool parseProfile(LuaBinding &lua_binding, const LuaTable &table,
         lua_binding.setError(flywow_navigation::NavErrorName(valid.error), valid.detail);
         return false;
     }
-    *output = profile;
+    output = profile;
     return true;
 }
 
 // profiles 只验证正整数数组段；忽略命名字段，读取仍按 1..count 的原始顺序。
 bool readProfiles(LuaBinding &lua_binding, const LuaTable &table, std::size_t count,
-                  std::vector<flywow_navigation::AgentProfile> *output)
+                  std::vector<flywow_navigation::AgentProfile> &output)
 {
-    output->reserve(count);
+    output.reserve(count);
     for (std::size_t i = 1; i <= count; ++i)
     {
         LuaTable                        profile_table;
         flywow_navigation::AgentProfile profile;
-        if (!table.readTable(static_cast<std::int64_t>(i), &profile_table) ||
-            !parseProfile(lua_binding, profile_table, &profile))
+        if (!table.readTable(static_cast<std::int64_t>(i), profile_table) ||
+            !parseProfile(lua_binding, profile_table, profile))
         {
             return false;
         }
-        for (const auto &existing : *output)
+        for (const auto &existing : output)
         {
             if (existing.id == profile.id)
             {
@@ -237,7 +237,7 @@ bool readProfiles(LuaBinding &lua_binding, const LuaTable &table, std::size_t co
                 return false;
             }
         }
-        output->push_back(profile);
+        output.push_back(profile);
     }
     return true;
 }
@@ -275,7 +275,7 @@ int loadMap(LuaBinding &lua_binding)
 {
     void       *registry_pointer = nullptr; // 闭包借用的 Registry，Native 单例覆盖 State 生命周期。
     std::string path;
-    if (!lua_binding.readUpvalue(1, &registry_pointer) || !lua_binding.readValue(1, &path))
+    if (!lua_binding.readUpvalue(1, registry_pointer) || !lua_binding.readValue(1, path))
     {
         return lua_binding.pushError();
     }
@@ -319,10 +319,10 @@ int queryCell(LuaBinding &lua_binding)
     std::uint32_t map_id           = 0; // 必填地图身份，由正数业务检查拒绝默认 0。
     std::uint32_t map_version      = 0;
     WorldPosition position;
-    if (!lua_binding.readUpvalue(1, &registry_pointer) ||
-        !readPositiveId(lua_binding, 1, "map_id", &map_id) ||
-        !readPositiveId(lua_binding, 2, "map_version", &map_version) ||
-        !readWorldPosition(lua_binding, 3, &position))
+    if (!lua_binding.readUpvalue(1, registry_pointer) ||
+        !readPositiveId(lua_binding, 1, "map_id", map_id) ||
+        !readPositiveId(lua_binding, 2, "map_version", map_version) ||
+        !readWorldPosition(lua_binding, 3, position))
     {
         return lua_binding.pushError();
     }
@@ -354,10 +354,10 @@ int newContext(LuaBinding &lua_binding)
     std::uint32_t map_version      = 0;
     std::size_t   profile_count    = 0; // 稠密正整数数组长度，不包括命名元信息字段。
     LuaTable      profiles;
-    if (!lua_binding.readUpvalue(1, &registry_pointer) ||
-        !readPositiveId(lua_binding, 1, "map_id", &map_id) ||
-        !readPositiveId(lua_binding, 2, "map_version", &map_version) ||
-        !lua_binding.readTable(3, &profiles) || !profiles.denseArrayLength(&profile_count))
+    if (!lua_binding.readUpvalue(1, registry_pointer) ||
+        !readPositiveId(lua_binding, 1, "map_id", map_id) ||
+        !readPositiveId(lua_binding, 2, "map_version", map_version) ||
+        !lua_binding.readTable(3, profiles) || !profiles.denseArrayLength(profile_count))
     {
         return lua_binding.pushError();
     }
@@ -372,12 +372,12 @@ int newContext(LuaBinding &lua_binding)
         return lua_binding.pushError(flywow_navigation::NavErrorName(found.error), found.detail);
     }
     LuaNavigationContext *owner = nullptr; // Lua GC 管理外壳，本回调借用，不手动 delete。
-    if (!lua_binding.newUserdata(kContextMeta, &owner))
+    if (!lua_binding.newUserdata(kContextMeta, owner))
     {
         return lua_binding.pushError();
     }
     owner->context.reset(new flywow_navigation::NavigationContext(found.value));
-    if (!readProfiles(lua_binding, profiles, profile_count, &owner->profiles))
+    if (!readProfiles(lua_binding, profiles, profile_count, owner->profiles))
     {
         return lua_binding.pushError();
     }
@@ -393,17 +393,17 @@ struct PathQuery
     WorldPosition                          target;
 };
 
-bool readPathQuery(LuaBinding &lua_binding, PathQuery *query)
+bool readPathQuery(LuaBinding &lua_binding, PathQuery &query)
 {
     std::uint32_t profile_id = 0;
-    if (!readContext(lua_binding, &query->owner) ||
-        !readPositiveId(lua_binding, 2, "profile_id", &profile_id))
+    if (!readContext(lua_binding, query.owner) ||
+        !readPositiveId(lua_binding, 2, "profile_id", profile_id))
     {
         return false;
     }
-    query->profile = findProfile(lua_binding, *query->owner, profile_id);
-    return query->profile != nullptr && readWorldPosition(lua_binding, 3, &query->start) &&
-           readWorldPosition(lua_binding, 4, &query->target);
+    query.profile = findProfile(lua_binding, *query.owner, profile_id);
+    return query.profile != nullptr && readWorldPosition(lua_binding, 3, query.start) &&
+           readWorldPosition(lua_binding, 4, query.target);
 }
 
 /// find_path(profile_id,start,end,self_id)：同步规划，返回独占 Path/cursor。
@@ -411,8 +411,8 @@ int findPath(LuaBinding &lua_binding)
 {
     PathQuery     query;
     std::uint32_t self_id = 0;
-    if (!readPathQuery(lua_binding, &query) ||
-        !readPositiveId(lua_binding, 5, "self_unit_id", &self_id))
+    if (!readPathQuery(lua_binding, query) ||
+        !readPositiveId(lua_binding, 5, "self_unit_id", self_id))
     {
         return lua_binding.pushError();
     }
@@ -426,7 +426,7 @@ int findPath(LuaBinding &lua_binding)
         return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
     }
     LuaPath *path = nullptr;
-    if (!lua_binding.newUserdata(kPathMeta, &path, std::move(result.value)))
+    if (!lua_binding.newUserdata(kPathMeta, path, std::move(result.value)))
     {
         return lua_binding.pushError();
     }
@@ -439,8 +439,8 @@ int findPathToRange(LuaBinding &lua_binding)
     PathQuery     query;
     std::uint32_t range_mm = 0; // uint32 毫米距离，0 合法，不作为实体 ID 检查。
     std::uint32_t self_id  = 0;
-    if (!readPathQuery(lua_binding, &query) || !lua_binding.readValue(5, &range_mm) ||
-        !readPositiveId(lua_binding, 6, "self_unit_id", &self_id))
+    if (!readPathQuery(lua_binding, query) || !lua_binding.readValue(5, range_mm) ||
+        !readPositiveId(lua_binding, 6, "self_unit_id", self_id))
     {
         return lua_binding.pushError();
     }
@@ -454,7 +454,7 @@ int findPathToRange(LuaBinding &lua_binding)
         return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
     }
     LuaPath *path = nullptr;
-    if (!lua_binding.newUserdata(kPathMeta, &path, std::move(result.value)))
+    if (!lua_binding.newUserdata(kPathMeta, path, std::move(result.value)))
     {
         return lua_binding.pushError();
     }
@@ -462,29 +462,29 @@ int findPathToRange(LuaBinding &lua_binding)
 }
 
 // 出生与移动共同验证的实体输入；句柄必须已有稳定身份，不能用 0 代替。
-bool readMoveAgent(LuaBinding &lua_binding, LuaNavigationContext **owner, NavigationAgent *agent)
+bool readMoveAgent(LuaBinding &lua_binding, LuaNavigationContext *&owner, NavigationAgent &agent)
 {
     std::uint32_t profile_id = 0;
     std::uint32_t unit_id    = 0;
     if (!readContext(lua_binding, owner) ||
-        !readPositiveId(lua_binding, 2, "profile_id", &profile_id) ||
-        !readPositiveId(lua_binding, 3, "unit_id", &unit_id))
+        !readPositiveId(lua_binding, 2, "profile_id", profile_id) ||
+        !readPositiveId(lua_binding, 3, "unit_id", unit_id))
     {
         return false;
     }
-    const auto *profile = findProfile(lua_binding, **owner, profile_id);
+    const auto *profile = findProfile(lua_binding, *owner, profile_id);
     if (profile == nullptr)
     {
         return false;
     }
-    *agent = NavigationAgent{NavigationAgentHandle{unit_id}, profile};
+    agent = NavigationAgent{NavigationAgentHandle{unit_id}, profile};
     return true;
 }
 
 // 缓存路径生成后动态事实会变化；提交必须重新验证跨格及对角侧格。
 // 出生用 from==to 的 MoveUnit；不能直接写 Occupancy 绕过静态/动态和业务规则。
 int commitMove(LuaBinding &lua_binding, LuaNavigationContext &owner, const NavigationAgent &agent,
-               const WorldPosition &from, const WorldPosition &to)
+               const WorldPosition from, const WorldPosition to)
 {
     // 先准备权威位置；归格失败时尚未写入 Occupancy，不需要回滚原 footprint。
     const auto grid = owner.context->map()->WorldToGrid(to);
@@ -519,7 +519,7 @@ int placeUnit(LuaBinding &lua_binding)
     LuaNavigationContext *owner = nullptr;
     NavigationAgent       agent;
     WorldPosition         world;
-    if (!readMoveAgent(lua_binding, &owner, &agent) || !readWorldPosition(lua_binding, 4, &world))
+    if (!readMoveAgent(lua_binding, owner, agent) || !readWorldPosition(lua_binding, 4, world))
     {
         return lua_binding.pushError();
     }
@@ -533,8 +533,8 @@ int moveUnit(LuaBinding &lua_binding)
     NavigationAgent       agent;
     WorldPosition         from;
     WorldPosition         to;
-    if (!readMoveAgent(lua_binding, &owner, &agent) || !readWorldPosition(lua_binding, 4, &from) ||
-        !readWorldPosition(lua_binding, 5, &to))
+    if (!readMoveAgent(lua_binding, owner, agent) || !readWorldPosition(lua_binding, 4, from) ||
+        !readWorldPosition(lua_binding, 5, to))
     {
         return lua_binding.pushError();
     }
@@ -550,16 +550,16 @@ struct AdvanceRequest
     WorldPosition from_world;
 };
 
-bool readAdvanceRequest(LuaBinding &lua_binding, AdvanceRequest *request)
+bool readAdvanceRequest(LuaBinding &lua_binding, AdvanceRequest request)
 {
     LuaTable table;
     LuaTable from;
-    return lua_binding.readTable(2, &table) &&
-           readPositiveId(lua_binding, table, "profile_id", &request->profile_id) &&
-           readPositiveId(lua_binding, table, "unit_id", &request->unit_id) &&
-           table.readValue("distance_mm", &request->distance_mm) &&
-           table.readUserdata("path", kPathMeta, &request->path) &&
-           table.readTable("from_world", &from) && readWorldPosition(from, &request->from_world);
+    return lua_binding.readTable(2, table) &&
+           readPositiveId(lua_binding, table, "profile_id", request.profile_id) &&
+           readPositiveId(lua_binding, table, "unit_id", request.unit_id) &&
+           table.readValue("distance_mm", request.distance_mm) &&
+           table.readUserdata("path", kPathMeta, request.path) &&
+           table.readTable("from_world", from) && readWorldPosition(from, request.from_world);
 }
 
 // Native 状态映射为稳定 Lua 字符串；未知枚举视为 Native 编程错误。
@@ -604,7 +604,7 @@ int advancePath(LuaBinding &lua_binding)
 {
     LuaNavigationContext *owner = nullptr;
     AdvanceRequest        request;
-    if (!readContext(lua_binding, &owner) || !readAdvanceRequest(lua_binding, &request))
+    if (!readContext(lua_binding, owner) || !readAdvanceRequest(lua_binding, request))
     {
         return lua_binding.pushError();
     }
@@ -632,7 +632,7 @@ int advancePath(LuaBinding &lua_binding)
 int cellSizeMm(LuaBinding &lua_binding)
 {
     LuaNavigationContext *owner = nullptr;
-    if (!readContext(lua_binding, &owner))
+    if (!readContext(lua_binding, owner))
     {
         return lua_binding.pushError();
     }
@@ -644,7 +644,7 @@ int releaseUnit(LuaBinding &lua_binding)
 {
     LuaNavigationContext *owner   = nullptr;
     std::uint32_t         unit_id = 0;
-    if (!readContext(lua_binding, &owner) || !readPositiveId(lua_binding, 2, "unit_id", &unit_id))
+    if (!readContext(lua_binding, owner) || !readPositiveId(lua_binding, 2, "unit_id", unit_id))
     {
         return lua_binding.pushError();
     }
@@ -661,7 +661,7 @@ int releaseUnit(LuaBinding &lua_binding)
 int closeContext(LuaBinding &lua_binding)
 {
     LuaNavigationContext *owner = nullptr;
-    if (!lua_binding.readUserdata(1, kContextMeta, &owner))
+    if (!lua_binding.readUserdata(1, kContextMeta, owner))
     {
         return lua_binding.pushError();
     }
@@ -677,7 +677,7 @@ int closeContext(LuaBinding &lua_binding)
 int pathCount(LuaBinding &lua_binding)
 {
     LuaPath *path = nullptr;
-    if (!lua_binding.readUserdata(1, kPathMeta, &path))
+    if (!lua_binding.readUserdata(1, kPathMeta, path))
     {
         return lua_binding.pushError();
     }
@@ -689,7 +689,7 @@ int pathWorldPoint(LuaBinding &lua_binding)
 {
     LuaPath     *path  = nullptr;
     std::int64_t index = 0; // Lua 下标先保留有符号值，验证后转为 Native 0-based。
-    if (!lua_binding.readUserdata(1, kPathMeta, &path) || !lua_binding.readValue(2, &index))
+    if (!lua_binding.readUserdata(1, kPathMeta, path) || !lua_binding.readValue(2, index))
     {
         return lua_binding.pushError();
     }
@@ -706,7 +706,7 @@ int pathWorldPoint(LuaBinding &lua_binding)
 int pathLengthMm(LuaBinding &lua_binding)
 {
     LuaPath *path = nullptr;
-    if (!lua_binding.readUserdata(1, kPathMeta, &path))
+    if (!lua_binding.readUserdata(1, kPathMeta, path))
     {
         return lua_binding.pushError();
     }
@@ -718,7 +718,7 @@ bool registerPath(LuaBinding &lua_binding)
 {
     LuaTable meta;
     bool     created = false;
-    if (!lua_binding.registerUserdata<LuaPath>(kPathMeta, &meta, &created))
+    if (!lua_binding.registerUserdata<LuaPath>(kPathMeta, meta, created))
     {
         return false;
     }
@@ -736,7 +736,7 @@ bool registerContext(LuaBinding &lua_binding)
 {
     LuaTable meta;
     bool     created = false;
-    if (!lua_binding.registerUserdata<LuaNavigationContext>(kContextMeta, &meta, &created))
+    if (!lua_binding.registerUserdata<LuaNavigationContext>(kContextMeta, meta, created))
     {
         return false;
     }

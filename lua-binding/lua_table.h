@@ -20,7 +20,10 @@ class LuaTable
 
     bool valid() const;
     /// 按真实整数 key 或完整字符串 key 读取；失败不改 output。
-    template <typename Key, typename T> bool readValue(const Key &key, T *output) const
+    /// @param key Lua 整数 key 或完整字符串 key。
+    /// @param output 输出对象；失败时保留原值。
+    /// @return 成功读取并完成严格类型检查时返回 true。
+    template <typename Key, typename T> bool readValue(const Key &key, T &output) const
     {
         if (!requireValid())
         {
@@ -34,7 +37,11 @@ class LuaTable
         return binding_->readAt(-1, output);
     }
 
-    template <typename Key> bool readTable(const Key &key, LuaTable *output) const
+    /// 读取字段中的 table 引用；失败时保留 output 原句柄。
+    /// @param key Lua 整数 key 或完整字符串 key。
+    /// @param output 输出 table；成功时写入借用句柄。
+    /// @return 字段存在且为 table 时返回 true。
+    template <typename Key> bool readTable(const Key &key, LuaTable &output) const
     {
         if (!requireValid())
         {
@@ -57,7 +64,10 @@ class LuaTable
     }
 
     /// 显式 Lua 真值规则：只有 nil/false 为假，0 和空串为真。
-    template <typename Key> bool readTruth(const Key &key, bool *output) const
+    /// @param key Lua 整数 key 或完整字符串 key。
+    /// @param output 输出布尔值；失败时保留原值。
+    /// @return 成功读取时返回 true。
+    template <typename Key> bool readTruth(const Key &key, bool &output) const
     {
         if (!requireValid())
         {
@@ -90,9 +100,13 @@ class LuaTable
     /// @note LuaValue 只在本轮 visitor 内有效；嵌套操作的临时栈由内部恢复。
     bool forEach(const std::function<bool(const LuaValue &, const LuaValue &)> &visitor) const;
     /// rawlen 只给出数组边界，不承诺无空洞；失败保持输出。
-    bool arrayLength(std::size_t *output) const;
+    /// @param output 输出长度；失败时保留原值。
+    /// @return 成功读取时返回 true。
+    bool arrayLength(std::size_t &output) const;
     /// 只检查正整数 key 的连续 1..N；忽略其它 key，空数组得到 0。
-    bool denseArrayLength(std::size_t *output) const;
+    /// @param output 输出连续长度；失败时保留原值。
+    /// @return 成功完成检查时返回 true。
+    bool denseArrayLength(std::size_t &output) const;
 
     /// 普通函数和闭包统一注册；最多 254 个业务 upvalue。
     /// @note void* 为借用指针；Table/本封装管理的 userdata 由闭包强引用。
@@ -135,11 +149,17 @@ class LuaTable
 
     bool setMetatable(const LuaTable &meta);
     /// 无 metatable 视为正常读取失败，记录 INVALID_ARGUMENT。
-    bool readMetatable(LuaTable *output) const;
+    /// @param output 输出 metatable 借用句柄；失败时保留原句柄。
+    /// @return 成功读取时返回 true。
+    bool readMetatable(LuaTable &output) const;
 
     /// 读取字段中的已注册 userdata；返回本回调内借用的 T*。
+    /// @param key Lua 整数 key 或完整字符串 key。
+    /// @param name 注册 userdata 时使用的精确类型名。
+    /// @param output 输出借用指针；失败时保留原指针。
+    /// @return 类型匹配时返回 true。
     template <typename Key, typename T>
-    bool readUserdata(const Key &key, const std::string &name, T **output) const
+    bool readUserdata(const Key &key, const std::string &name, T *&output) const
     {
         if (!requireValid())
         {
@@ -154,6 +174,13 @@ class LuaTable
     LuaTable(LuaBinding *binding, int reference);
     bool requireValid() const;
     bool push() const;
+    /// 为字段读取准备 Lua 栈，不负责 C++ 类型转换。
+    /// 成功时把当前 table 和 key 对应的字段值放入栈顶，栈变化为 [S] -> [S, table, value]；
+    /// table 保留在 value 下方，调用方随后可用 -1 读取 value。字符串和整数 key 都走同一套 raw 读取语义。
+    /// 该函数通常由 readValue、readTable、readTruth 或 readUserdata 调用，成功后立即由具体接口消费栈顶 value。
+    /// 失败时不承诺新增栈项；调用方必须由 StackRestore 或等价逻辑恢复临时栈。
+    /// @param key 要读取的 Lua 整数 key；范围检查由 pushValue 完成，不默默截断。
+    /// @return key 合法且字段读取准备成功时返回 true。
     template <typename T>
     typename std::enable_if<std::is_integral<T>::value && !std::is_same<T, bool>::value, bool>::type
     pushField(T key) const
@@ -171,6 +198,10 @@ class LuaTable
         lua_rawget(binding_->state_, -2);
         return true;
     }
+    /// 字符串 key 的字段读取版本；行为和整数 key 的 pushField 相同。
+    /// 使用完整字节长度压入 key，支持包含内嵌零字节的字符串；只做 raw 读取，不触发 __index。
+    /// @param key 要读取的完整 Lua 字符串 key。
+    /// @return 字段读取准备成功时返回 true。
     bool pushField(const std::string &key) const;
     template <typename T>
     typename std::enable_if<std::is_integral<T>::value && !std::is_same<T, bool>::value, bool>::type

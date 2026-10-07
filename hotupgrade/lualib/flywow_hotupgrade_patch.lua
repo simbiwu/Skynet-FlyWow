@@ -1,5 +1,6 @@
 --- 从 Patch Root 扫描、校验并冻结 Lua 模块文件；不执行 Patch 顶层代码。
 local native = require "flywow_hotupgrade_native"
+local native_error = require "flywow_hotupgrade_native_error"
 local result = require "flywow_hotupgrade_error"
 local M = {}
 
@@ -23,15 +24,16 @@ end
 
 local function load_category(root, patch_path, category, frozen, budget)
     local paths, code = native.list_lua(root, patch_path, category)
+    code = native_error.code(code)
     if not paths and code == "HU_PATCH_EMPTY" then return result.success({entries = {}}) end
-    if not paths then return result.failure(code, "Patch 目录扫描失败: " .. category) end
+    if not paths then return result.failure(native_error.code(code), "Patch 目录扫描失败: " .. category) end
     table.sort(paths)
 
     local entries = {}
     for _, relative in ipairs(paths) do
         local absolute = root .. "/" .. patch_path .. "/" .. category .. "/" .. relative
         local located, locate_error = native.resolve(absolute)
-        if not located then return result.failure(locate_error, relative) end
+        if not located then return result.failure(native_error.code(locate_error), relative) end
         local loaded = read(located)
         if not loaded.ok then return loaded end
         budget.bytes = budget.bytes + #loaded.bytes
@@ -112,7 +114,8 @@ function M.load(options)
         return result.failure("HU_INVALID_PATCH", "Patch Root 或目录路径无效")
     end
     local root, code = native.resolve(options.root)
-    if not root then return result.failure(code, "Patch Root 不存在") end
+    code = native_error.code(code)
+    if not root then return result.failure(native_error.code(code), "Patch Root 不存在") end
     return build_patch(root, options.path)
 end
 

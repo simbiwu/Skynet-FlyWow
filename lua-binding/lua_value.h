@@ -29,14 +29,20 @@ class LuaValue
     LuaType type() const;
     bool isNil() const;
     /// 与位置参数相同的严格转换；失败保持输出并记录所属 Binding 的错误。
-    template <typename T> bool readValue(T *output) const
+    /// @param output 输出对象；失败时保留原值。
+    /// @return 成功完成严格类型检查时返回 true。
+    template <typename T> bool readValue(T &output) const
     {
         return binding_->readAt(index_, output);
     }
     /// 将本轮 Table 值变为独立 registry 引用；句柄仍限当前 Binding 回调。
-    bool readTable(LuaTable *output) const;
+    /// @param output 输出 table 借用句柄；失败时保留原句柄。
+    /// @return 当前值为 table 且引用创建成功时返回 true。
+    bool readTable(LuaTable &output) const;
     /// 显式 Lua 真值读取，nil/false 为假；失败不改 output。
-    bool readTruth(bool *output) const;
+    /// @param output 输出布尔值；失败时保留原值。
+    /// @return 成功读取时返回 true。
+    bool readTruth(bool &output) const;
 
   private:
     friend class LuaTable;

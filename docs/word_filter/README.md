@@ -7,7 +7,7 @@ compact 及原文 byte 映射算法；移除 FCLib 类型/导出宏及文件配�
 
 ## 构建与加载
 
-固定使用 C++14、CMake/Linux/WSL2、Skynet v1.8.0 自带 Lua 5.4.7。
+固定使用 C++17、CMake/Linux/WSL2、Skynet v1.8.0 自带 Lua 5.4.7。
 在 FlyWow 根目录运行：
 
 ~~~bash
@@ -43,7 +43,7 @@ Wrapper flywow_word_filter.lua 加载 flywow_word_filter_native.so。
 local word_filter = require "flywow_word_filter"
 local filter, err = word_filter.new(
 {
-    keywords = {"外挂", "广告词"},
+    file    = "config/word_filter.txt",
     compact  = false,
 })
 assert(filter, err)
@@ -56,13 +56,15 @@ assert(output == "这里有*")
 ~~~
 
 以上示例只演示调用。业务自行决定命中后的拒绝、替换及错误处理。
-词库由宿主加载并传入，模块不读文件。对象由当前 Lua State 独占、GC 释放；
+词库可以由宿主传入连续字符串数组，也可以由模块读取 `file` 指定的 UTF-8 文本文件；
+文件每行一个词，空行忽略，CRLF 的 `CR` 会被去除。对象由当前 Lua State 独占、GC 释放；
 词库创建后只读，更新时创建新对象，再由业务替换引用。
-所有调用同步、无 I/O、无 yield，会分配内存。
+查询调用同步、无 I/O、无 yield，会分配内存；创建外部词库时会同步读取指定文件。
 
 ## API 与参数
 
 - new({keywords=连续字符串数组, compact=false})：返回 filter 或 nil,error。
+  也可使用 `new({file="词库路径", compact=false})`；`keywords` 与 `file` 不能同时提供。
   关键词 ID 为词库数组的 1-based 索引。空词库合法；空关键词非法；
   重复词保留各自 ID；未知选项拒绝。
 - filter:find(text)：返回命中数组或 nil,error。每项 keyword_id、offset、length；
@@ -85,9 +87,10 @@ compact=true 复用旧算法，删除空白/控制字符、ASCII 标点及常见
 
 固定资源边界：最多 16384 词、每词 4096 bytes、词库原文总计 1 MiB、
 262144 trie 节点、构建后的后缀输出总计 1048576 项；
+外部词库文件最多读取 2 MiB，超过上限直接返回 dictionary_limit；
 每次文本最多 65536 bytes、命中最多 4096 项；超限失败，不截断。
 错误码：invalid_options、invalid_keyword、invalid_text、invalid_utf8、
-invalid_replacement、dictionary_limit、text_limit、match_limit、
+invalid_replacement、dictionary_io、dictionary_limit、text_limit、match_limit、
 out_of_memory、internal_error。Native 对已释放对象返回 closed。
 业务不得把 nil,error 当作“无命中”。
 

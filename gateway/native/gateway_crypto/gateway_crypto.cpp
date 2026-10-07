@@ -2,11 +2,8 @@
 // 边界：FlyWow Native Lua Binding；输入固定握手字节，输出 challenge/ready 或 Lua 异常。
 // 生命周期：每个 Lua userdata 独占临时密钥和派生密钥；close/__gc 擦除并释放，不共享可变 scratch。
 // 不负责：不访问 Socket、Skynet、业务、登录或文件；私钥和 secret 不返回 Lua 字符串。
-extern "C"
-{
-#include <lua.h>
-#include <lauxlib.h>
-}
+#include "lua_binding.h"
+#include "lua_table.h"
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/core_names.h>
@@ -21,6 +18,8 @@ extern "C"
 
 namespace
 {
+using flywow_lua_binding::LuaBinding;
+using flywow_lua_binding::LuaTable;
 constexpr const char* TYPE = "flywow.gateway.crypto";
 struct Context
 {
@@ -28,6 +27,7 @@ struct Context
     std::array<unsigned char,32> secret = {};      // HMAC 密钥，握手结束擦除。
     std::array<unsigned char,32> hash   = {};      // 公开 transcript 摘要。
     bool                         active = false;   // 成功 verify 后不允许重复使用。
+    ~Context() noexcept;
 };
 template<class T, void(*Free)(T*)> using Handle = std::unique_ptr<T, decltype(Free)>;
 
@@ -45,6 +45,11 @@ void clear(Context* c)
     c->active = false;
     OPENSSL_cleanse(c->secret.data(), c->secret.size());
     OPENSSL_cleanse(c->hash.data(), c->hash.size());
+}
+
+Context::~Context() noexcept
+{
+    clear(this);
 }
 
 // 对指定消息执行完整 HMAC-SHA256；key/message 只在调用期间借用，输出为32字节。
@@ -144,95 +149,82 @@ std::string challenge(Context* c, const char* hello)
 }
 
 // 创建独占userdata和challenge；参数hello为67字节。非法输入抛稳定错误，不执行I/O/yield。
-int create(lua_State* L)
+int create(LuaBinding &lua_binding)
 {
-    size_t size = 0;
-    const char* hello = luaL_checklstring(L, 1, &size);
-    if (size != 67 || hello[0] != 1 || hello[1] != 1 || static_cast<unsigned char>(hello[2]) != 4)
-        return luaL_error(L, "HANDSHAKE_HELLO");
-    auto* c = static_cast<Context*>(lua_newuserdatauv(L, sizeof(Context), 0));
-    new(c) Context();
-    luaL_setmetatable(L, TYPE);
-    char error[80] = {};
-    char output[99] = {};
-    try
+    std::string hello;
+    if (!lua_binding.readValue(1, hello)) return lua_binding.pushError();
+    if (hello.size() != 67 || hello[0] != 1 || hello[1] != 1 ||
+        static_cast<unsigned char>(hello[2]) != 4)
     {
-        auto response = challenge(c, hello);
-        std::memcpy(output, response.data(), sizeof(output));
+        lua_binding.setError("HANDSHAKE_HELLO", "invalid handshake hello");
+        return lua_binding.pushError();
     }
-    catch (const std::exception& e)
-    {
-        std::strncpy(error, e.what(), sizeof(error) - 1);
-        clear(c);
-    }
-    // 离开C++对象作用域后再Lua longjmp，避免绕过析构。
-    if (error[0]) return luaL_error(L, "%s", error);
-    lua_pushlstring(L, output, sizeof(output));
-    return 2;
+    Context *context = nullptr;
+    if (!lua_binding.newUserdata(TYPE, context)) return lua_binding.pushError();
+    const std::string response = challenge(context, hello.data());
+    return lua_binding.returnValues(context, response);
 }
 
 // 验证33字节客户端证明并返回33字节服务端证明；常量时间比较，成功即擦除secret。
-int proof(lua_State* L)
+int proof(LuaBinding &lua_binding)
 {
-    auto* c = static_cast<Context*>(luaL_checkudata(L, 1, TYPE));
-    size_t size = 0;
-    const char* bytes = luaL_checklstring(L, 2, &size);
-    if (!c->active || size != 33 || bytes[0] != 3)
+    Context *context = nullptr;
+    std::string bytes;
+    if (!lua_binding.readUserdata(1, TYPE, context) || !lua_binding.readValue(2, bytes))
+        return lua_binding.pushError();
+    if (!context->active || bytes.size() != 33 || bytes[0] != 3)
     {
-        clear(c);
-        return luaL_error(L, "HANDSHAKE_PROOF");
+        clear(context);
+        lua_binding.setError("HANDSHAKE_PROOF", "invalid handshake proof");
+        return lua_binding.pushError();
     }
-    char error[80] = {};
-    char output[33] = {};
+    std::array<unsigned char,32> expected = {};
+    std::string message = "client-proof";
+    message.append(reinterpret_cast<const char*>(context->hash.data()), 32);
+    hmac(context->secret.data(), message, expected.data());
     try
     {
-        std::array<unsigned char,32> expected = {};
-        std::string message = "client-proof";
-        message.append(reinterpret_cast<const char*>(c->hash.data()), 32);
-        hmac(c->secret.data(), message, expected.data());
-        check(CRYPTO_memcmp(expected.data(), bytes + 1, 32) == 0, "HANDSHAKE_PROOF");
+        check(CRYPTO_memcmp(expected.data(), bytes.data() + 1, 32) == 0, "HANDSHAKE_PROOF");
         message = "server-ready";
-        message.append(reinterpret_cast<const char*>(c->hash.data()), 32);
+        message.append(reinterpret_cast<const char*>(context->hash.data()), 32);
         std::string response(33, '\0');
         response[0] = 4;
-        hmac(c->secret.data(), message, reinterpret_cast<unsigned char*>(&response[1]));
-        clear(c);
-        std::memcpy(output, response.data(), sizeof(output));
+        hmac(context->secret.data(), message, reinterpret_cast<unsigned char*>(&response[1]));
+        clear(context);
+        return lua_binding.returnValues(response);
     }
-    catch (const std::exception& e)
+    catch (...)
     {
-        std::strncpy(error, e.what(), sizeof(error) - 1);
-        clear(c);
+        clear(context);
+        throw;
     }
-    if (error[0]) return luaL_error(L, "%s", error);
-    lua_pushlstring(L, output, sizeof(output));
-    return 1;
 }
 
 // close/__gc幂等释放本userdata；无返回、无yield，不能释放其他连接。
-int close(lua_State* L)
+int close(LuaBinding &lua_binding)
 {
-    clear(static_cast<Context*>(luaL_checkudata(L, 1, TYPE)));
-    return 0;
+    Context *context = nullptr;
+    if (!lua_binding.readUserdata(1, TYPE, context)) return lua_binding.pushError();
+    clear(context);
+    return lua_binding.returnValues();
 }
 }
 
 // 注册本Lua State的模块及userdata方法；无全局可变context，不接触Skynet服务。
-extern "C" int luaopen_flywow_gateway_crypto(lua_State* L)
+int initializeCrypto(LuaBinding &lua_binding)
 {
-    const luaL_Reg methods[] =
-    {
-        {"verify", proof}, {"close", close}, {"__gc", close}, {nullptr, nullptr}
-    };
-    luaL_newmetatable(L, TYPE);
-    luaL_setfuncs(L, methods, 0);
-    lua_pushvalue(L, -1);
-    lua_setfield(L, -2, "__index");
-    lua_pop(L, 1);
-    const luaL_Reg module[] =
-    {
-        {"new", create}, {nullptr, nullptr}
-    };
-    luaL_newlib(L, module);
-    return 1;
+    LuaTable metatable;
+    bool created = false;
+    if (!lua_binding.registerUserdata<Context>(TYPE, metatable, created)) return lua_binding.pushError();
+    LuaTable methods = lua_binding.newTable();
+    if (!methods.setFunction("verify", proof) || !methods.setFunction("close", close) ||
+        !metatable.writeValue("__index", methods)) return lua_binding.pushError();
+    LuaTable module = lua_binding.newTable();
+    if (!module.setFunction("new", create)) return lua_binding.pushError();
+    return lua_binding.returnValues(module);
+}
+
+extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
+{
+    return LuaBinding::initialize(state, initializeCrypto);
 }
