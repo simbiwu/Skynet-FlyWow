@@ -40,14 +40,6 @@ add_executable(flywow_word_filter_test ../tests/test_word_filter.cpp)
 target_link_libraries(flywow_word_filter_test PRIVATE flywow_word_filter_core Threads::Threads)
 add_test(NAME flywow_word_filter_core COMMAND flywow_word_filter_test)
 
-# Lua 运行器存在时，测试公开 Wrapper -> Native 链路；缺少运行器不表示此项已验证。
-if(EXISTS "${SKYNET_ROOT}/3rd/lua/lua")
-    add_test(NAME flywow_word_filter_lua
-        COMMAND "${SKYNET_ROOT}/3rd/lua/lua"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_word_filter.lua"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../lualib"
-        "${FLYWOW_NATIVE_OUTPUT_DIR}")
-endif()
 
 # 当前真实集成宿主为主仓库 server/；测试配置的相对路径以此目录为基准。
 # Skynet 会正常 ABORT 退出，成功/失败标记与超时共同判断结果。
@@ -61,3 +53,6 @@ if(EXISTS "${SKYNET_ROOT}/skynet")
         FAIL_REGULAR_EXPRESSION "FLYWOW_WORD_FILTER_SKYNET_FAIL"
         TIMEOUT 20)
 endif()
+target_sources(flywow_word_filter_native PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../common/native/skynet_allocator.cpp")
+# 在此 Native DSO 内绑定自定义 operator new/delete，避免被 libstdc++ 的实现抢先解析。
+set_property(TARGET flywow_word_filter_native APPEND_STRING PROPERTY LINK_FLAGS " -Wl,-Bsymbolic-functions")

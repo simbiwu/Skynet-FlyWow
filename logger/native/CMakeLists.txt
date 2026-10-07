@@ -23,3 +23,8 @@ add_library(flywow_logger_probe_native MODULE ../tests/native_probe.cpp)
 target_include_directories(flywow_logger_probe_native PRIVATE include "${SKYNET_ROOT}/skynet-src")
 target_compile_options(flywow_logger_probe_native PRIVATE -Wall -Wextra -Werror)
 set_target_properties(flywow_logger_probe_native PROPERTIES PREFIX "")
+target_sources(flywow_logger PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../common/native/skynet_allocator.cpp")
+# 在此 Native DSO 内绑定自定义 operator new/delete，避免被 libstdc++ 的实现抢先解析。
+target_sources(flywow_logger_probe_native PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../common/native/skynet_allocator.cpp")
+set_property(TARGET flywow_logger_probe_native APPEND_STRING PROPERTY LINK_FLAGS " -Wl,-Bsymbolic-functions")
+set_property(TARGET flywow_logger APPEND_STRING PROPERTY LINK_FLAGS " -Wl,-Bsymbolic-functions")

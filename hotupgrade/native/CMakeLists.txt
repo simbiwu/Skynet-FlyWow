@@ -23,3 +23,6 @@ set_target_properties(flywow_hotupgrade_native PROPERTIES
     PREFIX ""
     LIBRARY_OUTPUT_DIRECTORY "${FLYWOW_NATIVE_OUTPUT_DIR}"
 )
+target_sources(flywow_hotupgrade_native PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../common/native/skynet_allocator.cpp")
+# 在此 Native DSO 内绑定自定义 operator new/delete，避免被 libstdc++ 的实现抢先解析。
+set_property(TARGET flywow_hotupgrade_native APPEND_STRING PROPERTY LINK_FLAGS " -Wl,-Bsymbolic-functions")

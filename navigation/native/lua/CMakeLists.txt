@@ -47,3 +47,6 @@ if(FLYWOW_NATIVE_OUTPUT_DIR)
         LIBRARY_OUTPUT_DIRECTORY "${FLYWOW_NATIVE_OUTPUT_DIR}"
     )
 endif()
+target_sources(flywow_navigation_lua PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../../common/native/skynet_allocator.cpp")
+# 在此 Native DSO 内绑定自定义 operator new/delete，避免被 libstdc++ 的实现抢先解析。
+set_property(TARGET flywow_navigation_lua APPEND_STRING PROPERTY LINK_FLAGS " -Wl,-Bsymbolic-functions")

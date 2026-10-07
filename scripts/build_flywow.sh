@@ -80,6 +80,8 @@ fi
 if [[ "$MODULE" == gateway || "$MODULE" == all ]]; then
     # Gateway Crypto 直接生成临时文件，成功后再替换正式产物。
     read -r -a CRYPTO_FLAGS <<< "$(pkg-config --cflags --libs libcrypto)"
+    # 确保 Native 模块内的 C++ 分配调用绑定到本模块的全局重载。
+    CRYPTO_FLAGS+=(-Wl,-Bsymbolic-functions)
     TEMP_OUTPUT="$(mktemp "$NATIVE_DIR/.gateway_crypto.XXXXXX")"
     trap 'rm -f -- "$TEMP_OUTPUT"' EXIT
     "${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Werror -fPIC -shared \
@@ -88,7 +90,7 @@ if [[ "$MODULE" == gateway || "$MODULE" == all ]]; then
         "$FRAMEWORK_DIR/gateway/native/gateway_crypto/gateway_crypto.cpp" \
         "$FRAMEWORK_DIR/lua-binding/lua_binding.cpp" \
         "$FRAMEWORK_DIR/lua-binding/lua_table.cpp" \
-        "${CRYPTO_FLAGS[@]}" -o "$TEMP_OUTPUT"
+        "${CRYPTO_FLAGS[@]}" "$FRAMEWORK_DIR/common/native/skynet_allocator.cpp" -o "$TEMP_OUTPUT"
     chmod 755 "$TEMP_OUTPUT"
     mv -f "$TEMP_OUTPUT" "$NATIVE_DIR/flywow_gateway_crypto.so"
     trap - EXIT
