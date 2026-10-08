@@ -13,13 +13,10 @@ namespace flywow_navigation
 
 // ---- 构造与内存统计：一次接管数据，之后只读 ----
 
-// cells 与规则数组按值传入，再 move 到本对象；构造成功后调用方不再拥有这些数组。
+// cells 按值传入，再 move 到本对象；构造成功后调用方不再拥有该数组。
 // 这里检查内存数据是否自洽，不替代 Reader 的文件版本、长度和 CRC 校验。
-GridMap::GridMap(BMapMetadata metadata, std::vector<NavCell> cells,
-                 GridDynamicEntryRules dynamic_rules)
-    : metadata_(metadata), cells_(std::move(cells)),
-      default_dynamic_entry_allowed_(dynamic_rules.default_allow),
-      dynamic_entry_rules_(std::move(dynamic_rules.per_cell))
+GridMap::GridMap(BMapMetadata metadata, std::vector<NavCell> cells)
+    : metadata_(metadata), cells_(std::move(cells))
 {
     // 先提升再相乘，避免 width*height 在 32 位就回绕；每个格子必须恰有一个 Cell。
     const std::uint64_t expected = static_cast<std::uint64_t>(metadata_.width) * metadata_.height;
@@ -27,26 +24,13 @@ GridMap::GridMap(BMapMetadata metadata, std::vector<NavCell> cells,
     {
         throw std::invalid_argument("GridMap metadata/cell mismatch");
     }
-    if (!dynamic_entry_rules_.empty() && dynamic_entry_rules_.size() != cells_.size())
-    {
-        throw std::invalid_argument("GridMap dynamic rule/cell mismatch");
-    }
-    for (const CellDynamicEntryRule rule : dynamic_entry_rules_)
-    {
-        if (rule != CellDynamicEntryRule::kUseGridDefault && rule != CellDynamicEntryRule::kAllow &&
-            rule != CellDynamicEntryRule::kBlock)
-        {
-            throw std::invalid_argument("GridMap dynamic rule is invalid");
-        }
-    }
 }
 
 std::size_t GridMap::memory_bytes() const noexcept
 {
     // capacity 包含已经预留但未使用的空间，size 只计有效元素；这里估算占用，
     // 不包含分配器开销，也不是进程的实测内存。
-    return sizeof(*this) + cells_.capacity() * sizeof(NavCell) +
-           dynamic_entry_rules_.capacity() * sizeof(CellDynamicEntryRule);
+    return sizeof(*this) + cells_.capacity() * sizeof(NavCell);
 }
 
 // ---- 坐标转换：世界毫米位置与地图内部格下标 ----
@@ -145,31 +129,6 @@ const NavCell *GridMap::TryCell(const GridPos &grid) const noexcept
         return nullptr;
     }
     return &cells_[IndexOf(grid)];
-}
-
-bool GridMap::AllowsDynamicEntry(const GridPos &grid) const noexcept
-{
-    if (!Contains(grid))
-    {
-        return false;
-    }
-    if (dynamic_entry_rules_.empty())
-    {
-        return default_dynamic_entry_allowed_;
-    }
-
-    // 单格明确覆盖优先于整图默认值；这是地图允许的重叠范围，
-    // 不表示目标一定可走，体型、静态阻挡与业务回调仍需另外检查。
-    const CellDynamicEntryRule rule = dynamic_entry_rules_[IndexOf(grid)];
-    if (rule == CellDynamicEntryRule::kAllow)
-    {
-        return true;
-    }
-    if (rule == CellDynamicEntryRule::kBlock)
-    {
-        return false;
-    }
-    return default_dynamic_entry_allowed_;
 }
 
 // ---- 内部边界与索引：先确认范围，再读连续数组 ----

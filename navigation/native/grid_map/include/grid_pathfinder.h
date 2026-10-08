@@ -28,7 +28,7 @@ class GridPathfinder final
     static NavResult<Path> FindPathStatic(NavigationContext &context, const AgentProfile &profile,
                                           const WorldPosition &start, const WorldPosition &end);
 
-    // 在静态规则、Grid/Cell 动态配置和业务回调上寻找 A->B 路径。
+    // 在静态地图、Context 的 Battle-local 格子规则和业务回调上寻找 A->B 路径。
     // context：本 Battle 的 scratch 和动态事实 owner；agent：借用的当前实体视图。
     // start/end：整数毫米 WorldPosition；policy/user_data 由调用方拥有，查询期间必须有效。
     // 返回值：成功返回 Path；参数、静态规则或动态回调拒绝时返回明确 NavError。

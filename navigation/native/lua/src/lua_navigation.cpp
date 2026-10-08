@@ -22,6 +22,8 @@ namespace
 using flywow_lua_binding::LuaBinding;
 using flywow_lua_binding::LuaTable;
 using flywow_navigation::DynamicNavigationPolicy;
+using flywow_navigation::CellDynamicEntryRule;
+using flywow_navigation::GridPos;
 using flywow_navigation::MapRegistry;
 using flywow_navigation::NavigationAgent;
 using flywow_navigation::NavigationAgentHandle;
@@ -242,34 +244,6 @@ bool readProfiles(LuaBinding &lua_binding, const LuaTable &table, std::size_t co
     return true;
 }
 
-// 判断 agent 整个目标 footprint 是否只包含自己。
-// query 指针只在本次同步查询内借用，不保存、不分配、不 yield。
-bool exclusiveDynamicRule(void *, const flywow_navigation::DynamicNavigationQuery &query)
-{
-    if (query.agent == nullptr || query.agent->profile == nullptr || query.occupancy == nullptr)
-    {
-        return false;
-    }
-    const NavigationAgentHandle self = query.agent->handle;
-    return query.occupancy->ForEachFootprintCell(*query.agent->profile, query.target,
-                                                 [&](const flywow_navigation::GridPos &grid)
-                                                 {
-                                                     bool allowed = true;
-                                                     query.occupancy->ForEachOccupant(
-                                                         grid,
-                                                         [&](NavigationAgentHandle other)
-                                                         {
-                                                             if (other != self)
-                                                             {
-                                                                 allowed = false;
-                                                                 return false;
-                                                             }
-                                                             return true;
-                                                         });
-                                                     return allowed;
-                                                 });
-}
-
 /// load_map(path)：启动阶段读取、校验并注册 BMAP；执行文件 I/O，返回地图身份或 nil,error。
 int loadMap(lua_State *state)
 {
@@ -422,7 +396,7 @@ int findPath(lua_State *state)
     }
 
     const NavigationAgent         agent{NavigationAgentHandle{self_id}, query.profile};
-    const DynamicNavigationPolicy policy{nullptr, &exclusiveDynamicRule};
+    const DynamicNavigationPolicy policy{};
     auto result = flywow_navigation::GridPathfinder::FindPath(*query.owner->context, agent,
                                                               query.start, query.target, policy);
     if (!result.ok())
@@ -451,7 +425,7 @@ int findPathToRange(lua_State *state)
     }
 
     const NavigationAgent         agent{NavigationAgentHandle{self_id}, query.profile};
-    const DynamicNavigationPolicy policy{nullptr, &exclusiveDynamicRule};
+    const DynamicNavigationPolicy policy{};
     auto                          result = flywow_navigation::GridPathfinder::FindPathToRange(
         *query.owner->context, agent, query.start, query.target, range_mm, policy);
     if (!result.ok())
@@ -504,7 +478,7 @@ int commitMove(LuaBinding &lua_binding, LuaNavigationContext &owner, const Navig
                                      normalized.detail);
     }
 
-    const DynamicNavigationPolicy policy{nullptr, &exclusiveDynamicRule};
+    const DynamicNavigationPolicy policy{};
     const auto                    moved =
         flywow_navigation::GridPathfinder::MoveUnit(*owner.context, agent, from, to, policy);
     if (!moved.ok())
@@ -557,7 +531,7 @@ struct AdvanceRequest
     WorldPosition from_world;
 };
 
-bool readAdvanceRequest(LuaBinding &lua_binding, AdvanceRequest request)
+bool readAdvanceRequest(LuaBinding &lua_binding, AdvanceRequest &request)
 {
     LuaTable table;
     LuaTable from;
@@ -623,7 +597,7 @@ int advancePath(lua_State *state)
     }
 
     const NavigationAgent         agent{NavigationAgentHandle{request.unit_id}, profile};
-    const DynamicNavigationPolicy policy{nullptr, &exclusiveDynamicRule};
+    const DynamicNavigationPolicy policy{};
     auto                          advanced = flywow_navigation::GridPathfinder::AdvancePath(
         *owner->context, agent, request.path->path, request.path->cursor, request.from_world,
         request.distance_mm, policy);
@@ -646,6 +620,59 @@ int cellSizeMm(lua_State *state)
         return lua_binding.pushError();
     }
     return lua_binding.returnValues(owner->context->map()->metadata().cell_size_mm);
+}
+
+// 读取 Lua 的规则名；default 删除当前格覆盖，恢复默认允许重叠行为。
+bool readCellDynamicEntryRule(LuaBinding &lua_binding, int index, CellDynamicEntryRule &output)
+{
+    std::string           rule_name;
+    if (!lua_binding.readValue(index, rule_name))
+    {
+        return false;
+    }
+
+    if (rule_name == "allow")
+    {
+        output = CellDynamicEntryRule::kAllow;
+    }
+    else if (rule_name == "block")
+    {
+        output = CellDynamicEntryRule::kBlock;
+    }
+    else if (rule_name != "default")
+    {
+        lua_binding.setError(kInvalidArgument, "rule must be 'allow', 'block', or 'default'");
+        return false;
+    }
+    else
+    {
+        output = CellDynamicEntryRule::kDefault;
+    }
+    return true;
+}
+
+/// set_cell_rule(grid_x,grid_z,rule)：零基格坐标；rule 为 allow/block/default。
+/// 成功返回 true；失败返回 nil,error。只影响当前 Battle，规则变化不移动已有单位。
+int setCellRule(lua_State *state)
+{
+    LuaBinding lua_binding(state);
+    LuaNavigationContext *owner = nullptr;
+    std::int32_t          grid_x = 0;
+    std::int32_t          grid_z = 0;
+    CellDynamicEntryRule  rule   = CellDynamicEntryRule::kDefault;
+    if (!readContext(lua_binding, owner) || !lua_binding.readValue(2, grid_x) ||
+        !lua_binding.readValue(3, grid_z) ||
+        !readCellDynamicEntryRule(lua_binding, 4, rule))
+    {
+        return lua_binding.pushError();
+    }
+    const auto changed = owner->context->SetCellDynamicEntryRule(GridPos{grid_x, grid_z}, rule);
+    if (!changed.ok())
+    {
+        return lua_binding.pushError(flywow_navigation::NavErrorName(changed.error),
+                                     changed.detail);
+    }
+    return lua_binding.returnValues(true);
 }
 
 /// release_unit：释放该 handle 当前 footprint，成功返回 true。
@@ -750,6 +777,7 @@ bool registerContext(LuaBinding &lua_binding)
     }
     auto methods = lua_binding.newTable();
     return methods.setFunction("find_path", &findPath) &&
+           methods.setFunction("set_cell_rule", &setCellRule) &&
            methods.setFunction("find_path_to_range", &findPathToRange) &&
            methods.setFunction("place_unit", &placeUnit) &&
            methods.setFunction("move_unit", &moveUnit) &&

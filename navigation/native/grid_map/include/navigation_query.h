@@ -40,9 +40,9 @@ using DynamicEnterCallback = bool (*)(void *user_data, const DynamicNavigationQu
 
 // 由 Battle/业务层传入的动态查询策略。
 // callback 可以通过 query.agent->profile 和 query.occupancy 查询 footprint 与当前实体。
-// callback 为空时只执行 Grid/Cell 动态进入配置，不执行业务层动态阻挡判断。
-// 例如地图允许同格，但 Battle 要求敌我都独占时，由 callback 进一步拒绝；
-// callback 不能放宽地图明确禁止的重叠，也不能在搜索途中移动单位来改变判断依据。
+// callback 为空时仍执行 Context 的 Battle-local 格子规则，但不调用额外业务动态阻挡判断。
+// callback 可以进一步拒绝 Context 已允许的进入，但不能放宽 Context 单格规则已禁止的重叠，
+// 也不能在搜索途中移动单位来改变判断依据。
 struct DynamicNavigationPolicy
 {
     void                *user_data = nullptr; // 业务层状态；不由导航底层释放。

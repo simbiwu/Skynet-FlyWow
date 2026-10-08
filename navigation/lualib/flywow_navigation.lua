@@ -38,7 +38,11 @@
 ---@field consumed_mm integer 实际消费预算；毫米，不是 Tick 数。
 ---@field moved boolean 是否有已成功提交的 XZ 变化。
 
+---@alias FlyWowNavigationCellRule "allow"|"block"|"default"
+--- allow 允许与其他单位重叠；block 禁止重叠但空格仍可进入；default 恢复默认允许重叠行为。
+
 ---@class FlyWowNavigationContext
+---@field set_cell_rule fun(self:FlyWowNavigationContext,grid_x:integer,grid_z:integer,rule:FlyWowNavigationCellRule):boolean?,FlyWowNavigationError? 运行时设置当前 Battle 的单格重叠规则；default 清除覆盖。
 ---@field find_path fun(self:FlyWowNavigationContext,profile_id:integer,start:FlyWowNavigationPosition,goal:FlyWowNavigationPosition,self_unit_id:integer):FlyWowNavigationPath?,FlyWowNavigationError?
 ---@field find_path_to_range fun(self:FlyWowNavigationContext,profile_id:integer,start:FlyWowNavigationPosition,target:FlyWowNavigationPosition,attack_range_mm:integer,self_unit_id:integer):FlyWowNavigationPath?,FlyWowNavigationError?
 ---@field place_unit fun(self:FlyWowNavigationContext,profile_id:integer,unit_id:integer,position:FlyWowNavigationPosition):FlyWowNavigationPosition?,FlyWowNavigationError?
@@ -61,7 +65,7 @@
 ---@field walkable boolean 静态 Walkable bit；不代表所有 Agent 都能站立。
 
 ---@class FlyWowNavigationModule
----@field load_map fun(path:string):FlyWowNavigationIdentity?,FlyWowNavigationError? 文件 I/O/分配/Registry 短锁；启动阶段调用。
+---@field load_map fun(path:string):FlyWowNavigationIdentity?,FlyWowNavigationError? 加载 immutable 静态地图；执行文件 I/O/分配/Registry 短锁。
 ---@field query_cell fun(map_id:integer,map_version:integer,position:FlyWowNavigationPosition):FlyWowNavigationCell?,FlyWowNavigationError? 只读同步查询；Registry 查找短锁。
 ---@field new_context fun(map_id:integer,map_version:integer,profiles:FlyWowNavigationProfile[]):FlyWowNavigationContext?,FlyWowNavigationError? 分配私有 scratch/occupancy，返回调用方独占 userdata。
 

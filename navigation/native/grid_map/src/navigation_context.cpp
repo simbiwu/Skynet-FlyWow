@@ -1,6 +1,6 @@
-// 职责：实现 NavigationContext 的 scratch 分配、generation 生命周期和按需 Node 初始化。
+// 职责：实现 Battle-local 规则、动态占位、scratch 分配与 generation 生命周期。
 // 边界：Server Runtime Battle-local Mutable State；不访问 Skynet/Lua，不执行 I/O。
-// 输入/输出：immutable GridMap -> 可复用 A* scratch + Battle-local DynamicOccupancy。
+// 输入/输出：immutable GridMap -> Battle-local 规则/occupancy 与可复用 A* scratch。
 // 内存：构造时按 cell_count 分配 nodes + heap；每次查询不做 per-node allocation。
 // 不负责：不计算邻居、不判断 Agent、不生成 Path，也不拥有跨 Battle 的动态状态。
 #include "navigation_context.h"
@@ -63,6 +63,71 @@ void NavigationContext::BeginQuery()
     }
     heap_size_     = 0;
     visited_nodes_ = 0;
+}
+
+// 修改当前 Context 的单格规则；规则列表只保存例外，不按地图大小分配。
+NavResult<bool> NavigationContext::SetCellDynamicEntryRule(const GridPos &grid,
+                                                           CellDynamicEntryRule rule)
+{
+    if (map_->TryCell(grid) == nullptr)
+    {
+        return NavResult<bool>::Failure(NavError::kOutOfBounds,
+                                        "dynamic rule cell is outside map");
+    }
+    if (rule != CellDynamicEntryRule::kDefault &&
+        rule != CellDynamicEntryRule::kAllow && rule != CellDynamicEntryRule::kBlock)
+    {
+        return NavResult<bool>::Failure(NavError::kInvalidArgument,
+                                        "invalid dynamic entry rule");
+    }
+
+    // 列表按 z、x 排序，lower_bound 同时定位已有覆盖和新覆盖的插入位置。
+    const auto entry = std::lower_bound(
+        dynamic_entry_rules_.begin(), dynamic_entry_rules_.end(), grid,
+        [](const CellDynamicEntryOverride &candidate, const GridPos &target)
+        {
+            return candidate.grid.z < target.z ||
+                   (candidate.grid.z == target.z && candidate.grid.x < target.x);
+        });
+    const bool found = entry != dynamic_entry_rules_.end() && entry->grid.x == grid.x &&
+                       entry->grid.z == grid.z;
+    if (rule == CellDynamicEntryRule::kDefault)
+    {
+        if (found)
+        {
+            dynamic_entry_rules_.erase(entry);
+        }
+    }
+    else if (found)
+    {
+        entry->rule = rule;
+    }
+    else
+    {
+        dynamic_entry_rules_.insert(entry, CellDynamicEntryOverride{grid, rule});
+    }
+    return NavResult<bool>::Success(true);
+}
+
+// 覆盖项只保存 allow/block；无覆盖时使用默认的允许重叠行为。
+bool NavigationContext::AllowsDynamicEntry(const GridPos &grid) const noexcept
+{
+    if (map_->TryCell(grid) == nullptr)
+    {
+        return false;
+    }
+
+    const auto entry = std::lower_bound(
+        dynamic_entry_rules_.begin(), dynamic_entry_rules_.end(), grid,
+        [](const CellDynamicEntryOverride &candidate, const GridPos &target)
+        {
+            return candidate.grid.z < target.z ||
+                   (candidate.grid.z == target.z && candidate.grid.x < target.x);
+        });
+    return entry == dynamic_entry_rules_.end() || entry->grid.x != grid.x ||
+                   entry->grid.z != grid.z ||
+                   entry->rule == CellDynamicEntryRule::kDefault ||
+                   entry->rule == CellDynamicEntryRule::kAllow;
 }
 
 // 返回 node_index 在当前 generation 的可变 scratch，首次触达时惰性初始化。

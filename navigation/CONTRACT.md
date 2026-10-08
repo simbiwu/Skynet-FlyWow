@@ -15,6 +15,7 @@ Native/Lua 使用整数毫米世界坐标 `{x_mm,y_mm,z_mm}`。X/Z 决定归格�
 | `load_map(path)` | `{map_id,map_version}` | 启动时读取及注册地图；文件 I/O、分配、Registry 短锁 |
 | `query_cell(id,version,worldPosition)` | Cell 查询 record | 只读查询；返回 grid 调试下标、高度、Area、Clearance、walkable |
 | `new_context(id,version,profiles)` | Context userdata | 每场 Battle 独占；分配 A* scratch 与动态占位 |
+| `context:set_cell_rule(x,z,rule)` | 成功布尔值 | 运行时设置当前 Battle 单格重叠规则；不影响其它 Context |
 | `context:find_path(...)` | Path userdata | 按 Agent 静态规则与当前动态事实规划路径 |
 | `context:find_path_to_range(...)` | Path userdata | 寻找可站立且进入目标范围的位置，不要求占据目标中心 |
 | `context:place_unit(...)` / `move_unit(...)` / `release_unit(...)` | 成功布尔值或新位置 | 本 Context 的动态占位操作 |
@@ -23,11 +24,13 @@ Native/Lua 使用整数毫米世界坐标 `{x_mm,y_mm,z_mm}`。X/Z 决定归格�
 | `context:close()` | 无返回值 | 幂等释放 Context；后续访问返回关闭错误 |
 | `path:count()` / `world_point(index)` / `length_mm()` | 点数/位置/整数长度 | Path 独占世界点和推进 cursor；不能跨单位共享推进状态 |
 
-参数 record、稳定错误码和边界检查以 `native/lua/src/lua_navigation.cpp` 为实现合同。所有公开 Binding API 的失败——包括参数类型/范围错误、地图未加载、越界、不可达、动态占用和 Context 已关闭——统一返回 `nil, {code,message}`，不通过 Lua 错误机制抛出。调用方必须检查第一个返回值，并按稳定 `code` 处理；`message` 只用于诊断。Native 查询不执行 Skynet yield；动态规则回调也必须同步且不能 yield。
+参数 record、稳定错误码和边界检查以 `native/lua/src/lua_navigation.cpp` 为实现合同。所有公开 Binding API 的失败——包括参数类型/范围错误、地图未加载、越界、不可达、动态占用和 Context 已关闭——统一返回 `nil, {code,message}`，不通过 Lua 错误机制抛出。调用方必须检查第一个返回值，并按稳定 `code` 处理；`message` 只用于诊断。Native 查询不执行 Skynet yield。
+
+`context:set_cell_rule(x,z,rule)` 使用零基 Grid 坐标；`rule` 为 `"allow"`、`"block"` 或 `"default"`。它只影响当前 Battle Context；`default` 清除该格覆盖，恢复默认允许重叠行为。未设置规则时无需额外配置。规则只约束已有其他单位时是否允许重叠，不会封闭空格；修改规则不移动已经占位的单位，后续寻路和移动检查使用新规则。
 
 ## 状态归属
 
-Registry 的地图以 `shared_ptr<const GridMap>` 共享；注册受锁保护，不共享可变查询 scratch。每个 Context 拥有 Node/Heap/occupancy，单个 Context 必须由一个执行 owner 顺序使用；不同 Skynet Service 不能并发操作同一个可变 Context。
+Registry 的地图以 `shared_ptr<const GridMap>` 共享；注册受锁保护，不共享可变查询 scratch。每个 Context 拥有 Node/Heap/occupancy 和稀疏动态规则，单个 Context 必须由一个执行 owner 顺序使用；不同 Skynet Service 不能并发操作同一个可变 Context。
 
 静态 Clearance 是 Bake 后到障碍和边界的保守格距，动态单位不会重写它。动态 footprint 与可通行规则在规划和移动时另外验证；旧 Path 不能直接授权移动。Clearance、footprint、A*、区域 Dijkstra、smoothing 和逐格移动复验的推导、例子及不变量保留在对应源码注释中。
 

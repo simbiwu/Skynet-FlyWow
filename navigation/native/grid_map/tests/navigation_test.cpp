@@ -23,8 +23,7 @@ namespace
 
 // 创建全可走 synthetic map；origin 是毫米制世界原点，返回 immutable shared owner。
 std::shared_ptr<const GridMap> MakeMap(std::uint32_t width, std::uint32_t height,
-                                       std::int32_t origin_x_mm = 0, std::int32_t origin_z_mm = 0,
-                                       GridDynamicEntryRules dynamic_rules = {})
+                                       std::int32_t origin_x_mm = 0, std::int32_t origin_z_mm = 0)
 {
     BMapMetadata meta;
     meta.map_id       = 9001;
@@ -43,7 +42,7 @@ std::shared_ptr<const GridMap> MakeMap(std::uint32_t width, std::uint32_t height
         cell.area_type       = 0;
         cell.clearance_cells = 10;
     }
-    return std::make_shared<const GridMap>(meta, std::move(cells), std::move(dynamic_rules));
+    return std::make_shared<const GridMap>(meta, std::move(cells));
 }
 
 // 构造带自定义 Cell 的地图，避免测试通过 const GridMap 后再修改共享资产。
@@ -344,34 +343,39 @@ void TestSmoothedPathSegments()
     assert(!GridPathfinder::ValidatePath(ctx, self, invalid, ExclusivePolicy()).ok());
 }
 
-// Grid 默认禁止穿人、Cell 允许覆盖：空格始终可走，配置只约束有其他实体的格子。
-void TestGridAndCellDynamicOverlapRules()
+// 运行时动态规则只属于设置它的 Battle Context；同地图的其他 Battle 不受影响。
+void TestBattleLocalDynamicEntryRules()
 {
-    GridDynamicEntryRules rules;
-    rules.default_allow = false;
-    rules.per_cell.resize(6, CellDynamicEntryRule::kUseGridDefault);
-    rules.per_cell[Idx(3, 2, 0)] = CellDynamicEntryRule::kAllow;
-    auto                  map    = MakeMap(3, 2, 0, 0, std::move(rules));
-    NavigationContext     ctx(map);
+    auto                  map = MakeMap(3, 1);
+    NavigationContext     first(map);
+    NavigationContext     second(map);
     const AgentProfile    profile = Small();
     const NavigationAgent mover{NavigationAgentHandle{100}, &profile};
+    const NavigationAgent blocker{NavigationAgentHandle{200}, &profile};
 
-    // 即使默认禁止穿人，(1,0) 空着时仍可作为路径终点。
-    assert(GridPathfinder::FindPath(ctx, mover, P(250, 250), P(750, 250), SharedPolicy()).ok());
-    assert(ctx.occupancy().Move(NavigationAgentHandle{200}, profile, GridPos{1, 0}).ok());
-    assert(ctx.occupancy().Move(NavigationAgentHandle{300}, profile, GridPos{2, 0}).ok());
+    assert(first.occupancy().Move(blocker.handle, profile, GridPos{1, 0}).ok());
+    assert(second.occupancy().Move(blocker.handle, profile, GridPos{1, 0}).ok());
+    assert(first.AllowsDynamicEntry(GridPos{1, 0}));
+    assert(second.AllowsDynamicEntry(GridPos{1, 0}));
+    assert(first.SetCellDynamicEntryRule(GridPos{1, 0}, CellDynamicEntryRule::kBlock).ok());
+    assert(!first.AllowsDynamicEntry(GridPos{1, 0}));
+    assert(second.AllowsDynamicEntry(GridPos{1, 0}));
 
-    // (1,0) 有人时必须绕行；(2,0) 虽有人，但 Cell 级覆盖允许共存。
-    const auto result =
-        GridPathfinder::FindPath(ctx, mover, P(250, 250), P(1250, 250), SharedPolicy());
-    assert(result.ok());
-    assert(GridPathfinder::ValidatePath(ctx, mover, result.value, SharedPolicy()).ok());
-    for (std::size_t i = 0; i < result.value.count(); ++i)
-    {
-        const auto grid = map->WorldToGrid(result.value.WorldPoint(i));
-        assert(grid.ok());
-        assert(!(grid.value.x == 1 && grid.value.z == 0));
-    }
+    const auto allowed =
+        GridPathfinder::FindPath(first, mover, P(250, 250), P(1250, 250), SharedPolicy());
+    const auto blocked =
+        GridPathfinder::FindPath(second, mover, P(250, 250), P(1250, 250), SharedPolicy());
+    assert(!allowed.ok());
+    assert(blocked.ok());
+
+    assert(first.SetCellDynamicEntryRule(GridPos{1, 0}, CellDynamicEntryRule::kAllow).ok());
+    assert(first.AllowsDynamicEntry(GridPos{1, 0}));
+    assert(first.SetCellDynamicEntryRule(GridPos{1, 0},
+                                         CellDynamicEntryRule::kDefault).ok());
+    assert(first.AllowsDynamicEntry(GridPos{1, 0}));
+    assert(!first.SetCellDynamicEntryRule(GridPos{3, 0}, CellDynamicEntryRule::kAllow).ok());
+    assert(!first.SetCellDynamicEntryRule(GridPos{1, 0},
+                                          static_cast<CellDynamicEntryRule>(3)).ok());
 }
 
 // 锁定统一 Move、多个实体事实和冲突时保留旧位置。
@@ -598,7 +602,7 @@ int main()
     TestClearanceAndSlope();
     TestAreaCostChangesRoute();
     TestSmoothedPathSegments();
-    TestGridAndCellDynamicOverlapRules();
+    TestBattleLocalDynamicEntryRules();
     TestDynamicOccupancyAndAtomicMove();
     TestSharedCellAndRadiusFootprint();
     TestMoveRevalidatesDynamicCorner();

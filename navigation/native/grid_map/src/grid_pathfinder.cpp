@@ -51,6 +51,7 @@ constexpr std::array<Direction, 8> kDirections{{
 struct QueryPolicy
 {
     const DynamicNavigationPolicy *dynamic_policy = nullptr; // 借用业务层策略，不转移所有权。
+    const NavigationContext      *context        = nullptr; // 当前 Battle 的动态规则 owner；仅动态查询设置。
     const NavigationAgent         *agent          = nullptr; // 当前移动者视图；借用。
     DynamicQueryPurpose            purpose        = DynamicQueryPurpose::kFindPath;
 };
@@ -156,7 +157,7 @@ bool CanOccupyStaticCell(const GridMap &map, const AgentProfile &profile, const 
     return profile.area_allowed[area] != 0;
 }
 
-// 函数职责：组合静态地图判断、Grid/Cell 动态配置和业务层动态回调。
+// 函数职责：组合静态地图判断、Context 的 Battle-local 格子规则和业务层动态回调。
 // map/profile/grid：当前 immutable 地图、单位静态规则和候选中心 Cell；均只读借用。
 // from：候选移动的来源中心 Cell；起点检查时 from==grid。
 // policy：静态查询不带动态策略；Battle 查询带业务回调和当前 NavigationAgent。
@@ -175,17 +176,17 @@ bool CanOccupy(const GridMap &map, const AgentProfile &profile, const GridPos &f
         return true;
     }
 
-    // Grid/Cell 配置只约束“已有其他实体时能否重叠”；空 Cell 即使配置 kBlock 仍可进入。
-    // Occupancy 统一枚举半径 footprint，底层只在 kBlock Cell 查找非 self 实体。
-    // 业务回调随后可以进一步拒绝，但不能放宽地图已禁止的重叠。
-    if (policy.agent == nullptr)
+    // Context 的单格规则只约束“已有其他实体时能否重叠”；空 Cell 即使设为 block 仍可进入。
+    // Occupancy 统一枚举半径 footprint，底层只在禁止重叠的 Cell 查找非 self 实体。
+    // 业务回调随后可以进一步拒绝，但不能放宽 Context 已禁止的重叠。
+    if (policy.agent == nullptr || policy.context == nullptr)
     {
         return false;
     }
     if (!occupancy.ForEachFootprintCell(profile, grid,
                                         [&](const GridPos &footprint_cell)
                                         {
-                                            if (map.AllowsDynamicEntry(footprint_cell))
+                                            if (policy.context->AllowsDynamicEntry(footprint_cell))
                                             {
                                                 return true;
                                             }
@@ -920,6 +921,7 @@ NavResult<bool> GridPathfinder::ValidatePath(NavigationContext     &context,
     }
     QueryPolicy policy;
     policy.dynamic_policy = &dynamic_policy;
+    policy.context        = &context;
     policy.agent          = &agent;
     policy.purpose        = DynamicQueryPurpose::kFindPath;
     return ValidatePathImpl(context, *agent.profile, path, policy);
@@ -945,6 +947,7 @@ NavResult<Path> GridPathfinder::FindPath(NavigationContext &context, const Navig
     }
     QueryPolicy policy;
     policy.dynamic_policy = &dynamic_policy;
+    policy.context        = &context;
     policy.agent          = &agent;
     policy.purpose        = DynamicQueryPurpose::kFindPath;
     return FindPathImpl(context, *agent.profile, start, end, policy, false, 0);
@@ -966,6 +969,7 @@ NavResult<Path> GridPathfinder::FindPathToRange(NavigationContext             &c
     }
     QueryPolicy policy;
     policy.dynamic_policy = &dynamic_policy;
+    policy.context        = &context;
     policy.agent          = &agent;
     policy.purpose        = DynamicQueryPurpose::kFindPath;
     return FindPathImpl(context, *agent.profile, start, target, policy, true, attack_range_mm);
@@ -1005,6 +1009,7 @@ NavResult<bool> GridPathfinder::MoveUnit(NavigationContext &context, const Navig
 
     QueryPolicy policy;
     policy.dynamic_policy = &dynamic_policy;
+    policy.context        = &context;
     policy.agent          = &agent;
     policy.purpose        = DynamicQueryPurpose::kMove;
     if (dx != 0 || dz != 0)

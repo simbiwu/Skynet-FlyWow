@@ -1,7 +1,7 @@
 // 职责：拥有一场 Battle/一次独立导航会话的 A* 可变查询状态。
 // 边界：Server Runtime Battle-local Navigation；只读共享 GridMap，可写状态绝不跨 Context。
-// 输入/输出：immutable GridMap -> 可重复使用的 Node/Heap scratch 和当前动态占位。
-// 生命周期：通常与一场 Battle 相同；销毁时释放 scratch 和 DynamicOccupancy。
+// 输入/输出：immutable GridMap -> 可重复使用的 Node/Heap scratch、动态占位和 Battle-local 格子规则。
+// 生命周期：通常与一场 Battle 相同；销毁时释放 scratch、DynamicOccupancy 和格子规则。
 // 不负责：不拥有 MapRegistry，不把 GridPos 暴露给 Lua 业务，不执行 Skynet yield 或跨 Battle 状态。
 #pragma once
 
@@ -16,6 +16,22 @@
 
 namespace flywow_navigation
 {
+
+// 该值只决定当前 Battle 中“已有其他单位的 Cell”是否允许重叠；空 Cell 始终可进入。
+// kDefault 清除当前 Context 的覆盖，恢复默认的允许重叠行为。
+enum class CellDynamicEntryRule : std::uint8_t
+{
+    kDefault        = 0, // 清除本格覆盖；恢复默认的允许重叠规则。
+    kAllow          = 1, // 已有其他单位时仍允许重叠进入。
+    kBlock          = 2, // 禁止与其他单位重叠进入；空格仍可进入。
+};
+
+// 当前 Battle 对一个格子的重叠规则；只存显式覆盖项，不为整张地图分配数组。
+struct CellDynamicEntryOverride
+{
+    GridPos              grid;
+    CellDynamicEntryRule rule = CellDynamicEntryRule::kDefault;
+};
 
 class NavigationContext final
 {
@@ -39,6 +55,17 @@ class NavigationContext final
     // 为 map 分配一次 dense scratch；构造阶段会发生 O(cell_count) 内存分配。
     // map 必须非空，cell_count 必须可由 int32 node_index 表示。
     explicit NavigationContext(std::shared_ptr<const GridMap> map);
+
+    /// 设置当前 Battle 对单个格子的动态重叠规则。
+    /// @param grid 零基 Grid 坐标，必须位于当前地图内。
+    /// @param rule allow/block 设置覆盖；kDefault 移除覆盖并恢复默认允许重叠行为。
+    /// @return 成功返回 true；坐标越界或规则值无效时返回对应 NavError。
+    /// 规则只属于当前 Context；不修改共享 GridMap，不重新分配整张地图大小的数组。
+    /// 修改规则不会移走已占位单位；后续寻路和移动检查使用新规则。
+    NavResult<bool> SetCellDynamicEntryRule(const GridPos &grid, CellDynamicEntryRule rule);
+
+    /// 判断当前 Battle 在该格已有其他单位时是否允许重叠；越界返回 false。
+    bool AllowsDynamicEntry(const GridPos &grid) const noexcept;
 
     // 开始一次新查询：递增 generation、清空 heap_size，不扫描清零全部 Node。
     // Generation 回卷时才 O(cell_count) 清零 generation 字段。
@@ -97,10 +124,11 @@ class NavigationContext final
     }
 
   private:
-    std::shared_ptr<const GridMap> map_;       // 与 MapRegistry 共享 immutable GridMap 所有权。
-    DynamicOccupancy               occupancy_; // 当前 Battle 的真实动态 footprint 占用。
-    std::vector<NodeScratch>       nodes_;     // 每 Cell 一个 scratch record，本 Context 独占。
-    std::vector<std::int32_t>      heap_;      // Binary Heap 的 node_index 存储，本 Context 独占。
+    std::shared_ptr<const GridMap>        map_;                 // 与 MapRegistry 共享 immutable GridMap 所有权。
+    DynamicOccupancy                      occupancy_;           // 当前 Battle 的真实动态 footprint 占用。
+    std::vector<CellDynamicEntryOverride> dynamic_entry_rules_; // 本 Battle 的稀疏覆盖，按 z、x 排序。
+    std::vector<NodeScratch>              nodes_;               // 每 Cell 一个 scratch record，本 Context 独占。
+    std::vector<std::int32_t>              heap_;                // Binary Heap 的 node_index 存储，本 Context 独占。
     std::size_t                    heap_size_        = 0; // 本次 query 的有效 heap slot 数。
     std::uint32_t                  query_generation_ = 0; // 0 保留为“从未属于任何查询”。
     std::uint32_t                  visited_nodes_    = 0; // 本次查询 Touch 的唯一 Node 计数。
