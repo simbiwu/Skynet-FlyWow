@@ -51,9 +51,15 @@ class Path final
 
     // 接管已经按行进顺序排列的世界坐标点。
     // points 可以只含一个点（start==end）；本构造不执行地图合法性检查。
-    explicit Path(std::vector<WorldPosition> points, std::uint64_t length_mm)
-        : points_(std::move(points)), length_mm_(length_mm)
+    explicit Path(std::vector<WorldPosition> points, std::uint64_t length_mm, bool partial = false)
+        : points_(std::move(points)), length_mm_(length_mm), partial_(partial)
     {
+    }
+
+    /// 查询结果是否进入目标区域；与 AdvancePath 的执行状态独立。
+    const char *status() const noexcept
+    {
+        return partial_ ? "partial" : "reached";
     }
 
     // 返回路径点数量；不分配、不加锁、不 yield。
@@ -87,6 +93,7 @@ class Path final
   private:
     std::vector<WorldPosition> points_;        // 按移动顺序保存；Path 独占内存。
     std::uint64_t              length_mm_ = 0; // XZ 折线总长度，单位毫米。
+    bool                       partial_   = false; // true 表示搜索耗尽后返回的最近可达路线。
 };
 
 } // namespace flywow_navigation

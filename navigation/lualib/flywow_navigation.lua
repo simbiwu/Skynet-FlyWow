@@ -21,6 +21,7 @@
 ---@field area_allowed? table<integer,boolean> Area 0..255 通行开关；未配置使用 Native 默认。
 
 ---@class FlyWowNavigationPath
+---@field status fun(self:FlyWowNavigationPath):string 查询终点 reached/partial；不是推进状态。
 ---@field count fun(self:FlyWowNavigationPath):integer 点数；只读、不 yield。
 ---@field world_point fun(self:FlyWowNavigationPath,index:integer):FlyWowNavigationPosition 下标从 1 开始；越界抛错。
 ---@field length_mm fun(self:FlyWowNavigationPath):integer XZ 路径长度；毫米。
@@ -43,8 +44,9 @@
 
 ---@class FlyWowNavigationContext
 ---@field set_cell_rule fun(self:FlyWowNavigationContext,grid_x:integer,grid_z:integer,rule:FlyWowNavigationCellRule):boolean?,FlyWowNavigationError? 运行时设置当前 Battle 的单格重叠规则；default 清除覆盖。
----@field find_path fun(self:FlyWowNavigationContext,profile_id:integer,start:FlyWowNavigationPosition,goal:FlyWowNavigationPosition,self_unit_id:integer):FlyWowNavigationPath?,FlyWowNavigationError?
----@field find_path_to_range fun(self:FlyWowNavigationContext,profile_id:integer,start:FlyWowNavigationPosition,target:FlyWowNavigationPosition,attack_range_mm:integer,self_unit_id:integer):FlyWowNavigationPath?,FlyWowNavigationError?
+---@field find_path fun(self:FlyWowNavigationContext,profile_id:integer,start:FlyWowNavigationPosition,goal:FlyWowNavigationPosition,mover_unit_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError?
+---@field find_path_to_range fun(self:FlyWowNavigationContext,profile_id:integer,start:FlyWowNavigationPosition,target:FlyWowNavigationPosition,attack_range_mm:integer,mover_unit_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError?
+---@field find_path_to_unit_range fun(self:FlyWowNavigationContext,mover_profile_id:integer,start_world:FlyWowNavigationPosition,target_profile_id:integer,target_world:FlyWowNavigationPosition,edge_range_mm:integer,mover_unit_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError? 双方半径之外的合法终点；零范围使用格子对角线容差。
 ---@field place_unit fun(self:FlyWowNavigationContext,profile_id:integer,unit_id:integer,position:FlyWowNavigationPosition):FlyWowNavigationPosition?,FlyWowNavigationError?
 ---@field move_unit fun(self:FlyWowNavigationContext,profile_id:integer,unit_id:integer,from_world:FlyWowNavigationPosition,to_world:FlyWowNavigationPosition):FlyWowNavigationPosition?,FlyWowNavigationError?
 ---@field release_unit fun(self:FlyWowNavigationContext,unit_id:integer):boolean?,FlyWowNavigationError?

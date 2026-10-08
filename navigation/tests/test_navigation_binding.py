@@ -15,6 +15,14 @@ class NavigationBindingTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('SKYNET_LUA') and os.environ.get('NAVIGATION_NATIVE_DIR'),
                          '需要 SKYNET_LUA 和 NAVIGATION_NATIVE_DIR 运行真实绑定测试')
     def test_real_binding_context_isolation_and_close(self):
+        self.run_binding_script('navigation_binding_test.lua', 'FLYWOW_NAVIGATION_BINDING_OK')
+
+    @unittest.skipUnless(os.environ.get('SKYNET_LUA') and os.environ.get('NAVIGATION_NATIVE_DIR'),
+                         '需要 SKYNET_LUA 和 NAVIGATION_NATIVE_DIR 运行真实绑定测试')
+    def test_real_unit_range_and_partial(self):
+        self.run_binding_script('navigation_unit_range_test.lua', 'FLYWOW_UNIT_RANGE_OK', 10)
+
+    def run_binding_script(self, script_name, marker, clearance=1):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:
             bmap = Path(directory) / 'map.bmap'
@@ -22,7 +30,7 @@ class NavigationBindingTests(unittest.TestCase):
             with oversized.open('wb') as stream:
                 stream.truncate(128 * 1024 * 1024 + 1)
             # 5×5 平地；每格完整 V1 record 为 i32 高度、u16 flags、u8 Area、u8 Clearance。
-            payload = struct.pack('<iHBB', 0, 1, 0, 1) * 25
+            payload = struct.pack('<iHBB', 0, 1, 0, clearance) * 25
             header = bytearray(64)
             header[:4] = b'BMAP'
             struct.pack_into('<HHIIIII', header, 4, 1, 64, 17, 2, 5, 5, 500)
@@ -31,8 +39,8 @@ class NavigationBindingTests(unittest.TestCase):
             struct.pack_into('<I', header, 52, zlib.crc32(header))
             bmap.write_bytes(header + payload)
             result = subprocess.run([os.environ['SKYNET_LUA'],
-                                     str(root / 'navigation/tests/navigation_binding_test.lua'), str(root),
+                                     str(root / 'navigation/tests' / script_name), str(root),
                                      os.environ['NAVIGATION_NATIVE_DIR'], str(bmap), str(oversized)],
                                     text=True, capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn('FLYWOW_NAVIGATION_BINDING_OK', result.stdout)
+            self.assertIn(marker, result.stdout)

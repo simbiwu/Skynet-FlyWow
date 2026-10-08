@@ -299,6 +299,24 @@ int readTracked(lua_State *state)
     return lua_binding.returnValues(object->value, object);
 }
 
+int userdataGcIdempotent(lua_State *state)
+{
+    LuaBinding binding(state);
+    const int top = lua_gettop(state);
+    luaL_getmetatable(state, kTracked);
+    lua_getfield(state, -1, "__gc");
+    lua_pushvalue(state, 1);
+    lua_call(state, 1, 0);
+    lua_getfield(state, -1, "__gc");
+    lua_pushvalue(state, 1);
+    lua_call(state, 1, 0);
+    lua_settop(state, top);
+    Tracked *dead = nullptr;
+    require(!binding.readUserdata(1, kTracked, dead), "finalized userdata must not be readable");
+    require(binding.errorCode() == "INVALID_ARGUMENT", "finalized userdata must report INVALID_ARGUMENT");
+    return binding.returnValues(true);
+}
+
 int userdataErrors(lua_State *state)
 {
     LuaBinding lua_binding(state);
@@ -431,6 +449,7 @@ int openTest(lua_State *state)
                 module.setFunction("new_tracked", &newTracked, pointer) &&
                 module.setFunction("read_tracked", &readTracked) &&
                 module.setFunction("userdata_errors", &userdataErrors, pointer) &&
+                module.setFunction("userdata_gc_idempotent", &userdataGcIdempotent) &&
                 module.setFunction("new_tiny", &newTiny) &&
                 module.setFunction("counters", &counters, pointer) &&
                 module.setFunction("make_closure", &makeClosure, pointer) &&
@@ -572,6 +591,14 @@ closure = nil
 collectgarbage("collect")
 created, destroyed = binding.counters()
 assert(created == 2 and destroyed == 2, "closure registry reference leaked")
+local finalized = binding.new_tracked(false)
+assert(binding.userdata_gc_idempotent(finalized))
+local dead, dead_error = binding.read_tracked(finalized)
+assert(dead == nil and dead_error.code == "INVALID_ARGUMENT")
+finalized = nil
+collectgarbage("collect")
+created, destroyed = binding.counters()
+assert(created == 3 and destroyed == 3, "manual and automatic GC destroyed userdata more than once")
 )lua";
 
 void measure(lua_State *state)
@@ -641,7 +668,7 @@ int main()
         run(first.get(), kUserdataTests);
         // 第二个 State 拥有独立 metatable/registry/闭包，只读 T 标记允许共享。
         run(second.get(), "assert(binding.uint(0)==0); object=binding.new_tracked(false)");
-        require(first_env.constructed == 2 && second_env.constructed == 1, "State counters shared");
+        require(first_env.constructed == 3 && second_env.constructed == 1, "State counters shared");
         run(first.get(), "collectgarbage('collect')");
         require(second_env.destroyed == 0, "other State GC touched object");
         second.reset(); // lua_close 也必须执行仍存活对象的统一 __gc。

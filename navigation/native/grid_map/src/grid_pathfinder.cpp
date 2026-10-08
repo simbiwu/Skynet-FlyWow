@@ -420,6 +420,7 @@ struct GoalPolicy
     bool          exact = true;        // true=exact_grid；false=target_world 的范围条件。
     GridPos       exact_grid{};        // 精确目标 Grid Cell；仅 exact=true 时读取。
     WorldPosition target_world{};      // 目标世界毫米坐标；仅 exact=false 时读取。
+    std::uint32_t min_range_mm    = 0; // 单位目标：双方半径之和，候选不能位于其内部。
     std::uint32_t attack_range_mm = 0; // 目标中心到候选 Cell Center 的 XZ 半径。
 };
 
@@ -443,6 +444,37 @@ bool WorldWithinAttackRange(const WorldPosition &world, const WorldPosition &tar
     return az * az <= range2 - ax2;
 }
 
+// 精确保存最多 65-bit 的平方距离，避免极端 int32 坐标相加溢出。
+struct DistanceScore
+{
+    bool          carry = false;
+    std::uint64_t low   = 0;
+    bool          operator<(const DistanceScore &other) const
+    {
+        return carry != other.carry ? !carry : low < other.low;
+    }
+    bool operator==(const DistanceScore &other) const
+    {
+        return carry == other.carry && low == other.low;
+    }
+};
+
+DistanceScore distanceScore(const WorldPosition &a, const WorldPosition &b)
+{
+    const auto dx = static_cast<std::uint64_t>(std::llabs(static_cast<long long>(a.x_mm) - b.x_mm));
+    const auto dz = static_cast<std::uint64_t>(std::llabs(static_cast<long long>(a.z_mm) - b.z_mm));
+    const auto x2 = dx * dx;
+    const auto z2 = dz * dz;
+    return DistanceScore{x2 + z2 < x2, x2 + z2};
+}
+
+bool outsideUnit(const WorldPosition &world, const GoalPolicy &goal)
+{
+    const DistanceScore minimum{false,
+                                static_cast<std::uint64_t>(goal.min_range_mm) * goal.min_range_mm};
+    return !(distanceScore(world, goal.target_world) < minimum);
+}
+
 // 搜索 goal 使用 Cell Center；世界点检查与它共用相同距离公式。
 // map/grid：借用的合法地图与 Cell；转换失败时返回 false；不加锁、不 yield。
 bool InAttackRange(const GridMap &map, const GridPos &grid, const WorldPosition &target,
@@ -460,7 +492,9 @@ bool IsGoal(const GridMap &map, const GridPos &current, const GoalPolicy &goal)
     {
         return current.x == goal.exact_grid.x && current.z == goal.exact_grid.z;
     }
-    return InAttackRange(map, current, goal.target_world, goal.attack_range_mm);
+    const auto world = map.GridToWorldCenter(current);
+    return world.ok() && outsideUnit(world.value, goal) &&
+           InAttackRange(map, current, goal.target_world, goal.attack_range_mm);
 }
 
 // 精确目标用可采纳 Octile；区域目标先用 h=0 的 Dijkstra 保证不高估。
@@ -752,7 +786,8 @@ NavResult<bool> ValidatePathImpl(NavigationContext &context, const AgentProfile 
 static NavResult<Path> FindPathImpl(NavigationContext &context, const AgentProfile &profile,
                                     const WorldPosition &start, const WorldPosition &end,
                                     const QueryPolicy &policy, bool range_goal,
-                                    std::uint32_t attack_range_mm)
+                                    std::uint32_t attack_range_mm, bool allow_partial = false,
+                                    std::uint32_t min_range_mm = 0, bool nearest_edge = false)
 {
     // 先验证 profile 的 id、体型和 Area Cost 前提；失败立即返回，不启动查询或修改 scratch。
     const auto valid_profile = ValidateAgentProfile(profile);
@@ -778,13 +813,14 @@ static NavResult<Path> FindPathImpl(NavigationContext &context, const AgentProfi
     goal.exact_grid      = end_grid.value;
     goal.target_world    = end;
     goal.attack_range_mm = attack_range_mm;
+    goal.min_range_mm    = min_range_mm;
     // 起点和终点必须先满足单格站立条件；边坡度和切角规则留给邻居扩展阶段。
     if (!CanOccupy(map, profile, start_grid.value, start_grid.value, policy, context.occupancy()))
     {
         return NavResult<Path>::Failure(NavError::kStartNotNavigable,
                                         "start cell rejected by walkable/clearance/area");
     }
-    if (goal.exact &&
+    if (goal.exact && !allow_partial &&
         !CanOccupy(map, profile, end_grid.value, end_grid.value, policy, context.occupancy()))
     {
         return NavResult<Path>::Failure(NavError::kEndNotNavigable,
@@ -803,6 +839,12 @@ static NavResult<Path> FindPathImpl(NavigationContext &context, const AgentProfi
     start_node.state               = NavigationContext::NodeState::kOpen;
     HeapPush(context, map, start_index, goal);
 
+    std::int32_t  reached_index = -1;
+    DistanceScore reached_distance{};
+    std::uint64_t reached_cost  = 0;
+    std::int32_t  closest_index = -1;
+    DistanceScore closest_distance{};
+    std::uint64_t closest_cost = 0;
     while (context.heap_size() > 0)
     {
         // HeapPop 取出当前 f 最小的候选；节点改善时用 decrease-key 原地调整，不会留下重复旧条目。
@@ -817,14 +859,47 @@ static NavResult<Path> FindPathImpl(NavigationContext &context, const AgentProfi
         // 的最低到达成本已确定，因此 CLOSED 不必重新加入 OPEN。
         current_node.state         = NavigationContext::NodeState::kClosed;
         const GridPos current_grid = GridFromIndex(map, current_index);
+        if (allow_partial)
+        {
+            const auto world = map.GridToWorldCenter(current_grid);
+            if (world.ok() && outsideUnit(world.value, goal))
+            {
+                const auto distance = distanceScore(world.value, end);
+                if (closest_index < 0 || distance < closest_distance ||
+                    (distance == closest_distance &&
+                     (current_node.g_cost < closest_cost ||
+                      (current_node.g_cost == closest_cost && current_index < closest_index))))
+                {
+                    closest_index    = current_index;
+                    closest_distance = distance;
+                    closest_cost     = current_node.g_cost;
+                }
+            }
+        }
         // 必须在目标“出堆”时结束，不能在第一次看到它作为邻居时结束：
         // 第一次发现可能是绕了一大圈的路线，OPEN 中仍可能藏着更便宜的入口。
-        if (IsGoal(map, current_grid, goal))
+        const bool is_goal = IsGoal(map, current_grid, goal);
+        if (is_goal && nearest_edge)
+        {
+            const auto world    = map.GridToWorldCenter(current_grid);
+            const auto distance = distanceScore(world.value, end);
+            if (reached_index < 0 || distance < reached_distance ||
+                (distance == reached_distance &&
+                 (current_node.g_cost < reached_cost ||
+                  (current_node.g_cost == reached_cost && current_index < reached_index))))
+            {
+                reached_index    = current_index;
+                reached_distance = distance;
+                reached_cost     = current_node.g_cost;
+            }
+        }
+        if (is_goal && !nearest_edge)
         {
             auto path = BuildPath(context, map, profile, policy, context.occupancy(), current_index,
                                   start, goal.exact ? &end : nullptr);
             if (!path.ok() || !range_goal || current_index != start_index ||
-                path.value.count() != 1 || WorldWithinAttackRange(start, end, attack_range_mm))
+                path.value.count() != 1 ||
+                (WorldWithinAttackRange(start, end, attack_range_mm) && outsideUnit(start, goal)))
             {
                 return path;
             }
@@ -896,6 +971,44 @@ static NavResult<Path> FindPathImpl(NavigationContext &context, const AgentProfi
         }
     }
 
+    if (reached_index >= 0)
+    {
+        auto path = BuildPath(context, map, profile, policy, context.occupancy(), reached_index,
+                              start, nullptr);
+        if (!path.ok() || reached_index != start_index ||
+            (WorldWithinAttackRange(start, end, attack_range_mm) && outsideUnit(start, goal)))
+        {
+            return path;
+        }
+        const auto                 center = map.GridToWorldCenter(start_grid.value);
+        std::vector<WorldPosition> points{path.value.WorldPoint(0), center.value};
+        const auto                 length = SegmentLengthMm(points[0], points[1]);
+        return NavResult<Path>::Success(Path(std::move(points), length));
+    }
+    if (allow_partial && closest_index >= 0)
+    {
+        auto path = BuildPath(context, map, profile, policy, context.occupancy(), closest_index,
+                              start, nullptr);
+        if (!path.ok())
+        {
+            return path;
+        }
+        // 同格实际起点可能偏离格中心；有真实接近进展时也可返回 partial。
+        if (closest_index == start_index)
+        {
+            const auto center = map.GridToWorldCenter(start_grid.value);
+            std::vector<WorldPosition> points{path.value.WorldPoint(0), center.value};
+            const auto length = SegmentLengthMm(points[0], points[1]);
+            path = NavResult<Path>::Success(Path(std::move(points), length));
+        }
+        // 起点已经更接近目标时，不交付向后退的零价值 partial。
+        const auto endpoint = path.value.WorldPoint(path.value.count() - 1);
+        if (path.value.length_mm() > 0 && distanceScore(endpoint, end) < distanceScore(start, end))
+        {
+            return NavResult<Path>::Success(
+                Path(path.value.points(), path.value.length_mm(), true));
+        }
+    }
     // OPEN 耗尽仍未弹出 goal：在本次静态/动态策略下，没有可达的合法目标。
     // 这不代表以后也不可达；其他单位让路后，下一次查询可能成功。
     return NavResult<Path>::Failure(NavError::kNoPath,
@@ -938,7 +1051,8 @@ NavResult<Path> GridPathfinder::FindPathStatic(NavigationContext   &context,
 // Battle 入口：在相同 A* 主循环上叠加当前 Context 的动态 footprint 快照。
 NavResult<Path> GridPathfinder::FindPath(NavigationContext &context, const NavigationAgent &agent,
                                          const WorldPosition &start, const WorldPosition &end,
-                                         const DynamicNavigationPolicy &dynamic_policy)
+                                         const DynamicNavigationPolicy &dynamic_policy,
+                                         bool                           allow_partial)
 {
     if (agent.profile == nullptr || !agent.handle.valid())
     {
@@ -950,17 +1064,16 @@ NavResult<Path> GridPathfinder::FindPath(NavigationContext &context, const Navig
     policy.context        = &context;
     policy.agent          = &agent;
     policy.purpose        = DynamicQueryPurpose::kFindPath;
-    return FindPathImpl(context, *agent.profile, start, end, policy, false, 0);
+    return FindPathImpl(context, *agent.profile, start, end, policy, false, 0, allow_partial);
 }
 
 // Battle 范围入口：目标中心只需在地图内，不要求该中心可站立或未被占用。
 // agent/policy 借用到同步调用返回；结果 Path 由调用者拥有；不执行 I/O、加锁或 yield。
-NavResult<Path> GridPathfinder::FindPathToRange(NavigationContext             &context,
-                                                const NavigationAgent         &agent,
-                                                const WorldPosition           &start,
-                                                const WorldPosition           &target,
+NavResult<Path>
+GridPathfinder::FindPathToRange(NavigationContext &context, const NavigationAgent &agent,
+                                const WorldPosition &start, const WorldPosition &target,
                                                 std::uint32_t                  attack_range_mm,
-                                                const DynamicNavigationPolicy &dynamic_policy)
+                                const DynamicNavigationPolicy &dynamic_policy, bool allow_partial)
 {
     if (agent.profile == nullptr || !agent.handle.valid())
     {
@@ -972,7 +1085,60 @@ NavResult<Path> GridPathfinder::FindPathToRange(NavigationContext             &c
     policy.context        = &context;
     policy.agent          = &agent;
     policy.purpose        = DynamicQueryPurpose::kFindPath;
-    return FindPathImpl(context, *agent.profile, start, target, policy, true, attack_range_mm);
+    return FindPathImpl(context, *agent.profile, start, target, policy, true, attack_range_mm,
+                        allow_partial);
+}
+
+NavResult<Path> GridPathfinder::findPathToUnitRange(
+    NavigationContext &context, const NavigationAgent &mover, const WorldPosition &start,
+    const AgentProfile &target_profile, const WorldPosition &target, std::uint32_t edge_range_mm,
+    const DynamicNavigationPolicy &dynamic_policy, bool allow_partial)
+{
+    const auto valid = ValidateAgentProfile(target_profile);
+    if (!valid.ok())
+    {
+        return NavResult<Path>::Failure(valid.error, valid.detail);
+    }
+    if (mover.profile == nullptr || !mover.handle.valid())
+    {
+        return NavResult<Path>::Failure(NavError::kInvalidArgument,
+                                        "invalid mover or target profile");
+    }
+    const auto valid_mover = ValidateAgentProfile(*mover.profile);
+    if (!valid_mover.ok())
+    {
+        return NavResult<Path>::Failure(valid_mover.error, valid_mover.detail);
+    }
+    const auto minimum =
+        static_cast<std::uint64_t>(mover.profile->radius_mm) + target_profile.radius_mm;
+    const auto    cell      = context.map()->metadata().cell_size_mm;
+    // ceil(sqrt(2) * cell)，通过整数平方复验避免浮点舍入影响边界。
+    std::uint64_t tolerance = static_cast<std::uint64_t>(std::sqrt(2.0L) * cell);
+    if (tolerance > std::numeric_limits<std::uint32_t>::max())
+    {
+        return NavResult<Path>::Failure(NavError::kInvalidArgument,
+                                        "grid tolerance exceeds uint32 millimeters");
+    }
+    const std::uint64_t cell2 = static_cast<std::uint64_t>(cell) * cell;
+    const DistanceScore diagonal2{cell2 + cell2 < cell2, cell2 + cell2};
+    while (DistanceScore{false, tolerance * tolerance} < diagonal2)
+    {
+        ++tolerance;
+    }
+    const auto maximum = minimum + (edge_range_mm == 0 ? tolerance : edge_range_mm);
+    if (maximum > std::numeric_limits<std::uint32_t>::max())
+    {
+        return NavResult<Path>::Failure(NavError::kInvalidArgument,
+                                        "unit range exceeds uint32 millimeters");
+    }
+    QueryPolicy policy;
+    policy.dynamic_policy = &dynamic_policy;
+    policy.context        = &context;
+    policy.agent          = &mover;
+    policy.purpose        = DynamicQueryPurpose::kFindPath;
+    return FindPathImpl(context, *mover.profile, start, target, policy, true,
+                        static_cast<std::uint32_t>(maximum), allow_partial,
+                        static_cast<std::uint32_t>(minimum), edge_range_mm == 0);
 }
 
 // 重新验证并提交一次相邻 Cell 移动；这是缓存 Path 消费时的权威边界。

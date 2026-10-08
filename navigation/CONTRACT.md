@@ -43,3 +43,28 @@ Context 构造按 Cell 数分配 dense scratch，地图变大和同时 Battle �
 Context/Path 使用统一类型核验与 GC。close 幂等释放 Context 大块内存，profiles/vector 外壳由最终 GC 析构；已关闭的 Context 返回 CONTEXT_CLOSED。重复 GC 不重复析构，不匹配或已经析构的 userdata 返回 INVALID_ARGUMENT。
 
 封装内部注释按栈底到栈顶用 `[S, table, value]` 说明 Lua C API；S 是进入操作前已有内容。栈、registry 引用、closure/upvalue 和 GC 的详细合同见 [Lua Binding 使用说明](../lua-binding/使用说明.md)及对应实现，不在导航业务函数中重复 Lua 栈教程。
+
+
+## 单位边缘范围与部分路径
+
+`find_path_to_range(profile_id, start, target, range_mm, mover_unit_id[, allow_partial])`
+保持中心距离语义。`find_path` 也在最后增加同样的可选参数。省略、nil、false
+均关闭部分路径；错误类型返回 `INVALID_ARGUMENT`。
+
+新增 `find_path_to_unit_range(mover_profile_id, start_world, target_profile_id,
+target_world, edge_range_mm, mover_unit_id[, allow_partial])`。双方半径来自 Context
+构造时复制的 Profile，目标位置和 Profile 必须由调用者保持一致，不反查 Occupancy。
+`mover_unit_id` 用于忽略移动者自身占位。允许重叠也不把目标圆形体型内部作为终点。
+正范围的终点满足 `r_mover+r_target <= 中心距离 <= r_mover+r_target+edge_range_mm`。
+这只约束终点，沿途仍使用原有格子重叠策略。
+
+零范围采用 `ceil(sqrt(2)*cell_size_mm)` 接近容差，在容差内选择中心距离最小的
+可达合法格，再按路径成本、格子索引打破平局。需要遍历当前可达区域，最坏与 NO_PATH
+搜索相同。该规则是格子接近，不是几何接触；静态净空与动态占位仍可能返回 NO_PATH。
+
+成功结果可调用 `path:status()`：`reached` 表示终点满足查询目标；`partial` 表示
+搜索耗尽后返回最接近目标中心的可达合法格（单位查询排除体型内部）。距离相同按
+最低已走成本、稳定格子索引选择。默认关闭；非法参数、越界、非法起点不会转为成功。
+没有更接近目标的实际移动仍返回 NO_PATH。精确终点不可站立时默认返回
+END_NOT_NAVIGABLE；开启 partial 后继续搜索。查询状态与 advance_path 的执行状态独立。
+旧 Lua 调用保持兼容；新增 C++ 可选参数需要重新编译使用者。

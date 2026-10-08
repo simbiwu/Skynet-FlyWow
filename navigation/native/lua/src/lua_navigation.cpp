@@ -389,7 +389,8 @@ int findPath(lua_State *state)
     LuaBinding lua_binding(state);
     PathQuery     query;
     std::uint32_t self_id = 0;
-    if (!readPathQuery(lua_binding, query) ||
+    bool          allow_partial = false;
+    if (!lua_binding.readOptionalValue(6, allow_partial) || !readPathQuery(lua_binding, query) ||
         !readPositiveId(lua_binding, 5, "self_unit_id", self_id))
     {
         return lua_binding.pushError();
@@ -397,8 +398,8 @@ int findPath(lua_State *state)
 
     const NavigationAgent         agent{NavigationAgentHandle{self_id}, query.profile};
     const DynamicNavigationPolicy policy{};
-    auto result = flywow_navigation::GridPathfinder::FindPath(*query.owner->context, agent,
-                                                              query.start, query.target, policy);
+    auto                          result = flywow_navigation::GridPathfinder::FindPath(
+        *query.owner->context, agent, query.start, query.target, policy, allow_partial);
     if (!result.ok())
     {
         return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
@@ -418,7 +419,9 @@ int findPathToRange(lua_State *state)
     PathQuery     query;
     std::uint32_t range_mm = 0; // uint32 毫米距离，0 合法，不作为实体 ID 检查。
     std::uint32_t self_id  = 0;
-    if (!readPathQuery(lua_binding, query) || !lua_binding.readValue(5, range_mm) ||
+    bool          allow_partial = false;
+    if (!lua_binding.readOptionalValue(7, allow_partial) || !readPathQuery(lua_binding, query) ||
+        !lua_binding.readValue(5, range_mm) ||
         !readPositiveId(lua_binding, 6, "self_unit_id", self_id))
     {
         return lua_binding.pushError();
@@ -427,7 +430,7 @@ int findPathToRange(lua_State *state)
     const NavigationAgent         agent{NavigationAgentHandle{self_id}, query.profile};
     const DynamicNavigationPolicy policy{};
     auto                          result = flywow_navigation::GridPathfinder::FindPathToRange(
-        *query.owner->context, agent, query.start, query.target, range_mm, policy);
+        *query.owner->context, agent, query.start, query.target, range_mm, policy, allow_partial);
     if (!result.ok())
     {
         return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
@@ -438,6 +441,43 @@ int findPathToRange(lua_State *state)
         return lua_binding.pushError();
     }
     return lua_binding.returnValues(path);
+}
+
+/// find_path_to_unit_range：目标 Profile 显式提供，不反查占位身份。
+int findPathToUnitRange(lua_State *state)
+{
+    LuaBinding            binding(state);
+    LuaNavigationContext *owner    = nullptr;
+    std::uint32_t         mover_id = 0, target_id = 0, unit_id = 0, range = 0;
+    WorldPosition         start{}, target{};
+    bool                  allow_partial = false;
+    if (!readContext(binding, owner) || !readPositiveId(binding, 2, "mover_profile_id", mover_id) ||
+        !readWorldPosition(binding, 3, start) ||
+        !readPositiveId(binding, 4, "target_profile_id", target_id) ||
+        !readWorldPosition(binding, 5, target) || !binding.readValue(6, range) ||
+        !readPositiveId(binding, 7, "mover_unit_id", unit_id) ||
+        !binding.readOptionalValue(8, allow_partial))
+    {
+        return binding.pushError();
+    }
+    const auto *mover_profile  = findProfile(binding, *owner, mover_id);
+    const auto *target_profile = findProfile(binding, *owner, target_id);
+    if (mover_profile == nullptr || target_profile == nullptr)
+    {
+        return binding.pushError();
+    }
+    const NavigationAgent mover{NavigationAgentHandle{unit_id}, mover_profile};
+    auto                  result = flywow_navigation::GridPathfinder::findPathToUnitRange(
+        *owner->context, mover, start, *target_profile, target, range, DynamicNavigationPolicy{},
+        allow_partial);
+    if (!result.ok())
+    {
+        return binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
+    }
+    LuaPath *path = nullptr;
+    return binding.newUserdata(kPathMeta, path, std::move(result.value))
+               ? binding.returnValues(path)
+               : binding.pushError();
 }
 
 // 出生与移动共同验证的实体输入；句柄必须已有稳定身份，不能用 0 代替。
@@ -754,6 +794,18 @@ int pathLengthMm(lua_State *state)
     return lua_binding.returnValues(path->path.length_mm());
 }
 
+/// status：查询终点 reached/partial，不代表单位已走完路径。
+int pathStatus(lua_State *state)
+{
+    LuaBinding binding(state);
+    LuaPath   *path = nullptr;
+    if (!binding.readUserdata(1, kPathMeta, path))
+    {
+        return binding.pushError();
+    }
+    return binding.returnValues(path->path.status());
+}
+
 // 在当前 State 注册一次类型与方法；方法表和 metatable 都是普通 LuaTable。
 bool registerPath(LuaBinding &lua_binding)
 {
@@ -763,7 +815,7 @@ bool registerPath(LuaBinding &lua_binding)
         return false;
     }
     auto methods = lua_binding.newTable();
-    return methods.setFunction("count", &pathCount) &&
+    return methods.setFunction("count", &pathCount) && methods.setFunction("status", &pathStatus) &&
            methods.setFunction("world_point", &pathWorldPoint) &&
            methods.setFunction("length_mm", &pathLengthMm) && meta.writeValue("__index", methods);
 }
@@ -779,6 +831,7 @@ bool registerContext(LuaBinding &lua_binding)
     return methods.setFunction("find_path", &findPath) &&
            methods.setFunction("set_cell_rule", &setCellRule) &&
            methods.setFunction("find_path_to_range", &findPathToRange) &&
+           methods.setFunction("find_path_to_unit_range", &findPathToUnitRange) &&
            methods.setFunction("place_unit", &placeUnit) &&
            methods.setFunction("move_unit", &moveUnit) &&
            methods.setFunction("release_unit", &releaseUnit) &&

@@ -44,3 +44,7 @@ python3 third_party/skynet-flywow/scripts/ci/check_repository.py
 Unity 工程在 manifest 的 `testables` 中加入 `com.flywow.navigation`，在 Test Runner 执行 `FlyWow.Navigation.EditorTests`。测试应在隔离工程运行，避免加载其它 Scene 的 NavMesh。
 
 `navigation_benchmark` 是单独产物，不是 CTest 门禁。吞吐、总地图数、总 Context 内存和商业负载容量需要宿主按地图规模另外验证；不能从这些功能测试推断上线容量。
+
+单位间接近使用 `context:find_path_to_unit_range`，坐标范围查询保留中心语义。
+可选 `allow_partial` 默认关闭，通过 `path:status()` 区分 `reached` 与 `partial`。
+几何边界、零范围接近容差及失败合同见 [CONTRACT.md](CONTRACT.md)。

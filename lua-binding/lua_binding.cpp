@@ -305,6 +305,14 @@ void *LuaBinding::checkUserdata(int index, const std::string &name)
         setError("INVALID_ARGUMENT", "value must be userdata with the registered metatable");
         return nullptr;
     }
+    const int state_type = lua_getiuservalue(state_, index, 1);
+    const bool alive = state_type == LUA_TBOOLEAN && lua_toboolean(state_, -1) != 0;
+    lua_pop(state_, 1);
+    if (!alive)
+    {
+        setError("INVALID_ARGUMENT", "userdata has already been finalized");
+        return nullptr;
+    }
     if (!holdUserdata(index, object))
     {
         return nullptr;

@@ -370,12 +370,11 @@ void TestBattleLocalDynamicEntryRules()
 
     assert(first.SetCellDynamicEntryRule(GridPos{1, 0}, CellDynamicEntryRule::kAllow).ok());
     assert(first.AllowsDynamicEntry(GridPos{1, 0}));
-    assert(first.SetCellDynamicEntryRule(GridPos{1, 0},
-                                         CellDynamicEntryRule::kDefault).ok());
+    assert(first.SetCellDynamicEntryRule(GridPos{1, 0}, CellDynamicEntryRule::kDefault).ok());
     assert(first.AllowsDynamicEntry(GridPos{1, 0}));
     assert(!first.SetCellDynamicEntryRule(GridPos{3, 0}, CellDynamicEntryRule::kAllow).ok());
-    assert(!first.SetCellDynamicEntryRule(GridPos{1, 0},
-                                          static_cast<CellDynamicEntryRule>(3)).ok());
+    assert(
+        !first.SetCellDynamicEntryRule(GridPos{1, 0}, static_cast<CellDynamicEntryRule>(3)).ok());
 }
 
 // 锁定统一 Move、多个实体事实和冲突时保留旧位置。
@@ -591,6 +590,67 @@ void TestIndependentContextsConcurrent()
 } // namespace
 
 // 运行全部第二课 Native correctness/stress case；任一 assert 失败返回非零。
+// 单位边缘、零射程离散容差和不可达时的部分路径共用同一个搜索器。
+void testUnitRangeAndPartial()
+{
+    auto              map = MakeMap(9, 5);
+    NavigationContext ctx(map);
+    auto              mover_profile  = Small();
+    auto              target_profile = Small();
+    mover_profile.radius_mm          = 100;
+    target_profile.radius_mm         = 800;
+    const NavigationAgent mover{NavigationAgentHandle{101}, &mover_profile};
+    const auto            start  = P(250, 1250);
+    const auto            target = P(3250, 1250);
+    assert(ctx.occupancy().Move(mover.handle, mover_profile, GridPos{0, 2}).ok());
+    assert(ctx.occupancy().Move(NavigationAgentHandle{102}, target_profile, GridPos{6, 2}).ok());
+    for (auto policy : {DynamicNavigationPolicy{}, ExclusivePolicy()})
+    {
+        auto edge = GridPathfinder::findPathToUnitRange(ctx, mover, start, target_profile, target,
+                                                        600, policy);
+        assert(edge.ok());
+        const auto end = edge.value.WorldPoint(edge.value.count() - 1);
+        const auto dx  = static_cast<std::int64_t>(end.x_mm) - target.x_mm;
+        const auto dz  = static_cast<std::int64_t>(end.z_mm) - target.z_mm;
+        assert(dx * dx + dz * dz >= 900LL * 900LL);
+        assert(dx * dx + dz * dz <= 1500LL * 1500LL);
+        assert(GridPathfinder::ValidatePath(ctx, mover, edge.value, policy).ok());
+        auto zero = GridPathfinder::findPathToUnitRange(ctx, mover, start, target_profile, target,
+                                                        0, policy);
+        assert(zero.ok());
+        assert(std::string(zero.value.status()) == "reached");
+    }
+    // 一堵不能绕过的动态墙；默认不给失败目标返回伪成功。
+    NavigationContext     wall(map);
+    auto                  small = Small();
+    const NavigationAgent walker{NavigationAgentHandle{201}, &small};
+    for (int z = 0; z < 5; ++z)
+    {
+        assert(wall.occupancy()
+                   .Move(NavigationAgentHandle{static_cast<std::uint32_t>(300 + z)}, small,
+                         GridPos{3, z})
+                   .ok());
+    }
+    auto full = GridPathfinder::FindPathToRange(wall, walker, start, target, 0, ExclusivePolicy());
+    assert(!full.ok() && full.error == NavError::kNoPath);
+    auto partial =
+        GridPathfinder::FindPathToRange(wall, walker, start, target, 0, ExclusivePolicy(), true);
+    assert(partial.ok() && std::string(partial.value.status()) == "partial");
+    const auto end = partial.value.WorldPoint(partial.value.count() - 1);
+    assert(end.x_mm == 1250 && end.z_mm == 1250);
+    assert(GridPathfinder::ValidatePath(wall, walker, partial.value, ExclusivePolicy()).ok());
+    auto stalled =
+        GridPathfinder::FindPathToRange(wall, walker, end, target, 0, ExclusivePolicy(), true);
+    assert(!stalled.ok() && stalled.error == NavError::kNoPath);
+    const auto blocked_target = P(1750, 1250);
+    assert(!GridPathfinder::FindPath(wall, walker, start, blocked_target, ExclusivePolicy()).ok());
+    assert(GridPathfinder::FindPath(wall, walker, start, blocked_target, ExclusivePolicy(), true)
+               .ok());
+    assert(!GridPathfinder::FindPathToRange(wall, walker, P(-1, 250), target, 0, ExclusivePolicy(),
+                                            true)
+                .ok());
+}
+
 int main()
 {
     // 先验证基本坐标/通行，再验证平滑与动态状态，最后验证重复查询和并发隔离。
@@ -608,6 +668,17 @@ int main()
     TestMoveRevalidatesDynamicCorner();
     TestFindPathToOccupiedTargetRange();
     TestRangeGoalUsesActualStartPosition();
+    testUnitRangeAndPartial();
+    // 新范围/partial 查询没有共享 scratch；相同请求在独立 Context 可并行执行。
+    std::vector<std::thread> range_threads;
+    for (int i = 0; i < 4; ++i)
+    {
+        range_threads.emplace_back(testUnitRangeAndPartial);
+    }
+    for (auto &thread : range_threads)
+    {
+        thread.join();
+    }
     TestNegativeWorldCoordinates();
     TestDeterministicRepeatedQuery();
     TestIndependentContextsConcurrent();

@@ -186,6 +186,14 @@ class LuaBinding
         return readAt(index, output);
     }
 
+    /// 读取可省略的位置参数；缺省或 nil 保留调用者设置的默认值。
+    /// @param index 参数栈下标；@param output 默认值与成功读取的输出。
+    /// @return 已省略或类型检查成功为 true；类型错误记录最近错误。
+    template <typename T> bool readOptionalValue(int index, T &output)
+    {
+        return lua_isnoneornil(state_, index) || readValue(index, output);
+    }
+
     /// 读取 table 引用，不占据长期栈槽；失败保留 output 原句柄。
     /// @param index Lua 栈中待读 table 的参数索引。
     /// @param output 输出对象；成功时写入借用 table 句柄，失败时保留原句柄。
@@ -265,8 +273,7 @@ class LuaBinding
     /// @note T 必须 noexcept 析构，且对齐不超过 Lua userdata 的保证。
     /// @param name 由模块约定与 T 对应的 metatable 名称。
     /// @param output 输出对象；成功时写入 metatable 句柄。
-    template <typename T>
-    bool registerUserdata(const std::string &name, LuaTable &output)
+    template <typename T> bool registerUserdata(const std::string &name, LuaTable &output)
     {
         static_assert(std::is_nothrow_destructible<T>::value,
                       "userdata destructor must be noexcept");
@@ -291,7 +298,7 @@ class LuaBinding
         }
 
         // userdata 内存直接作为 T 的存储；先构造，成功后才挂 __gc，失败时不会析构未构造对象。
-        void *storage = lua_newuserdatauv(state_, sizeof(T), 0);
+        void *storage = lua_newuserdatauv(state_, sizeof(T), 1);
         T *object = nullptr;
         try
         {
@@ -302,6 +309,9 @@ class LuaBinding
             setError("INTERNAL_ERROR", "userdata construction failed");
             return false;
         }
+        // 用 userdata 自己的 uservalue 记录对象仍存活；__gc 重复运行时据此跳过析构。
+        lua_pushboolean(state_, 1);
+        lua_setiuservalue(state_, -2, 1);
         // [S, metatable, userdata] -> [S, metatable, userdata, metatable] -> [S, metatable, userdata]。
         // userdata 绑定类型专属 metatable 后，Lua GC 才会用对应的 T 析构函数回收它。
         lua_pushvalue(state_, -2);
@@ -341,9 +351,18 @@ class LuaBinding
         int         reference; // 本回调持有；析构时 unref，Lua 返回值可继续持有对象。
     };
 
-    // 只由 Lua 对此类型的 userdata 自动调用；用户不应手动调用 __gc。
+    // Lua 自动 GC 或手动 finalize 均只析构一次；状态保存在 userdata 自己的 uservalue。
     template <typename T> static int collectUserdata(lua_State *state) noexcept
     {
+        const int state_type = lua_getiuservalue(state, 1, 1);
+        if (state_type != LUA_TBOOLEAN || lua_toboolean(state, -1) == 0)
+        {
+            lua_pop(state, 1);
+            return 0;
+        }
+        lua_pop(state, 1);
+        lua_pushboolean(state, 0);
+        lua_setiuservalue(state, 1, 1);
         static_cast<T *>(lua_touserdata(state, 1))->~T();
         return 0;
     }

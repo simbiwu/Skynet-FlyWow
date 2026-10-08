@@ -32,10 +32,12 @@ class GridPathfinder final
     // context：本 Battle 的 scratch 和动态事实 owner；agent：借用的当前实体视图。
     // start/end：整数毫米 WorldPosition；policy/user_data 由调用方拥有，查询期间必须有效。
     // 返回值：成功返回 Path；参数、静态规则或动态回调拒绝时返回明确 NavError。
+    // allow_partial 默认 false；开启后失败目标可返回最近可达且有进展的 partial Path。
     // 动态状态只代表查询时刻的快照；真正跨格前仍必须调用 MoveUnit 再次验证。
     static NavResult<Path> FindPath(NavigationContext &context, const NavigationAgent &agent,
                                     const WorldPosition &start, const WorldPosition &end,
-                                    const DynamicNavigationPolicy &policy);
+                                    const DynamicNavigationPolicy &policy,
+                                    bool                           allow_partial = false);
 
     // 诊断一条 Path 的每个 Grid Segment 是否仍符合静态地图规则。
     // context：借用地图和本次查询环境；profile：只读 Agent 规则；path：只读世界毫米点。
@@ -55,11 +57,23 @@ class GridPathfinder final
     // start/target：整数毫米 WorldPosition；attack_range_mm：包含边界的 XZ 半径。
     // policy：与 FindPath/MoveUnit 一致的同步业务规则；调用期间指针与 user_data 必须有效。
     // 返回 Path 的终点为命中的 Cell Center，而不是 target；越界、无效 Agent 或不可达返回 NavError。
+    // allow_partial 默认 false；Path::status() 区分 reached/partial，非法起点不回退。
     // 区域目标使用同一 Heap/Relax 主循环的 h=0 Dijkstra；不执行 I/O、加锁或 yield。
     static NavResult<Path> FindPathToRange(NavigationContext &context, const NavigationAgent &agent,
                                            const WorldPosition &start, const WorldPosition &target,
                                            std::uint32_t                  attack_range_mm,
-                                           const DynamicNavigationPolicy &policy);
+                                           const DynamicNavigationPolicy &policy,
+                                           bool                           allow_partial = false);
+    /// 查询单位边缘范围；双方 Profile 半径参与 XZ 距离，目标内部不是终点。
+    /// 零范围使用一个 Grid 对角线的接近容差；正范围不扩大。
+    /// allow_partial 默认关闭；开启后耗尽搜索可返回最近可达的非零进展路径。
+    /// 结果归调用者独占，通过 Path::status() 区分 reached/partial；不 yield。
+    static NavResult<Path>
+    findPathToUnitRange(NavigationContext &context, const NavigationAgent &mover,
+                        const WorldPosition &start, const AgentProfile &target_profile,
+                        const WorldPosition &target, std::uint32_t edge_range_mm,
+                        const DynamicNavigationPolicy &policy, bool allow_partial = false);
+
     // 重新验证一个单位从 from 到 to 的单步移动，并在成功后原子提交动态 footprint。
     // context：当前 Battle 状态 owner；agent：当前实体句柄和静态 profile 的借用视图。
     // from/to：整数毫米 WorldPosition，必须落在同一 Cell 或相邻 Cell。
