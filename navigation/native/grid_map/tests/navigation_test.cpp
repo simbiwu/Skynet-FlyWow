@@ -218,6 +218,71 @@ void TestSameCellExactEndpoints()
     assert(result.value.WorldPoint(1).z_mm == 400);
 }
 
+// 障碍迫使 A* 采用一条可被格心直线等成本替代的路线；实际端点偏移时直线会切入阻挡格。
+std::shared_ptr<const GridMap> MakeOffCenterEndpointMap()
+{
+    std::vector<NavCell> cells(5 * 2);
+    for (auto &cell : cells)
+    {
+        cell.flags           = kWalkableFlag;
+        cell.clearance_cells = 10;
+    }
+    cells[Idx(5, 1, 1)].flags = 0;
+    cells[Idx(5, 3, 0)].flags = 0;
+    cells[Idx(5, 4, 0)].flags = 0;
+    return MakeMapFromCells(5, 2, std::move(cells));
+}
+
+// 起点靠近格边时，实际直线会偏离已验证的格心路线；锚点后仍可走完静态路径。
+void TestOffCenterStartAdvancesOnStaticPath()
+{
+    const auto                    map = MakeOffCenterEndpointMap();
+    NavigationContext             context(map);
+    const AgentProfile            profile = Small();
+    const DynamicNavigationPolicy policy{};
+    const WorldPosition           start = P(250, 499);
+    const WorldPosition           goal  = P(2250, 750);
+    const auto path = GridPathfinder::FindPathStatic(context, profile, start, goal);
+    assert(path.ok() && path.value.count() == 3);
+    assert(path.value.WorldPoint(0).z_mm == start.z_mm);
+    assert(path.value.WorldPoint(1).x_mm == 250 && path.value.WorldPoint(1).z_mm == 250);
+    assert(GridPathfinder::ValidatePathStatic(context, profile, path.value).ok());
+
+    const NavigationAgent agent{NavigationAgentHandle{501}, &profile};
+    assert(GridPathfinder::MoveUnit(context, agent, start, start, policy).ok());
+    PathFollowCursor cursor;
+    const auto       advanced =
+        GridPathfinder::AdvancePath(context, agent, path.value, cursor, start, 5000, policy);
+    assert(advanced.ok() && advanced.value.status == PathAdvanceStatus::kReached);
+    assert(advanced.value.position.x_mm == goal.x_mm && advanced.value.position.z_mm == goal.z_mm);
+}
+
+// 终点靠近格边时，实际直线会切入已阻挡格；终点格心锚定后仍可走完静态路径。
+void TestOffCenterGoalAdvancesOnStaticPath()
+{
+    const auto                    map = MakeOffCenterEndpointMap();
+    NavigationContext             context(map);
+    const AgentProfile            profile = Small();
+    const DynamicNavigationPolicy policy{};
+    const WorldPosition           start = P(250, 250);
+    const WorldPosition           goal  = P(2250, 501);
+    const auto path = GridPathfinder::FindPathStatic(context, profile, start, goal);
+    assert(path.ok() && path.value.count() == 3);
+    const auto &goal_anchor = path.value.WorldPoint(path.value.count() - 2);
+    assert(goal_anchor.x_mm == 2250 && goal_anchor.z_mm == 750);
+    assert(path.value.WorldPoint(path.value.count() - 1).x_mm == goal.x_mm);
+    assert(path.value.WorldPoint(path.value.count() - 1).z_mm == goal.z_mm);
+    assert(GridPathfinder::ValidatePathStatic(context, profile, path.value).ok());
+
+    const NavigationAgent agent{NavigationAgentHandle{502}, &profile};
+    assert(GridPathfinder::MoveUnit(context, agent, start, start, policy).ok());
+    PathFollowCursor cursor;
+    const auto       advanced =
+        GridPathfinder::AdvancePath(context, agent, path.value, cursor, start, 5000, policy);
+    assert(advanced.ok() && advanced.value.status == PathAdvanceStatus::kReached);
+    assert(advanced.value.position.x_mm == goal.x_mm && advanced.value.position.z_mm == goal.z_mm);
+}
+
 // 锁定无路可达与 8-way 禁止切角规则。
 void TestNoPathAndCornerCutting()
 {
@@ -658,6 +723,8 @@ int main()
     TestBoundsAndBlockedEndpoints();
     TestStraightAndAroundWall();
     TestSameCellExactEndpoints();
+    TestOffCenterStartAdvancesOnStaticPath();
+    TestOffCenterGoalAdvancesOnStaticPath();
     TestNoPathAndCornerCutting();
     TestClearanceAndSlope();
     TestAreaCostChangesRoute();

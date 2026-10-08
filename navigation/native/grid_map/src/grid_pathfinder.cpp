@@ -681,7 +681,7 @@ NavResult<Path> BuildPath(NavigationContext &context, const GridMap &map,
 
     // 这里只分配最终 Path 的点；A* 搜索阶段没有为每个 Node 分配对象。
     std::vector<WorldPosition> points;
-    points.reserve(smoothed.size());
+    points.reserve(smoothed.size() + 2);
     for (const GridPos &grid : smoothed)
     {
         // node_index 只在 Native 内部使用；输出前转换成地图定义的世界毫米坐标。
@@ -693,6 +693,8 @@ NavResult<Path> BuildPath(NavigationContext &context, const GridMap &map,
         points.push_back(world.value);
     }
 
+    const WorldPosition start_cell_center = points.front();
+    const WorldPosition end_cell_center   = points.back();
     if (!points.empty())
     {
         // 起点 Cell 的 Y 仍来自 GridMap，只有 X/Z 恢复为业务输入位置。
@@ -717,6 +719,31 @@ NavResult<Path> BuildPath(NavigationContext &context, const GridMap &map,
             points.back().x_mm = exact_end_world->x_mm;
             points.back().z_mm = exact_end_world->z_mm;
         }
+    }
+
+    // SmoothGridPath 验证的是格心之间的线段；端点恢复为精确坐标后，首尾线段可能改变经过的 Cell。
+    // 在端点与格心不重合时保留格心锚点，使新增线段留在已验证的端点 Cell 内。
+    const bool endpoints_share_cell = start_cell_center.x_mm == end_cell_center.x_mm &&
+                                      start_cell_center.z_mm == end_cell_center.z_mm;
+    const bool start_needs_center_anchor =
+        !endpoints_share_cell && (points.front().x_mm != start_cell_center.x_mm ||
+                                  points.front().z_mm != start_cell_center.z_mm);
+    if (start_needs_center_anchor)
+    {
+        points.insert(points.begin() + 1, start_cell_center);
+    }
+
+    const bool end_needs_center_anchor =
+        !endpoints_share_cell && exact_end_world != nullptr &&
+        (points.back().x_mm != end_cell_center.x_mm || points.back().z_mm != end_cell_center.z_mm);
+    const std::size_t last_index                 = points.size() - 1;
+    const bool        end_center_already_present = last_index > 0 &&
+                                            points[last_index - 1].x_mm == end_cell_center.x_mm &&
+                                            points[last_index - 1].y_mm == end_cell_center.y_mm &&
+                                            points[last_index - 1].z_mm == end_cell_center.z_mm;
+    if (end_needs_center_anchor && !end_center_already_present)
+    {
+        points.insert(points.end() - 1, end_cell_center);
     }
 
     // 端点已经修正，必须重新计算长度；不能使用修改前的 Cell Center 长度。
