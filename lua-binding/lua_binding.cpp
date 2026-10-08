@@ -262,7 +262,11 @@ bool LuaBinding::registerUserdataType(const std::string &name, lua_CFunction col
     }
 
     detail::StackRestore stack(state_);
-    luaL_newmetatable(state_, name.c_str());
+    if (luaL_newmetatable(state_, name.c_str()) == 0)
+    {
+        setError("INVALID_ARGUMENT", "userdata metatable name is already registered");
+        return false;
+    }
     lua_pushcfunction(state_, collector);
     lua_setfield(state_, -2, "__gc");
     return readTableAt(-1, output);

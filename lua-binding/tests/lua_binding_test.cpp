@@ -64,8 +64,9 @@ struct Tiny
 };
 int Tiny::destroyed = 0;
 
-constexpr const char *kTracked = "flywow_binding_test.Tracked";
-constexpr const char *kTiny    = "flywow_binding_test.Tiny";
+constexpr const char *kTracked   = "flywow_binding_test.Tracked";
+constexpr const char *kTiny      = "flywow_binding_test.Tiny";
+constexpr const char *kDuplicate = "flywow_binding_test.Duplicate";
 
 TestEnvironment *environment(LuaBinding &lua_binding)
 {
@@ -302,8 +303,30 @@ int userdataErrors(lua_State *state)
 {
     LuaBinding lua_binding(state);
     LuaTable meta;
-    require(lua_binding.registerUserdata<Tracked>(kTracked, meta),
-            "same type registration failed");
+    require(lua_binding.registerUserdata<Tracked>(kDuplicate, meta),
+            "first userdata registration failed");
+    const int stack_top = lua_gettop(state);
+    luaL_getmetatable(state, kDuplicate);
+    lua_getfield(state, -1, "__gc");
+    const lua_CFunction original_collector = lua_tocfunction(state, -1);
+    lua_settop(state, stack_top);
+
+    LuaTable duplicate;
+    require(!lua_binding.registerUserdata<Tracked>(kDuplicate, duplicate),
+            "duplicate same-type registration accepted");
+    require(lua_binding.errorCode() == "INVALID_ARGUMENT" && !duplicate.valid(),
+            "same-type duplicate changed its output/error contract");
+    require(!lua_binding.registerUserdata<Tiny>(kDuplicate, duplicate),
+            "duplicate different-type registration accepted");
+    require(lua_binding.errorCode() == "INVALID_ARGUMENT" && !duplicate.valid(),
+            "different-type duplicate changed its output/error contract");
+
+    luaL_getmetatable(state, kDuplicate);
+    lua_getfield(state, -1, "__gc");
+    const bool collector_unchanged = lua_tocfunction(state, -1) == original_collector;
+    lua_settop(state, stack_top);
+    require(original_collector != nullptr && collector_unchanged,
+            "duplicate registration replaced the original collector");
     require(!meta.setFunction("__gc", &countMetamethod), "GC overwritten by registration");
     require(!meta.writeValue("__gc", nullptr), "GC removed by field write");
     Tracked *pointer = nullptr;

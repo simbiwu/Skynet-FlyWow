@@ -261,6 +261,7 @@ class LuaBinding
     const std::string &errorMessage() const;
 
     /// 注册 T 的具名 metatable，并设置直接调用 T 析构函数的 __gc。
+    /// @note name 在当前 Lua State 中只能注册一次；重复注册返回 INVALID_ARGUMENT，且不修改原 metatable。
     /// @note T 必须 noexcept 析构，且对齐不超过 Lua userdata 的保证。
     /// @param name 由模块约定与 T 对应的 metatable 名称。
     /// @param output 输出对象；成功时写入 metatable 句柄。

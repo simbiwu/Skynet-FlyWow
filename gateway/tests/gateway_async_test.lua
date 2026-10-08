@@ -31,8 +31,8 @@ local function scenario(overrides)
     -- 替身不允许数据平面出现同步 call；任何意外等待立即使测试失败。
     function skynet.call() error("Gateway must never call handler") end
     -- 固定签名记录本地异步消息；返回 session=0，符合 pinned Skynet send。
-    function skynet.send(handle, protocol, command, message)
-        e.sends[#e.sends + 1] = { handle, command, message }
+    function skynet.send(address, protocol, command, message)
+        e.sends[#e.sends + 1] = { address, command, message }
         return 0
     end
     -- 注册但不抢先执行任务；测试自行控制协程推进，无 OS 线程。
@@ -164,7 +164,7 @@ local function scenario(overrides)
     dofile(root .. "/gateway/service/gateway/flywow_gateway.lua")
     e.dispatch(1, 8, "start",
     {
-        handler_service = 7,
+        handler_service = ".test_handler",
     }
     )
     return e
@@ -188,6 +188,7 @@ e.accept(10, "peer")
 resume(e.forks[2])
 
 assert(#e.sends == 2)
+assert(e.sends[1][1] == ".test_handler", "Gateway must send to the configured service name")
 assert(e.sends[1][2] == "send_data")
 assert(e.sends[1][3].connection_id == 1)
 assert(e.sends[2][3].connection_id == 1)
@@ -210,7 +211,7 @@ e.dispatch(0, 7, "send_data", message)
 assert(#e.writes == 1, "encoding failure must not close healthy connection")
 message.data = { result = 2 }
 e.dispatch(0, 999, "send_data", message)
-assert(#e.writes == 1, "unauthorized source must be dropped")
+assert(#e.writes == 2, "Gateway does not validate the reply source identity")
 
 local push =
 {
@@ -221,9 +222,9 @@ local push =
     data = { result = 3 },
 }
 e.dispatch(0, 7, "send_data", push)
-assert(#e.writes == 2, "one active connection receives broadcast")
+assert(#e.writes == 3, "one active connection receives broadcast")
 
-e.dispatch(0, 7, "close",
+e.dispatch(0, 999, "close",
 {
     gateway_epoch = current_epoch,
     connection_id = message.connection_id,
@@ -236,7 +237,7 @@ e.streams[10] = frame(1)
 e.accept(10, "peer")
 resume(e.forks[2])
 assert(e.sends[1][2] == "send_data")
-e.dispatch(0, 7, "close", e.sends[1][3])
+e.dispatch(0, 999, "close", e.sends[1][3])
 resume(e.forks[3])
 assert(e.closed[10])
 

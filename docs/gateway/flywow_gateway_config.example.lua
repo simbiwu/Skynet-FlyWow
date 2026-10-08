@@ -2,7 +2,7 @@
 -- 边界：Host Configuration Example；由宿主复制为 server/config/gateway.lua 后按部署修改。
 -- 输入/输出：协议生成物路径、传输参数和资源上限 -> flywow_gateway Service 的默认配置 table。
 -- 生命周期：每个 Gateway Service 在 start 命令中读取一次；运行中不热重载。
--- 不负责：不创建 Service、不生成 .proto/.pb/registry、不保存 handler Service handle。
+-- 不负责：不创建 Service、不生成 .proto/.pb/registry、不保存 handler service name。
 --
 -- 配置调用链：
 --   1. 宿主 composition root 调用 skynet.newservice("flywow_gateway")。
@@ -17,12 +17,12 @@
 --   # 按宿主目录和协议修改 descriptor_path、registry_module、port 等字段。
 --   skynet.call(gateway, "lua", "start",
 --   {
---       handler_service = query_service,
+--       handler_service = ".my_gateway_handler",
 --   })
 --
 -- 运行时调用者和时机：
 --   flywow_gateway Service 是本配置的唯一运行时读取者；每个 Service/Lua State 各自读取一次。
---   handler_service 是 start 调用方提供的运行时 Service handle，不能写入静态配置。
+--   handler_service 是 start 调用方提供的运行时本地 Skynet 服务名，不能写入静态配置；宿主须预先注册该名称。
 --   start 失败时配置、协议产物或资源上限校验失败会直接返回错误，不发布 Gateway 就绪状态。
 --   当前没有配置热重载；修改文件后必须重启对应 Gateway Service。
 --

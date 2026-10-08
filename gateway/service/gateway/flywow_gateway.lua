@@ -33,12 +33,12 @@ local state =
     rate_started       = 0, -- 实例当前一秒限流窗口起点，单位10ms tick。
     rate_count         = 0, -- 实例当前窗口接纳帧数，不是业务等待数。
     responses_sent     = 0, -- 已由 transport 接纳的响应/推送数，不表示客户端收到。
-    responses_dropped  = 0, -- 旧实例/已关闭连接/未授权来源等丢弃数。
+    responses_dropped  = 0, -- 旧实例/已关闭连接/无效消息等丢弃数。
     epoch              = nil, -- 每次 Service 启动的新身份，隔离旧进程迟到响应。
     client_count       = 0, -- 当前已完成接入的连接数。
 }
 
---- 将启动时覆盖项浅合并到默认配置；handler_service 等运行期 handle 不写入静态配置。
+--- 将启动时覆盖项浅合并到默认配置；handler_service 是运行期提供的本地服务名。
 --- 参数 defaults/overrides：默认配置和可选覆盖 table；调用方拥有输入，函数不修改它们。
 --- 返回值：Gateway 私有候选配置；不执行 I/O、不 yield；同名顶层字段由 overrides 覆盖。
 local function merge_config(defaults, overrides)
@@ -125,13 +125,10 @@ local function normalize_config(input)
         0xffffffff
     )
 
-    -- 参数/状态检查：Service handle 和构建产物路径必须来自显式配置。
-    local handler_service = require_integer(
-        merged.handler_service,
-        "handler_service",
-        1,
-        math.maxinteger
-    )
+    -- handler_service 是宿主注册的本地 Skynet 服务名，发送时由 Skynet 解析当前注册者。
+    local handler_service = merged.handler_service
+    assert(type(handler_service) == "string" and handler_service ~= "",
+        "handler_service must be a non-empty Skynet service name")
     local observer_service = merged.observer_service
     if observer_service ~= nil then
         observer_service = require_integer(
@@ -161,7 +158,7 @@ local function normalize_config(input)
         backlog                       = backlog, -- OS accept backlog，不等于 max_clients。
         transport                     = transport, -- tcp 或 websocket；运行期不可切换。
         websocket_protocol            = "ws", -- TLS 由宿主前置终止；Gateway 不隐式读取证书。
-        handler_service               = handler_service, -- 已创建的业务 Service handle；不通过全局名字发现。
+        handler_service               = handler_service, -- 宿主注册的本地服务名；发送时解析当前服务。
         observer_service              = observer_service, -- 可选观测 Service handle；只接收异步事件。
         descriptor_path               = merged.descriptor_path, -- 运行目录下的 descriptor 文件路径。
         registry_module               = merged.registry_module, -- 生成 registry 的 require 名称。
@@ -577,10 +574,9 @@ local function write_connection(connection, encoded)
     return true
 end
 
-local function deliver_data(source, message)
-    -- 参数/状态检查：只接受当前 Gateway handler 发来的当前实例消息。
-    if not state.config or source ~= state.config.handler_service or
-        type(message) ~= "table" or
+local function deliver_data(message)
+    -- 参数/状态检查：只接受当前 Gateway 实例的有效消息；发送方由宿主信任边界管理。
+    if not state.config or type(message) ~= "table" or
         message.gateway_epoch ~= state.epoch or
         state.phase ~= "running" then
         state.responses_dropped = state.responses_dropped + 1
@@ -651,13 +647,12 @@ local function deliver_data(source, message)
 end
 
 --- 接收 handler 的主动断开命令；只按当前实例与连接身份关闭，不查业务请求记录。
---- source 必须是配置的 handler；message.gateway_epoch/connection_id 来自原请求或项目会话。
---- 返回是否首次接纳；未授权、旧实例、失效连接或重复关闭返回 false，不影响新连接。
+--- message.gateway_epoch/connection_id 来自原请求或项目会话；发送方由宿主信任边界管理。
+--- 返回是否首次接纳；旧实例、失效连接或重复关闭返回 false，不影响新连接。
 --- 先摘除连接，再 fork transport 关闭；消息入口不 yield，关闭任务可能 yield。
-local function request_close(source, message)
-    -- 参数/状态检查：只接受当前 Gateway handler 发来的当前实例请求。
+local function request_close(message)
+    -- 参数/状态检查：只接受当前 Gateway 实例和有效连接的关闭请求。
     if not state.config or state.phase ~= "running" or
-        source ~= state.config.handler_service or
         type(message) ~= "table" or message.gateway_epoch ~= state.epoch or
         math.type(message.connection_id) ~= "integer" then
         return false
@@ -1058,10 +1053,10 @@ end
 
 
 --- 校验启动配置、加载协议 descriptor/registry 并开始监听，最后才发布 running 状态。
---- input 是宿主传入的可选覆盖 table；handler_service 必须是已启动 handler 的显式 Service handle。
+--- input 是宿主传入的可选覆盖 table；handler_service 必须是已注册的本地 Skynet 服务名。
 --- 成功返回实际 address/port、transport 与 command_count；配置、文件、协议或 bind 失败时抛错，不宣告就绪。
 --- 执行文件 I/O、创建 codec 和监听 Socket，socket.listen 可能 yield；只允许从 created 启动一次。
----@param input table|nil 宿主启动覆盖项；handler_service 必须显式提供。
+---@param input table|nil 宿主启动覆盖项；handler_service 必须显式提供非空服务名。
 ---@return table 实际监听地址、端口、transport 和 registry command_count；失败抛错，可能 yield。
 local function start(input)
     -- 参数/状态检查：Gateway 只能从 created 状态启动一次。
@@ -1184,14 +1179,14 @@ skynet.start(function()
     --- LuaPanda 只连接当前 FlyWow Lua State；8820 不与 Proxy/Query/Battle Service 复用。
     luapanda_debug.start(8820)
 
-    skynet.dispatch("lua", function(_session, source, command, argument)
+    skynet.dispatch("lua", function(_session, _source, command, argument)
         if command == "close" then
-            request_close(source, argument)
+            request_close(argument)
             return
         end
 
         if command == "send_data" then
-            deliver_data(source, argument)
+            deliver_data(argument)
             return
         end
 

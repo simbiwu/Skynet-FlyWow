@@ -27,11 +27,16 @@ FlyWow ??????????????? gateway/ ? navigation/????????? flywow_??????????????????
 
 宿主通过 start 注入业务 handler：
 
+    -- 先为 handler 注册稳定的本地服务名；名称由宿主选取并避免冲突。
+    skynet.name(".my_gateway_handler", skynet.self())
     local gateway = skynet.newservice("flywow_gateway")
     skynet.call(gateway, "lua", "start",
     {
-        handler_service = handler_service,
+        handler_service = ".my_gateway_handler",
     })
+
+Gateway 每次发送时由 Skynet 按名称解析当前注册的 Service；名称未注册期间发送会失败，不排队、不重试。
+Gateway 不校验 send_data/close 的回复来源身份；宿主负责控制本地服务访问边界。
 
 handler Service 接收 send_data：
 
