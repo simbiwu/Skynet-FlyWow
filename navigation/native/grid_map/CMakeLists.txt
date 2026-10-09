@@ -19,6 +19,7 @@ add_library(grid_map_core STATIC
     nav_result.cpp
     dynamic_occupancy.cpp
     navigation_context.cpp
+    navigation_profile_registry.cpp
     grid_pathfinder.cpp
 )
 # grid_map_core 也会被链接进 Lua 动态模块，因此其目标文件必须可用于共享库。

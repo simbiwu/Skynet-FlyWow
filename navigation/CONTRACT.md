@@ -12,15 +12,18 @@ Native/Lua 使用整数毫米世界坐标 `{x_mm,y_mm,z_mm}`。X/Z 决定归格�
 
 | API | 成功结果 | 用途与副作用 |
 | --- | --- | --- |
-| `load_map(path)` | `{map_id,map_version}` | 启动时读取及注册地图；文件 I/O、分配、Registry 短锁 |
+| load_map(path) | {map_id,map_version} | 校验后按 map_id 替换当前地图；已有 Context 继续持有旧地图 |
 | `query_cell(id,version,worldPosition)` | Cell 查询 record | 只读查询；返回 grid 调试下标、高度、Area、Clearance、walkable |
-| `new_context(id,version,profiles)` | Context userdata | 每场 Battle 独占；分配 A* scratch 与动态占位 |
+| load_navigation_profiles(profiles) | 成功布尔值 | 校验连续 ID 后替换当前导航表；正在执行的同步调用保留其短期快照 |
+| new_context(map_id) | Context userdata | 固定当前地图；每场 Battle 独占 scratch 与动态占位，Profile 每次操作按 unit_id 查当前 Registry |
 | `context:set_cell_rule(x,z,rule)` | 成功布尔值 | 运行时设置当前 Battle 单格重叠规则；不影响其它 Context |
 | `context:find_path(...)` | Path userdata | 按 Agent 静态规则与当前动态事实规划路径 |
 | `context:find_path_to_range(...)` | Path userdata | 寻找可站立且进入目标范围的位置，不要求占据目标中心 |
 | `context:place_unit(...)` / `move_unit(...)` / `release_unit(...)` | 成功布尔值或新位置 | 本 Context 的动态占位操作 |
 | `context:advance_path(...)` | 移动结果 record | 消耗 Tick 距离预算，跨格复验后提交占位与 cursor |
 | `context:cell_size_mm()` | 整数毫米边长 | 只读地图尺度 |
+| context:unit_radius_mm(unit_id) | 整数毫米半径 | 读取当前 NavigationProfile Registry；只服务导航 |
+| context:map_version() | 地图资产版本 | 读取本 Context 固定地图的实际版本 |
 | `context:close()` | 无返回值 | 幂等释放 Context；后续访问返回关闭错误 |
 | `path:count()` / `world_point(index)` / `length_mm()` | 点数/位置/整数长度 | Path 独占世界点和推进 cursor；不能跨单位共享推进状态 |
 
@@ -30,41 +33,37 @@ Native/Lua 使用整数毫米世界坐标 `{x_mm,y_mm,z_mm}`。X/Z 决定归格�
 
 ## 状态归属
 
-Registry 的地图以 `shared_ptr<const GridMap>` 共享；注册受锁保护，不共享可变查询 scratch。每个 Context 拥有 Node/Heap/occupancy 和稀疏动态规则，单个 Context 必须由一个执行 owner 顺序使用；不同 Skynet Service 不能并发操作同一个可变 Context。
+MapRegistry 按 map_id 只保存当前只读 GridMap；NavigationProfileRegistry 保存当前导航配置。启动时主动加载配置中的全部地图和完整导航 Profile 表。运行期重新调用 load_map 或 load_navigation_profiles 可替换当前表；地图由 Context 固定持有，Profile 则在每次同步导航操作时短暂持有当前不可变表并按 unit_id 二分查找，替换不会让本次调用失效。UnitProfile 是独立 sharedata 业务配置，Native Navigation 不读取它。每个 Context 只拥有自己的 Node/Heap scratch、occupancy 和稀疏动态规则；单个 Context 必须由一个执行 owner 顺序使用，不同 Battle 不共享这些可变状态。
 
 静态 Clearance 是 Bake 后到障碍和边界的保守格距，动态单位不会重写它。动态 footprint 与可通行规则在规划和移动时另外验证；旧 Path 不能直接授权移动。Clearance、footprint、A*、区域 Dijkstra、smoothing 和逐格移动复验的推导、例子及不变量保留在对应源码注释中。
 
-Context 构造按 Cell 数分配 dense scratch，地图变大和同时 Battle 增加都会增长内存。Registry 生命周期是 OS 进程；本版没有地图卸载 API。热更不是就地修改只读地图，宿主使用新版本并决定旧 Battle 何时退出。
+Context 构造按 Cell 数分配 dense scratch，地图变大和同时 Battle 增加都会增长内存。Registry 生命周期是 OS 进程；本版没有地图卸载 API。热更通过加载完整新对象并替换 Registry 当前指针，不原地修改只读对象；旧对象在引用它的 Context 结束后释放。map_version 仍是地图资产身份，也可用于协议请求校验，但不参与 Registry 选取地图。
 
 ## Native Binding 实现边界
 
 导航通过 `lua-binding/` 的 LuaBinding/LuaTable 读取参数、创建结果和管理 userdata，不直接维护 Lua 栈。Lua API、坐标与领域错误码保持上述合同。C++ 入口只交给初始化适配器；普通失败正常返回，C++ exception 在统一入口转为 INTERNAL_ERROR。
 
-Context/Path 使用统一类型核验与 GC。close 幂等释放 Context 大块内存，profiles/vector 外壳由最终 GC 析构；已关闭的 Context 返回 CONTEXT_CLOSED。重复 GC 不重复析构，不匹配或已经析构的 userdata 返回 INVALID_ARGUMENT。
+Context/Path 使用统一类型核验与 GC。close 幂等释放 Context 大块内存；已关闭的 Context 返回 CONTEXT_CLOSED。重复 GC 不重复析构，不匹配或已经析构的 userdata 返回 INVALID_ARGUMENT。
 
 封装内部注释按栈底到栈顶用 `[S, table, value]` 说明 Lua C API；S 是进入操作前已有内容。栈、registry 引用、closure/upvalue 和 GC 的详细合同见 [Lua Binding 使用说明](../lua-binding/使用说明.md)及对应实现，不在导航业务函数中重复 Lua 栈教程。
 
 
-## 单位边缘范围与部分路径
+## 单位接近范围与部分路径
 
-`find_path_to_range(profile_id, start, target, range_mm, mover_unit_id[, allow_partial])`
-保持中心距离语义。`find_path` 也在最后增加同样的可选参数。省略、nil、false
-均关闭部分路径；错误类型返回 `INVALID_ARGUMENT`。
+find_path_to_range(unit_id, start, target, range_mm, unit_instance_id[, allow_partial])
+是通用导航范围查询：寻找以目标中心为圆心、距离不超过 range_mm 的可站立 Cell。
+这个参数不来源于 UnitProfile.combat.attack_range_mm，也不定义战斗规则。
 
-新增 `find_path_to_unit_range(mover_profile_id, start_world, target_profile_id,
-target_world, edge_range_mm, mover_unit_id[, allow_partial])`。双方半径来自 Context
-构造时复制的 Profile，目标位置和 Profile 必须由调用者保持一致，不反查 Occupancy。
-`mover_unit_id` 用于忽略移动者自身占位。允许重叠也不把目标圆形体型内部作为终点。
-正范围的终点满足 `r_mover+r_target <= 中心距离 <= r_mover+r_target+edge_range_mm`。
-这只约束终点，沿途仍使用原有格子重叠策略。
+find_path_to_unit_range(mover_unit_id, start_world, target_unit_id, target_world,
+mover_unit_instance_id[, allow_partial]) 按双方当前 NavigationProfile 的半径寻找可站立接近点。
+有效中心距区间为 r_mover+r_target 到 r_mover+r_target+ceil(sqrt(2)*cell_size_mm)：
+下界避免单位体型重叠，上界只补偿离散 Grid 的接近误差。该查询不接收攻击距离。
+Battle 独立按 UnitProfile.combat.attack_range_mm 判定是否攻击；该值是中心点间最大 XZ 距离。
 
-零范围采用 `ceil(sqrt(2)*cell_size_mm)` 接近容差，在容差内选择中心距离最小的
-可达合法格，再按路径成本、格子索引打破平局。需要遍历当前可达区域，最坏与 NO_PATH
-搜索相同。该规则是格子接近，不是几何接触；静态净空与动态占位仍可能返回 NO_PATH。
-
+部分路径参数省略、nil、false 均关闭；错误类型返回 INVALID_ARGUMENT。
 成功结果可调用 `path:status()`：`reached` 表示终点满足查询目标；`partial` 表示
 搜索耗尽后返回最接近目标中心的可达合法格（单位查询排除体型内部）。距离相同按
 最低已走成本、稳定格子索引选择。默认关闭；非法参数、越界、非法起点不会转为成功。
 没有更接近目标的实际移动仍返回 NO_PATH。精确终点不可站立时默认返回
 END_NOT_NAVIGABLE；开启 partial 后继续搜索。查询状态与 advance_path 的执行状态独立。
-旧 Lua 调用保持兼容；新增 C++ 可选参数需要重新编译使用者。
+单位接近 Lua API 已移除 edge_range_mm 参数，所有仓库调用点与签名同步更新；C++ 使用者需重新编译。

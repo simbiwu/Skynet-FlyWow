@@ -13,7 +13,7 @@
 ---@field message string 诊断上下文；只用于日志，不进入业务判断。
 
 ---@class FlyWowNavigationProfile
----@field id integer 正 uint32 Profile 身份；构造 Context 时复制且不得重复。
+---@field unit_id integer 通用 Unit 类型 ID；Registry 按该 ID 排序并二分查找。
 ---@field radius_mm integer 非负体型半径，毫米；静态/动态 footprint 共同使用。
 ---@field max_step_mm integer 非负最大跨格高度差，毫米。
 ---@field max_slope_permille integer 非负坡度上限；1000 表示高差等于水平距离。
@@ -27,8 +27,8 @@
 ---@field length_mm fun(self:FlyWowNavigationPath):integer XZ 路径长度；毫米。
 
 ---@class FlyWowNavigationAdvanceRequest
----@field profile_id integer 当前单位使用的 Profile 身份。
----@field unit_id integer 本 Context 的正 uint32 单位句柄。
+---@field unit_id integer 静态 Unit 类型 ID；每次调用从当前 Registry 查询。
+---@field unit_instance_id integer 当前 Battle 中实体实例的正 uint32 句柄。
 ---@field path FlyWowNavigationPath 此单位独占 Path/cursor，不可跨单位共享推进状态。
 ---@field from_world FlyWowNavigationPosition 当前权威位置，调用方拥有且只读。
 ---@field distance_mm integer 本 Tick 非负 uint32 距离预算，毫米。
@@ -44,13 +44,15 @@
 
 ---@class FlyWowNavigationContext
 ---@field set_cell_rule fun(self:FlyWowNavigationContext,grid_x:integer,grid_z:integer,rule:FlyWowNavigationCellRule):boolean?,FlyWowNavigationError? 运行时设置当前 Battle 的单格重叠规则；default 清除覆盖。
----@field find_path fun(self:FlyWowNavigationContext,profile_id:integer,start:FlyWowNavigationPosition,goal:FlyWowNavigationPosition,mover_unit_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError?
----@field find_path_to_range fun(self:FlyWowNavigationContext,profile_id:integer,start:FlyWowNavigationPosition,target:FlyWowNavigationPosition,attack_range_mm:integer,mover_unit_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError?
----@field find_path_to_unit_range fun(self:FlyWowNavigationContext,mover_profile_id:integer,start_world:FlyWowNavigationPosition,target_profile_id:integer,target_world:FlyWowNavigationPosition,edge_range_mm:integer,mover_unit_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError? 双方半径之外的合法终点；零范围使用格子对角线容差。
----@field place_unit fun(self:FlyWowNavigationContext,profile_id:integer,unit_id:integer,position:FlyWowNavigationPosition):FlyWowNavigationPosition?,FlyWowNavigationError?
----@field move_unit fun(self:FlyWowNavigationContext,profile_id:integer,unit_id:integer,from_world:FlyWowNavigationPosition,to_world:FlyWowNavigationPosition):FlyWowNavigationPosition?,FlyWowNavigationError?
----@field release_unit fun(self:FlyWowNavigationContext,unit_id:integer):boolean?,FlyWowNavigationError?
+---@field find_path fun(self:FlyWowNavigationContext,unit_id:integer,start:FlyWowNavigationPosition,goal:FlyWowNavigationPosition,unit_instance_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError?
+---@field find_path_to_range fun(self:FlyWowNavigationContext,unit_id:integer,start:FlyWowNavigationPosition,target:FlyWowNavigationPosition,range_mm:integer,unit_instance_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError? 以目标中心为圆心的通用导航范围查询，不代表战斗攻击规则。
+---@field find_path_to_unit_range fun(self:FlyWowNavigationContext,mover_unit_id:integer,start_world:FlyWowNavigationPosition,target_unit_id:integer,target_world:FlyWowNavigationPosition,unit_instance_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError? 双方导航半径限定不可重叠距离，Grid 对角线容差适配离散终点；不读取攻击距离。
+---@field place_unit fun(self:FlyWowNavigationContext,unit_id:integer,unit_instance_id:integer,position:FlyWowNavigationPosition):FlyWowNavigationPosition?,FlyWowNavigationError?
+---@field move_unit fun(self:FlyWowNavigationContext,unit_id:integer,unit_instance_id:integer,from_world:FlyWowNavigationPosition,to_world:FlyWowNavigationPosition):FlyWowNavigationPosition?,FlyWowNavigationError?
+---@field release_unit fun(self:FlyWowNavigationContext,unit_instance_id:integer):boolean?,FlyWowNavigationError?
 ---@field advance_path fun(self:FlyWowNavigationContext,request:FlyWowNavigationAdvanceRequest):FlyWowNavigationAdvanceResult?,FlyWowNavigationError?
+---@field unit_radius_mm fun(self:FlyWowNavigationContext,unit_id:integer):integer?,FlyWowNavigationError? 读取当前 Registry 中该 Unit 类型的导航半径。
+---@field map_version fun(self:FlyWowNavigationContext):integer?,FlyWowNavigationError? 读取 Context 固定地图的资产版本。
 ---@field cell_size_mm fun(self:FlyWowNavigationContext):integer?,FlyWowNavigationError?
 ---@field close fun(self:FlyWowNavigationContext) 幂等释放大块 Context 内存，无返回值；GC 兜底析构 userdata。
 
@@ -67,9 +69,10 @@
 ---@field walkable boolean 静态 Walkable bit；不代表所有 Agent 都能站立。
 
 ---@class FlyWowNavigationModule
----@field load_map fun(path:string):FlyWowNavigationIdentity?,FlyWowNavigationError? 加载 immutable 静态地图；执行文件 I/O/分配/Registry 短锁。
+---@field load_navigation_profiles fun(profiles:FlyWowNavigationProfile[]):boolean?,FlyWowNavigationError? 校验并原子替换进程当前导航配置；已有 Context 下一次调用即使用新表。
+---@field load_map fun(path:string):FlyWowNavigationIdentity?,FlyWowNavigationError? 加载并按 map_id 替换当前地图；执行文件 I/O；已有 Context 保留旧地图。
 ---@field query_cell fun(map_id:integer,map_version:integer,position:FlyWowNavigationPosition):FlyWowNavigationCell?,FlyWowNavigationError? 只读同步查询；Registry 查找短锁。
----@field new_context fun(map_id:integer,map_version:integer,profiles:FlyWowNavigationProfile[]):FlyWowNavigationContext?,FlyWowNavigationError? 分配私有 scratch/occupancy，返回调用方独占 userdata。
+---@field new_context fun(map_id:integer):FlyWowNavigationContext?,FlyWowNavigationError? 固定当前地图并分配私有 scratch/occupancy；不缓存 Profile，返回调用方独占 userdata.
 
 --- Lua 对外入口：把稳定的 FlyWow Navigation 合同转交给 Native 实现。
 ---

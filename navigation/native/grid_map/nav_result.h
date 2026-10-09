@@ -27,12 +27,10 @@ enum class NavError
     kPayloadCrcMismatch,  // Cell Payload 校验失败。
     kTruncated,           // 文件短于 Header 声明的长度。
     kTrailingBytes,       // 合法内容后仍有未定义字节。
-    kDuplicateMap,        // 相同 mapId、mapVersion 被重复注册。
-    kRegistryFrozen,      // Registry 冻结后仍尝试修改。
     kMapNotFound,         // 查询的 mapId 或版本未加载。
     kOutOfBounds,         // 世界坐标或 Grid 下标位于地图外。
     kInvalidArgument,     // 其他调用参数违反公开合同。
-    kInvalidAgent,        // AgentProfile 本身不合法或 profile_id 不存在。
+    kInvalidAgent,        // NavigationProfile 本身不合法或 unit_id 不存在。
     kStartNotNavigable,   // 起点在地图内，但不满足静态/动态通行规则。
     kEndNotNavigable,     // 终点在地图内，但不满足静态/动态通行规则。
     kNoPath,              // 起终点均合法，但当前规则下不存在连通路径。

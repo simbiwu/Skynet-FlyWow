@@ -25,26 +25,20 @@ BMAP V1 内容保持兼容，Manifest 新增空间与 SHA-256 是发布门禁要
 回滚使用原框架提交、原宿主 Adapter、原 Unity 文件/包和原协议产物的完整组合。地图格式未改变，可使用已验证的旧 BMAP。不要让新 Lua 加载旧 `.so`，不要同时安装旧脚本和保留同 GUID 的新 Package。发布后再同步固定 submodule 提交；本迁移不自动 commit、push 或发布 Release。
 
 
-## 单位边缘范围与部分路径
+## 单位接近范围与部分路径
 
-`find_path_to_range(profile_id, start, target, range_mm, mover_unit_id[, allow_partial])`
-保持中心距离语义。`find_path` 也在最后增加同样的可选参数。省略、nil、false
-均关闭部分路径；错误类型返回 `INVALID_ARGUMENT`。
+find_path_to_range(unit_id, start, target, range_mm, unit_instance_id[, allow_partial])
+是通用导航范围查询；range_mm 不是 Battle 攻击距离。
 
-新增 `find_path_to_unit_range(mover_profile_id, start_world, target_profile_id,
-target_world, edge_range_mm, mover_unit_id[, allow_partial])`。双方半径来自 Context
-构造时复制的 Profile，目标位置和 Profile 必须由调用者保持一致，不反查 Occupancy。
-`mover_unit_id` 用于忽略移动者自身占位。允许重叠也不把目标圆形体型内部作为终点。
-正范围的终点满足 `r_mover+r_target <= 中心距离 <= r_mover+r_target+edge_range_mm`。
-这只约束终点，沿途仍使用原有格子重叠策略。
-
-零范围采用 `ceil(sqrt(2)*cell_size_mm)` 接近容差，在容差内选择中心距离最小的
-可达合法格，再按路径成本、格子索引打破平局。需要遍历当前可达区域，最坏与 NO_PATH
-搜索相同。该规则是格子接近，不是几何接触；静态净空与动态占位仍可能返回 NO_PATH。
+find_path_to_unit_range(mover_unit_id, start_world, target_unit_id, target_world,
+mover_unit_instance_id[, allow_partial]) 使用双方当前 NavigationProfile 半径限定可接近中心距：
+下界为 r_mover+r_target，上界额外容纳 ceil(sqrt(2)*cell_size_mm) 的 Grid 离散误差。
+不再传入任何 edge/attack range。Battle 自己按 UnitProfile.combat.attack_range_mm
+执行中心距攻击判定；UnitProfile 不传入 Navigation Native。
 
 成功结果可调用 `path:status()`：`reached` 表示终点满足查询目标；`partial` 表示
 搜索耗尽后返回最接近目标中心的可达合法格（单位查询排除体型内部）。距离相同按
 最低已走成本、稳定格子索引选择。默认关闭；非法参数、越界、非法起点不会转为成功。
 没有更接近目标的实际移动仍返回 NO_PATH。精确终点不可站立时默认返回
 END_NOT_NAVIGABLE；开启 partial 后继续搜索。查询状态与 advance_path 的执行状态独立。
-旧 Lua 调用保持兼容；新增 C++ 可选参数需要重新编译使用者。
+单位接近 Lua API 已移除 edge_range_mm 参数，所有仓库调用点与签名同步更新；C++ 使用者需重新编译。

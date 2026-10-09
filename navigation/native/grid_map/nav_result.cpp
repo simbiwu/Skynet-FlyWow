@@ -38,10 +38,6 @@ const char *NavErrorName(NavError error) noexcept
         return "BMAP_TRUNCATED";
     case NavError::kTrailingBytes:
         return "BMAP_TRAILING_BYTES";
-    case NavError::kDuplicateMap:
-        return "DUPLICATE_MAP_VERSION";
-    case NavError::kRegistryFrozen:
-        return "REGISTRY_FROZEN";
     case NavError::kMapNotFound:
         return "MAP_NOT_FOUND";
     case NavError::kOutOfBounds:

@@ -11,20 +11,63 @@ local loaded, load_error = navigation.load_map(arg[3])
 assert(loaded, load_error and load_error.message)
 assert(loaded.map_id == 17 and loaded.map_version == 2)
 
---- 本测试 profiles 归各 Context 复制；0 半径只占一个格，不影响其它测试前提。
+--- Navigation 配置与 UnitProfile 分离；稀疏 ID 排序后可查，重复 ID 拒绝替换。
 local profiles =
 {
     {
-        id                 = 1,
-        radius_mm          = 0,
-        max_step_mm        = 1000,
+        unit_id = 10000,
+        radius_mm = 300,
+        max_step_mm = 1000,
         max_slope_permille = 1000,
     },
+    {
+        unit_id = 1,
+        radius_mm = 0,
+        max_step_mm = 1000,
+        max_slope_permille = 1000,
+        area_cost_permille = { [0] = 2000 },
+        area_allowed = { [0] = 0 }, -- 数字 0 按原 Lua 真值规则为允许。
+    },
 }
--- 稠密性校验只统计正整数下标；命名字段不应被当作 profile 或拒绝。
-profiles.source = false
-local first = assert(navigation.new_context(17, 2, profiles))
-local second = assert(navigation.new_context(17, 2, profiles))
+profiles.source = false -- 命名字段不属于稠密 NavigationProfile 数组。
+local empty_profiles, empty_error = navigation.load_navigation_profiles({})
+assert(empty_profiles == nil and empty_error.code == "INVALID_ARGUMENT")
+local sparse_profiles, sparse_error = navigation.load_navigation_profiles({
+    [1] = profiles[1],
+    [3] = profiles[2],
+})
+assert(sparse_profiles == nil and sparse_error.code == "INVALID_ARGUMENT")
+local duplicate_profiles, duplicate_error =
+    navigation.load_navigation_profiles({ profiles[2], profiles[2] })
+assert(duplicate_profiles == nil and duplicate_error.code == "INVALID_AGENT")
+local invalid_profiles, invalid_profile_error = navigation.load_navigation_profiles({
+    { unit_id = 1, radius_mm = "invalid", max_step_mm = 1000, max_slope_permille = 1000 },
+})
+assert(invalid_profiles == nil and invalid_profile_error.code == "INVALID_ARGUMENT")
+assert(navigation.load_navigation_profiles(profiles))
+local first = assert(navigation.new_context(17))
+local second = assert(navigation.new_context(17))
+assert(first:unit_radius_mm(1) == 0)
+assert(first:unit_radius_mm(10000) == 300)
+
+local updated_profiles = {
+    {
+        unit_id = 1,
+        radius_mm = 100,
+        max_step_mm = 1000,
+        max_slope_permille = 1000,
+        area_cost_permille = { [0] = 2000 },
+        area_allowed = { [0] = 0 },
+    },
+    profiles[1],
+}
+assert(navigation.load_navigation_profiles(updated_profiles))
+assert(first:unit_radius_mm(1) == 100) -- 已有 Context 的后续调用读取新 Registry 表。
+local updated_context = assert(navigation.new_context(17))
+assert(updated_context:unit_radius_mm(1) == 100)
+updated_context:close()
+assert(navigation.load_navigation_profiles(profiles)) -- 恢复本测试的当前导航配置。
+assert(first:map_version() == 2)
 local start = { x_mm = 750, y_mm = 0, z_mm = 750 }
 local goal = { x_mm = 1750, y_mm = 0, z_mm = 1750 }
 assert(first:place_unit(1, 1, start))
@@ -59,32 +102,20 @@ assert(ok)
 assert(invalid_map == nil)
 assert(map_error.code == "INVALID_ARGUMENT")
 
-local invalid_context, context_error = navigation.new_context(17, 2, {})
-assert(invalid_context == nil)
-assert(context_error.code == "INVALID_ARGUMENT")
-
-local sparse_ok, sparse_context, sparse_error = pcall(function()
-    return navigation.new_context(17, 2, { [1] = profiles[1], [3] = profiles[1] })
-end)
-assert(sparse_ok)
-assert(sparse_context == nil)
-assert(sparse_error.code == "INVALID_ARGUMENT")
-
 local id_ok, invalid_map_id, map_id_error = pcall(function()
-    return navigation.new_context(0, 2, profiles)
+    return navigation.new_context(0)
 end)
 assert(id_ok)
 assert(invalid_map_id == nil)
 assert(map_id_error.code == "INVALID_ARGUMENT")
+local replacement_map, replacement_error = navigation.load_map(arg[5])
+assert(replacement_map, replacement_error and replacement_error.message)
+assert(replacement_map.map_id == 17 and replacement_map.map_version == 3)
+assert(first:map_version() == 2) -- 已有 Context 固定旧地图。
+local old_map_query, old_map_error = navigation.query_cell(17, 2, start)
+assert(old_map_query == nil and old_map_error.code == "MAP_VERSION_MISMATCH")
+assert(navigation.query_cell(17, 3, start).walkable)
 
-local profile_ok, invalid_profile, profile_error = pcall(function()
-    return navigation.new_context(17, 2, {
-        { id = 1, radius_mm = "invalid", max_step_mm = 1000, max_slope_permille = 1000 },
-    })
-end)
-assert(profile_ok)
-assert(invalid_profile == nil)
-assert(profile_error.code == "INVALID_ARGUMENT")
 first:close()
 first:close()
 local closed, closed_error = first:find_path(1, start, goal, 1)
@@ -92,31 +123,22 @@ assert(closed == nil and closed_error.code == "CONTEXT_CLOSED")
 assert(second:release_unit(1))
 second:close()
 -- 真实调用覆盖 record 中的 Path userdata、推进结果和 Range 查询，确保迁移保持合同。
-local third = assert(navigation.new_context(17, 2, {
-    {
-        id                 = 1,
-        radius_mm          = 0,
-        max_step_mm        = 1000,
-        max_slope_permille = 1000,
-        area_cost_permille = { [0] = 2000 },
-        area_allowed       = { [0] = 0 }, -- 数字 0 按原 Lua 真值规则为允许。
-    },
-}))
+local third = assert(navigation.new_context(17))
+assert(third:map_version() == 3)
 assert(third:cell_size_mm() == 500)
-assert(navigation.query_cell(17, 2, start).walkable)
 assert(third:place_unit(1, 7, start))
 local third_path = assert(third:find_path(1, start, goal, 7))
 local paused = assert(third:advance_path({
-    profile_id  = 1,
-    unit_id     = 7,
+    unit_id          = 1,
+    unit_instance_id = 7,
     distance_mm = 0,
     path        = third_path,
     from_world  = start,
 }))
 assert(paused.status == "moving" and not paused.moved and paused.consumed_mm == 0)
 local advanced = assert(third:advance_path({
-    profile_id  = 1,
-    unit_id     = 7,
+    unit_id          = 1,
+    unit_instance_id = 7,
     distance_mm = 5000,
     path        = third_path,
     from_world  = start,
@@ -126,8 +148,8 @@ assert(advanced.position.x_mm == goal.x_mm and advanced.position.y_mm == 0)
 assert(third:move_unit(1, 7, goal, goal))
 assert(third:find_path_to_range(1, goal, start, 500, 7):count() > 0)
 local wrong_path, wrong_path_error = third:advance_path({
-    profile_id  = 1,
-    unit_id     = 7,
+    unit_id          = 1,
+    unit_instance_id = 7,
     distance_mm = 10,
     path        = third,
     from_world  = goal,

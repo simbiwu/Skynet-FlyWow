@@ -91,7 +91,7 @@ void RunCase(std::uint32_t width, std::uint32_t height)
     constexpr int           kQueries        = 2000;
     auto                    map = MakeSynthetic(width, height, kBlockedPercent, 0x12345678u);
     NavigationContext       context(map);
-    AgentProfile            profile = MakeDefaultAgentProfile(1);
+    NavigationProfile            profile = MakeDefaultNavigationProfile(1);
     profile.radius_mm               = 200;
     profile.max_step_mm             = 500;
     profile.max_slope_permille      = 1000;

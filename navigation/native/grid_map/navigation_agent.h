@@ -1,12 +1,12 @@
 // 职责：定义导航层使用的实体句柄和 Agent 查询上下文。
 // 边界：Server Runtime Native Navigation；不拥有业务实体，不保存 Battle 位置。
-// 输入/输出：业务层提供稳定 opaque handle + AgentProfile -> 导航查询对象。
+// 输入/输出：业务层提供稳定 opaque handle + NavigationProfile -> 导航查询对象。
 // 生命周期：NavigationAgent 只借用 profile；调用期间 profile 必须保持有效。
 // 不负责：不把业务指针、Lua userdata 或具体业务 ID 直接存入导航资产。
 
 #pragma once
 
-#include "agent_profile.h"
+#include "navigation_profile.h"
 
 #include <cstdint>
 
@@ -45,7 +45,7 @@ inline bool operator!=(const NavigationAgentHandle &lhs, const NavigationAgentHa
 struct NavigationAgent
 {
     NavigationAgentHandle handle;            // 当前实体的导航层身份。
-    const AgentProfile   *profile = nullptr; // 共享静态导航配置；不转移所有权。
+    const NavigationProfile   *profile = nullptr; // 共享静态导航配置；不转移所有权。
 };
 
 } // namespace flywow_navigation

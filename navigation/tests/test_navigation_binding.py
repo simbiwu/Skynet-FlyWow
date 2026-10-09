@@ -38,9 +38,19 @@ class NavigationBindingTests(unittest.TestCase):
             struct.pack_into('<III', header, 44, len(payload), zlib.crc32(payload), 0)
             struct.pack_into('<I', header, 52, zlib.crc32(header))
             bmap.write_bytes(header + payload)
+
+            # 同一 map_id 的新资产版本用于验证 Registry 替换和旧 Context 保活。
+            replacement = Path(directory) / 'map_replacement.bmap'
+            replacement_header = bytearray(header)
+            struct.pack_into('<I', replacement_header, 12, 3)
+            struct.pack_into('<I', replacement_header, 52, 0)
+            struct.pack_into('<I', replacement_header, 52, zlib.crc32(replacement_header))
+            replacement.write_bytes(replacement_header + payload)
+
             result = subprocess.run([os.environ['SKYNET_LUA'],
                                      str(root / 'navigation/tests' / script_name), str(root),
-                                     os.environ['NAVIGATION_NATIVE_DIR'], str(bmap), str(oversized)],
+                                     os.environ['NAVIGATION_NATIVE_DIR'], str(bmap), str(oversized),
+                                     str(replacement)],
                                     text=True, capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn(marker, result.stdout)

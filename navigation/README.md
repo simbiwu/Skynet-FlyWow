@@ -29,6 +29,8 @@ C++17、CMake/Linux/WSL2、Skynet v1.8.0 自带修改版 Lua 5.4.7；团结引�
 - [公开合同与生命周期](CONTRACT.md)：坐标、资产、Lua 返回值、状态归属和失败处理。
 - [迁移与回滚](UPGRADE.md)：旧路径、旧模块名以及成套升级范围。
 
+Server 启动时调用 load_navigation_profiles 加载导航专用配置，并主动加载配置列出的全部地图。NavigationProfile Registry 只保留当前表；每次 Native 导航调用临时持有不可变表并按 unit_id 二分查找。new_context 只固定地图并拥有本 Battle 的动态占位与 scratch。UnitProfile 是独立业务配置，由进程入口发布到 sharedata，Battle Core 从中读取 combat.attack_range_mm。
+
 可运行的最小新场景入口是 `Tools/FlyWow/Navigation/创建最小接入场景`。`NavigationPublicationTests` 使用公开组件与方法完成 Bake→采样→Clearance→校验→导出，不依赖课程代码；它同时锁定幂等导出和损坏清单拒绝。
 
 ## 独立验证
@@ -45,6 +47,7 @@ Unity 工程在 manifest 的 `testables` 中加入 `com.flywow.navigation`，在
 
 `navigation_benchmark` 是单独产物，不是 CTest 门禁。吞吐、总地图数、总 Context 内存和商业负载容量需要宿主按地图规模另外验证；不能从这些功能测试推断上线容量。
 
-单位间接近使用 `context:find_path_to_unit_range`，坐标范围查询保留中心语义。
-可选 `allow_partial` 默认关闭，通过 `path:status()` 区分 `reached` 与 `partial`。
-几何边界、零范围接近容差及失败合同见 [CONTRACT.md](CONTRACT.md)。
+单位间接近使用 context:find_path_to_unit_range，只使用双方 NavigationProfile 半径；
+普通攻击射程由 Battle Core 单独按中心距判定，不传入导航。
+可选 allow_partial 默认关闭，通过 path:status() 区分 reached 与 partial。
+格子接近容差及失败合同见 CONTRACT.md。

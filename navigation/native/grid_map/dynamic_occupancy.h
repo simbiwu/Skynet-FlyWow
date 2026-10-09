@@ -1,11 +1,11 @@
 // 职责：保存一场 Battle 的动态 footprint 事实，并提供无分配查询/提交基础能力。
 // 边界：Server Runtime Battle-local Mutable State；绝不修改共享 GridMap。
-// 输入/输出：NavigationAgentHandle + AgentProfile + GridPos -> footprint 查询和事实提交。
+// 输入/输出：NavigationAgentHandle + NavigationProfile + GridPos -> footprint 查询和事实提交。
 // 生命周期：随 NavigationContext/Battle 创建和销毁；不跨 Battle 共享。
 // 不负责：不决定实体是否互相阻挡；是否允许进入由业务层回调解释本对象保存的事实。
 #pragma once
 
-#include "agent_profile.h"
+#include "navigation_profile.h"
 #include "grid_map.h"
 #include "nav_result.h"
 #include "navigation_agent.h"
@@ -30,7 +30,7 @@ class DynamicOccupancy final
 
     // 使用“任意其他实体都阻挡”的默认规则检查整个 footprint。
     // GridPathfinder 不直接调用它；业务回调可以按需复用或实现自己的规则。
-    bool IsFootprintBlocked(const AgentProfile &profile, const GridPos &center,
+    bool IsFootprintBlocked(const NavigationProfile &profile, const GridPos &center,
                             NavigationAgentHandle ignore_handle) const noexcept;
 
     // 遍历某个 Cell 当前的所有动态实体句柄；callback 返回 false 时提前停止。
@@ -56,7 +56,7 @@ class DynamicOccupancy final
     // 根据 Agent 半径遍历保守 footprint；业务回调直接复用它，不重复计算半径覆盖范围。
     // callback 返回 false 时提前停止；不构造临时 Cell vector。
     template <typename Callback>
-    bool ForEachFootprintCell(const AgentProfile &profile, const GridPos &center,
+    bool ForEachFootprintCell(const NavigationProfile &profile, const GridPos &center,
                               Callback callback) const
     {
         const std::int64_t cell       = map_.metadata().cell_size_mm;
@@ -128,7 +128,7 @@ class DynamicOccupancy final
 
     // 统一处理首次进入和后续移动：没有旧记录时写入，有旧记录时先清旧再写新。
     // 业务层必须先通过 DynamicNavigationPolicy 判断目标是否允许进入。
-    NavResult<bool> Move(NavigationAgentHandle handle, const AgentProfile &profile,
+    NavResult<bool> Move(NavigationAgentHandle handle, const NavigationProfile &profile,
                          const GridPos &target);
 
     // 按 handle 释放当前已记录的 footprint；重复 Release 安全。

@@ -125,7 +125,7 @@ bool DynamicOccupancy::IsBlocked(const GridPos        &grid,
 // 遍历 Agent 的完整 footprint，判断是否存在其他动态实体。
 // profile：体型和半径规则；center：候选中心 Cell；ignore_handle：移动者句柄。
 // 返回值：越界或任一 footprint Cell 被其他实体占用时为 true。
-bool DynamicOccupancy::IsFootprintBlocked(const AgentProfile &profile, const GridPos &center,
+bool DynamicOccupancy::IsFootprintBlocked(const NavigationProfile &profile, const GridPos &center,
                                           NavigationAgentHandle ignore_handle) const noexcept
 {
     const bool available = ForEachFootprintCell(profile, center, [&](const GridPos &grid)
@@ -139,7 +139,7 @@ bool DynamicOccupancy::IsFootprintBlocked(const AgentProfile &profile, const Gri
 // handle：本 Context 内唯一且有效的句柄；profile：体型规则借用；target：目标中心 Cell。
 // 返回值：成功返回 true；越界返回 OUT_OF_BOUNDS；无效句柄返回 INVALID_ARGUMENT。
 // 失败时保持旧 footprint；函数不执行 I/O、加锁或 yield，复杂度为 footprint 数量加 Cell 列表维护成本。
-NavResult<bool> DynamicOccupancy::Move(NavigationAgentHandle handle, const AgentProfile &profile,
+NavResult<bool> DynamicOccupancy::Move(NavigationAgentHandle handle, const NavigationProfile &profile,
                                        const GridPos &target)
 {
     if (!handle.valid())
