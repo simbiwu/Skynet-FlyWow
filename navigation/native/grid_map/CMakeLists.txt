@@ -11,20 +11,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # 先构建共享的 Native 核心，再分别链接测试与 Benchmark；三者复用同一份实现。
-# Lua Binding 在自己的 CMake 中链接该核心，不能在这里引入 Lua/Skynet 运行依赖。
+# Lua Binding 在 Native 根 CMake 中链接该核心，不能在这里引入 Lua/Skynet 运行依赖。
 add_library(grid_map_core STATIC
-    src/bmap_reader.cpp
-    src/grid_map.cpp
-    src/map_registry.cpp
-    src/nav_result.cpp
-    src/dynamic_occupancy.cpp
-    src/navigation_context.cpp
-    src/grid_pathfinder.cpp
+    bmap_reader.cpp
+    grid_map.cpp
+    map_registry.cpp
+    nav_result.cpp
+    dynamic_occupancy.cpp
+    navigation_context.cpp
+    grid_pathfinder.cpp
 )
 # grid_map_core 也会被链接进 Lua 动态模块，因此其目标文件必须可用于共享库。
 set_target_properties(grid_map_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-target_include_directories(grid_map_core PUBLIC include)
+target_include_directories(grid_map_core PUBLIC .)
 target_compile_options(grid_map_core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(grid_map_test tests/grid_map_test.cpp)

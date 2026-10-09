@@ -24,7 +24,7 @@ Native/Lua 使用整数毫米世界坐标 `{x_mm,y_mm,z_mm}`。X/Z 决定归格�
 | `context:close()` | 无返回值 | 幂等释放 Context；后续访问返回关闭错误 |
 | `path:count()` / `world_point(index)` / `length_mm()` | 点数/位置/整数长度 | Path 独占世界点和推进 cursor；不能跨单位共享推进状态 |
 
-参数 record、稳定错误码和边界检查以 `native/lua/src/lua_navigation.cpp` 为实现合同。所有公开 Binding API 的失败——包括参数类型/范围错误、地图未加载、越界、不可达、动态占用和 Context 已关闭——统一返回 `nil, {code,message}`，不通过 Lua 错误机制抛出。调用方必须检查第一个返回值，并按稳定 `code` 处理；`message` 只用于诊断。Native 查询不执行 Skynet yield。
+参数 record、稳定错误码和边界检查以 `native/navigation_binding.cpp` 为实现合同。所有公开 Binding API 的失败——包括参数类型/范围错误、地图未加载、越界、不可达、动态占用和 Context 已关闭——统一返回 `nil, {code,message}`，不通过 Lua 错误机制抛出。调用方必须检查第一个返回值，并按稳定 `code` 处理；`message` 只用于诊断。Native 查询不执行 Skynet yield。
 
 `context:set_cell_rule(x,z,rule)` 使用零基 Grid 坐标；`rule` 为 `"allow"`、`"block"` 或 `"default"`。它只影响当前 Battle Context；`default` 清除该格覆盖，恢复默认允许重叠行为。未设置规则时无需额外配置。规则只约束已有其他单位时是否允许重叠，不会封闭空格；修改规则不移动已经占位的单位，后续寻路和移动检查使用新规则。
 

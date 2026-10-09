@@ -66,7 +66,7 @@ skynet.error("地图加载失败")
 
 ## Native API 与默认回退
 
-公共头 logger/native/include/flywow_logger.h 编入调用者，不链接 Logger .so；提供固定 Skynet skynet-src 头路径，使用宿主导出的 C API：
+公共头 logger/native/flywow_logger.h 编入调用者，不链接 Logger .so；提供固定 Skynet skynet-src 头路径，使用宿主导出的 C API：
 ~~~cpp
 flywow_logger::register_service(ctx, "my_native_service");
 flywow_logger::log_write(

@@ -2,7 +2,7 @@
 // 边界：Server Runtime；不 yield，不包含 Skynet 业务，不自行操作 Lua 栈。
 // 生命周期：Context/Path 由 Lua userdata 独占；Registry 共享已发布静态地图。
 // 不保存全局 mutable scratch；每个 Battle 的 occupancy 和 Path cursor 独立。
-#include "lua_navigation.h"
+#include "navigation_binding.h"
 #include "agent_profile.h"
 #include "grid_pathfinder.h"
 #include "lua_binding.h"

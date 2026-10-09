@@ -17,10 +17,10 @@ Logger 由四个部分组成：
 
 | 部件 | 作用 | 创建 Logger | 直接写文件 |
 | --- | --- | --- | --- |
-| logger/native/src/service_logger.cpp | Skynet Native Logger Service | 是 | 是 |
+| logger/native/service_logger.cpp | Skynet Native Logger Service | 是 | 是 |
 | logger/lualib/flywow_logger.lua | Lua 适配和 flush 接口 | 否 | 否 |
 | logger/lualib/flywow_logger_preload.lua | 自动安装 Lua 适配 | 否 | 否 |
-| logger/native/include/flywow_logger.h | 其他 Native 模块的发送接口 | 否 | 否 |
+| logger/native/flywow_logger.h | 其他 Native 模块的发送接口 | 否 | 否 |
 
 最容易混淆的一点是：flywow_logger.so 和 flywow_logger.lua 不是同一个东西。前者由 Skynet 启动，后者只负责 Lua 层转发。
 
@@ -96,7 +96,7 @@ flywow_logger_release(...);
 源码位于：
 
 ~~~text
-logger/native/src/service_logger.cpp
+logger/native/service_logger.cpp
 ~~~
 
 ~~~cpp
