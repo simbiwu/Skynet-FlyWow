@@ -10,7 +10,7 @@
 | `clients/unity` / `clients/h5` | `gateway/clients/unity` / `gateway/clients/h5` |
 | Gateway registry 生成工具 | `gateway/tools/generate_gateway_registry.py` |
 | Gateway crypto 构建脚本 | `scripts/build_flywow.sh` |
-| 宿主 `native/grid_map` 源码 | `navigation/native/grid_map` |
+| 宿主 Navigation Native 源码 | `navigation/native` |
 | 宿主 `native/lua_battle_nav` 源码 | `navigation/native/navigation_binding.cpp` |
 | `require "battle_nav"` | `require "flywow_navigation"` |
 | `battle_nav.so` / `luaopen_battle_nav` | `flywow_navigation_native.so` / `luaopen_flywow_navigation_native` |
