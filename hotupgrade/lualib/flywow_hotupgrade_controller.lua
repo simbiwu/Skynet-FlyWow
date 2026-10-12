@@ -425,6 +425,7 @@ function Controller:discard_candidate(txn, target)
     return result.success()
 end
 
+--- 候选清理后恢复旧实例与旧路由；若旧实例已准备退休，先撤销退休准备。
 function Controller:restore_old(txn, target)
     if target.prepared_retire then
         local restored = self:step(txn, target.old, "cancel_retire")
@@ -440,6 +441,7 @@ function Controller:restore_old(txn, target)
     return result.success()
 end
 
+--- 逐目标清理候选并恢复旧实例；单个目标失败不阻塞其它目标继续收敛。
 function Controller:abort_targets(txn, targets)
     local failed
     for _, target in ipairs(targets) do
@@ -518,6 +520,7 @@ function Controller:resume_routes(txn, targets)
     return result.success()
 end
 
+--- 按路由切换、注册表发布、参与者恢复、路由恢复的固定顺序发布一批目标。
 function Controller:publish_targets(txn, targets)
     local switched = self:switch_routes(txn, targets)
     if not switched.ok then return switched end
@@ -530,6 +533,7 @@ function Controller:publish_targets(txn, targets)
     return self:resume_routes(txn, targets)
 end
 
+--- 等待旧代际访问者排空后退休旧实例；轮询调用 skynet.sleep，会 yield。
 function Controller:cleanup_old(txn, targets)
     local deadline = skynet.now() + math.ceil((txn.patch.strategy and txn.patch.strategy.drain_timeout_ms or 10000) / 10)
     local pending = {}
@@ -605,6 +609,7 @@ function Controller:finish_group(txn, targets)
     return cleaned
 end
 
+--- 推进一个一致性批次；dry_run 只暂存并验证，随后清理候选，不发布新代际。
 function Controller:run_group(txn, targets, dry_run)
     txn.group_published = false
     txn.machine = transaction.new(txn.id .. ":" .. txn.current_batch)
@@ -620,6 +625,7 @@ function Controller:run_group(txn, targets, dry_run)
     return self:finish_group(txn, targets)
 end
 
+--- 按策略顺序执行批次；一致性组作为整体处理，已完成批次不会因后续失败回滚。
 function Controller:run(txn, dry_run)
     local policy = txn.patch.strategy or {}
     local size = (policy.batch or {}).size or math.min(100, #txn.targets)
@@ -657,6 +663,7 @@ function Controller:run(txn, dry_run)
     return result.success()
 end
 
+--- 记录并锁定目标后 fork 后台事务；立即返回 txn_id，调用者用 status/history 查询进度。
 function Controller:apply(request, source, dry_run)
     local loaded = self:load(request)
     if not loaded.ok then return loaded end
@@ -680,6 +687,7 @@ function Controller:apply(request, source, dry_run)
     return result.success({txn_id = id, target_count = #txn.targets})
 end
 
+--- 控制面命令入口：参与者请求与管理员命令分别校验来源；已发布事务不能直接 abort。
 function Controller:control(command, request, source)
     if command == "register" then return self:register(request, source) end
     if command == "register_module" then return self:register_module(request, source) end

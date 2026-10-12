@@ -53,6 +53,7 @@ function Runtime:begin(request)
     return result.success()
 end
 
+--- 取得安全点并等待活动业务处理排空；wait_idle 会 yield，超时仍保持暂停状态供协调方收敛。
 function Runtime:prepare(request)
     local began = self:begin(request)
     if not began.ok then return began end
@@ -77,6 +78,7 @@ local function stage_configs(runtime, patch, txn_id)
     return result.success()
 end
 
+--- 在安全点内暂存模块和配置；失败时撤销本次候选，不修改正在运行的配置快照。
 function Runtime:stage(request)
     if self.phase ~= "QUIESCED" or self.guard.owner ~= request.txn_id then
         return result.failure("HU_SAFEPOINT_REQUIRED", "暂存需要已取得安全点")
@@ -116,6 +118,7 @@ function Runtime:import(request)
     return hook(self.adapter, "rebuild_runtime", request)
 end
 
+--- 仅在持有安全点且活动调用为零时提交配置与模块，再切换当前代码版本。
 function Runtime:activate(request)
     if self.phase == "ACTIVATED" then return result.success() end
     if self.guard.owner ~= request.txn_id or self.guard.active ~= 0 then
@@ -162,6 +165,7 @@ end
 local hooks = {health = "healthcheck", prepare_retire = "prepare_retire",
     cancel_retire = "cancel_retire", begin_drain = "begin_drain", can_retire = "can_retire"}
 
+--- 校验访问者和代际后计入活动调用；Guard:run 在业务处理结束后释放计数，供安全点排空。
 function Runtime:invoke(request, source)
     if not self.visitors[source] then return result.failure("HU_UNAUTHORIZED", "访问者未绑定") end
     if request.generation ~= self.options.generation then
@@ -173,12 +177,14 @@ function Runtime:invoke(request, source)
     return called
 end
 
+--- 等待指定访问者已进入的调用完成；循环 sleep 会 yield，供旧路由排空后再退休实例。
 function Runtime:visitor_barrier(request, source)
     if not self.visitors[source] then return result.failure("HU_UNAUTHORIZED", "访问者未绑定") end
     while (self.visitor_active[source] or 0) > 0 do skynet.sleep(1) end
     return result.success()
 end
 
+--- 校验实例身份、控制来源和事务序号后分派内部命令；普通业务调用走 invoke。
 function Runtime:control(command, request, source)
     if request.instance_id ~= self.options.instance_id then
         return result.failure("HU_STALE_INSTANCE", "实例身份不匹配")

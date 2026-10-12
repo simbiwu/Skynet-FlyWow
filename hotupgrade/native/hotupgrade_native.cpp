@@ -23,15 +23,17 @@
 namespace {
 using flywow_lua_binding::LuaBinding;
 using flywow_lua_binding::LuaTable;
+// 单次补丁扫描的硬上限：文件数、总 Lua 字节数和单文件字节数分别独立校验。
 constexpr std::size_t kMaxLuaFiles = 1024;
 constexpr std::size_t kMaxTotalBytes = 16U * 1024U * 1024U;
 constexpr std::size_t kMaxFileBytes = 2U * 1024U * 1024U;
 
 struct FileList {
-  std::vector<std::string> paths;
-  std::size_t total_bytes = 0;
+  std::vector<std::string> paths; // 相对补丁根目录的 Lua 文件路径，供 Lua 层加载。
+  std::size_t total_bytes = 0;    // 已接受文件的累计字节数，用于限制扫描资源。
 };
 
+// 将任意输入计算为 SHA-256，并用小写十六进制输出 64 个字符。
 bool makeDigest(const std::string &input, std::string &output) {
   unsigned char bytes[EVP_MAX_MD_SIZE];
   unsigned int length = 0;
@@ -49,6 +51,7 @@ bool makeDigest(const std::string &input, std::string &output) {
   return true;
 }
 
+// 生成 128 位 OpenSSL CSPRNG 随机数，并编码为 32 个小写十六进制字符供身份令牌使用。
 bool makeNonce(std::string &output) {
   unsigned char bytes[16];
   if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
@@ -63,6 +66,7 @@ bool makeNonce(std::string &output) {
   return true;
 }
 
+// realpath 要求目标已存在；输出规范化绝对路径，供后续根目录包含关系校验。
 bool resolvePath(const std::string &path, std::string &output) {
   if (path.empty() || path.size() >= PATH_MAX ||
       path.find('\0') != std::string::npos) {
@@ -76,6 +80,7 @@ bool resolvePath(const std::string &path, std::string &output) {
   return true;
 }
 
+// 文件 fsync 只保证文件内容；再 fsync 父目录，持久化新建文件的目录项。
 int syncParent(const std::string &path) {
   if (path.size() >= PATH_MAX) {
     return -1;
@@ -99,6 +104,8 @@ int syncParent(const std::string &path) {
   return synced == 0 && closed == 0 ? 0 : -1;
 }
 
+// 递归枚举受信任根目录内的普通 Lua 文件；拒绝符号链接/特殊文件，并累计资源上限。
+// 返回 0 成功，-1 路径/文件结构无效，-2 超出文件数或字节预算。
 int scanDirectory(const std::string &root, const std::string &directory,
                   const std::string &relative, FileList &files) {
   DIR *handle = opendir(directory.c_str());
@@ -169,6 +176,7 @@ int scanDirectory(const std::string &root, const std::string &directory,
   return status;
 }
 
+// 校验补丁目录必须位于 root 下，再扫描白名单分类；1 表示分类目录或内容为空。
 int listLuaFiles(const std::string &root_argument, const std::string &relative,
                  const std::string &category,
                  std::vector<std::string> &output) {
@@ -211,6 +219,7 @@ int listLuaFiles(const std::string &root_argument, const std::string &relative,
   return 0;
 }
 
+// 以仅追加、禁止跟随符号链接的方式写审计记录；文件和父目录都同步后才报告成功。
 bool appendSynchronized(const std::string &path, const std::string &bytes) {
   if (path.empty() || path.size() >= PATH_MAX ||
       path.find('\0') != std::string::npos) {

@@ -138,6 +138,7 @@ local function stage_loader(engine, state)
     end
 end
 
+--- 在受限环境加载声明模块；loading 检测依赖环，成功结果只进入当前 stage。
 function Engine:load_entry(state, name)
     if state.new[name] then return result.success() end
     if state.loading[name] then
@@ -190,6 +191,7 @@ function Engine:stage(entries)
     return result.success({stage = state})
 end
 
+--- 递归修正候选闭包捕获的导出表引用；seen 防止闭包间循环导致重复遍历。
 local function rebind_function(fn, candidate, live, seen)
     if seen[fn] then return end
     seen[fn] = true
@@ -204,6 +206,7 @@ local function rebind_function(fn, candidate, live, seen)
     end
 end
 
+--- 把候选导出写入原 live table 并保存 undo；保留 table 身份供旧引用继续工作。
 function Engine:install_entry(state, name)
     local candidate = state.new[name]
     local entry = state.entries[name]
