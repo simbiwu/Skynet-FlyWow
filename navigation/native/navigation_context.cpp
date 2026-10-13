@@ -66,31 +66,29 @@ void NavigationContext::BeginQuery()
 }
 
 // 修改当前 Context 的单格规则；规则列表只保存例外，不按地图大小分配。
-NavResult<bool> NavigationContext::SetCellDynamicEntryRule(const GridPos &grid,
+NavResult<bool> NavigationContext::SetCellDynamicEntryRule(const GridPos       &grid,
                                                            CellDynamicEntryRule rule)
 {
     if (map_->TryCell(grid) == nullptr)
     {
-        return NavResult<bool>::Failure(NavError::kOutOfBounds,
-                                        "dynamic rule cell is outside map");
+        return NavResult<bool>::Failure(NavError::kOutOfBounds, "dynamic rule cell is outside map");
     }
-    if (rule != CellDynamicEntryRule::kDefault &&
-        rule != CellDynamicEntryRule::kAllow && rule != CellDynamicEntryRule::kBlock)
+    if (rule != CellDynamicEntryRule::kDefault && rule != CellDynamicEntryRule::kAllow &&
+        rule != CellDynamicEntryRule::kBlock)
     {
-        return NavResult<bool>::Failure(NavError::kInvalidArgument,
-                                        "invalid dynamic entry rule");
+        return NavResult<bool>::Failure(NavError::kInvalidArgument, "invalid dynamic entry rule");
     }
 
     // 列表按 z、x 排序，lower_bound 同时定位已有覆盖和新覆盖的插入位置。
-    const auto entry = std::lower_bound(
-        dynamic_entry_rules_.begin(), dynamic_entry_rules_.end(), grid,
-        [](const CellDynamicEntryOverride &candidate, const GridPos &target)
-        {
-            return candidate.grid.z < target.z ||
-                   (candidate.grid.z == target.z && candidate.grid.x < target.x);
-        });
-    const bool found = entry != dynamic_entry_rules_.end() && entry->grid.x == grid.x &&
-                       entry->grid.z == grid.z;
+    const auto entry =
+        std::lower_bound(dynamic_entry_rules_.begin(), dynamic_entry_rules_.end(), grid,
+                         [](const CellDynamicEntryOverride &candidate, const GridPos &target)
+                         {
+                             return candidate.grid.z < target.z ||
+                                    (candidate.grid.z == target.z && candidate.grid.x < target.x);
+                         });
+    const bool found =
+        entry != dynamic_entry_rules_.end() && entry->grid.x == grid.x && entry->grid.z == grid.z;
     if (rule == CellDynamicEntryRule::kDefault)
     {
         if (found)
@@ -117,17 +115,16 @@ bool NavigationContext::AllowsDynamicEntry(const GridPos &grid) const noexcept
         return false;
     }
 
-    const auto entry = std::lower_bound(
-        dynamic_entry_rules_.begin(), dynamic_entry_rules_.end(), grid,
-        [](const CellDynamicEntryOverride &candidate, const GridPos &target)
-        {
-            return candidate.grid.z < target.z ||
-                   (candidate.grid.z == target.z && candidate.grid.x < target.x);
-        });
+    const auto entry =
+        std::lower_bound(dynamic_entry_rules_.begin(), dynamic_entry_rules_.end(), grid,
+                         [](const CellDynamicEntryOverride &candidate, const GridPos &target)
+                         {
+                             return candidate.grid.z < target.z ||
+                                    (candidate.grid.z == target.z && candidate.grid.x < target.x);
+                         });
     return entry == dynamic_entry_rules_.end() || entry->grid.x != grid.x ||
-                   entry->grid.z != grid.z ||
-                   entry->rule == CellDynamicEntryRule::kDefault ||
-                   entry->rule == CellDynamicEntryRule::kAllow;
+           entry->grid.z != grid.z || entry->rule == CellDynamicEntryRule::kDefault ||
+           entry->rule == CellDynamicEntryRule::kAllow;
 }
 
 // 返回 node_index 在当前 generation 的可变 scratch，首次触达时惰性初始化。
@@ -156,6 +153,45 @@ NavigationContext::NodeScratch &NavigationContext::TouchNode(std::int32_t node_i
         ++visited_nodes_;
     }
     return node;
+}
+
+AirState &NavigationContext::airState()
+{
+    if (!air_)
+    {
+        auto state    = std::make_unique<AirState>();
+        state->limits = air_limits_;
+        air_          = std::move(state);
+    }
+    return *air_;
+}
+NavResult<bool> NavigationContext::setAirLimits(const AirLimits &l)
+{
+    const AirLimits hard;
+    if (air_ || !l.expanded || l.expanded > hard.expanded || !l.nodes || l.nodes > hard.nodes ||
+        !l.buckets || l.buckets > hard.buckets || !l.tests || l.tests > hard.tests ||
+        !l.path_points || l.path_points > hard.path_points || !l.objects ||
+        l.objects > hard.objects || !l.object_links || l.object_links > hard.object_links ||
+        !l.links || l.links > hard.links)
+    {
+        return NavResult<bool>::Failure(NavError::kInvalidArgument,
+                                        "air limits invalid or already active");
+    }
+    air_limits_ = l;
+    return NavResult<bool>::Success(true);
+}
+std::size_t NavigationContext::airMemoryBytes() const noexcept
+{
+    if (!air_)
+        return 0;
+    return sizeof(AirState) +
+           air_->objects.size() * (sizeof(AirBox) + sizeof(std::uint64_t) + 3 * sizeof(void *)) +
+           air_->links.size() * (sizeof(std::pair<std::uint32_t, std::uint64_t>) + sizeof(bool) +
+                                 3 * sizeof(void *)) +
+           air_->empty_cells.capacity() * sizeof(std::uint32_t) +
+           air_->nodes.capacity() * sizeof(AirNode) +
+           air_->index.capacity() * sizeof(decltype(air_->index)::value_type) +
+           air_->heap.capacity() * sizeof(std::uint32_t);
 }
 
 } // namespace flywow_navigation

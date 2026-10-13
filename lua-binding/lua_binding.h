@@ -74,7 +74,7 @@ template <typename T> struct ValueCodec
                 }
             }
             else if (value < 0 || static_cast<std::uintmax_t>(value) >
-                                  static_cast<std::uintmax_t>(std::numeric_limits<T>::max()))
+                                      static_cast<std::uintmax_t>(std::numeric_limits<T>::max()))
             {
                 *reason = "integer outside destination range";
                 return false;
@@ -194,6 +194,12 @@ class LuaBinding
         return lua_isnoneornil(state_, index) || readValue(index, output);
     }
 
+    /// 判断可选参数是否省略/nil；只读栈类型，栈高度不变，不触发元方法。
+    bool isNoneOrNil(int index) const noexcept
+    {
+        return lua_isnoneornil(state_, index);
+    }
+
     /// 读取 table 引用，不占据长期栈槽；失败保留 output 原句柄。
     /// @param index Lua 栈中待读 table 的参数索引。
     /// @param output 输出对象；成功时写入借用 table 句柄，失败时保留原句柄。
@@ -221,7 +227,7 @@ class LuaBinding
     /// @param value 待写入的 C++ 值；Table/userdata 由 closure 持有引用。
     template <typename T> bool writeUpvalue(int index, const T &value)
     {
-        const int actual = lua_upvalueindex(index);
+        const int            actual = lua_upvalueindex(index);
         detail::StackRestore stack(state_);
         if (!pushValue(value))
         {
@@ -299,7 +305,7 @@ class LuaBinding
 
         // userdata 内存直接作为 T 的存储；先构造，成功后才挂 __gc，失败时不会析构未构造对象。
         void *storage = lua_newuserdatauv(state_, sizeof(T), 1);
-        T *object = nullptr;
+        T    *object  = nullptr;
         try
         {
             object = new (storage) T(std::forward<Args>(args)...);
@@ -347,8 +353,8 @@ class LuaBinding
 
     struct UserdataReference
     {
-        void       *object; // 对齐后的 T 地址，用于返回/写表时找回原 userdata。
-        int         reference; // 本回调持有；析构时 unref，Lua 返回值可继续持有对象。
+        void *object;    // 对齐后的 T 地址，用于返回/写表时找回原 userdata。
+        int   reference; // 本回调持有；析构时 unref，Lua 返回值可继续持有对象。
     };
 
     // Lua 自动 GC 或手动 finalize 均只析构一次；状态保存在 userdata 自己的 uservalue。
@@ -426,7 +432,7 @@ class LuaBinding
         return (pushValue(values) && ...);
     }
 
-    lua_State                     *state_;     // 借用宿主 State。
+    lua_State                     *state_; // 借用宿主 State。
     std::string                    error_code_;
     std::string                    error_message_;
     std::uint64_t                  error_revision_ = 0; // visitor 判断本轮是否产生新错误。

@@ -15,8 +15,8 @@ namespace flywow_navigation
 
 // cells 按值传入，再 move 到本对象；构造成功后调用方不再拥有该数组。
 // 这里检查内存数据是否自洽，不替代 Reader 的文件版本、长度和 CRC 校验。
-GridMap::GridMap(BMapMetadata metadata, std::vector<NavCell> cells)
-    : metadata_(metadata), cells_(std::move(cells))
+GridMap::GridMap(BMapMetadata metadata, std::vector<NavCell> cells, AirAsset air)
+    : air_(std::move(air)), metadata_(metadata), cells_(std::move(cells))
 {
     // 先提升再相乘，避免 width*height 在 32 位就回绕；每个格子必须恰有一个 Cell。
     const std::uint64_t expected = static_cast<std::uint64_t>(metadata_.width) * metadata_.height;
@@ -30,7 +30,9 @@ std::size_t GridMap::memory_bytes() const noexcept
 {
     // capacity 包含已经预留但未使用的空间，size 只计有效元素；这里估算占用，
     // 不包含分配器开销，也不是进程的实测内存。
-    return sizeof(*this) + cells_.capacity() * sizeof(NavCell);
+    return sizeof(*this) + cells_.capacity() * sizeof(NavCell) +
+           air_.cells.capacity() * sizeof(AirCell) +
+           air_.intervals.capacity() * sizeof(AirInterval);
 }
 
 // ---- 坐标转换：世界毫米位置与地图内部格下标 ----

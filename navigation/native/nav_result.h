@@ -14,31 +14,37 @@ namespace flywow_navigation
 // 错误枚举属于跨模块合同；已有值不要随意改名或复用为其他语义。
 enum class NavError
 {
-    kOk = 0,              // 操作成功。
-    kIoError,             // 文件打开、读取或系统 I/O 失败。
-    kBadMagic,            // 文件开头不是 BMAP。
-    kUnsupportedVersion,  // BMAP 版本不受当前 Reader 支持。
-    kInvalidHeaderSize,   // Header 长度与 V1 合同不符。
-    kInvalidDimensions,   // width、height 或 cellSize 非法。
-    kSizeOverflow,        // 尺寸乘法超出可安全表示的范围。
-    kInvalidStride,       // 单格磁盘长度与 V1 合同不符。
-    kPayloadSizeMismatch, // Header 声明的 Payload 长度与尺寸不一致。
-    kHeaderCrcMismatch,   // Header 自身校验失败。
-    kPayloadCrcMismatch,  // Cell Payload 校验失败。
-    kTruncated,           // 文件短于 Header 声明的长度。
-    kTrailingBytes,       // 合法内容后仍有未定义字节。
-    kMapNotFound,         // 查询的 mapId 或版本未加载。
-    kOutOfBounds,         // 世界坐标或 Grid 下标位于地图外。
-    kInvalidArgument,     // 其他调用参数违反公开合同。
-    kInvalidAgent,        // NavigationProfile 本身不合法或 unit_id 不存在。
-    kStartNotNavigable,   // 起点在地图内，但不满足静态/动态通行规则。
-    kEndNotNavigable,     // 终点在地图内，但不满足静态/动态通行规则。
-    kNoPath,              // 起终点均合法，但当前规则下不存在连通路径。
-    kContextClosed,       // Lua/业务仍在调用已经关闭的 NavigationContext。
-    kPathTooLong,         // 回溯点数或累计长度超过项目保护上限。
-    kDynamicOccupied,     // 动态占位提交与其他 Unit 冲突。
-    kMoveBlocked,         // 缓存路径的本次跨格已被静态或动态规则拒绝。
-    kInternalError,       // Native 未预期异常在 C ABI 边界被收敛，不能继续传播。
+    kOk = 0,               // 操作成功。
+    kIoError,              // 文件打开、读取或系统 I/O 失败。
+    kBadMagic,             // 文件开头不是 BMAP。
+    kUnsupportedVersion,   // BMAP 版本不受当前 Reader 支持。
+    kInvalidHeaderSize,    // Header 长度与 V1 合同不符。
+    kInvalidDimensions,    // width、height 或 cellSize 非法。
+    kSizeOverflow,         // 尺寸乘法超出可安全表示的范围。
+    kInvalidStride,        // 单格磁盘长度与 V1 合同不符。
+    kPayloadSizeMismatch,  // Header 声明的 Payload 长度与尺寸不一致。
+    kHeaderCrcMismatch,    // Header 自身校验失败。
+    kPayloadCrcMismatch,   // Cell Payload 校验失败。
+    kTruncated,            // 文件短于 Header 声明的长度。
+    kTrailingBytes,        // 合法内容后仍有未定义字节。
+    kMapNotFound,          // 查询的 mapId 或版本未加载。
+    kOutOfBounds,          // 世界坐标或 Grid 下标位于地图外。
+    kInvalidArgument,      // 其他调用参数违反公开合同。
+    kInvalidAgent,         // NavigationProfile 本身不合法或 unit_id 不存在。
+    kStartNotNavigable,    // 起点在地图内，但不满足静态/动态通行规则。
+    kEndNotNavigable,      // 终点在地图内，但不满足静态/动态通行规则。
+    kNoPath,               // 起终点均合法，但当前规则下不存在连通路径。
+    kContextClosed,        // Lua/业务仍在调用已经关闭的 NavigationContext。
+    kPathTooLong,          // 回溯点数或累计长度超过项目保护上限。
+    kDynamicOccupied,      // 动态占位提交与其他 Unit 冲突。
+    kMoveBlocked,          // 缓存路径的本次跨格已被静态或动态规则拒绝。
+    kInvalidAirAsset,      // AIRN 格式或区间非法。
+    kAssetMismatch,        // 可选组件与 BMAP 身份不配对。
+    kSearchBudgetExceeded, // A* 节点资源已耗尽。
+    kQueryBudgetExceeded,  // 扫掠桶或候选测试预算耗尽。
+    kCapacityExceeded,     // 动态资源容量不足；旧状态不变。
+    kBlocked,              // 连续移动遭到阻挡。
+    kInternalError,        // Native 未预期异常在 C ABI 边界被收敛，不能继续传播。
 };
 
 // 返回便于日志和 Lua 错误结果使用的稳定 ASCII 名称。

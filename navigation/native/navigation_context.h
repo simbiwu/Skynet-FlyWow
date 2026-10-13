@@ -5,6 +5,7 @@
 // 不负责：不拥有 MapRegistry，不把 GridPos 暴露给 Lua 业务，不执行 Skynet yield 或跨 Battle 状态。
 #pragma once
 
+#include "air_navigation.h"
 #include "dynamic_occupancy.h"
 #include "grid_map.h"
 #include "nav_result.h"
@@ -21,9 +22,9 @@ namespace flywow_navigation
 // kDefault 清除当前 Context 的覆盖，恢复默认的允许重叠行为。
 enum class CellDynamicEntryRule : std::uint8_t
 {
-    kDefault        = 0, // 清除本格覆盖；恢复默认的允许重叠规则。
-    kAllow          = 1, // 已有其他单位时仍允许重叠进入。
-    kBlock          = 2, // 禁止与其他单位重叠进入；空格仍可进入。
+    kDefault = 0, // 清除本格覆盖；恢复默认的允许重叠规则。
+    kAllow   = 1, // 已有其他单位时仍允许重叠进入。
+    kBlock   = 2, // 禁止与其他单位重叠进入；空格仍可进入。
 };
 
 // 当前 Battle 对一个格子的重叠规则；只存显式覆盖项，不为整张地图分配数组。
@@ -123,15 +124,25 @@ class NavigationContext final
         return visited_nodes_;
     }
 
+    /// 首次空中操作才分配状态；当前 Context 单 owner，无 I/O/yield。
+    AirState       &airState();
+    /// 仅在首次空中操作前调低默认保护上限；不建立第二套配置源。
+    NavResult<bool> setAirLimits(const AirLimits &limits);
+    /// 近似空中状态内存，不包含 allocator 开销；关闭空中时为 0。
+    std::size_t     airMemoryBytes() const noexcept;
+
   private:
-    std::shared_ptr<const GridMap>        map_;                 // 与 MapRegistry 共享 immutable GridMap 所有权。
-    DynamicOccupancy                      occupancy_;           // 当前 Battle 的真实动态 footprint 占用。
-    std::vector<CellDynamicEntryOverride> dynamic_entry_rules_; // 本 Battle 的稀疏覆盖，按 z、x 排序。
-    std::vector<NodeScratch>              nodes_;               // 每 Cell 一个 scratch record，本 Context 独占。
-    std::vector<std::int32_t>              heap_;                // Binary Heap 的 node_index 存储，本 Context 独占。
-    std::size_t                    heap_size_        = 0; // 本次 query 的有效 heap slot 数。
-    std::uint32_t                  query_generation_ = 0; // 0 保留为“从未属于任何查询”。
-    std::uint32_t                  visited_nodes_    = 0; // 本次查询 Touch 的唯一 Node 计数。
+    std::unique_ptr<AirState>      air_;        // 按需创建；Context 析构统一释放。
+    AirLimits                      air_limits_; // 不分配资源；首次空中操作后保持不变。
+    std::shared_ptr<const GridMap> map_;        // 与 MapRegistry 共享 immutable GridMap 所有权。
+    DynamicOccupancy               occupancy_;  // 当前 Battle 的真实动态 footprint 占用。
+    std::vector<CellDynamicEntryOverride>
+                              dynamic_entry_rules_; // 本 Battle 的稀疏覆盖，按 z、x 排序。
+    std::vector<NodeScratch>  nodes_; // 每 Cell 一个 scratch record，本 Context 独占。
+    std::vector<std::int32_t> heap_;  // Binary Heap 的 node_index 存储，本 Context 独占。
+    std::size_t               heap_size_        = 0; // 本次 query 的有效 heap slot 数。
+    std::uint32_t             query_generation_ = 0; // 0 保留为“从未属于任何查询”。
+    std::uint32_t             visited_nodes_    = 0; // 本次查询 Touch 的唯一 Node 计数。
 };
 
 } // namespace flywow_navigation

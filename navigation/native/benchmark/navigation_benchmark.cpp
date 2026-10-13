@@ -88,10 +88,10 @@ double Percentile(std::vector<double> values, double p)
 void RunCase(std::uint32_t width, std::uint32_t height)
 {
     constexpr std::uint32_t kBlockedPercent = 15;
-    constexpr int           kQueries        = 2000;
+    constexpr int           kQueries        = 10000;
     auto                    map = MakeSynthetic(width, height, kBlockedPercent, 0x12345678u);
     NavigationContext       context(map);
-    NavigationProfile            profile = MakeDefaultNavigationProfile(1);
+    NavigationProfile       profile = MakeDefaultNavigationProfile(1);
     profile.radius_mm               = 200;
     profile.max_step_mm             = 500;
     profile.max_slope_permille      = 1000;
@@ -147,7 +147,10 @@ void RunCase(std::uint32_t width, std::uint32_t height)
               << " success=" << success << " no_path=" << no_path
               << " p50_us=" << Percentile(microseconds, 0.50)
               << " p95_us=" << Percentile(microseconds, 0.95)
-              << " p99_us=" << Percentile(microseconds, 0.99) << " qps=" << (kQueries / seconds)
+              << " p99_us=" << Percentile(microseconds, 0.99)
+              << " max_us=" << *std::max_element(microseconds.begin(), microseconds.end())
+              << " air_context_bytes=" << context.airMemoryBytes()
+              << " qps=" << (kQueries / seconds)
               << " avg_visited=" << (visited_sum / static_cast<double>(kQueries))
               << " node_scratch_bytes=" << node_scratch_bytes << " heap_bytes=" << heap_bytes
               << " occupancy_index_bytes_est=" << occupancy_index_bytes_est

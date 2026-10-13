@@ -3,17 +3,18 @@
 // 生命周期：Context/Path 由 Lua userdata 独占；Context 固定共享只读地图与 Profile 快照。
 // 不保存全局 mutable scratch；每个 Battle 的 occupancy 和 Path cursor 独立。
 #include "navigation_binding.h"
-#include "navigation_profile.h"
-#include "navigation_profile_registry.h"
 #include "grid_pathfinder.h"
 #include "lua_binding.h"
 #include "lua_table.h"
 #include "map_registry.h"
 #include "navigation_context.h"
 #include "navigation_path.h"
+#include "navigation_profile.h"
+#include "navigation_profile_registry.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
@@ -23,13 +24,13 @@ namespace
 {
 using flywow_lua_binding::LuaBinding;
 using flywow_lua_binding::LuaTable;
-using flywow_navigation::NavigationProfileRegistry;
-using flywow_navigation::DynamicNavigationPolicy;
 using flywow_navigation::CellDynamicEntryRule;
+using flywow_navigation::DynamicNavigationPolicy;
 using flywow_navigation::GridPos;
 using flywow_navigation::MapRegistry;
 using flywow_navigation::NavigationAgent;
 using flywow_navigation::NavigationAgentHandle;
+using flywow_navigation::NavigationProfileRegistry;
 using flywow_navigation::WorldPosition;
 
 // 固定类型名只读共享；用 string 常量避免每次访问 userdata 都临时分配同一份长名称。
@@ -37,7 +38,7 @@ const std::string     kContextMeta     = "flywow_navigation.NavigationContext";
 const std::string     kPathMeta        = "flywow_navigation.Path";
 constexpr const char *kInvalidArgument = "INVALID_ARGUMENT";
 
-using NavigationProfileSnapshot = NavigationProfileRegistry::SnapshotType;
+using NavigationProfileSnapshot    = NavigationProfileRegistry::SnapshotType;
 using NavigationProfileSnapshotPtr = std::shared_ptr<const NavigationProfileSnapshot>;
 
 struct LuaNavigationContext
@@ -101,15 +102,13 @@ bool readContext(LuaBinding &lua_binding, LuaNavigationContext *&output)
 }
 
 // 对本次调用取得的不可变快照二分查找；快照由调用方持有到导航操作结束。
-const flywow_navigation::NavigationProfile *findNavigationProfile(
-    LuaBinding &lua_binding, const NavigationProfileSnapshot &profiles, std::uint32_t unit_id)
+const flywow_navigation::NavigationProfile *
+findNavigationProfile(LuaBinding &lua_binding, const NavigationProfileSnapshot &profiles,
+                      std::uint32_t unit_id)
 {
-    const auto found = std::lower_bound(
-        profiles.begin(), profiles.end(), unit_id,
-        [](const flywow_navigation::NavigationProfile &profile, std::uint32_t id)
-        {
-            return profile.unit_id < id;
-        });
+    const auto found = std::lower_bound(profiles.begin(), profiles.end(), unit_id,
+                                        [](const flywow_navigation::NavigationProfile &profile,
+                                           std::uint32_t id) { return profile.unit_id < id; });
     if (found == profiles.end() || found->unit_id != unit_id)
     {
         lua_binding.setError(
@@ -231,7 +230,7 @@ bool readNavigationProfiles(LuaBinding &lua_binding, const LuaTable &table, std:
     profiles.reserve(count);
     for (std::size_t index = 1; index <= count; ++index)
     {
-        LuaTable profile_table;
+        LuaTable                             profile_table;
         flywow_navigation::NavigationProfile profile;
         if (!table.readTable(static_cast<std::int64_t>(index), profile_table) ||
             !parseProfile(lua_binding, profile_table, profile))
@@ -247,17 +246,22 @@ bool readNavigationProfiles(LuaBinding &lua_binding, const LuaTable &table, std:
 /// load_map(path)：读取并校验完整 BMAP，按 map_id 替换当前地图；已有 Context 继续持有旧地图。
 int loadMap(lua_State *state)
 {
-    LuaBinding lua_binding(state);
-    void *registry_pointer = nullptr;
+    LuaBinding  lua_binding(state);
+    void       *registry_pointer = nullptr;
     std::string path;
     if (!lua_binding.readUpvalue(1, registry_pointer) || !lua_binding.readValue(1, path))
         return lua_binding.pushError();
-    auto *maps = static_cast<MapRegistry *>(registry_pointer);
-    const auto loaded = maps->Load(path.c_str());
+    auto       *maps = static_cast<MapRegistry *>(registry_pointer);
+    std::string air_path;
+    if (!lua_binding.readOptionalValue(2, air_path))
+        return lua_binding.pushError();
+    if (!lua_binding.isNoneOrNil(2) && air_path.empty())
+        return lua_binding.pushError(kInvalidArgument, "explicit airnav path is empty");
+    const auto loaded = maps->Load(path, air_path);
     if (!loaded.ok())
         return lua_binding.pushError(flywow_navigation::NavErrorName(loaded.error), loaded.detail);
     const auto &metadata = loaded.value->metadata();
-    auto table = lua_binding.newTable();
+    auto        table    = lua_binding.newTable();
     if (!table.writeValue("map_id", metadata.map_id) ||
         !table.writeValue("map_version", metadata.map_version))
         return lua_binding.pushError();
@@ -282,7 +286,7 @@ LuaTable cellResultTable(LuaBinding &lua_binding, const flywow_navigation::GridP
 /// query_cell(id,version,position)：按当前 map_id 查询并校验资产版本；只读、不 yield。
 int queryCell(lua_State *state)
 {
-    LuaBinding lua_binding(state);
+    LuaBinding    lua_binding(state);
     void         *registry_pointer = nullptr;
     std::uint32_t map_id           = 0; // 必填地图身份，由正数业务检查拒绝默认 0。
     std::uint32_t map_version      = 0;
@@ -302,7 +306,8 @@ int queryCell(lua_State *state)
     }
     if (found.value->metadata().map_version != map_version)
     {
-        return lua_binding.pushError("MAP_VERSION_MISMATCH", "map_version does not match current map");
+        return lua_binding.pushError("MAP_VERSION_MISMATCH",
+                                     "map_version does not match current map");
     }
     const auto grid = found.value->WorldToGrid(position);
     if (!grid.ok())
@@ -321,8 +326,8 @@ int queryCell(lua_State *state)
 /// load_navigation_profiles(profiles)：校验独立导航配置并原子替换当前只读表。
 int loadNavigationProfiles(lua_State *state)
 {
-    LuaBinding lua_binding(state);
-    LuaTable profiles;
+    LuaBinding  lua_binding(state);
+    LuaTable    profiles;
     std::size_t profile_count = 0;
     if (!lua_binding.readTable(1, profiles) || !profiles.denseArrayLength(profile_count))
     {
@@ -346,10 +351,10 @@ int loadNavigationProfiles(lua_State *state)
     return lua_binding.returnValues(true);
 }
 
-/// new_context(map_id)：固定当前地图和 Profile 快照，每场 Battle 独占动态状态。
+/// new_context(map_id[,air_limits])：固定地图；owner 独占动态状态，Profile 在地面操作时读取。
 int newContext(lua_State *state)
 {
-    LuaBinding lua_binding(state);
+    LuaBinding    lua_binding(state);
     void         *registry_pointer = nullptr;
     std::uint32_t map_id           = 0;
     if (!lua_binding.readUpvalue(1, registry_pointer) ||
@@ -358,11 +363,8 @@ int newContext(lua_State *state)
         return lua_binding.pushError();
     }
 
-    const auto profiles = NavigationProfileRegistry::Instance().Snapshot();
-    if (profiles == nullptr)
-    {
-        return lua_binding.pushError("INVALID_AGENT", "navigation profiles are not loaded");
-    }
+    // Context 只固定静态地图；纯空中调用不依赖 ground Profile。
+    // 地面入口各自读取/校验当前 Profile，保持未配置时的 INVALID_AGENT 失败语义。
     const auto found = static_cast<MapRegistry *>(registry_pointer)->Find(map_id);
     if (!found.ok())
     {
@@ -374,17 +376,46 @@ int newContext(lua_State *state)
         return lua_binding.pushError();
     }
     owner->context.reset(new flywow_navigation::NavigationContext(found.value));
+    if (!lua_binding.isNoneOrNil(2))
+    {
+        LuaTable                     limits;
+        flywow_navigation::AirLimits air;
+        if (!lua_binding.readTable(2, limits))
+            return lua_binding.pushError();
+        if (!limits.isNil("expanded") && !limits.readValue("expanded", air.expanded))
+            return lua_binding.pushError();
+        if (!limits.isNil("nodes") && !limits.readValue("nodes", air.nodes))
+            return lua_binding.pushError();
+        if (!limits.isNil("buckets") && !limits.readValue("buckets", air.buckets))
+            return lua_binding.pushError();
+        if (!limits.isNil("tests") && !limits.readValue("tests", air.tests))
+            return lua_binding.pushError();
+        if (!limits.isNil("path_points") && !limits.readValue("path_points", air.path_points))
+            return lua_binding.pushError();
+        if (!limits.isNil("objects") && !limits.readValue("objects", air.objects))
+            return lua_binding.pushError();
+        if (!limits.isNil("object_links") && !limits.readValue("object_links", air.object_links))
+            return lua_binding.pushError();
+        if (!limits.isNil("links") && !limits.readValue("links", air.links))
+            return lua_binding.pushError();
+
+        const auto valid = owner->context->setAirLimits(air);
+        if (!valid.ok())
+            return lua_binding.pushError(flywow_navigation::NavErrorName(valid.error),
+                                         valid.detail);
+    }
+
     return lua_binding.returnValues(owner);
 }
 
 // 一次路径查询持有调用开始时的 Registry 快照，保证 Profile 指针在本次同步调用内有效。
 struct PathQuery
 {
-    LuaNavigationContext                  *owner = nullptr;
-    NavigationProfileSnapshotPtr              profiles;
+    LuaNavigationContext                       *owner = nullptr;
+    NavigationProfileSnapshotPtr                profiles;
     const flywow_navigation::NavigationProfile *profile = nullptr;
-    WorldPosition                          start;
-    WorldPosition                          target;
+    WorldPosition                               start;
+    WorldPosition                               target;
 };
 
 bool readPathQuery(LuaBinding &lua_binding, PathQuery &query)
@@ -409,9 +440,9 @@ bool readPathQuery(LuaBinding &lua_binding, PathQuery &query)
 /// find_path(unit_id,start,end,self_id)：同步规划，返回独占 Path/cursor。
 int findPath(lua_State *state)
 {
-    LuaBinding lua_binding(state);
+    LuaBinding    lua_binding(state);
     PathQuery     query;
-    std::uint32_t self_id = 0;
+    std::uint32_t self_id       = 0;
     bool          allow_partial = false;
     if (!lua_binding.readOptionalValue(6, allow_partial) || !readPathQuery(lua_binding, query) ||
         !readPositiveId(lua_binding, 5, "unit_instance_id", self_id))
@@ -438,10 +469,10 @@ int findPath(lua_State *state)
 /// find_path_to_range：搜索进入指定通用中心距范围的可站立位置；不定义战斗规则。
 int findPathToRange(lua_State *state)
 {
-    LuaBinding lua_binding(state);
+    LuaBinding    lua_binding(state);
     PathQuery     query;
-    std::uint32_t range_mm = 0; // uint32 毫米距离，0 合法，不作为实体 ID 检查。
-    std::uint32_t self_id  = 0;
+    std::uint32_t range_mm      = 0; // uint32 毫米距离，0 合法，不作为实体 ID 检查。
+    std::uint32_t self_id       = 0;
     bool          allow_partial = false;
     if (!lua_binding.readOptionalValue(7, allow_partial) || !readPathQuery(lua_binding, query) ||
         !lua_binding.readValue(5, range_mm) ||
@@ -469,14 +500,15 @@ int findPathToRange(lua_State *state)
 /// find_path_to_unit_range：按双方导航半径寻找合法接近点；不接收战斗攻击距离。
 int findPathToUnitRange(lua_State *state)
 {
-    LuaBinding binding(state);
-    LuaNavigationContext *owner = nullptr;
-    std::uint32_t mover_unit_id = 0;
-    std::uint32_t target_unit_id = 0;
-    std::uint32_t unit_instance_id = 0;
-    WorldPosition start{}, target{};
-    bool allow_partial = false;
-    if (!readContext(binding, owner) || !readPositiveId(binding, 2, "mover_unit_id", mover_unit_id) ||
+    LuaBinding            binding(state);
+    LuaNavigationContext *owner            = nullptr;
+    std::uint32_t         mover_unit_id    = 0;
+    std::uint32_t         target_unit_id   = 0;
+    std::uint32_t         unit_instance_id = 0;
+    WorldPosition         start{}, target{};
+    bool                  allow_partial = false;
+    if (!readContext(binding, owner) ||
+        !readPositiveId(binding, 2, "mover_unit_id", mover_unit_id) ||
         !readWorldPosition(binding, 3, start) ||
         !readPositiveId(binding, 4, "target_unit_id", target_unit_id) ||
         !readWorldPosition(binding, 5, target) ||
@@ -491,7 +523,7 @@ int findPathToUnitRange(lua_State *state)
     {
         return binding.pushError("INVALID_AGENT", "navigation profiles are not loaded");
     }
-    const auto *mover_profile = findNavigationProfile(binding, *profiles, mover_unit_id);
+    const auto *mover_profile  = findNavigationProfile(binding, *profiles, mover_unit_id);
     const auto *target_profile = findNavigationProfile(binding, *profiles, target_unit_id);
     if (mover_profile == nullptr || target_profile == nullptr)
     {
@@ -499,9 +531,9 @@ int findPathToUnitRange(lua_State *state)
     }
 
     const NavigationAgent mover{NavigationAgentHandle{unit_instance_id}, mover_profile};
-    auto result = flywow_navigation::GridPathfinder::findPathToUnitRange(
-        *owner->context, mover, start, *target_profile, target,
-        DynamicNavigationPolicy{}, allow_partial);
+    auto                  result = flywow_navigation::GridPathfinder::findPathToUnitRange(
+        *owner->context, mover, start, *target_profile, target, DynamicNavigationPolicy{},
+        allow_partial);
     if (!result.ok())
     {
         return binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
@@ -516,10 +548,9 @@ int findPathToUnitRange(lua_State *state)
 bool readMoveAgent(LuaBinding &lua_binding, LuaNavigationContext *&owner,
                    NavigationProfileSnapshotPtr &profiles, NavigationAgent &agent)
 {
-    std::uint32_t unit_id = 0;
+    std::uint32_t unit_id          = 0;
     std::uint32_t unit_instance_id = 0;
-    if (!readContext(lua_binding, owner) ||
-        !readPositiveId(lua_binding, 2, "unit_id", unit_id) ||
+    if (!readContext(lua_binding, owner) || !readPositiveId(lua_binding, 2, "unit_id", unit_id) ||
         !readPositiveId(lua_binding, 3, "unit_instance_id", unit_instance_id))
     {
         return false;
@@ -575,11 +606,11 @@ int commitMove(LuaBinding &lua_binding, LuaNavigationContext &owner, const Navig
 /// place_unit：出生也是一次正常占位提交；失败不改变现有动态事实。
 int placeUnit(lua_State *state)
 {
-    LuaBinding lua_binding(state);
-    LuaNavigationContext *owner = nullptr;
+    LuaBinding                   lua_binding(state);
+    LuaNavigationContext        *owner = nullptr;
     NavigationProfileSnapshotPtr profiles;
-    NavigationAgent agent;
-    WorldPosition world;
+    NavigationAgent              agent;
+    WorldPosition                world;
     if (!readMoveAgent(lua_binding, owner, profiles, agent) ||
         !readWorldPosition(lua_binding, 4, world))
     {
@@ -591,15 +622,14 @@ int placeUnit(lua_State *state)
 /// move_unit：复验当前子步并提交占位，成功返回 Server 地表 Y 归一的世界位置。
 int moveUnit(lua_State *state)
 {
-    LuaBinding lua_binding(state);
-    LuaNavigationContext *owner = nullptr;
+    LuaBinding                   lua_binding(state);
+    LuaNavigationContext        *owner = nullptr;
     NavigationProfileSnapshotPtr profiles;
-    NavigationAgent agent;
-    WorldPosition from;
-    WorldPosition         to;
+    NavigationAgent              agent;
+    WorldPosition                from;
+    WorldPosition                to;
     if (!readMoveAgent(lua_binding, owner, profiles, agent) ||
-        !readWorldPosition(lua_binding, 4, from) ||
-        !readWorldPosition(lua_binding, 5, to))
+        !readWorldPosition(lua_binding, 4, from) || !readWorldPosition(lua_binding, 5, to))
     {
         return lua_binding.pushError();
     }
@@ -608,10 +638,10 @@ int moveUnit(lua_State *state)
 
 struct AdvanceRequest
 {
-    LuaPath *path = nullptr; // request.path 保留 Lua 引用，本回调只借用。
-    std::uint32_t unit_id = 0; // 静态 Unit 类型 ID，用于本次 Registry 查找。
-    std::uint32_t unit_instance_id = 0; // 当前 Battle 中实体实例的动态句柄。
-    std::uint32_t distance_mm = 0; // 本次 fixed-tick 预算，0 合法。
+    LuaPath      *path             = nullptr; // request.path 保留 Lua 引用，本回调只借用。
+    std::uint32_t unit_id          = 0;       // 静态 Unit 类型 ID，用于本次 Registry 查找。
+    std::uint32_t unit_instance_id = 0;       // 当前 Battle 中实体实例的动态句柄。
+    std::uint32_t distance_mm      = 0;       // 本次 fixed-tick 预算，0 合法。
     WorldPosition from_world;
 };
 
@@ -667,7 +697,7 @@ LuaTable advanceResultTable(LuaBinding                                 &lua_bind
 /// request 的 path/from_world 本次同步借用；失败返回 nil,error。
 int advancePath(lua_State *state)
 {
-    LuaBinding lua_binding(state);
+    LuaBinding            lua_binding(state);
     LuaNavigationContext *owner = nullptr;
     AdvanceRequest        request;
     if (!readContext(lua_binding, owner) || !readAdvanceRequest(lua_binding, request))
@@ -702,7 +732,7 @@ int advancePath(lua_State *state)
 /// cell_size_mm：只读地图边长，单位毫米。
 int cellSizeMm(lua_State *state)
 {
-    LuaBinding lua_binding(state);
+    LuaBinding            lua_binding(state);
     LuaNavigationContext *owner = nullptr;
     if (!readContext(lua_binding, owner))
     {
@@ -714,7 +744,7 @@ int cellSizeMm(lua_State *state)
 // 读取 Lua 的规则名；default 删除当前格覆盖，恢复默认允许重叠行为。
 bool readCellDynamicEntryRule(LuaBinding &lua_binding, int index, CellDynamicEntryRule &output)
 {
-    std::string           rule_name;
+    std::string rule_name;
     if (!lua_binding.readValue(index, rule_name))
     {
         return false;
@@ -744,14 +774,13 @@ bool readCellDynamicEntryRule(LuaBinding &lua_binding, int index, CellDynamicEnt
 /// 成功返回 true；失败返回 nil,error。只影响当前 Battle，规则变化不移动已有单位。
 int setCellRule(lua_State *state)
 {
-    LuaBinding lua_binding(state);
-    LuaNavigationContext *owner = nullptr;
+    LuaBinding            lua_binding(state);
+    LuaNavigationContext *owner  = nullptr;
     std::int32_t          grid_x = 0;
     std::int32_t          grid_z = 0;
     CellDynamicEntryRule  rule   = CellDynamicEntryRule::kDefault;
     if (!readContext(lua_binding, owner) || !lua_binding.readValue(2, grid_x) ||
-        !lua_binding.readValue(3, grid_z) ||
-        !readCellDynamicEntryRule(lua_binding, 4, rule))
+        !lua_binding.readValue(3, grid_z) || !readCellDynamicEntryRule(lua_binding, 4, rule))
     {
         return lua_binding.pushError();
     }
@@ -767,15 +796,16 @@ int setCellRule(lua_State *state)
 /// release_unit：释放该 handle 当前 footprint，成功返回 true。
 int releaseUnit(lua_State *state)
 {
-    LuaBinding lua_binding(state);
-    LuaNavigationContext *owner   = nullptr;
-    std::uint32_t unit_instance_id = 0;
+    LuaBinding            lua_binding(state);
+    LuaNavigationContext *owner            = nullptr;
+    std::uint32_t         unit_instance_id = 0;
     if (!readContext(lua_binding, owner) ||
         !readPositiveId(lua_binding, 2, "unit_instance_id", unit_instance_id))
     {
         return lua_binding.pushError();
     }
-    const auto released = owner->context->occupancy().Release(NavigationAgentHandle{unit_instance_id});
+    const auto released =
+        owner->context->occupancy().Release(NavigationAgentHandle{unit_instance_id});
     if (!released.ok())
     {
         return lua_binding.pushError(flywow_navigation::NavErrorName(released.error),
@@ -787,9 +817,9 @@ int releaseUnit(lua_State *state)
 /// unit_radius_mm：每次调用按静态 unit_id 查询当前 Registry 的导航半径。
 int unitRadiusMm(lua_State *state)
 {
-    LuaBinding binding(state);
-    LuaNavigationContext *owner = nullptr;
-    std::uint32_t unit_id = 0;
+    LuaBinding            binding(state);
+    LuaNavigationContext *owner   = nullptr;
+    std::uint32_t         unit_id = 0;
     if (!readContext(binding, owner) || !readPositiveId(binding, 2, "unit_id", unit_id))
     {
         return binding.pushError();
@@ -800,14 +830,13 @@ int unitRadiusMm(lua_State *state)
         return binding.pushError("INVALID_AGENT", "navigation profiles are not loaded");
     }
     const auto *profile = findNavigationProfile(binding, *profiles, unit_id);
-    return profile == nullptr ? binding.pushError()
-                              : binding.returnValues(profile->radius_mm);
+    return profile == nullptr ? binding.pushError() : binding.returnValues(profile->radius_mm);
 }
 
 /// map_version：返回该 Context 固定地图的资产版本。
 int mapVersion(lua_State *state)
 {
-    LuaBinding binding(state);
+    LuaBinding            binding(state);
     LuaNavigationContext *owner = nullptr;
     if (!readContext(binding, owner))
     {
@@ -819,7 +848,7 @@ int mapVersion(lua_State *state)
 /// close：幂等释放大块 Context 内存；userdata 外壳由统一 GC 最终析构。
 int closeContext(lua_State *state)
 {
-    LuaBinding lua_binding(state);
+    LuaBinding            lua_binding(state);
     LuaNavigationContext *owner = nullptr;
     if (!lua_binding.readUserdata(1, kContextMeta, owner))
     {
@@ -837,7 +866,7 @@ int closeContext(lua_State *state)
 int pathCount(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    LuaPath *path = nullptr;
+    LuaPath   *path = nullptr;
     if (!lua_binding.readUserdata(1, kPathMeta, path))
     {
         return lua_binding.pushError();
@@ -848,7 +877,7 @@ int pathCount(lua_State *state)
 /// world_point：Lua 1-based index 对应的毫米 WorldPosition；越界返回 nil,error。
 int pathWorldPoint(lua_State *state)
 {
-    LuaBinding lua_binding(state);
+    LuaBinding   lua_binding(state);
     LuaPath     *path  = nullptr;
     std::int64_t index = 0; // Lua 下标先保留有符号值，验证后转为 Native 0-based。
     if (!lua_binding.readUserdata(1, kPathMeta, path) || !lua_binding.readValue(2, index))
@@ -868,7 +897,7 @@ int pathWorldPoint(lua_State *state)
 int pathLengthMm(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    LuaPath *path = nullptr;
+    LuaPath   *path = nullptr;
     if (!lua_binding.readUserdata(1, kPathMeta, path))
     {
         return lua_binding.pushError();
@@ -902,6 +931,205 @@ bool registerPath(LuaBinding &lua_binding)
            methods.setFunction("length_mm", &pathLengthMm) && meta.writeValue("__index", methods);
 }
 
+// 空中入口全部使用具名 record；这里只转换合同，不维护第二套 Context/Path 类型。
+bool readAirPolicy(const LuaTable &request, flywow_navigation::AirPolicy &policy)
+{
+    if (!request.isNil("check_terrain") &&
+        !request.readValue("check_terrain", policy.check_terrain))
+        return false;
+    return request.isNil("clearance_mm") || request.readValue("clearance_mm", policy.clearance_mm);
+}
+bool readAirPosition(const LuaTable &request, const char *name, WorldPosition &position)
+{
+    LuaTable table;
+    return request.readTable(name, table) && readWorldPosition(table, position);
+}
+bool readAirBody(const LuaTable &request, flywow_navigation::AirBody &body)
+{
+    LuaTable table;
+    return request.readTable("body", table) && table.readValue("radius_mm", body.radius_mm) &&
+           table.readValue("half_height_mm", body.half_height_mm);
+}
+int setAirObstacle(lua_State *state)
+{
+    LuaBinding                lua_binding(state);
+    LuaNavigationContext     *owner = nullptr;
+    LuaTable                  request;
+    std::uint64_t             handle = 0;
+    flywow_navigation::AirBox box;
+    if (!readContext(lua_binding, owner) || !lua_binding.readTable(2, request) ||
+        !request.readValue("handle", handle) || !readAirPosition(request, "min", box.min) ||
+        !readAirPosition(request, "max", box.max))
+        return lua_binding.pushError();
+
+    const auto result = flywow_navigation::setAirObstacle(*owner->context, {handle}, box);
+    if (!result.ok())
+        return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
+    return lua_binding.returnValues(true);
+}
+int removeAirObstacle(lua_State *state)
+{
+    LuaBinding            lua_binding(state);
+    LuaNavigationContext *owner = nullptr;
+    LuaTable              request;
+    std::uint64_t         handle = 0;
+    if (!readContext(lua_binding, owner) || !lua_binding.readTable(2, request) ||
+        !request.readValue("handle", handle))
+        return lua_binding.pushError();
+
+    const auto result = flywow_navigation::removeAirObstacle(*owner->context, {handle});
+    if (!result.ok())
+        return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
+    return lua_binding.returnValues(true);
+}
+int sweepAir(lua_State *state)
+{
+    LuaBinding                   lua_binding(state);
+    LuaNavigationContext        *owner = nullptr;
+    LuaTable                     request;
+    WorldPosition                from, to;
+    flywow_navigation::AirBody   body;
+    flywow_navigation::AirPolicy policy;
+    std::uint64_t                exclude = 0;
+    if (!readContext(lua_binding, owner) || !lua_binding.readTable(2, request) ||
+        !readAirPosition(request, "from", from) || !readAirPosition(request, "to", to) ||
+        !readAirBody(request, body) || !readAirPolicy(request, policy) ||
+        (!request.isNil("exclude_handle") && !request.readValue("exclude_handle", exclude)))
+        return lua_binding.pushError();
+
+    const auto result =
+        flywow_navigation::sweepAir(*owner->context, from, to, body, {exclude}, policy);
+    if (!result.ok())
+        return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
+
+    auto        out  = lua_binding.newTable();
+    const auto &hit  = result.value;
+    const char *kind = hit.kind == flywow_navigation::AirHitKind::kClear    ? "clear"
+                       : hit.kind == flywow_navigation::AirHitKind::kStatic ? "static"
+                                                                            : "dynamic";
+    // 完整 uint64 有理数可大于 Lua 正整数范围；十进制串保留精确值，不以浮点时间排序。
+    if (!out.writeValue("kind", kind) || !out.writeValue("handle", hit.handle.value) ||
+        !out.writeValue("cell_index", hit.cell_index) ||
+        !out.writeValue("time_numerator", std::to_string(hit.time.numerator)) ||
+        !out.writeValue("time_denominator", std::to_string(hit.time.denominator)))
+        return lua_binding.pushError();
+    return lua_binding.returnValues(out);
+}
+int findAirPath(lua_State *state)
+{
+    LuaBinding                   lua_binding(state);
+    LuaNavigationContext        *owner = nullptr;
+    LuaTable                     request;
+    WorldPosition                from, to;
+    flywow_navigation::AirBody   body;
+    flywow_navigation::AirPolicy policy;
+    std::uint64_t                exclude = 0;
+    std::int64_t                 y       = 0;
+    std::uint32_t                range   = 0;
+    if (!readContext(lua_binding, owner) || !lua_binding.readTable(2, request) ||
+        !readAirPosition(request, "start", from) || !readAirPosition(request, "target", to) ||
+        !readAirBody(request, body) || !readAirPolicy(request, policy) ||
+        !request.readValue("flight_y_mm", y) ||
+        (!request.isNil("exclude_handle") && !request.readValue("exclude_handle", exclude)) ||
+        (!request.isNil("range_mm") && !request.readValue("range_mm", range)))
+        return lua_binding.pushError();
+
+    auto result = flywow_navigation::findAirPath(*owner->context, from, to, y, body, {exclude},
+                                                 policy, range);
+    if (!result.ok())
+        return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
+
+    LuaPath *path = nullptr;
+    if (!lua_binding.newUserdata(kPathMeta, path, std::move(result.value)))
+        return lua_binding.pushError();
+    return lua_binding.returnValues(path);
+}
+int moveAir(lua_State *state)
+{
+    LuaBinding                   lua_binding(state);
+    LuaNavigationContext        *owner = nullptr;
+    LuaTable                     request;
+    WorldPosition                target;
+    flywow_navigation::AirPolicy policy;
+    std::uint64_t                handle = 0;
+    if (!readContext(lua_binding, owner) || !lua_binding.readTable(2, request) ||
+        !request.readValue("handle", handle) || !readAirPosition(request, "target", target) ||
+        !readAirPolicy(request, policy))
+        return lua_binding.pushError();
+
+    const auto result = flywow_navigation::moveAir(*owner->context, {handle}, target, policy);
+    if (!result.ok())
+        return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
+
+    auto out = worldPositionTable(lua_binding, result.value);
+    return out.valid() ? lua_binding.returnValues(out) : lua_binding.pushError();
+}
+int advanceAirPath(lua_State *state)
+{
+    LuaBinding                   lua_binding(state);
+    LuaNavigationContext        *owner = nullptr;
+    LuaTable                     request;
+    LuaPath                     *path = nullptr;
+    flywow_navigation::AirPolicy policy;
+    std::uint64_t                handle   = 0;
+    std::uint32_t                distance = 0;
+    if (!readContext(lua_binding, owner) || !lua_binding.readTable(2, request) ||
+        !request.readValue("handle", handle) || !request.readUserdata("path", kPathMeta, path) ||
+        !request.readValue("distance_mm", distance) || !readAirPolicy(request, policy))
+        return lua_binding.pushError();
+
+    const auto result = flywow_navigation::advanceAirPath(*owner->context, {handle}, path->path,
+                                                          path->cursor, distance, policy);
+    if (!result.ok())
+    {
+        // 推进可在后段失败前已有合法提交；错误 record 携带真实位置，Lua owner 不会丢失恢复依据。
+        auto error = lua_binding.newTable();
+        if (!error.writeValue("code", flywow_navigation::NavErrorName(result.error)) ||
+            !error.writeValue("message", result.detail))
+            return lua_binding.pushError();
+        const auto &objects = owner->context->airState().objects;
+        auto        it      = objects.find(handle);
+        if (it != objects.end())
+        {
+            const auto         &box = it->second;
+            WorldPosition       position{box.min.x_mm + (box.max.x_mm - box.min.x_mm) / 2, 0,
+                                   box.min.z_mm + (box.max.z_mm - box.min.z_mm) / 2};
+            const std::uint64_t y_bits =
+                std::uint64_t(box.min.y_mm) +
+                (std::uint64_t(box.max.y_mm) - std::uint64_t(box.min.y_mm)) / 2;
+            std::memcpy(&position.y_mm, &y_bits, sizeof(y_bits));
+            auto world = worldPositionTable(lua_binding, position);
+            if (!world.valid() || !error.writeValue("position", world))
+                return lua_binding.pushError();
+        }
+        return lua_binding.returnValues(nullptr, error);
+    }
+
+    auto out = advanceResultTable(lua_binding, result.value);
+    return out.valid() ? lua_binding.returnValues(out) : lua_binding.pushError();
+}
+template <int (*Callback)(lua_State *)> int airBoundary(lua_State *state)
+{
+    try
+    {
+        return Callback(state);
+    }
+    catch (const std::bad_alloc &)
+    {
+        LuaBinding binding(state);
+        return binding.pushError("CAPACITY_EXCEEDED", "air allocation failed");
+    }
+    catch (const std::exception &)
+    {
+        LuaBinding binding(state);
+        return binding.pushError("INTERNAL_ERROR", "air native exception");
+    }
+    catch (...)
+    {
+        LuaBinding binding(state);
+        return binding.pushError("INTERNAL_ERROR", "unknown air native exception");
+    }
+}
 bool registerContext(LuaBinding &lua_binding)
 {
     LuaTable meta;
@@ -910,7 +1138,13 @@ bool registerContext(LuaBinding &lua_binding)
         return false;
     }
     auto methods = lua_binding.newTable();
-    return methods.setFunction("find_path", &findPath) &&
+    return methods.setFunction("set_air_obstacle", &airBoundary<setAirObstacle>) &&
+           methods.setFunction("remove_air_obstacle", &airBoundary<removeAirObstacle>) &&
+           methods.setFunction("find_air_path", &airBoundary<findAirPath>) &&
+           methods.setFunction("sweep_air", &airBoundary<sweepAir>) &&
+           methods.setFunction("move_air", &airBoundary<moveAir>) &&
+           methods.setFunction("advance_air_path", &airBoundary<advanceAirPath>) &&
+           methods.setFunction("find_path", &findPath) &&
            methods.setFunction("set_cell_rule", &setCellRule) &&
            methods.setFunction("find_path_to_range", &findPathToRange) &&
            methods.setFunction("find_path_to_unit_range", &findPathToUnitRange) &&
@@ -937,9 +1171,9 @@ extern "C" int luaopen_flywow_navigation_native(lua_State *state)
     auto  module = lua_binding.newTable();
     void *maps   = &MapRegistry::Instance(); // closure 只借用，单例 owner 覆盖所有 State。
     if (!module.setFunction("load_navigation_profiles", &loadNavigationProfiles) ||
-        !module.setFunction("load_map", &loadMap, maps) ||
+        !module.setFunction("load_map", &airBoundary<loadMap>, maps) ||
         !module.setFunction("query_cell", &queryCell, maps) ||
-        !module.setFunction("new_context", &newContext, maps))
+        !module.setFunction("new_context", &airBoundary<newContext>, maps))
     {
         return lua_binding.pushError();
     }

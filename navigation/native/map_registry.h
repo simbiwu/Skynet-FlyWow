@@ -30,7 +30,8 @@ class MapRegistry final
     /// 文件 I/O 和校验在锁外执行；已有 Context 持有旧 shared_ptr，不受替换影响。
     /// @param path BMAP 资产文件路径。
     /// @return 当前加载的 immutable 地图；文件错误时返回具体 NavError。
-    NavResult<std::shared_ptr<const GridMap>> Load(const std::string &path);
+    NavResult<std::shared_ptr<const GridMap>> Load(const std::string &path,
+                                                   const std::string &air_path = {});
 
     /// 按 map_id 取得当前地图；map_version 不参与资产选择。
     /// @param map_id BMAP Header 中的业务地图 ID。

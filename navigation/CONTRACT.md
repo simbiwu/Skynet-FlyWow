@@ -6,16 +6,16 @@ BMAP V1 沿用原二进制布局：Little Endian，64-byte Header，8-byte Cell�
 
 原点是 Cell (0,0) 的左下边界，不是中心。第 x 格先从原点走 x 个完整格，再走半格到中心：`origin + x * cellSize + cellSize / 2`。提出共同的 cellSize 才得到 `origin + (x + 0.5) * cellSize`。原点 -15 米、边长 0.5 米、第 3 格中心为 -15 + 1.5 + 0.25 = -13.25 米。
 
-Native/Lua 使用整数毫米世界坐标 `{x_mm,y_mm,z_mm}`。X/Z 决定归格，Y 高度由静态地图提供。负坐标归格使用向负无穷取整；Grid 下标是实现细节，不能成为长期 Replay/Persistence 合同。Manifest 门禁输入上限为 BMAP 128 MiB、清单 64 KiB；宿主还需限制总资产数与 Context 数。
+Native/Lua 使用整数毫米世界坐标 `{x_mm,y_mm,z_mm}`。X/Z 决定归格，地面 Y 高度由静态地图提供；空中 Y 是显式整数高度。负坐标归格使用向负无穷取整；Grid 下标是实现细节，不能成为长期 Replay/Persistence 合同。Manifest 门禁输入上限为 BMAP 128 MiB、清单 64 KiB；宿主还需限制总资产数与 Context 数。
 
 ## Lua 入口
 
 | API | 成功结果 | 用途与副作用 |
 | --- | --- | --- |
-| load_map(path) | {map_id,map_version} | 校验后按 map_id 替换当前地图；已有 Context 继续持有旧地图 |
+| load_map(path[,airnav_path]) | {map_id,map_version} | 校验后按 map_id 替换当前地图；已有 Context 继续持有旧地图 |
 | `query_cell(id,version,worldPosition)` | Cell 查询 record | 只读查询；返回 grid 调试下标、高度、Area、Clearance、walkable |
 | load_navigation_profiles(profiles) | 成功布尔值 | 校验连续 ID 后替换当前导航表；正在执行的同步调用保留其短期快照 |
-| new_context(map_id) | Context userdata | 固定当前地图；每场 Battle 独占 scratch 与动态占位，Profile 每次操作按 unit_id 查当前 Registry |
+| new_context(map_id[,air_limits]) | Context userdata | 固定当前地图；每场 Battle 独占 scratch 与动态占位，Profile 每次操作按 unit_id 查当前 Registry |
 | `context:set_cell_rule(x,z,rule)` | 成功布尔值 | 运行时设置当前 Battle 单格重叠规则；不影响其它 Context |
 | `context:find_path(...)` | Path userdata | 按 Agent 静态规则与当前动态事实规划路径 |
 | `context:find_path_to_range(...)` | Path userdata | 寻找可站立且进入目标范围的位置，不要求占据目标中心 |
@@ -67,3 +67,69 @@ Battle 独立按 UnitProfile.combat.attack_range_mm 判定是否攻击；该值�
 没有更接近目标的实际移动仍返回 NO_PATH。精确终点不可站立时默认返回
 END_NOT_NAVIGABLE；开启 partial 后继续搜索。查询状态与 advance_path 的执行状态独立。
 单位接近 Lua API 已移除 edge_range_mm 参数，所有仓库调用点与签名同步更新；C++ 使用者需重新编译。
+
+## 可选 AIRN V1 资产
+
+Context 创建只需要已加载地图，纯空中调用不需要 ground Profile；地面操作仍在各自入口读取/验证当前 Profile，未配置返回 INVALID_AGENT。
+
+空中能力是现有 GridMap 的可选不可变组成部分，沿用 MapRegistry、NavigationContext、Path 和同一构建产物。BMAP V1 不增加位或字段。Runtime 不读 Manifest，不推断建筑，不自动探测邻接文件。`load_map(bmap[,airnav])` 的显式第二参数缺失/损坏/不配对返回失败，Registry 不替换；空字符串非法。已有 Context 保留原来的完整静态快照。Native `airAsset()` 保存两份文件 SHA-256，Path 持有强快照引用。
+
+`map.airnav` 显式 little-endian；不 dump struct。Header 96 字节：
+
+|偏移|类型/长度|语义|
+|---:|---|---|
+|0|4 bytes|ASCII AIRN|
+|4|u16|format_version=1|
+|6|u16|header_size=96|
+|8/12|u32/u32|map_id/map_version，必须配对 BMAP|
+|16/20/24|u32/u32/u32|width/height/cell_size_mm|
+|28/32|i32/i32|origin_x_mm/origin_z_mm|
+|36|u32|保留，必须 0|
+|40|32 bytes|完整 BMAP 文件 SHA-256 原始字节|
+|72/76|u32/u32|稀疏格记录数/总区间数|
+|80|16 bytes|保留，全部 0|
+
+接着是按 cell_index 严格递增的 12-byte 格记录：u32 cell_index、u32 interval_offset、u32 count。offset 必须从 0 连续消费完整区间数组，count 为 1..64。之后每区间为 i64 min_y_mm、i64 max_y_mm（16 bytes）；min<=max，同格按高度递增且不重叠。文件长度必须精确 `96 + records*12 + intervals*16`，上限 32 MiB、总区间 1048576。BMAP 的尺寸、原点、身份和完整 hash 必须一致；截断、尾随字节、保留值、错误 offset 均拒绝。Unity/Native/Python 共用 `unity/Tests/Editor/Fixtures` golden bytes。
+
+闭高度区间、静态整格 XZ 保守覆盖；接触边界阻挡。Unity 离线下界 floor/上界 ceil 毫米，负坐标向负无穷取整，格线闭接触包括两侧。仅选择显式 LayerMask 的启用 Collider，默认关闭导出；旋转盒/其它 Collider 使用世界包围盒并警告。保留拱洞需作者用多个盒，不承诺网格精确碰撞。
+
+有空中组件时 Manifest 增加 `capabilities=["air_2_5d"]`、`airnav_sha256`、`package_hash`。包身份是 SHA-256(`ASCII "FlyWow.Navigation.Package.V1\0" + BMAP原始hash32 + byte(1) + airnav原始hash32`)；不包含 Manifest 自己。旧无空中包仍保持旧文件及命名字节。staging 内写入、读回验证全部文件，然后同文件系统原子目录 rename；目标已存在时校验地面、空中与 Manifest 后才幂等成功。失败清理 staging，不发布半包。
+
+## 空中公开操作与所有权
+
+Lua 的六个新增操作都接收一个具名 request；C++ 对应 lowerCamelCase，返回 NavResult。全部同步、不 yield、不 I/O、不回调 Service。字段标准类型见 LuaDoc：
+
+|操作|请求字段|成功结果/语义|
+|---|---|---|
+|set_air_obstacle|handle,min,max|true；闭整数 AABB，插入/瞬时更新，不代表扫掠移动|
+|remove_air_obstacle|handle|true；不存在也成功|
+|find_air_path|start,target,flight_y_mm,body,exclude_handle?,range_mm?,策略|Path；起终点 XZ 使用指定 Y，固定高度八邻接；range 为 XZ 中心距离|
+|sweep_air|from,to,body,exclude_handle?,策略|首个接触 record；只读连续扫掠，Y 可变|
+|move_air|handle,target,策略|新中心；保留注册盒尺寸，包括奇数/矩形边长，全成或全不成|
+|advance_air_path|handle,path,distance_mm,策略|moving/reached/blocked、position、consumed_mm、moved|
+
+body 为非负 uint32 `{radius_mm,half_height_mm}`，代表 XZ 对称轴对齐半宽与 Y 半高。handle 为 Context 私有正整数。动态 AABB 的 XZ 必须在地图内，Y 可用完整 int64（体积平移溢出拒绝）。策略 `check_terrain=false`、`clearance_mm=0`；显式启用时盒底必须严格高于所有覆盖格的地表加 clearance。静态/动态默认检查；排除自身不排除静态。ground 与 air 占位独立，不自动同步。
+
+扫掠结果 `{kind="clear"|"static"|"dynamic",handle,cell_index,time_numerator,time_denominator}`。时间分子/分母为十进制字符串，保留完整 uint64；范围 [0,1]。相同时间静态优先，再按格索引/动态 handle。采用完整连续 Minkowski/slab，有理数比较不溢出，不用离散采样或浮点决定顺序。DDA 子段枚举盒体覆盖桶，闭格线和角点保守包含；相邻格边一次包络枚举避免重复。固定高度单次搜索可缓存已经证明没有高度候选的桶；不访问空间桶的缓存复用仍计 tests，真实重复桶访问照常计数。缓存每次搜索清空，不跨动态更新复用。
+
+A* 固定 1000/1414 直/斜成本、固定邻居顺序；同 f 优先较大 g，再按格号。每条参与松弛的边、起终点连接及平滑都使用完整扫掠，斜走不穿角。查询返回的尺寸、高度和静态快照随 Path 保存，不能混用 ground/air 推进。Path 不借用 scratch，也不管理动态对象。动态变化之后每次移动仍复验，不自动重规划。
+
+推进按整数平方根向下取整的 XZ 段长累计 stride，插值向段起点截断；不是每轴独立走 stride。对象必须匹配 Path 的盒尺寸、固定高度和 cursor 实际位置。已完成段逐段提交，后段 BLOCKED 返回成功的 blocked 结果及合法前缀；预算失败返回明确错误，合法前缀和 cursor 同样保留，Lua error.position 给出实际已提交位置。单次 move 失败旧 AABB/索引不变。set/move 先准备所有关联及分配，再提交；分配/容量失败保留旧状态。
+
+## 空中资源和失败
+
+Context 单 owner 顺序使用；共享静态图不可变，不共享全局查询 scratch。未调用空中操作时不分配 AirState，ground 原 dense scratch 不变。空中节点/堆/排序索引/空桶缓存只按硬预算 reserve、复用，不按地图格数增加数组。动态对象和桶关联用有界排序结构，无退化 hash 假设；Context close/析构统一释放。
+
+|资源|默认/硬上限|
+|---|---:|
+|展开/touched 节点|4096/8192|
+|整次操作桶访问/tests|8192/65536|
+|路径点|4096|
+|动态对象/单对象关联/总关联|4096/256/262144|
+|文件/总区间/每格区间|32 MiB/1048576/64|
+
+`new_context(map_id,air_limits)` 可调低 expanded/nodes/buckets/tests/path_points/objects/object_links/links，不可调高、不可为零；Native setAirLimits 只允许首次空中操作前调用。预算在超额工作之前检查，覆盖 A*、Sweep、连接、构造、平滑及整次多段推进；嵌套调用不重置。平滑耗尽可保留已验证原路线，不返回未经验证捷径。
+
+稳定错误：INVALID_AIR_ASSET（格式）、ASSET_MISMATCH（配对）、SEARCH_BUDGET_EXCEEDED（展开/节点）、QUERY_BUDGET_EXCEEDED（桶/tests）、CAPACITY_EXCEEDED（资源/分配）、NO_PATH（完整搜索无路）、BLOCKED（移动碰撞），以及现有参数/IO/越界错误。Lua 始终 nil,{code,message}；预算耗尽不能表示 NO_PATH/clear。新增 Binding 和扩展加载入口捕获 C++ 异常，bad_alloc 映射容量失败，其它异常为 INTERNAL_ERROR。
+
+单次预算不等于耗时 SLA，也不限制宿主发起的每帧请求数。应用负责帧预算、请求数量、同时移动顺序和重新规划时机。本次不接入 Frame Core、Battle 或弹丸业务。

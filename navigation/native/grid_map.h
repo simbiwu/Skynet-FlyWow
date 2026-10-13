@@ -5,6 +5,7 @@
 // 不负责：不读磁盘、不管理动态单位、不执行寻路。
 #pragma once
 
+#include "air_asset.h"
 #include "bmap_format.h"
 #include "nav_result.h"
 
@@ -20,7 +21,7 @@ class GridMap final
   public:
     // 用已经校验的 metadata 和 z-major Cell 数组构造只读地图。
     // cells 的元素数必须等于 width*height，否则抛出 invalid_argument。
-    GridMap(BMapMetadata metadata, std::vector<NavCell> cells);
+    GridMap(BMapMetadata metadata, std::vector<NavCell> cells, AirAsset air = {});
 
     // 返回只读元数据引用；引用生命周期不超过当前 GridMap。
     const BMapMetadata &metadata() const noexcept
@@ -49,6 +50,12 @@ class GridMap final
     // 本函数不分配、不加锁、不修改共享状态。
     const NavCell           *TryCell(const GridPos &grid) const noexcept;
 
+    /// 可选不可变区间与完整资产身份；引用不超过地图生命周期。
+    const AirAsset &airAsset() const noexcept
+    {
+        return air_;
+    }
+
   private:
     // 判断 grid 是否落在 [0,width) x [0,height) 内。
     bool                Contains(const GridPos &grid) const noexcept;
@@ -58,6 +65,7 @@ class GridMap final
     // divisor<=0 抛出 invalid_argument。
     static std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor);
 
+    const AirAsset             air_;      // 只读组件；无空中资产时为空，不分配。
     const BMapMetadata         metadata_; // 地图身份、尺寸和坐标原点；构造后只读。
     const std::vector<NavCell> cells_;    // z-major Cell 数组；元素数必须等于 width*height。
 };

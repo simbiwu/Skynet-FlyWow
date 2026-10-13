@@ -51,9 +51,9 @@ constexpr std::array<Direction, 8> kDirections{{
 struct QueryPolicy
 {
     const DynamicNavigationPolicy *dynamic_policy = nullptr; // 借用业务层策略，不转移所有权。
-    const NavigationContext      *context        = nullptr; // 当前 Battle 的动态规则 owner；仅动态查询设置。
-    const NavigationAgent         *agent          = nullptr; // 当前移动者视图；借用。
-    DynamicQueryPurpose            purpose        = DynamicQueryPurpose::kFindPath;
+    const NavigationContext *context = nullptr; // 当前 Battle 的动态规则 owner；仅动态查询设置。
+    const NavigationAgent   *agent   = nullptr; // 当前移动者视图；借用。
+    DynamicQueryPurpose      purpose = DynamicQueryPurpose::kFindPath;
 };
 
 // 用途：把沿 Path 线段的消费进度换算成一个 X 或 Z 世界坐标，避免逐 Tick 累加坐标。
@@ -417,9 +417,9 @@ std::vector<GridPos> SmoothGridPath(const GridMap &map, const NavigationProfile 
 // 同一搜索主循环的终点条件：精确 Cell 或 target 周围指定的可站立范围。
 struct GoalPolicy
 {
-    bool          exact = true;        // true=exact_grid；false=target_world 的范围条件。
-    GridPos       exact_grid{};        // 精确目标 Grid Cell；仅 exact=true 时读取。
-    WorldPosition target_world{};      // 目标世界毫米坐标；仅 exact=false 时读取。
+    bool          exact = true;     // true=exact_grid；false=target_world 的范围条件。
+    GridPos       exact_grid{};     // 精确目标 Grid Cell；仅 exact=true 时读取。
+    WorldPosition target_world{};   // 目标世界毫米坐标；仅 exact=false 时读取。
     std::uint32_t min_range_mm = 0; // 单位目标：双方导航半径之和，候选不能位于其内部。
     std::uint32_t range_mm     = 0; // 普通范围查询：目标中心到候选 Cell Center 的 XZ 距离上限。
 };
@@ -428,7 +428,7 @@ struct GoalPolicy
 // world/target：借用的 XZ 毫米坐标；range_mm：包含边界的非负半径。
 // 返回 true 表示无需再向 Cell Center 移动；不分配、不加锁、不 yield。
 bool WorldWithinRange(const WorldPosition &world, const WorldPosition &target,
-                            std::uint32_t range_mm)
+                      std::uint32_t range_mm)
 {
     const std::int64_t  dx = static_cast<std::int64_t>(world.x_mm) - target.x_mm;
     const std::int64_t  dz = static_cast<std::int64_t>(world.z_mm) - target.z_mm;
@@ -478,7 +478,7 @@ bool outsideUnit(const WorldPosition &world, const GoalPolicy &goal)
 // 搜索 goal 使用 Cell Center；世界点检查与它共用相同距离公式。
 // map/grid：借用的合法地图与 Cell；转换失败时返回 false；不加锁、不 yield。
 bool InRange(const GridMap &map, const GridPos &grid, const WorldPosition &target,
-                   std::uint32_t range_mm)
+             std::uint32_t range_mm)
 {
     const auto world = map.GridToWorldCenter(grid);
     return world.ok() && WorldWithinRange(world.value, target, range_mm);
@@ -836,11 +836,11 @@ static NavResult<Path> FindPathImpl(NavigationContext &context, const Navigation
         return NavResult<Path>::Failure(NavError::kOutOfBounds, "end outside map");
     }
     GoalPolicy goal;
-    goal.exact           = !range_goal;
-    goal.exact_grid      = end_grid.value;
-    goal.target_world    = end;
-    goal.range_mm = range_mm;
-    goal.min_range_mm    = min_range_mm;
+    goal.exact        = !range_goal;
+    goal.exact_grid   = end_grid.value;
+    goal.target_world = end;
+    goal.range_mm     = range_mm;
+    goal.min_range_mm = min_range_mm;
     // 起点和终点必须先满足单格站立条件；边坡度和切角规则留给邻居扩展阶段。
     if (!CanOccupy(map, profile, start_grid.value, start_grid.value, policy, context.occupancy()))
     {
@@ -1023,9 +1023,9 @@ static NavResult<Path> FindPathImpl(NavigationContext &context, const Navigation
         // 同格实际起点可能偏离格中心；有真实接近进展时也可返回 partial。
         if (closest_index == start_index)
         {
-            const auto center = map.GridToWorldCenter(start_grid.value);
+            const auto                 center = map.GridToWorldCenter(start_grid.value);
             std::vector<WorldPosition> points{path.value.WorldPoint(0), center.value};
-            const auto length = SegmentLengthMm(points[0], points[1]);
+            const auto                 length = SegmentLengthMm(points[0], points[1]);
             path = NavResult<Path>::Success(Path(std::move(points), length));
         }
         // 起点已经更接近目标时，不交付向后退的零价值 partial。
@@ -1043,8 +1043,9 @@ static NavResult<Path> FindPathImpl(NavigationContext &context, const Navigation
 }
 
 // 静态复验入口：不读动态回调，失败按 NavResult 显式返回。
-NavResult<bool> GridPathfinder::ValidatePathStatic(NavigationContext  &context,
-                                                   const NavigationProfile &profile, const Path &path)
+NavResult<bool> GridPathfinder::ValidatePathStatic(NavigationContext       &context,
+                                                   const NavigationProfile &profile,
+                                                   const Path              &path)
 {
     return ValidatePathImpl(context, profile, path, QueryPolicy{});
 }
@@ -1068,8 +1069,8 @@ NavResult<bool> GridPathfinder::ValidatePath(NavigationContext     &context,
 }
 
 // 静态入口：不叠加 DynamicOccupancy，供静态 Golden Test 和无 Battle 占用查询使用。
-NavResult<Path> GridPathfinder::FindPathStatic(NavigationContext   &context,
-                                               const NavigationProfile  &profile,
+NavResult<Path> GridPathfinder::FindPathStatic(NavigationContext       &context,
+                                               const NavigationProfile &profile,
                                                const WorldPosition &start, const WorldPosition &end)
 {
     return FindPathImpl(context, profile, start, end, QueryPolicy{}, false, 0);
@@ -1096,11 +1097,12 @@ NavResult<Path> GridPathfinder::FindPath(NavigationContext &context, const Navig
 
 // Battle 范围入口：目标中心只需在地图内，不要求该中心可站立或未被占用。
 // agent/policy 借用到同步调用返回；结果 Path 由调用者拥有；不执行 I/O、加锁或 yield。
-NavResult<Path>
-GridPathfinder::FindPathToRange(NavigationContext &context, const NavigationAgent &agent,
-                                const WorldPosition &start, const WorldPosition &target,
-                                std::uint32_t range_mm,
-                                const DynamicNavigationPolicy &dynamic_policy, bool allow_partial)
+NavResult<Path> GridPathfinder::FindPathToRange(NavigationContext     &context,
+                                                const NavigationAgent &agent,
+                                                const WorldPosition   &start,
+                                                const WorldPosition &target, std::uint32_t range_mm,
+                                                const DynamicNavigationPolicy &dynamic_policy,
+                                                bool                           allow_partial)
 {
     if (agent.profile == nullptr || !agent.handle.valid())
     {
@@ -1140,10 +1142,10 @@ NavResult<Path> GridPathfinder::findPathToUnitRange(
     // 单位目标只以双方导航体型确定接近位置；攻击范围由 Battle 独立判断。
     const std::uint64_t minimum =
         static_cast<std::uint64_t>(mover.profile->radius_mm) + target_profile.radius_mm;
-    const std::uint64_t cell      = context.map()->metadata().cell_size_mm;
-    const std::uint64_t cell2     = cell * cell;
+    const std::uint64_t cell  = context.map()->metadata().cell_size_mm;
+    const std::uint64_t cell2 = cell * cell;
     const DistanceScore diagonal2{cell2 + cell2 < cell2, cell2 + cell2};
-    std::uint64_t tolerance = static_cast<std::uint64_t>(std::sqrt(2.0L) * cell);
+    std::uint64_t       tolerance = static_cast<std::uint64_t>(std::sqrt(2.0L) * cell);
     if (tolerance > std::numeric_limits<std::uint32_t>::max())
     {
         return NavResult<Path>::Failure(NavError::kInvalidArgument,
@@ -1235,6 +1237,11 @@ GridPathfinder::AdvancePath(NavigationContext &context, const NavigationAgent &a
                             const Path &path, PathFollowCursor &cursor, const WorldPosition &from,
                             std::uint32_t distance_mm, const DynamicNavigationPolicy &policy)
 {
+    if (path.isAir())
+    {
+        return NavResult<PathAdvanceResult>::Failure(NavError::kInvalidArgument,
+                                                     "ground advance rejects air path");
+    }
     if (agent.profile == nullptr || !agent.handle.valid() || path.count() == 0)
     {
         return NavResult<PathAdvanceResult>::Failure(

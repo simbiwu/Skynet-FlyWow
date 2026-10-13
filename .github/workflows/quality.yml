@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: 运行仓库自检工具测试
-        run: python3 -m unittest discover -s tests -p 'test_*.py'
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 
       - name: 检查仓库合同
         run: python3 scripts/ci/check_repository.py

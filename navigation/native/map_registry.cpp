@@ -20,17 +20,18 @@ MapRegistry &MapRegistry::Instance()
     return registry;
 }
 
-NavResult<std::shared_ptr<const GridMap>> MapRegistry::Load(const std::string &path)
+NavResult<std::shared_ptr<const GridMap>> MapRegistry::Load(const std::string &path,
+                                                            const std::string &air_path)
 {
     // 文件 I/O 和 CRC 不占用 Registry Lock。
-    NavResult<std::shared_ptr<const GridMap>> loaded = BMapReader::Read(path);
+    NavResult<std::shared_ptr<const GridMap>> loaded = BMapReader::Read(path, air_path);
     if (!loaded.ok())
     {
         return loaded;
     }
 
     // 完整读取和校验已在锁外完成；此处只替换当前快照。
-    const std::uint32_t map_id = loaded.value->metadata().map_id;
+    const std::uint32_t         map_id = loaded.value->metadata().map_id;
     std::lock_guard<std::mutex> lock(mutex_);
     maps_[map_id] = loaded.value;
     return loaded;

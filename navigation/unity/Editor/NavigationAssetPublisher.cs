@@ -15,7 +15,8 @@ namespace FlyWow.Navigation.Editor
         /// <param name="outputRoot">候选根目录；必须由宿主显式选择。</param>
         /// <returns>完整候选目录；同版本相同内容重复导出幂等，不覆盖不同内容。</returns>
         /// <exception cref="IOException">写盘或目录提交失败，已有候选保持不变。</exception>
-        public static string WriteCandidate(NavigationMapSnapshot snapshot, string outputRoot)
+        public static string WriteCandidate(NavigationMapSnapshot snapshot, string outputRoot,
+                                            AirNavSnapshot air = null)
         {
             if (snapshot == null || string.IsNullOrWhiteSpace(outputRoot))
             {
@@ -28,15 +29,26 @@ namespace FlyWow.Navigation.Editor
             {
                 string map = Path.Combine(stage, "map.bmap");
                 BMapWriter.Write(snapshot, map);
-                BMapManifestWriter.Write(snapshot, map);
-                string hash   = ContentHash(map);
+                string airPath = Path.Combine(stage, "map.airnav");
+                if (air != null)
+                    AirNavWriter.Write(snapshot, air, map, airPath);
+                string hash = air == null ? ContentHash(map) : PackageHash(map, airPath);
+                BMapManifestWriter.Write(snapshot, map, air == null ? null : airPath, hash);
                 string target = Path.Combine(outputRoot, "map-" + snapshot.mapId + "-v" +
                                                              snapshot.mapVersion + "-" + hash);
                 if (Directory.Exists(target))
                 {
                     // 名字相同不能直接相信旧文件；回读两份文件，防止损坏包被当作成功。
                     BMapWriter.Verify(Path.Combine(target, "map.bmap"));
-                    if (ContentHash(Path.Combine(target, "map.bmap")) != hash ||
+                    string previousAir = Path.Combine(target, "map.airnav");
+                    if (File.Exists(previousAir) != (air != null))
+                        throw new IOException("NAVIGATION_CANDIDATE_CONFLICT");
+                    if (air != null)
+                        AirNavWriter.Decode(File.ReadAllBytes(previousAir), snapshot,
+                                            File.ReadAllBytes(Path.Combine(target, "map.bmap")));
+                    if ((air == null ? ContentHash(Path.Combine(target, "map.bmap"))
+                                     : PackageHash(Path.Combine(target, "map.bmap"),
+                                                   previousAir)) != hash ||
                         File.ReadAllText(Path.Combine(target, "map.manifest.json")) !=
                             File.ReadAllText(Path.Combine(stage, "map.manifest.json")))
                     {
@@ -54,6 +66,27 @@ namespace FlyWow.Navigation.Editor
                 {
                     Directory.Delete(stage, true);
                 }
+            }
+        }
+
+        /// <summary>版本化域 + 原始 BMAP hash + 存在位 + 原始 airnav hash；Manifest 不参与自身身份。</summary>
+        public static string PackageHash(string bmap, string airnav)
+        {
+            byte[] domain = System.Text.Encoding.ASCII.GetBytes("FlyWow.Navigation.Package.V1\0");
+            using (var stream = new MemoryStream()) using (SHA256 sha = SHA256.Create())
+            {
+                stream.Write(domain, 0, domain.Length);
+                byte[] ground = sha.ComputeHash(File.ReadAllBytes(bmap));
+                stream.Write(ground, 0, ground.Length);
+                stream.WriteByte(airnav == null ? (byte)0 : (byte)1);
+                if (airnav != null)
+                {
+                    byte[] air = sha.ComputeHash(File.ReadAllBytes(airnav));
+                    stream.Write(air, 0, air.Length);
+                }
+                return BitConverter.ToString(sha.ComputeHash(stream.ToArray()))
+                    .Replace("-", "")
+                    .ToLowerInvariant();
             }
         }
 

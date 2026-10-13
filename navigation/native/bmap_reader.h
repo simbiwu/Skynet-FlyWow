@@ -20,7 +20,8 @@ class BMapReader final
     // 成功返回 immutable GridMap；I/O、Magic、版本、尺寸、CRC 等失败返回对应 NavError。
     // 本函数执行文件 I/O，分配完整文件缓冲和解码后的 Cell 数组，只应在资产加载阶段调用。
     // 成功地图独立拥有数据；前期缓冲分配等 C++ 异常可能传播，由调用边界处理。
-    static NavResult<std::shared_ptr<const GridMap>> Read(const std::string &path);
+    static NavResult<std::shared_ptr<const GridMap>> Read(const std::string &path,
+                                                          const std::string &air_path = {});
 };
 
 } // namespace flywow_navigation

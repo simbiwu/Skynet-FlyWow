@@ -20,6 +20,12 @@ namespace FlyWow.Navigation
         [Header("Export")]
         public string exportDirectory = "NavigationExports";
 
+        [Header("Optional air navigation")]
+        // 默认关闭，不自动把地表或所有 Collider 视为空中障碍。
+        public bool exportAirNavigation = false;
+        // 仅选取显式作者阻挡体；建议专用 Layer 与多个 BoxCollider 表达通道。
+        public LayerMask airObstacleLayers = 0;
+
         [Header("Identity")]
         // BMAP Header 的无符号数值地图 ID；0 保留为非法值。
         [Min(1)]

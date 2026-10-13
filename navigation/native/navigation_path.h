@@ -5,7 +5,9 @@
 // 不负责：不保存 A* node、GridPos、dynamic occupancy 或未来 Off-Mesh 语义。
 #pragma once
 
+#include "air_asset.h"
 #include "bmap_format.h"
+#include <memory>
 
 #include <cstddef>
 #include <cstdint>
@@ -42,6 +44,8 @@ struct PathAdvanceResult
     std::uint32_t     consumed_mm = 0;     // 本次调用真正消费的距离预算。
     bool              moved       = false; // X/Z 是否至少发生过一次成功变化。
 };
+
+class GridMap;
 
 class Path final
 {
@@ -90,10 +94,44 @@ class Path final
         return points_;
     }
 
+    /// 空中路径固定资产快照与规划尺寸/高度；不拥有动态对象，也不借用 scratch。
+    void markAir(std::shared_ptr<const GridMap> map, std::int64_t y, std::uint32_t radius,
+                 std::uint32_t half_height)
+    {
+        air_map_     = std::move(map);
+        flight_y_    = y;
+        radius_      = radius;
+        half_height_ = half_height;
+    }
+    bool isAir() const noexcept
+    {
+        return bool(air_map_);
+    }
+    const GridMap *airMap() const noexcept
+    {
+        return air_map_.get();
+    }
+    std::int64_t flightY() const noexcept
+    {
+        return flight_y_;
+    }
+    std::uint32_t airRadius() const noexcept
+    {
+        return radius_;
+    }
+    std::uint32_t airHalfHeight() const noexcept
+    {
+        return half_height_;
+    }
+
   private:
-    std::vector<WorldPosition> points_;        // 按移动顺序保存；Path 独占内存。
-    std::uint64_t              length_mm_ = 0; // XZ 折线总长度，单位毫米。
-    bool                       partial_   = false; // true 表示搜索耗尽后返回的最近可达路线。
+    std::shared_ptr<const GridMap> air_map_; // 空中快照强引用；同时作为 ground/air 类型标记。
+    std::int64_t                   flight_y_    = 0;   // 固定规划高度，毫米。
+    std::uint32_t                  radius_      = 0;   // 规划时 XZ 半宽，毫米。
+    std::uint32_t                  half_height_ = 0;   // 规划时 Y 半高，毫米。
+    std::vector<WorldPosition>     points_;            // 按移动顺序保存；Path 独占内存。
+    std::uint64_t                  length_mm_ = 0;     // XZ 折线总长度，单位毫米。
+    bool                           partial_   = false; // true 表示搜索耗尽后返回的最近可达路线。
 };
 
 } // namespace flywow_navigation

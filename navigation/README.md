@@ -20,7 +20,7 @@ Battle_1001 场景、出生点、战斗 Tick、技能、协议及 Replay 留在�
 
 C++17、CMake/Linux/WSL2、Skynet v1.8.0 自带修改版 Lua 5.4.7；团结引擎 1.10.0（Unity 2022.3 LTS）、AI Navigation 1.1.7。当前空间是 `ground_2_5d`：XZ 导航平面、Y 地表高度，每个 Cell 只能表达一个高度层。
 
-不要把修改版 Lua 绑定链接到系统 Lua；不要将同 XZ 的两层道路混成一张 Grid。包会明确拒绝多层歧义。本模块未提供飞行、跳跃、Crowd 或 Recast 实现。
+不要把修改版 Lua 绑定链接到系统 Lua；不要将同 XZ 的两层道路混成一张 Grid。包会明确拒绝多层歧义。本模块提供可选固定高度 2.5D 空中导航；跳跃、Crowd、自动三维升降规划和 Recast 不在此实现内。
 
 ## 接入与阅读
 
@@ -50,3 +50,13 @@ Unity 工程在 manifest 的 `testables` 中加入 `com.flywow.navigation`，在
 普通攻击射程由 Battle Core 单独按中心距判定，不传入导航。
 可选 allow_partial 默认关闭，通过 path:status() 区分 reached 与 partial。
 格子接近容差及失败合同见 CONTRACT.md。
+
+## 可选空中导航
+
+默认无静态空中障碍。Unity `NavigationMapRoot.exportAirNavigation` 显式开启后，`airObstacleLayers` 只选择专用 Collider；导出 `map.airnav`（AIRN V1），BMAP V1 字节不变。盒和其它 Collider 都按世界 AABB 保守覆盖，旋转/非盒会提示。包按 BMAP 与 airnav 的完整 SHA-256 共同确定身份，并通过原有 staging 校验、原子发布。
+
+Lua `load_map(bmap_path, airnav_path)` 显式加载完整配对；省略第二参数不猜邻接文件。原 Registry/Context 继续复用，旧 Context 保留旧完整快照。动态 AABB 属于单 owner Context，与 ground occupancy 不隐式同步。新增六个具名请求 API 的字段、预算和失败语义见 [公开合同](CONTRACT.md)及 [LuaDoc](lualib/flywow_navigation.lua)。
+
+独立调用示例：[air_navigation.lua](examples/air_navigation.lua)。使用固定高度 `find_air_path`；调用者通过 `move_air`/`sweep_air` 控制升降。每次推进重验动态障碍，基础库不负责 Battle 或弹丸命中效果。
+
+统一构建后，在 FlyWow 根目录运行 `build/cmake/navigation/air_navigation_benchmark` 与 `navigation_benchmark`。每场景 10000 次热查询，输出百分位、最大耗时、计数与内存；空中 Benchmark 对成功、不可达、故意耗尽预算分别断言预期，未通过时优化实现，不修改压力条件。包门禁显式传入 `python3 navigation/tools/verify_asset.py --bmap ... --manifest ... --airnav ...`；具体 CLI 参数以 `--help` 为准。

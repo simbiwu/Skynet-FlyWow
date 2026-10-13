@@ -22,6 +22,29 @@ class NavigationBindingTests(unittest.TestCase):
     def test_real_unit_range_and_partial(self):
         self.run_binding_script('navigation_unit_range_test.lua', 'FLYWOW_UNIT_RANGE_OK', 10)
 
+    @unittest.skipUnless(os.environ.get('SKYNET_LUA') and os.environ.get('NAVIGATION_NATIVE_DIR'),
+                         '需要真实固定 Lua 与 Native')
+    def test_air_chain(self):
+        root = Path(__file__).resolve().parents[2]
+        fixtures = root / 'navigation/unity/Tests/Editor/Fixtures'
+        with tempfile.TemporaryDirectory() as directory:
+            bmap = Path(directory) / 'map.bmap'
+            air = Path(directory) / 'map.airnav'
+            bmap.write_bytes(bytes.fromhex((fixtures / 'bmap_v1.txt').read_text()))
+            air.write_bytes(bytes.fromhex((fixtures / 'airnav_v1.txt').read_text()))
+            result = subprocess.run([os.environ['SKYNET_LUA'], str(root / 'navigation/tests/navigation_air_test.lua'),
+                str(root), os.environ['NAVIGATION_NATIVE_DIR'], str(bmap), str(air)],
+                text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('FLYWOW_AIR_BINDING_OK', result.stdout)
+            example = subprocess.run([os.environ['SKYNET_LUA'],
+                str(root / 'navigation/examples/air_navigation.lua'), str(root),
+                os.environ['NAVIGATION_NATIVE_DIR'], str(bmap), str(air)],
+                text=True, capture_output=True, timeout=15)
+            self.assertEqual(example.returncode, 0, example.stdout + example.stderr)
+            self.assertIn('FLYWOW_AIR_EXAMPLE_OK', example.stdout)
+
+
     def run_binding_script(self, script_name, marker, clearance=1):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:

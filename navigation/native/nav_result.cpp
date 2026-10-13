@@ -60,6 +60,18 @@ const char *NavErrorName(NavError error) noexcept
         return "DYNAMIC_OCCUPIED";
     case NavError::kMoveBlocked:
         return "MOVE_BLOCKED";
+    case NavError::kInvalidAirAsset:
+        return "INVALID_AIR_ASSET";
+    case NavError::kAssetMismatch:
+        return "ASSET_MISMATCH";
+    case NavError::kSearchBudgetExceeded:
+        return "SEARCH_BUDGET_EXCEEDED";
+    case NavError::kQueryBudgetExceeded:
+        return "QUERY_BUDGET_EXCEEDED";
+    case NavError::kCapacityExceeded:
+        return "CAPACITY_EXCEEDED";
+    case NavError::kBlocked:
+        return "BLOCKED";
     case NavError::kInternalError:
         return "INTERNAL_ERROR";
     }

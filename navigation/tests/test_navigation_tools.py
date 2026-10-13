@@ -51,6 +51,44 @@ class NavigationToolsTests(unittest.TestCase):
         """将当前测试元数据写到独占临时文件；不修改真实资产。"""
         self.manifest.write_text(json.dumps(self.metadata))
 
+    def test_air_golden_and_corruptions(self):
+        """与 Unity/Native 共用字节，锁定配对、排序、长度和发布身份。"""
+        fixtures = ROOT / 'navigation/unity/Tests/Editor/Fixtures'
+        bmap = bytes.fromhex((fixtures / 'bmap_v1.txt').read_text())
+        air = bytes.fromhex((fixtures / 'airnav_v1.txt').read_text())
+        asset.verify_air(air, bmap)
+        mutations = [(0, 0), (4, 2), (36, 1), (40, air[40] ^ 1),
+                     (80, 1), (96, 255), (100, 1), (104, 65)]
+        for offset, value in mutations:
+            with self.subTest(offset=offset):
+                damaged = bytearray(air)
+                damaged[offset] = value
+                with self.assertRaises(ValueError):
+                    asset.verify_air(damaged, bmap)
+        for damaged in (air[:-1], air + b'\0', bytes(32*1024*1024+1)):
+            with self.assertRaises(ValueError):
+                asset.verify_air(damaged, bmap)
+        self.bmap.write_bytes(bmap)
+        self.metadata.update(width=12, height=12, origin_mm=[-1000, -1000],
+                             payload_crc32=f'{zlib.crc32(bmap[64:]):08X}',
+                             content_sha256=hashlib.sha256(bmap).hexdigest(),
+                             capabilities=['air_2_5d'], airnav_sha256=hashlib.sha256(air).hexdigest(),
+                             package_hash=hashlib.sha256(b'FlyWow.Navigation.Package.V1\0' +
+                                 hashlib.sha256(bmap).digest() + b'\1' + hashlib.sha256(air).digest()).hexdigest())
+        air_path = self.root / 'map.airnav'
+        air_path.write_bytes(air)
+        self.write_manifest()
+        self.assertEqual(asset.verify(self.bmap, self.manifest, airnav=air_path), self.metadata)
+        with self.assertRaisesRegex(ValueError, 'EXPLICIT_PATH_REQUIRED'):
+            asset.verify(self.bmap, self.manifest)
+        for field in ('airnav_sha256', 'package_hash'):
+            original = self.metadata[field]
+            self.metadata[field] = '0' * 64
+            self.write_manifest()
+            with self.assertRaises(ValueError):
+                asset.verify(self.bmap, self.manifest, airnav=air_path)
+            self.metadata[field] = original
+
     def test_valid_asset_and_expected_identity(self):
         self.assertEqual(asset.verify(self.bmap, self.manifest, 17, 2), self.metadata)
         with self.assertRaisesRegex(ValueError, 'MAP_ID_MISMATCH'):

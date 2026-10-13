@@ -19,6 +19,8 @@ find_package(Threads REQUIRED)
 # Navigation 只有一个静态核心目标；地图、寻路和运行时状态实现共同组成它。
 # 新增核心 .cpp 在此目标列表登记；该 STATIC 库供 C++ 消费者和可选 Lua Binding 共用。
 add_library(flywow_navigation_core STATIC
+    air_asset.cpp
+    air_navigation.cpp
     bmap_reader.cpp
     grid_map.cpp
     map_registry.cpp
@@ -126,3 +128,16 @@ if(FLYWOW_NAVIGATION_LUA)
     )
     target_link_options(flywow_navigation_lua PRIVATE "-Wl,-Bsymbolic-functions")
 endif()
+add_executable(air_navigation_test tests/air_navigation_test.cpp)
+target_link_libraries(air_navigation_test PRIVATE FlyWow::Navigation)
+if(MSVC)
+    target_compile_options(air_navigation_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(air_navigation_test PRIVATE -UNDEBUG)
+endif()
+add_test(NAME air_navigation_test COMMAND air_navigation_test)
+
+target_compile_definitions(air_navigation_test PRIVATE FLYWOW_AIR_GOLDEN_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../unity/Tests/Editor/Fixtures")
+
+add_executable(air_navigation_benchmark benchmark/air_navigation_benchmark.cpp)
+target_link_libraries(air_navigation_benchmark PRIVATE FlyWow::Navigation)

@@ -58,7 +58,8 @@ namespace FlyWow.Navigation.Editor
                 }
                 string outputDirectory = Path.GetFullPath(
                     Path.Combine(Application.dataPath, "..", roots[0].exportDirectory));
-                NavigationAssetPublisher.WriteCandidate(snapshot, outputDirectory);
+                NavigationAssetPublisher.WriteCandidate(snapshot, outputDirectory,
+                    AirNavWriter.Sample(roots[0], snapshot));
                 LastSnapshot = snapshot;
                 SceneView.RepaintAll();
 

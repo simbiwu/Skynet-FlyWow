@@ -5,11 +5,12 @@
 
 ---@class FlyWowNavigationPosition
 ---@field x_mm integer 世界 X，整数毫米；调用方持有的纯数据。
----@field y_mm integer 世界高度 Y，整数毫米；移动成功值由地图归一化。
+---@field y_mm integer 世界高度 Y，整数毫米；地面移动由地图归一化，空中由调用方指定。
 ---@field z_mm integer 世界 Z，整数毫米；不是 Grid 下标。
 
 ---@class FlyWowNavigationError
 ---@field code string 稳定机器错误码；按此字段分支，不解析文案。
+---@field position? FlyWowNavigationPosition 空中推进预算失败时最后提交位置；其它错误可无此字段。
 ---@field message string 诊断上下文；只用于日志，不进入业务判断。
 
 ---@class FlyWowNavigationProfile
@@ -42,7 +43,69 @@
 ---@alias FlyWowNavigationCellRule "allow"|"block"|"default"
 --- allow 允许与其他单位重叠；block 禁止重叠但空格仍可进入；default 恢复默认允许重叠行为。
 
+---@class FlyWowNavigationAirBody
+---@field radius_mm integer XZ 盒半宽，非负 uint32 毫米。
+---@field half_height_mm integer Y 盒半高，非负 uint32 毫米。
+
+---@class FlyWowNavigationAirLimits
+---@field expanded? integer 展开上限，默认及最大 4096。
+---@field nodes? integer touched/open 上限，默认及最大 8192。
+---@field buckets? integer 重复访问桶也计数，默认及最大 8192。
+---@field tests? integer 区间、候选、地形与后处理工作，默认及最大 65536。
+---@field path_points? integer 路点上限，默认及最大 4096。
+---@field objects? integer Context 对象上限，默认及最大 4096。
+---@field object_links? integer 单对象关联上限，默认及最大 256。
+---@field links? integer 总关联上限，默认及最大 262144；只能调低上述保护值。
+
+---@class FlyWowNavigationAirPolicy
+---@field check_terrain? boolean 默认 false；开启后盒底严格高于地表加 clearance。
+---@field clearance_mm? integer 非负 uint32 毫米，默认 0。
+
+---@class FlyWowNavigationAirSetRequest
+---@field handle integer Context 内正整数句柄；业务 owner 管理其生命周期。
+---@field min FlyWowNavigationPosition 闭合 AABB 下界；XZ 在地图内。
+---@field max FlyWowNavigationPosition 闭合 AABB 上界；任意矩形尺寸。
+
+---@class FlyWowNavigationAirRemoveRequest
+---@field handle integer Context 内正整数句柄；不存在也成功。
+
+---@class FlyWowNavigationAirSweepRequest:FlyWowNavigationAirPolicy
+---@field from FlyWowNavigationPosition 段起点中心，调用方只读纯数据。
+---@field to FlyWowNavigationPosition 段终点中心；可改变 Y。
+---@field body FlyWowNavigationAirBody 本次查询体积。
+---@field exclude_handle? integer 仅排除此动态对象，默认不排除。
+
+---@class FlyWowNavigationAirFindRequest:FlyWowNavigationAirPolicy
+---@field start FlyWowNavigationPosition 起点 XZ；查询使用 flight_y_mm 作为 Y。
+---@field target FlyWowNavigationPosition 目标 XZ；查询使用 flight_y_mm 作为 Y。
+---@field flight_y_mm integer 本路径固定 int64 高度，不自动选择爬升高度。
+---@field body FlyWowNavigationAirBody 路径保存此体积；推进时匹配注册尺寸。
+---@field exclude_handle? integer 排除自身动态句柄。
+---@field range_mm? integer 非负 uint32 XZ 中心距离；0 精确终点，默认 0。
+
+---@class FlyWowNavigationAirMoveRequest:FlyWowNavigationAirPolicy
+---@field handle integer 已注册对象句柄。
+---@field target FlyWowNavigationPosition 新中心；完整连续扫掠通过后才提交。
+
+---@class FlyWowNavigationAirAdvanceRequest:FlyWowNavigationAirPolicy
+---@field handle integer 已注册对象句柄；与 Path/cursor 一起由单 owner 顺序使用。
+---@field path FlyWowNavigationPath 同地图快照的空中路径；不可跨对象共享推进 cursor。
+---@field distance_mm integer 非负 uint32 折线步长；后段失败保留已提交部分。
+
+---@class FlyWowNavigationAirSweepResult
+---@field kind "clear"|"static"|"dynamic" 同时接触静态优先，再按格或句柄排序。
+---@field handle integer 动态首命中句柄；其它类别为 0。
+---@field cell_index integer 静态格诊断下标；不是长期业务身份。
+---@field time_numerator string 十进制 uint64 分子，避免 Lua 有符号整数丢范围。
+---@field time_denominator string 十进制 uint64 正分母；段参数为两者之比。
+
 ---@class FlyWowNavigationContext
+---@field set_air_obstacle fun(self:FlyWowNavigationContext,request:FlyWowNavigationAirSetRequest):boolean?,FlyWowNavigationError? 状态设置不表示扫掠；失败旧索引完整。
+---@field remove_air_obstacle fun(self:FlyWowNavigationContext,request:FlyWowNavigationAirRemoveRequest):boolean?,FlyWowNavigationError? 幂等释放本 Context 对象。
+---@field find_air_path fun(self:FlyWowNavigationContext,request:FlyWowNavigationAirFindRequest):FlyWowNavigationPath?,FlyWowNavigationError? 固定高度八邻接规划，动态变化后移动仍重验。
+---@field sweep_air fun(self:FlyWowNavigationContext,request:FlyWowNavigationAirSweepRequest):FlyWowNavigationAirSweepResult?,FlyWowNavigationError? 连续盒体只读查询；预算错误不伪装 clear。
+---@field move_air fun(self:FlyWowNavigationContext,request:FlyWowNavigationAirMoveRequest):FlyWowNavigationPosition?,FlyWowNavigationError? 全成或全不成，保留原 AABB 尺寸。
+---@field advance_air_path fun(self:FlyWowNavigationContext,request:FlyWowNavigationAirAdvanceRequest):FlyWowNavigationAdvanceResult?,FlyWowNavigationError? blocked 返回合法前缀；预算错误的 error.position 为已提交位置。
 ---@field set_cell_rule fun(self:FlyWowNavigationContext,grid_x:integer,grid_z:integer,rule:FlyWowNavigationCellRule):boolean?,FlyWowNavigationError? 运行时设置当前 Battle 的单格重叠规则；default 清除覆盖。
 ---@field find_path fun(self:FlyWowNavigationContext,unit_id:integer,start:FlyWowNavigationPosition,goal:FlyWowNavigationPosition,unit_instance_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError?
 ---@field find_path_to_range fun(self:FlyWowNavigationContext,unit_id:integer,start:FlyWowNavigationPosition,target:FlyWowNavigationPosition,range_mm:integer,unit_instance_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError? 以目标中心为圆心的通用导航范围查询，不代表战斗攻击规则。
@@ -70,9 +133,9 @@
 
 ---@class FlyWowNavigationModule
 ---@field load_navigation_profiles fun(profiles:FlyWowNavigationProfile[]):boolean?,FlyWowNavigationError? 校验并原子替换进程当前导航配置；已有 Context 下一次调用即使用新表。
----@field load_map fun(path:string):FlyWowNavigationIdentity?,FlyWowNavigationError? 加载并按 map_id 替换当前地图；执行文件 I/O；已有 Context 保留旧地图。
+---@field load_map fun(path:string,airnav_path?:string):FlyWowNavigationIdentity?,FlyWowNavigationError? 加载并按 map_id 替换当前地图；执行文件 I/O；已有 Context 保留旧地图。
 ---@field query_cell fun(map_id:integer,map_version:integer,position:FlyWowNavigationPosition):FlyWowNavigationCell?,FlyWowNavigationError? 只读同步查询；Registry 查找短锁。
----@field new_context fun(map_id:integer):FlyWowNavigationContext?,FlyWowNavigationError? 固定当前地图并分配私有 scratch/occupancy；不缓存 Profile，返回调用方独占 userdata.
+---@field new_context fun(map_id:integer,air_limits?:FlyWowNavigationAirLimits):FlyWowNavigationContext?,FlyWowNavigationError? 固定当前地图并分配私有 scratch/occupancy；不缓存 Profile，返回调用方独占 userdata.
 
 --- Lua 对外入口：把稳定的 FlyWow Navigation 合同转交给 Native 实现。
 ---

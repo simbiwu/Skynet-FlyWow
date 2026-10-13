@@ -48,7 +48,8 @@ namespace FlyWow.Navigation.Editor
 
         /// <param name="snapshot">与正式 BMAP 对应的已验证快照。</param>
         /// <param name="bmapPath">刚完成回读验证的正式 BMAP 路径。</param>
-        public static void Write(NavigationMapSnapshot snapshot, string bmapPath)
+        public static void Write(NavigationMapSnapshot snapshot, string bmapPath,
+                                 string airnavPath = null, string packageHash = null)
         {
             // bmap 是刚完成回读验证的正式文件字节。
             byte[] bmap = File.ReadAllBytes(bmapPath);
@@ -92,7 +93,17 @@ namespace FlyWow.Navigation.Editor
 
             // Manifest 与 BMAP 同名同目录，扩展名固定为 .manifest.json。
             string manifestPath = Path.ChangeExtension(bmapPath, ".manifest.json");
-            File.WriteAllText(manifestPath, JsonUtility.ToJson(manifest, true) + "\n");
+            string json         = JsonUtility.ToJson(manifest, true);
+            // 旧无空中包保留原 Manifest 字节与目录名，升级后重复导出仍幂等。
+            if (airnavPath != null)
+            {
+                json = json.TrimEnd().Substring(0, json.TrimEnd().Length - 1).TrimEnd() +
+                       ",\n  \"airnav_sha256\": \"" +
+                       NavigationAssetPublisher.ContentHash(airnavPath) +
+                       "\",\n  \"capabilities\": [\"air_2_5d\"],\n  \"package_hash\": \"" +
+                       packageHash + "\"\n}";
+            }
+            File.WriteAllText(manifestPath, json + "\n");
         }
     }
 }

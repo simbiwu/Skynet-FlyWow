@@ -81,7 +81,8 @@ std::string SizeDetail(std::uint64_t expected, std::uint64_t actual)
 
 } // namespace
 
-NavResult<std::shared_ptr<const GridMap>> BMapReader::Read(const std::string &path)
+NavResult<std::shared_ptr<const GridMap>> BMapReader::Read(const std::string &path,
+                                                           const std::string &air_path)
 {
     // 1. 先取得文件长度，再一次读入字节缓冲；后续不逐格访问磁盘。
     // binary 保持原字节不变；ate 让打开后的读取位置位于文件尾，便于 tellg 取长度。
@@ -233,13 +234,26 @@ NavResult<std::shared_ptr<const GridMap>> BMapReader::Read(const std::string &pa
         cells[index].clearance_cells = source[7];
     }
 
+    AirAsset air;
+    // 仅启用空中组件时计算 SHA-256；旧加载/查询路径无额外 hash 工作。
+    if (!air_path.empty())
+    {
+        auto component = readAirAsset(air_path, metadata, sha256(file.data(), file.size()));
+        if (!component.ok())
+        {
+            return NavResult<std::shared_ptr<const GridMap>>::Failure(component.error,
+                                                                      component.detail);
+        }
+        air = std::move(component.value);
+    }
+
     // 6. 将已解码数组 move 给只读地图；地图自己持有 Cell，不依赖临时 file。
     // 构造失败时不向 Registry 发布半成品；此 catch 覆盖地图构造阶段，
     // 不包含前面读取缓冲与 Cell 数组分配时可能抛出的异常。
     try
     {
         std::shared_ptr<const GridMap> map =
-            std::make_shared<const GridMap>(metadata, std::move(cells));
+            std::make_shared<const GridMap>(metadata, std::move(cells), std::move(air));
         return NavResult<std::shared_ptr<const GridMap>>::Success(std::move(map));
     }
     catch (const std::exception &exception)
