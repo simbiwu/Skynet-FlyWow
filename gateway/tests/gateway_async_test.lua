@@ -4,6 +4,12 @@
 -- 生命周期：每场景重建 Lua State 模块状态；不启动网络，不冒充真实集成验证。
 -- 不负责：不验证 Protobuf 字节或真实 Skynet 调度，它们由宿主集成测试覆盖。
 local root = assert(arg[1])
+package.preload["shared.debug.luapanda_debug"] = function()
+    return
+    {
+        start = function() end,
+    }
+end
 package.path = root .. "/gateway/lualib/?.lua;" .. package.path
 
 -- 创建独立的可控场景；overrides 为配置覆盖，无 I/O；返回由测试拥有的控制对象。
@@ -29,64 +35,100 @@ local function scenario(overrides)
     for k, v in pairs(overrides or {}) do config[k] = v end
     local skynet = {}
     -- 替身不允许数据平面出现同步 call；任何意外等待立即使测试失败。
-    function skynet.call() error("Gateway must never call handler") end
+    function skynet.call()
+        error("Gateway must never call handler")
+    end
     -- 固定签名记录本地异步消息；返回 session=0，符合 pinned Skynet send。
     function skynet.send(address, protocol, command, message)
         e.sends[#e.sends + 1] = { address, command, message }
         return 0
     end
     -- 注册但不抢先执行任务；测试自行控制协程推进，无 OS 线程。
-    function skynet.fork(fn) e.forks[#e.forks + 1] = coroutine.create(fn) end
+    function skynet.fork(fn)
+        e.forks[#e.forks + 1] = coroutine.create(fn)
+    end
     -- 在测试调度器等待下一次扫描。
-    function skynet.sleep() coroutine.yield("sleep") end
+    function skynet.sleep()
+        coroutine.yield("sleep")
+    end
     -- 返回测试时钟 tick。
-    function skynet.now() return e.now end
+    function skynet.now()
+        return e.now
+    end
     -- 固定 Service handle。
-    function skynet.self() return 99 end
+    function skynet.self()
+        return 99
+    end
     -- 每场景由外部隔离状态，固定高精度 tick 足够验证不同 epoch 的拒绝。
-    function skynet.hpc() return 12345 end
+    function skynet.hpc()
+        return 12345
+    end
     -- 忽略诊断日志；结果通过状态断言检查。
-    function skynet.error() end
+    function skynet.error()
+    end
     -- 捕获管理调用返回 record。
-    function skynet.retpack(result) e.result = result end
+    function skynet.retpack(result)
+        e.result = result
+    end
     -- 保存真实 Service 的分发回调。
-    function skynet.dispatch(protocol, fn) e.dispatch = fn end
+    function skynet.dispatch(protocol, fn)
+        e.dispatch = fn
+    end
     -- 同步初始化入口，不执行真实调度。
-    function skynet.start(fn) fn() end
+    function skynet.start(fn)
+        fn()
+    end
     local socket = {}
     -- 固定监听 fd 和地址；无 I/O。
-    function socket.listen(host, port) return 1, host, port end
+    function socket.listen(host, port)
+        return 1, host, port
+    end
     -- 监听回调保存供测试注入连接；客户端 start 不执行 I/O。
     function socket.start(fd, fn)
         e.started[fd] = true
-        if fn then e.accept = fn end
+        if fn then
+            e.accept = fn
+        end
     end
     -- 缓冲限制由真实集成验证；替身保持签名。
-    function socket.limit() end
+    function socket.limit()
+    end
     -- 警告回调无需触发，真实集成另测写队列。
-    function socket.warning(fd, callback) e.warning = callback end
+    function socket.warning(fd, callback)
+        e.warning = callback
+    end
     -- 精确读取已有字节，不足时挂起；模仿 Socket read 的等待条件。
     function socket.read(fd, size)
         local data = e.streams[fd] or ""
-        if #data < size then coroutine.yield("read"); return false, "" end
+        if #data < size then
+            coroutine.yield("read")
+            return false, ""
+        end
         e.streams[fd] = data:sub(size + 1)
         return data:sub(1, size)
     end
     -- 记录完整 TCP frame；写入失败场景通过标志注入。
     function socket.write(fd, bytes)
-        if e.fail_write then return false end
+        if e.fail_write then
+            return false
+        end
         e.writes[#e.writes + 1] = { fd, bytes }
         return true
     end
     -- 记录关闭，不复用 fd。
-    function socket.close(fd) e.closed[fd] = true; e.started[fd] = nil end
+    function socket.close(fd)
+        e.closed[fd] = true
+        e.started[fd] = nil
+    end
     -- 接管前的 accepted fd 必须通过 close_fd 释放。
     function socket.close_fd(fd)
         assert(not e.started[fd], "close_fd is only valid before socket.start")
         e.closed[fd] = true
     end
     -- 与 pinned socket_pool ownership 保持一致。
-    function socket.invalid(fd) return not e.started[fd] end
+    function socket.invalid(fd)
+        return not e.started[fd]
+    end
     local websocket = {}
     -- 接受握手后模拟收到一个 binary 消息，再挂起等待后续消息。
     function websocket.accept(fd, handler)
@@ -97,11 +139,17 @@ local function scenario(overrides)
         return true
     end
     -- 记录 WS 完整消息写入；不 yield。
-    function websocket.write(fd, bytes) e.writes[#e.writes + 1] = { fd, bytes } end
+    function websocket.write(fd, bytes)
+        e.writes[#e.writes + 1] = { fd, bytes }
+    end
     -- 记录 WS 关闭。
-    function websocket.close(fd) e.closed[fd] = true end
+    function websocket.close(fd)
+        e.closed[fd] = true
+    end
     -- 返回握手前是否尚未建立 WS 对象。
-    function websocket.is_close(id) return e.ws == nil or e.closed[id] == true end
+    function websocket.is_close(id)
+        return e.ws == nil or e.closed[id] == true
+    end
     local registry = {}
     -- 提供只读测试索引。
     function registry.load() return
@@ -132,7 +180,9 @@ local function scenario(overrides)
         }
     end
     -- 请求 body 替身，与业务无关。
-    function codec.decode_request() return { test_id = 1, map_id = 1001 } end
+    function codec.decode_request()
+        return { test_id = 1, map_id = 1001 }
+    end
     -- 响应结果编码为文本，fail 注入编码异常。
     function codec.encode_response(definition, version, request_id, response)
         assert(not response.fail, "encode failure")
@@ -156,7 +206,7 @@ local function scenario(overrides)
             {
                 accept = function() return {} end,
                 close = function() end,
-                ready = function() return true end,
+                ready = function() return e.ready ~= false end,
                 expired = function() return false end,
             }
         end,
@@ -241,4 +291,48 @@ e.dispatch(0, 999, "close", e.sends[1][3])
 resume(e.forks[3])
 assert(e.closed[10])
 
+
+-- 两连接定向push审计；与旧用例独立，不修改旧用例的fork下标。
+e = scenario()
+e.streams[10] = frame(1)
+e.streams[11] = frame(2)
+e.accept(10, "peer-a")
+resume(e.forks[2])
+e.accept(11, "peer-b")
+resume(e.forks[3])
+local targeted =
+{
+    gateway_epoch = e.sends[1][3].gateway_epoch,
+    connection_id = e.sends[1][3].connection_id,
+    command_id    = 1001,
+    request_id    = 0,
+    data          = { result = 7 },
+}
+e.dispatch(0, 7, "send_data", targeted)
+assert(#e.writes == 1 and e.writes[1][1] == 10, "target push must not broadcast")
+assert(e.writes[1][2] == frame(0), "push preserves request_id zero")
+local epoch = targeted.gateway_epoch
+targeted.gateway_epoch = "old"
+e.dispatch(0, 7, "send_data", targeted)
+assert(#e.writes == 1, "old epoch push must be dropped")
+targeted.gateway_epoch = epoch
+e.ready = false
+e.dispatch(0, 7, "send_data", targeted)
+assert(#e.writes == 1, "not-ready push must be dropped")
+e.ready = true
+targeted.connection_id = 0
+e.dispatch(0, 7, "send_data", targeted)
+assert(#e.writes == 3, "broadcast still reaches both ready connections")
+targeted.request_id = 1
+e.dispatch(0, 7, "send_data", targeted)
+assert(#e.writes == 3, "broadcast cannot pretend to be correlated response")
+targeted.connection_id = 1
+targeted.request_id = 0
+e.dispatch(0, 7, "close", targeted)
+resume(e.forks[4])
+e.dispatch(0, 7, "send_data", targeted)
+assert(#e.writes == 3, "closed target must not fall back to broadcast")
+targeted.connection_id = 9999
+e.dispatch(0, 7, "send_data", targeted)
+assert(#e.writes == 3, "unknown target must be dropped")
 print("GATEWAY_ASYNC_UNIT_OK")

@@ -589,7 +589,6 @@ local function deliver_data(message)
         message.command_id <= 0 or
         math.type(message.request_id) ~= "integer" or
         (message.connection_id == 0 and message.request_id ~= 0) or
-        (message.connection_id > 0 and message.request_id == 0) or
         type(message.data) ~= "table" then
         state.responses_dropped = state.responses_dropped + 1
         return false
