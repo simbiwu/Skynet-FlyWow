@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <fstream>
+#include <fcntl.h>
 #include <iterator>
 #include <stdexcept>
 #include <unistd.h>
@@ -27,6 +28,47 @@ int main()
     const std::string path = directory;
     const auto first = std::chrono::system_clock::from_time_t(1767225599); // 2025-12-31 23:59:59 UTC。
     const auto next = first + std::chrono::seconds(2);
+    {
+        // 用非阻塞管道验证普通等级在 write 返回前已经刷新 stdout，而非等一秒定时器。
+        std::fflush(stdout);
+        const int saved_stdout = ::dup(STDOUT_FILENO);
+        int output[2]{};
+        assert(saved_stdout >= 0 && ::pipe(output) == 0);
+        assert(::fcntl(output[0], F_SETFL, O_NONBLOCK) == 0);
+        assert(::dup2(output[1], STDOUT_FILENO) >= 0);
+        ::close(output[1]);
+        {
+            flywow_logger::LogSink sink(path); // 未传参数默认开启 stdout。
+            assert(sink.write(1, "worker:12", "console\nline", first));
+            char captured[512]{};
+            const auto size = ::read(output[0], captured, sizeof(captured));
+            assert(size > 0);
+            assert(sink.flush());
+            assert(std::string(captured, static_cast<std::size_t>(size)) ==
+                read_file(path + "/2025-12-31.log"));
+        }
+        {
+            flywow_logger::LogSink sink(path, false);
+            assert(sink.write(2, "worker:12", "file_only", first));
+            char captured[512]{};
+            assert(::read(output[0], captured, sizeof(captured)) == -1);
+            assert(read_file(path + "/2025-12-31.log").find("file_only") != std::string::npos);
+        }
+
+        // stdout 写入失败不能让成功的文件写入/flush 变成失败。
+        const int full = ::open("/dev/full", O_WRONLY);
+        assert(full >= 0 && ::dup2(full, STDOUT_FILENO) >= 0);
+        ::close(full);
+        {
+            flywow_logger::LogSink sink(path, true);
+            assert(sink.write(2, "worker:12", "stdout_failed", first));
+            assert(sink.flush());
+        }
+        assert(::dup2(saved_stdout, STDOUT_FILENO) >= 0);
+        std::clearerr(stdout);
+        ::close(saved_stdout);
+        ::close(output[0]);
+    }
     {
         flywow_logger::LogSink sink(path);
         assert(sink.write(1, "worker:12", "first\nline", first));

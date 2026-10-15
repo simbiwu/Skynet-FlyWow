@@ -1,6 +1,6 @@
 // 本文件解决的问题：实现 Logger 的日期文件切换、单行格式化和失败恢复。
 // 所属边界：Runtime / File I/O；LogSink 的全部可变文件状态只由 Logger callback 串行访问。
-// 主要输入和输出：输入是日志记录和可注入时间；输出是 <log_path>/YYYY-MM-DD.log。
+// 主要输入和输出：输入是日志记录和可注入时间；输出是 <log_path>/YYYY-MM-DD.log 及可选 stdout 镜像。
 // 生命周期与所有权：path_ 是构造时解析出的绝对路径，file_ 由本对象打开并由本对象关闭。
 // 明确不负责的事情：不创建线程、不清理旧文件、不发送 Skynet 消息、不改变系统时钟。
 #include "log_sink.h"
@@ -109,7 +109,7 @@ std::string local_day(std::chrono::system_clock::time_point now)
 }
 
 // 创建目录并锁定绝对路径，使运行过程中不依赖后续工作目录变化。
-LogSink::LogSink(const std::string& path)
+LogSink::LogSink(const std::string& path, bool console) : console_(console)
 {
     if (path.empty() || path.size() >= PATH_MAX)
     {
@@ -255,8 +255,21 @@ bool LogSink::write(int level, const std::string& source, const std::string& tex
     const std::string body = single_line(text);
     const std::string name = single_line(source);
 
-    if (std::fprintf(file_, "%s.%03lld [%s] [%s] %s\n", stamp,
-        static_cast<long long>(milliseconds % 1000), label, name.c_str(), body.c_str()) < 0)
+    // 同一条日志只格式化一次，两个输出共用时间戳、等级、来源和转义后的正文。
+    char prefix[64]{};
+    std::snprintf(prefix, sizeof(prefix), "%s.%03lld [%s] [", stamp,
+        static_cast<long long>(milliseconds % 1000), label);
+    const std::string line = std::string(prefix) + name + "] " + body + "\n";
+
+    if (console_)
+    {
+        // stdout 即使重定向到管道也逐条刷新，不依赖终端行缓冲或 Logger 的一秒定时器。
+        // 这是同步镜像；慢终端仍可能阻塞线程，stdout 失败不改变文件写入/flush 的结果。
+        std::fwrite(line.data(), 1, line.size(), stdout);
+        std::fflush(stdout);
+    }
+
+    if (std::fwrite(line.data(), 1, line.size(), file_) != line.size())
     {
         report_failure();
         return false;

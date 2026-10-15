@@ -1,6 +1,6 @@
 # FlyWow Logger 初始化流程与接口
 
-本文说明 FlyWow Logger 从 Skynet 进程启动，到 Lua 业务调用 skynet.error，再到 Native Logger 写入每日日志文件的完整链路。
+本文说明 FlyWow Logger 从 Skynet 进程启动，到 Lua 业务调用 skynet.error，再到 Native Logger 写入每日日志文件及可选 stdout 镜像的完整链路。
 
 ## 一、整体链路
 
@@ -37,6 +37,7 @@ logger = "./logs/battle"
 
 -- 最低日志等级：debug、normal、error。
 flywow_logger_level = "normal"
+flywow_logger_console = true -- 默认开启 stdout 镜像；false 保留只写文件。
 
 -- 每个 Lua Service 执行业务代码前执行。
 preload = "./third_party/skynet-flywow/logger/lualib/flywow_logger_preload.lua"
@@ -140,6 +141,7 @@ int flywow_logger_init(
 
     读取 flywow_logger_level
         -> 检查等级是否合法
+        -> 读取 flywow_logger_console（默认 true，校验 true/false）
         -> 创建 LogSink
         -> 打开当天日志文件
         -> 注册 Skynet callback
@@ -152,13 +154,13 @@ const char* level =
     skynet_command(context, "GETENV", "flywow_logger_level");
 ~~~
 
-没有配置时默认 normal；未知等级会导致启动失败。
+没有配置时默认 normal；未知等级会导致启动失败。Native 同时读取 flywow_logger_console，未配置或 true 开启 stdout 镜像，false 关闭，其他值启动失败。console 是初始化时固定的 bool，并传给 LogSink；无运行时重载。
 
-创建写入对象并打开当天日志：
+创建写入对象并打开当天日志（console 是上述校验后的开关）：
 
 ~~~cpp
 logger->sink.reset(
-    new flywow_logger::LogSink(parm ? parm : ""));
+    new flywow_logger::LogSink(parm ? parm : "", console));
 
 logger->sink->open_day(std::chrono::system_clock::now());
 ~~~

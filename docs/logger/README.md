@@ -28,10 +28,11 @@ Gateway/Battle 的 Logger 配置是普通 Skynet 配置字段，无需 helper in
 logservice = "flywow_logger"
 logger = "./logs/battle"
 flywow_logger_level = "normal"
+flywow_logger_console = true -- 同一条日志写文件和 stdout；显式 false 只写文件。
 preload = "./third_party/skynet-flywow/logger/lualib/flywow_logger_preload.lua"
 ~~~
 
-logservice 选择 Native Logger；Skynet 把 logger 字段作为日志服务参数传入，表示输出目录；flywow_logger_level 由 Lua 适配读取；preload 在每个 Lua Service 执行业务代码前安装 skynet.error 转发。业务代码继续只调用 skynet.error。
+logservice 选择 Native Logger；Skynet 把 logger 字段作为日志服务参数传入，表示输出目录；flywow_logger_level 由 Lua 适配与 Native Logger 读取；flywow_logger_console 由 Native Logger 读取，默认 true；preload 在每个 Lua Service 执行业务代码前安装 skynet.error 转发。业务代码继续只调用 skynet.error。
 
 配置字段含义及按天写盘行为见本页“配置与文件”。每个 OS 进程在自己的进程配置中设置独立 log path。Skynet 配置是受限环境，因此使用普通赋值即可，不依赖 require、函数或路径生成器。
 
@@ -40,9 +41,12 @@ logservice 选择 Native Logger；Skynet 把 logger 字段作为日志服务参�
 | 字段 | 类型/默认 | 合同 |
 |---|---|---|
 | log_path | string，必填 | 输出目录；相对路径基于 OS 进程启动 cwd，Native 启动时创建并固定绝对路径 |
-| level | string，默认 normal | debug/normal/error，过滤低于阈值的日志；非法级别启动失败 |
+| level | string，默认 normal | 对应 flywow_logger_level；debug/normal/error，过滤低于阈值的日志；非法级别启动失败 |
+| flywow_logger_console | boolean，默认 true | 同一条格式化日志写入文件和 stdout；false 仅写文件；其它值启动失败 |
 
-配置修改需重启。每个输出目录由一个运行中的 Logger 使用；Gateway 和 Battle 分别设置 ./logs/gateway、./logs/battle，不自动增加层级，不配置 instance。空目录、路径为文件或无法打开当天文件，向 stderr 报告并阻止启动。
+配置修改需重启。未配置 flywow_logger_console 的旧使用者也会增加 stdout 输出；需要保留只写文件时显式设置 false。
+
+每个输出目录由一个运行中的 Logger 使用；Gateway 和 Battle 分别设置 ./logs/gateway、./logs/battle，不自动增加层级，不配置 instance。空目录、路径为文件或无法打开当天文件，向 stderr 报告并阻止启动。
 
 文件命名 YYYY-MM-DD.log，使用系统本地时间，部署机器时区由运维统一。Logger 接收时记毫秒时间；它可能晚于业务调用时间。跨天第一条日志刷新关闭旧文件再打开新文件；同日重启追加，无消息的次日不创建空文件。不做自动清理、压缩、保留期限或大小分片，运维自行处理。
 
@@ -85,6 +89,8 @@ Lua Native 模块不自动拥有 skynet_context。Navigation 核心不依赖日�
 
 单个 Logger callback 串行处理，不创建写线程。普通日志缓冲写，每 100 tick（一秒）刷新，error 立即刷新。flush 是用户态缓冲提交给 OS，不是 fsync，断电/强杀不保证持久性。磁盘阻塞仍占用 Skynet 工作线程。
 
+console 开启时，日志仅格式化一次，文件和 stdout 共用完整行（包括毫秒时间戳、等级、来源和转义正文）。stdout 每条 fflush，即使重定向到管道也及时提交；不改文件的普通等级缓冲、error 立即刷新和一秒定时刷新。stdout 是同步镜像，慢终端/管道可能阻塞工作线程，没有异步队列。stdout 写入/刷新失败不覆盖文件写入结果或文件 flush 响应；原有当天文件打不开的路径仍直接失败，不把终端当文件故障回退。
+
 名称表最多 4096 项，超出来源共享受限桶。单条正文限制 8 KiB，截断带 TRUNCATED；按字节截断，可能切开 UTF-8 最后字符。
 
 这些限制不是 Skynet mailbox 硬容量。原生 C 日志、多来源高压仍可能积压；Native SDK 不创建额外共享队列，不承诺无限吞吐。Skynet overload 日志可提示积压，商业负载容量需独立压测。
@@ -115,9 +121,9 @@ python3 logger/tests/integration_test.py \
   --skynet /path/to/skynet --build /path/to/flywow/build
 ~~~
 
-C++ 文件测试实际验证跨天、追加、转义、非法目录、/dev/full 写失败与恢复。真实 Skynet 集成验证三个等级、自动子 Service 名称、nil、长消息、Native SDK、默认回退、配置入口和刷新。测试自己的临时目录自动释放，不操作开发者日志。
+C++ 文件测试实际验证跨天、追加、转义、非法目录、/dev/full 写失败与恢复。文件测试还用非阻塞管道验证 stdout 逐条刷新、false 只写文件、stdout 故障不改变文件成功结果。真实 Skynet 集成验证三个等级、自动子 Service 名称、nil、长消息、Native SDK、默认回退、配置入口和刷新，并逐字比较本次文件与 stdout 内容，覆盖未配置默认 true、显式 true/false、非法开关。测试自己的临时目录自动释放，不操作开发者日志。
 
-没有文件时先查 stderr、路径权限、磁盘和 cpath/.so；正常日志在每日文件，启动脚本重定向只收诊断。当前未发布跨硬件吞吐数字，未验证断电持久性。跨天测试注入时钟，不修改系统日期。
+没有文件时先查 stderr、路径权限、磁盘和 cpath/.so；正常日志在每日文件；console 默认开启时 stdout 也包含正常日志，关闭 console 后重定向仅收原有诊断。当前未发布跨硬件吞吐数字，未验证断电持久性。跨天测试注入时钟，不修改系统日期。
 
 ## 升级与回滚
 

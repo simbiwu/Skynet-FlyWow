@@ -334,7 +334,7 @@ int queryCell(lua_State *state)
 }
 
 /// load_navigation_profiles(profiles)：校验独立导航配置并原子替换当前只读表。
-int loadNavigationProfiles(lua_State *state)
+int load_navigation_profiles(lua_State *state)
 {
     LuaBinding  lua_binding(state);
     LuaTable    profiles;
@@ -508,7 +508,7 @@ int findPathToRange(lua_State *state)
 }
 
 /// find_path_to_unit_range：按双方导航半径寻找合法接近点；不接收战斗攻击距离。
-int findPathToUnitRange(lua_State *state)
+int find_path_to_unit_range(lua_State *state)
 {
     LuaBinding            binding(state);
     LuaNavigationContext *owner            = nullptr;
@@ -614,7 +614,7 @@ int commitMove(LuaBinding &lua_binding, LuaNavigationContext &owner, const Navig
 }
 
 /// place_unit：出生也是一次正常占位提交；失败不改变现有动态事实。
-int placeUnit(lua_State *state)
+int place_unit(lua_State *state)
 {
     LuaBinding                   lua_binding(state);
     LuaNavigationContext        *owner = nullptr;
@@ -630,7 +630,7 @@ int placeUnit(lua_State *state)
 }
 
 /// move_unit：复验当前子步并提交占位，成功返回 Server 地表 Y 归一的世界位置。
-int moveUnit(lua_State *state)
+int move_unit(lua_State *state)
 {
     LuaBinding                   lua_binding(state);
     LuaNavigationContext        *owner = nullptr;
@@ -705,7 +705,7 @@ LuaTable advanceResultTable(LuaBinding                                 &lua_bind
 
 /// advance_path(request)：消费 fixed-tick 距离预算；blocked 是成功 result 状态。
 /// request 的 path/from_world 本次同步借用；失败返回 nil,error。
-int advancePath(lua_State *state)
+int advance_path(lua_State *state)
 {
     LuaBinding            lua_binding(state);
     LuaNavigationContext *owner = nullptr;
@@ -740,7 +740,7 @@ int advancePath(lua_State *state)
 }
 
 /// cell_size_mm：只读地图边长，单位毫米。
-int cellSizeMm(lua_State *state)
+int cell_size_mm(lua_State *state)
 {
     LuaBinding            lua_binding(state);
     LuaNavigationContext *owner = nullptr;
@@ -804,7 +804,7 @@ int setCellRule(lua_State *state)
 }
 
 /// release_unit：释放该 handle 当前 footprint，成功返回 true。
-int releaseUnit(lua_State *state)
+int release_unit(lua_State *state)
 {
     LuaBinding            lua_binding(state);
     LuaNavigationContext *owner            = nullptr;
@@ -825,7 +825,7 @@ int releaseUnit(lua_State *state)
 }
 
 /// unit_radius_mm：每次调用按静态 unit_id 查询当前 Registry 的导航半径。
-int unitRadiusMm(lua_State *state)
+int unit_radius_mm(lua_State *state)
 {
     LuaBinding            binding(state);
     LuaNavigationContext *owner   = nullptr;
@@ -856,7 +856,7 @@ int mapVersion(lua_State *state)
 }
 
 /// close：幂等释放大块 Context 内存；userdata 外壳由统一 GC 最终析构。
-int closeContext(lua_State *state)
+int close(lua_State *state)
 {
     LuaBinding            lua_binding(state);
     LuaNavigationContext *owner = nullptr;
@@ -1140,6 +1140,31 @@ template <int (*Callback)(lua_State *)> int airBoundary(lua_State *state)
         return binding.pushError("INTERNAL_ERROR", "unknown air native exception");
     }
 }
+int load_map(lua_State *state)
+{
+    return airBoundary<loadMap>(state);
+}
+
+int new_context(lua_State *state)
+{
+    return airBoundary<newContext>(state);
+}
+
+int set_air_obstacle(lua_State *state)
+{
+    return airBoundary<setAirObstacle>(state);
+}
+
+int remove_air_obstacle(lua_State *state)
+{
+    return airBoundary<removeAirObstacle>(state);
+}
+
+int sweep_air(lua_State *state)
+{
+    return airBoundary<sweepAir>(state);
+}
+
 bool registerContext(LuaBinding &lua_binding)
 {
     LuaTable meta;
@@ -1148,24 +1173,24 @@ bool registerContext(LuaBinding &lua_binding)
         return false;
     }
     auto methods = lua_binding.newTable();
-    return methods.setFunction("set_air_obstacle", &airBoundary<setAirObstacle>) &&
-           methods.setFunction("remove_air_obstacle", &airBoundary<removeAirObstacle>) &&
+    return methods.setFunction("set_air_obstacle", &set_air_obstacle) &&
+           methods.setFunction("remove_air_obstacle", &remove_air_obstacle) &&
            methods.setFunction("find_air_path", &airBoundary<findAirPath>) &&
-           methods.setFunction("sweep_air", &airBoundary<sweepAir>) &&
+           methods.setFunction("sweep_air", &sweep_air) &&
            methods.setFunction("move_air", &airBoundary<moveAir>) &&
            methods.setFunction("advance_air_path", &airBoundary<advanceAirPath>) &&
            methods.setFunction("find_path", &findPath) &&
            methods.setFunction("set_cell_rule", &setCellRule) &&
            methods.setFunction("find_path_to_range", &findPathToRange) &&
-           methods.setFunction("find_path_to_unit_range", &findPathToUnitRange) &&
-           methods.setFunction("place_unit", &placeUnit) &&
-           methods.setFunction("move_unit", &moveUnit) &&
-           methods.setFunction("release_unit", &releaseUnit) &&
-           methods.setFunction("advance_path", &advancePath) &&
-           methods.setFunction("cell_size_mm", &cellSizeMm) &&
-           methods.setFunction("unit_radius_mm", &unitRadiusMm) &&
+           methods.setFunction("find_path_to_unit_range", &find_path_to_unit_range) &&
+           methods.setFunction("place_unit", &place_unit) &&
+           methods.setFunction("move_unit", &move_unit) &&
+           methods.setFunction("release_unit", &release_unit) &&
+           methods.setFunction("advance_path", &advance_path) &&
+           methods.setFunction("cell_size_mm", &cell_size_mm) &&
+           methods.setFunction("unit_radius_mm", &unit_radius_mm) &&
            methods.setFunction("map_version", &mapVersion) &&
-           methods.setFunction("close", &closeContext) && meta.writeValue("__index", methods);
+           methods.setFunction("close", &close) && meta.writeValue("__index", methods);
 }
 
 // Registry 是进程级只读地图集合；可变 context/scratch 不共享。
@@ -1180,10 +1205,10 @@ extern "C" int luaopen_flywow_navigation_native(lua_State *state)
     }
     auto  module = lua_binding.newTable();
     void *maps   = &MapRegistry::Instance(); // closure 只借用，单例 owner 覆盖所有 State。
-    if (!module.setFunction("load_navigation_profiles", &loadNavigationProfiles) ||
-        !module.setFunction("load_map", &airBoundary<loadMap>, maps) ||
+    if (!module.setFunction("load_navigation_profiles", &load_navigation_profiles) ||
+        !module.setFunction("load_map", &load_map, maps) ||
         !module.setFunction("query_cell", &queryCell, maps) ||
-        !module.setFunction("new_context", &airBoundary<newContext>, maps))
+        !module.setFunction("new_context", &new_context, maps))
     {
         return lua_binding.pushError();
     }

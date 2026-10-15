@@ -296,9 +296,21 @@ int flywow_logger_init(Logger* logger, skynet_context* context, const char* parm
             logger->minimum = 2;
         }
 
+        // Skynet 将配置布尔值转换为字符串；缺省开启镜像，显式 false 保留只写文件。
+        const char* configured_console =
+            skynet_command(context, "GETENV", "flywow_logger_console");
+        if (configured_console != nullptr &&
+            std::strcmp(configured_console, "true") != 0 &&
+            std::strcmp(configured_console, "false") != 0)
+        {
+            throw std::runtime_error("flywow_logger_console 必须是 true 或 false");
+        }
+        const bool console = configured_console == nullptr ||
+            std::strcmp(configured_console, "true") == 0;
+
         // 第二阶段：创建 LogSink，并立即确认当天文件可写。
         const char* log_path = parm == nullptr ? "" : parm;
-        logger->sink.reset(new flywow_logger::LogSink(log_path));
+        logger->sink.reset(new flywow_logger::LogSink(log_path, console));
 
         if (!logger->sink->open_day(std::chrono::system_clock::now()))
         {
