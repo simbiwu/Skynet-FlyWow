@@ -1,14 +1,14 @@
 --- 职责：提供与业务无关的 Skynet Gateway Service，统一接入 TCP 与 WebSocket。
 --- 边界：FlyWow Runtime Service；拥有监听 fd、连接生命周期、frame、背压和协议编解码。
---- 输入/输出：config.gateway 默认配置 + 可选 start 覆盖项 + handler Service -> 已解码 command/request 与编码后的 response。
+--- 输入/输出：宿主传入的完整课程配置 + handler Service -> 已解码 command/request 与编码后的 response。
 --- 生命周期：由宿主通过 newservice 创建；start 后监听，stop 后释放所有 fd、连接和队列状态。
 --- 不负责：不注册业务 command、不理解 Battle/SLG DTO、不加载 .proto 源码、不保存业务状态。
 local skynet = require "skynet"
 local luapanda_debug = require "shared.debug.luapanda_debug"
 local socket = require "skynet.socket"
 local websocket = require "http.websocket"
-local registry_loader = require "flywow.gateway.registry"
-local codec_factory = require "flywow.gateway.codec"
+local registry_loader = require "registry"
+local codec_factory = require "codec"
 
 ---@class GatewayConnection
 ---@field handshake HandshakeContext 当前连接独占的握手状态。
@@ -17,7 +17,7 @@ local codec_factory = require "flywow.gateway.codec"
 ---@field peer string 对端地址诊断字符串。
 ---@field transport GatewayTransport 当前传输类型。
 ---@field closed boolean 是否已从连接表摘除。
-local handshake_factory = require "flywow.gateway.handshake"
+local handshake_factory = require "handshake"
 
 local state =
 {
@@ -64,15 +64,13 @@ local function require_integer(value, name, minimum, maximum)
     return value
 end
 
---- 校验并复制 start 配置，避免运行过程中读取宿主可能修改的 table。
---- 参数 input：可省略的启动覆盖 table；业务通常只传 handler_service，其他字段来自 config.gateway。
---- 返回值：当前 Service 私有的不可再变更配置；失败抛错，不执行 I/O、yield 或启动资源。
+--- 校验并复制宿主完整传入的课程配置，避免运行期间读取可变配置 table。
+--- 参数 input：必需的完整 Gateway 配置，包含 handler、descriptor、registry 和监听参数。
+--- 返回值：当前 Service 私有的规范化配置；失败抛错，不执行 I/O、yield 或启动资源。
 local function normalize_config(input)
-    -- 数据准备：读取宿主默认配置，再合并本次 start 的覆盖项。
-    local defaults = require "config.gateway"
-    assert(type(defaults) == "table", "config.gateway must return a table")
-
-    local merged = merge_config(defaults, input)
+    assert(type(input) == "table", "gateway start config must be a table")
+    -- Gateway 不 require 宿主业务配置；默认值只用于可选的通用传输参数。
+    local merged = merge_config({}, input)
 
     -- 参数/状态检查：先校验传输类型，再校验网络和资源上限。
     local transport = merged.transport or "tcp"

@@ -50,7 +50,7 @@ add_subdirectory(
 # MODULE 生成 Lua 可加载的共享模块，不是服务进程或可执行程序。
 # allocator 按既有 ABI 合同编入同一 DSO；Binding 源码由上面的静态目标提供。
 add_library(flywow_gateway_crypto MODULE
-    gateway_crypto/gateway_crypto.cpp
+    gateway_crypto.cpp
     "${CMAKE_CURRENT_LIST_DIR}/../../common/native/skynet_allocator.cpp"
 )
 

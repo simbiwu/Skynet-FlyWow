@@ -28,7 +28,7 @@ local function scenario(overrides)
     {
         host             = "127.0.0.1",
         port             = 19021,
-        protocol_version = 3,
+        protocol_version = 4,
         descriptor_path  = "stub",
         registry_module  = "test.registry",
     }
@@ -173,7 +173,7 @@ local function scenario(overrides)
         assert(payload ~= "bad", "malformed envelope")
         return
         {
-            protocol_version = 3,
+            protocol_version = 4,
             command          = 1001,
             body             = "",
         }
@@ -190,15 +190,14 @@ local function scenario(overrides)
     package.loaded["skynet"] = skynet
     package.loaded["skynet.socket"] = socket
     package.loaded["http.websocket"] = websocket
-    package.loaded["config.gateway"] = config
     package.loaded["test.registry"] = {}
-    package.loaded["flywow.gateway.registry"] = registry
-    package.loaded["flywow.gateway.codec"] =
+    package.loaded["registry"] = registry
+    package.loaded["codec"] =
     {
         new = function() return codec end,
     }
     package.loaded["flywow_gateway_crypto"] = {}
-    package.loaded["flywow.gateway.handshake"] =
+    package.loaded["handshake"] =
     {
         new = function()
             return
@@ -211,9 +210,15 @@ local function scenario(overrides)
         end,
     }
     dofile(root .. "/gateway/service/gateway/flywow_gateway.lua")
+    -- Gateway 不再隐式加载宿主 config.gateway；测试显式传入运行所需配置。
+    -- descriptor/registry 在本测试中由上方 package.loaded 替身提供，不读取磁盘协议产物。
     e.dispatch(1, 8, "start",
     {
         handler_service = ".test_handler",
+        port = 19001,
+        protocol_version = 4,
+        descriptor_path = "test.pb",
+        registry_module = "test.registry",
     }
     )
     return e

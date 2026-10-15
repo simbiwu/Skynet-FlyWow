@@ -55,6 +55,50 @@ message EchoResponse
         self.assertIsNone(commands[0]["request"])
         self.assertIn("request_type  = nil", MODULE.render("demo.v1", commands))
 
+    def test_split_proto_files_share_package_and_resolve_messages(self) -> None:
+        """命令枚举与消息分处不同文件时仍按同一 package 生成 registry。"""
+        common = """syntax = "proto3";
+package demo.v1;
+message Envelope {}
+enum CommandId { COMMAND_UNSPECIFIED = 0; ECHO = 42; }
+"""
+        messages = """syntax = "proto3";
+package demo.v1;
+message EchoRequest {}
+message EchoResponse {}
+"""
+        package, commands = MODULE.parse_protos([common, messages])
+        self.assertEqual("demo.v1", package)
+        self.assertEqual(".demo.v1.EchoRequest", commands[0]["request"])
+
+    def test_profile_registry_excludes_other_protocol_messages(self) -> None:
+        """公共命令号可跨 schema 稳定分配，目标 registry 只含本协议消息。"""
+        common = """syntax = "proto3";
+package demo.v1;
+message Envelope {}
+enum CommandId {
+  COMMAND_UNSPECIFIED = 0;
+  NAV_QUERY = 1001;
+  FRAME_JOIN = 1101;
+}
+"""
+        frame = """syntax = "proto3";
+package demo.v1;
+message FrameJoinRequest {}
+message FrameJoinResponse {}
+"""
+        _, commands = MODULE.parse_protos([common, frame])
+        self.assertEqual([1101], [item["id"] for item in commands])
+        self.assertEqual("FrameJoin", commands[0]["name"])
+
+    def test_split_proto_files_reject_package_mismatch(self) -> None:
+        """不同 package 的输入不能被悄悄合并成一个 registry。"""
+        with self.assertRaisesRegex(ValueError, "same package"):
+            MODULE.parse_protos([
+                self.valid_proto(),
+                self.valid_proto().replace("demo.v1", "other.v1"),
+            ])
+
     def test_duplicate_command_id_fails(self) -> None:
         """两个命令使用同一 command id 必须失败。"""
         with self.assertRaises(ValueError):
@@ -72,12 +116,17 @@ message EchoResponse
         self.assertIsNone(commands[0]["response"])
         self.assertIn("response_type = nil", MODULE.render("demo.v1", commands))
 
-    def test_invalid_structure_or_message_fails(self) -> None:
-        """缺失 Envelope 或 CommandId 时必须失败。"""
-        with self.assertRaisesRegex(ValueError, "Envelope"):
-            MODULE.parse_proto(self.valid_proto().replace("message Envelope\n{}\n", ""))
+    def test_course_registry_does_not_require_local_envelope(self) -> None:
+        """课程 Registry 只解析本课程命令与消息，Envelope 由 Gateway 配置指定。"""
+        source = self.valid_proto().replace("message Envelope\\n{}\\n", "")
+        package, commands = MODULE.parse_proto(source)
+        output = MODULE.render(package, commands).replace(
+            f'envelope_type = ".{package}.Envelope",',
+            'envelope_type = ".battle.transport.v1.Envelope",',
+        )
+        self.assertIn('envelope_type = ".battle.transport.v1.Envelope"', output)
         with self.assertRaisesRegex(ValueError, "CommandId"):
-            MODULE.parse_proto(self.valid_proto().replace("enum CommandId", "enum OtherId"))
+            MODULE.parse_proto(source.replace("enum CommandId", "enum OtherId"))
 
     def test_write_if_changed_is_stable_and_complete(self) -> None:
         """相同内容不改 mtime，变化内容只暴露完整最终文件。"""

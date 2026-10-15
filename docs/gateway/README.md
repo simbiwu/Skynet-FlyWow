@@ -14,21 +14,23 @@ Gateway 不保存业务请求，不创建 pending，不生成 route_token，不�
 
 ## 模块入口
 
-Gateway Lua模块位于`gateway/lualib/flywow/gateway/`，公开入口使用`flywow.gateway.*`。
+Gateway内部Lua模块位于`gateway/lualib/`，分别以模块名 `handshake`、`codec` 和 `registry` 加载。
 Service为`flywow_gateway`；协议registry由宿主唯一Proto源生成。
 Navigation独立使用`flywow_navigation`；不因命名接近而建立模块依赖。
 
 ## Service 合同
 
-宿主通过 start 注入业务 handler：
+宿主通过 start 注入完整的课程配置和业务 handler：
 
     -- 先为 handler 注册稳定的本地服务名；名称由宿主选取并避免冲突。
     skynet.name(".my_gateway_handler", skynet.self())
     local gateway = skynet.newservice("flywow_gateway")
-    skynet.call(gateway, "lua", "start",
-    {
-        handler_service = ".my_gateway_handler",
-    })
+    local options = {}
+    for key, value in pairs(require "config.gateway_lesson_02") do
+        options[key] = value
+    end
+    options.handler_service = ".my_gateway_handler"
+    skynet.call(gateway, "lua", "start", options)
 
 Gateway 每次发送时由 Skynet 按名称解析当前注册的 Service；名称未注册期间发送会失败，不排队、不重试。
 Gateway 不校验 send_data/close 的回复来源身份；宿主负责控制本地服务访问边界。
@@ -55,14 +57,12 @@ connection_id 大于 0 时发送给指定连接，等于 0 时广播给当前 Ga
 
 ## 协议合同
 
-客户端 Envelope 只包含：
+各课程共用的传输类型为 `battle.transport.v1.Envelope`；业务命令与消息由课程各自定义。客户端 Envelope 只包含：
 
     message Envelope {
       uint32 protocol_version = 1;
       uint32 command = 2;
-      reserved 3; // 历史request_id字段不得复用。
-      reserved "request_id";
-      bytes body = 4;
+      bytes body = 3;
     }
 
 客户端只根据 command 选择消息类型。协议不定义 request_id，也不要求 Gateway 保存请求响应关联。
@@ -96,6 +96,6 @@ connection_id=0 的广播只作用于当前 Gateway 实例。多 Gateway 节点�
 
 ## 生成与验证
 
-运行时不读取 proto。构建阶段使用固定 protoc 生成 descriptor，使用 gateway/tools/generate_gateway_registry.py 生成 registry。协议源、descriptor、registry 和客户端生成物必须来自同一提交。
+运行时不读取 proto，也不 require 宿主的固定 config.gateway。每个课程构建入口使用固定 protoc 生成本课 descriptor，并调用 gateway/tools/generate_gateway_registry.py 生成 protocol_registry_<course>.lua；宿主 composition root 选择课程配置并显式传入 start。协议源、descriptor、Registry 和客户端生成物必须来自同一协议版本。
 
-当前课程兼容版本为4：Gateway不读取、生成或回传request_id。定向Push通过正connection_id投递，0广播；两者都必须匹配当前gateway_epoch与ready连接。业务需要的序号/幂等/关联保留在data中，由宿主负责。
+当前课程协议版本为4：Gateway不读取、生成或回传request_id。定向Push通过正connection_id投递，0广播；两者都必须匹配当前gateway_epoch与ready连接。业务需要的序号/幂等/关联保留在data中，由宿主负责。

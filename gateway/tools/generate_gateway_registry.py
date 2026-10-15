@@ -2,7 +2,7 @@
 """生成 FlyWow Gateway command registry。
 
 边界：FlyWow Build Tool；只在构建阶段读取宿主 .proto。
-输入/输出：proto3 package、CommandId、Request/可选 Response -> 确定性 Lua registry。
+输入/输出：共享 package 的多个 proto3 文件中的 CommandId 与 Request/可选 Response -> 确定性 Lua registry。
 命令规则：
 1. .proto 必须声明 enum CommandId；每个非零枚举项是一个业务命令。
 2. 枚举名按 QUERY_CELL -> QueryCell 转换为消息前缀。
@@ -42,34 +42,43 @@ def _pascal_name(enum_name: str) -> str:
 
 
 def parse_proto(source: str) -> tuple[str, list[dict[str, str | int | None]]]:
-    """解析 CommandId 和消息命名合同，返回可生成的命令记录。"""
-    structural = _without_comments(source)
+    """解析单个 proto 文件；保留单文件调用者的现有 Python API。"""
+    return parse_protos([source])
 
-    if not re.search(r'^\s*syntax\s*=\s*"proto3"\s*;', source, re.MULTILINE):
-        raise ValueError('syntax = "proto3" is required')
 
-    package_match = re.search(
-        r"^\s*package\s+([\w.]+)\s*;",
-        structural,
-        re.MULTILINE,
-    )
-    if not package_match:
-        raise ValueError("proto package is required")
-    package = package_match.group(1)
+def parse_protos(sources: list[str]) -> tuple[str, list[dict[str, str | int | None]]]:
+    """汇总多个职责文件中的命令与消息名，校验共享 package。"""
+    if not sources:
+        raise ValueError("at least one proto file is required")
 
-    if "Envelope" not in {
-        match.group("name") for match in MESSAGE_RE.finditer(structural)
-    }:
-        raise ValueError("proto must declare message Envelope")
+    structural_sources = []
+    packages = set()
+    for source in sources:
+        structural = _without_comments(source)
+        if not re.search(r'^\s*syntax\s*=\s*"proto3"\s*;', source, re.MULTILINE):
+            raise ValueError('syntax = "proto3" is required')
+        package_match = re.search(
+            r"^\s*package\s+([\w.]+)\s*;",
+            structural,
+            re.MULTILINE,
+        )
+        if not package_match:
+            raise ValueError("proto package is required")
+        packages.add(package_match.group(1))
+        structural_sources.append(structural)
 
+    if len(packages) != 1:
+        raise ValueError("all proto files must use the same package")
+    package = next(iter(packages))
+    structural = "\n".join(structural_sources)
     message_names = {
         match.group("name")
         for match in MESSAGE_RE.finditer(structural)
     }
-
-    enum_match = ENUM_RE.search(structural)
-    if not enum_match:
-        raise ValueError("proto must declare enum CommandId")
+    enum_matches = list(ENUM_RE.finditer(structural))
+    if len(enum_matches) != 1:
+        raise ValueError("proto files must declare exactly one enum CommandId")
+    enum_match = enum_matches[0]
 
     commands: list[dict[str, str | int | None]] = []
     seen_ids: set[int] = set()
@@ -104,6 +113,10 @@ def parse_proto(source: str) -> tuple[str, list[dict[str, str | int | None]]]:
             if response_name in message_names
             else None
         )
+        if request_type is None and response_type is None:
+            # Common CommandId lists the stable global IDs; a profile registry only
+            # includes the messages supplied by that profile's schema inputs.
+            continue
         if method_name in seen_names:
             raise ValueError(f"duplicate command method name: {method_name}")
         seen_names.add(method_name)
@@ -215,19 +228,29 @@ def write_if_changed(path: Path, content: str) -> None:
 def main() -> int:
     """执行构建期 CLI。"""
     parser = argparse.ArgumentParser(
-        description="Generate FlyWow Gateway Lua registry",
+        description="Generate FlyWow Gateway Lua registry from related proto files",
     )
-    parser.add_argument("--proto", required=True, type=Path)
+    parser.add_argument("--proto", required=True, nargs="+", type=Path)
+    parser.add_argument(
+        "--envelope-type",
+        default=None,
+        help="Envelope 的完整 Protobuf 类型名；省略时使用当前 package 的 .Envelope",
+    )
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
 
-    package, commands = parse_proto(
-        args.proto.read_text(encoding="utf-8"),
+    package, commands = parse_protos(
+        [path.read_text(encoding="utf-8") for path in args.proto],
     )
-    write_if_changed(
-        args.output,
-        render(package, commands),
-    )
+    content = render(package, commands)
+    if args.envelope_type:
+        if not args.envelope_type.startswith("."):
+            parser.error("--envelope-type 必须是以点开头的完整 Protobuf 类型名")
+        content = content.replace(
+            f'envelope_type = ".{package}.Envelope",',
+            f'envelope_type = "{args.envelope_type}",',
+        )
+    write_if_changed(args.output, content)
     return 0
 
 
