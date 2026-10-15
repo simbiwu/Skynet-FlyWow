@@ -6,13 +6,14 @@
 # 也可从 FlyWow 根目录运行 bash scripts/build_flywow.sh <Skynet目录> <模块>。
 # 参数：第 1 个位置参数是 Skynet 根目录；第 2 个是模块名，省略时构建 all。
 # 可选模块：gateway、navigation、logger、word_filter、hotupgrade、lua_binding、all。
-# 环境变量：BUILD_TYPE 选择 CMake 构建类型，默认 RelWithDebInfo；CXX 仅替换 Gateway 使用的编译器。
+# 环境变量：BUILD_TYPE 选择 CMake 构建类型，默认 RelWithDebInfo；CXX 在 Gateway 首次配置时选择编译器。
+# 注意：CMake 缓存会保存首次选择的 CXX；更换编译器时为 Gateway 使用新的构建目录。
 # 提醒：本文件中的 $NAME 是 Bash 展开；传给 CMake 的 -DNAME=VALUE 才会设置 CMake 变量。
 # 输入：指定模块源码、Skynet 自带 Lua/Skynet 头文件及模块所需系统开发库。
 # 输出：最终 .so 统一写入 build/native/；CMake 缓存和中间文件写入 build/cmake/<模块>/。
 # 失败行为：参数、依赖、配置、编译或测试失败时立即返回非零状态。
 # 修改指引：新增模块时同步更新用法、模块名校验、依赖检查和对应构建分支。
-# 修改指引：新增 C++ 源文件时更新模块 CMake 的 add_library/add_executable 列表；Gateway 是直接编译，需更新本文件的编译命令。
+# 修改指引：新增 C++ 源文件时更新对应模块 CMakeLists.txt；Gateway 源文件清单位于 gateway/native/CMakeLists.txt。
 # 修改指引：调整最终产物目录时改 NATIVE_DIR，并确认各模块的 FLYWOW_NATIVE_OUTPUT_DIR 与产物检查一致。
 # 修改指引：改 Native 模块名或 .so 文件名时同步更新目标链接、产物检查及 Lua 加载名称。
 # 示例：bash scripts/build_flywow.sh /path/to/skynet navigation
@@ -58,10 +59,6 @@ if [[ "$MODULE" == gateway || "$MODULE" == all ]]; then
         printf '%s\n' 'Gateway 需要 Skynet 自带的 Lua 头文件' >&2
         exit 1
     }
-    [[ "$(pkg-config --modversion libcrypto)" == 3.* ]] || {
-        printf '%s\n' 'Gateway Crypto 要求 OpenSSL 3 libcrypto 开发文件' >&2
-        exit 1
-    }
 fi
 
 if [[ "$MODULE" == navigation || "$MODULE" == all ]]; then
@@ -96,24 +93,22 @@ if [[ "$MODULE" == lua_binding || "$MODULE" == navigation || "$MODULE" == all ]]
     ctest --test-dir "$BUILD_ROOT/cmake/lua-binding" --output-on-failure
 fi
 
-# Gateway 目前直接调用编译器，没有自己的 CMakeLists；增删源文件或库依赖需改本分支。
+# Gateway 分支只构建握手 Native .so；Lua Service、客户端 SDK 和协议工具不属于这个目标。
+# 源码、OpenSSL 3、链接选项与原子发布规则集中在 gateway/native/CMakeLists.txt。
 if [[ "$MODULE" == gateway || "$MODULE" == all ]]; then
-    # 先生成临时 .so，成功后才替换正式产物，避免留下半成品。
-    read -r -a CRYPTO_FLAGS <<< "$(pkg-config --cflags --libs libcrypto)"
-    # 确保 Native 模块内的 C++ 分配调用绑定到本模块的全局重载。
-    CRYPTO_FLAGS+=(-Wl,-Bsymbolic-functions)
-    TEMP_OUTPUT="$(mktemp "$NATIVE_DIR/.gateway_crypto.XXXXXX")"
-    trap 'rm -f -- "$TEMP_OUTPUT"' EXIT
-    "${CXX:-c++}" -std=c++17 -O2 -Wall -Wextra -Werror -fPIC -shared \
-        -I"$SKYNET_ROOT/3rd/lua" \
-        -I"$FRAMEWORK_DIR/lua-binding" \
-        "$FRAMEWORK_DIR/gateway/native/gateway_crypto/gateway_crypto.cpp" \
-        "$FRAMEWORK_DIR/lua-binding/lua_binding.cpp" \
-        "$FRAMEWORK_DIR/lua-binding/lua_table.cpp" \
-        "${CRYPTO_FLAGS[@]}" "$FRAMEWORK_DIR/common/native/skynet_allocator.cpp" -o "$TEMP_OUTPUT"
-    chmod 755 "$TEMP_OUTPUT"
-    mv -f "$TEMP_OUTPUT" "$NATIVE_DIR/flywow_gateway_crypto.so"
-    trap - EXIT
+    # -S 选择 Gateway Native 源码；-B 隔离此模块 CMake 缓存。
+    # CXX 仅在首次配置缓存时选编译器；Skynet 路径固定 Lua ABI，输出路径匹配 Gateway lua_cpath。
+    cmake -S "$FRAMEWORK_DIR/gateway/native" -B "$BUILD_ROOT/cmake/gateway" \
+        -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+        -DCMAKE_CXX_COMPILER="${CXX:-c++}" \
+        -DSKYNET_ROOT="$SKYNET_ROOT" \
+        -DFLYWOW_NATIVE_OUTPUT_DIR="$NATIVE_DIR"
+
+    # 默认构建会编译模块及发布目标；仅在链接成功后替换正式 .so。
+    cmake --build "$BUILD_ROOT/cmake/gateway" -j"$(nproc)"
+
+    # 确认 Lua require 搜索目录中存在非空正式产物。
+    test -s "$NATIVE_DIR/flywow_gateway_crypto.so"
 fi
 
 # CMake 参数：-S 指源码目录，-B 指生成/中间目录，-DNAME=VALUE 向 CMake 传配置变量。
