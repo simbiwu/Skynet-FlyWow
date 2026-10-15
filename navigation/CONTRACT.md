@@ -12,7 +12,7 @@ Native/Lua 使用整数毫米世界坐标 `{x_mm,y_mm,z_mm}`。X/Z 决定归格�
 
 | API | 成功结果 | 用途与副作用 |
 | --- | --- | --- |
-| load_map(path[,airnav_path]) | {map_id,map_version} | 校验后按 map_id 替换当前地图；已有 Context 继续持有旧地图 |
+| load_map(path[,airnav_path]) | {map_id,map_version,content_sha256} | 校验后按 map_id 替换当前地图；已有 Context 继续持有旧地图 |
 | `query_cell(id,version,worldPosition)` | Cell 查询 record | 只读查询；返回 grid 调试下标、高度、Area、Clearance、walkable |
 | load_navigation_profiles(profiles) | 成功布尔值 | 校验连续 ID 后替换当前导航表；正在执行的同步调用保留其短期快照 |
 | new_context(map_id[,air_limits]) | Context userdata | 固定当前地图；每场 Battle 独占 scratch 与动态占位，Profile 每次操作按 unit_id 查当前 Registry |
@@ -133,3 +133,5 @@ Context 单 owner 顺序使用；共享静态图不可变，不共享全局查�
 稳定错误：INVALID_AIR_ASSET（格式）、ASSET_MISMATCH（配对）、SEARCH_BUDGET_EXCEEDED（展开/节点）、QUERY_BUDGET_EXCEEDED（桶/tests）、CAPACITY_EXCEEDED（资源/分配）、NO_PATH（完整搜索无路）、BLOCKED（移动碰撞），以及现有参数/IO/越界错误。Lua 始终 nil,{code,message}；预算耗尽不能表示 NO_PATH/clear。新增 Binding 和扩展加载入口捕获 C++ 异常，bad_alloc 映射容量失败，其它异常为 INTERNAL_ERROR。
 
 单次预算不等于耗时 SLA，也不限制宿主发起的每帧请求数。应用负责帧预算、请求数量、同时移动顺序和重新规划时机。本次不接入 Frame Core、Battle 或弹丸业务。
+
+load_map返回的content_sha256是已校验完整BMAP字节的64字符小写SHA-256。加载阶段计算一次，查询不重复hash；BMAP字节布局不变。宿主可在启动阶段对照发布清单拒绝同ID/版本但内容不同的资产。

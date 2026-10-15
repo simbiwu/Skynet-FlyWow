@@ -128,6 +128,7 @@ if(FLYWOW_NAVIGATION_LUA)
     )
     target_link_options(flywow_navigation_lua PRIVATE "-Wl,-Bsymbolic-functions")
 endif()
+# 空中导航回归测试同时消费由 Unity 导出的 Golden Fixture。
 add_executable(air_navigation_test tests/air_navigation_test.cpp)
 target_link_libraries(air_navigation_test PRIVATE FlyWow::Navigation)
 if(MSVC)
@@ -137,7 +138,9 @@ else()
 endif()
 add_test(NAME air_navigation_test COMMAND air_navigation_test)
 
+# 将 Unity 测试夹具目录编译进测试程序，测试从这里加载固定输入/预期结果。
 target_compile_definitions(air_navigation_test PRIVATE FLYWOW_AIR_GOLDEN_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../unity/Tests/Editor/Fixtures")
 
+# Benchmark 只构建、不注册为 CTest，避免性能采样影响常规正确性门禁。
 add_executable(air_navigation_benchmark benchmark/air_navigation_benchmark.cpp)
 target_link_libraries(air_navigation_benchmark PRIVATE FlyWow::Navigation)

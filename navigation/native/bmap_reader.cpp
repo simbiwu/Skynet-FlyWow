@@ -235,10 +235,11 @@ NavResult<std::shared_ptr<const GridMap>> BMapReader::Read(const std::string &pa
     }
 
     AirAsset air;
-    // 仅启用空中组件时计算 SHA-256；旧加载/查询路径无额外 hash 工作。
+    // 加载阶段保存完整内容身份；查询热路径不重复hash，BMAP-only宿主也能验证发布资产。
+    air.bmap_hash = sha256(file.data(), file.size());
     if (!air_path.empty())
     {
-        auto component = readAirAsset(air_path, metadata, sha256(file.data(), file.size()));
+        auto component = readAirAsset(air_path, metadata, air.bmap_hash);
         if (!component.ok())
         {
             return NavResult<std::shared_ptr<const GridMap>>::Failure(component.error,

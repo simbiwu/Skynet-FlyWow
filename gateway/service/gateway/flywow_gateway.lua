@@ -386,7 +386,7 @@ local function dispatch_payload(connection, payload)
         return false
     end
 
-    -- 核心计算：解码 Envelope、校验协议版本和请求编号。
+    -- 核心计算：解码 Envelope、校验协议版本；业务关联由消息 body 定义。
     --- pcall 把不可信网络字节导致的解码异常限制在当前请求，便于统一发事件并关闭连接。
     local envelope_ok, envelope = pcall(state.codec.decode_envelope, payload)
     if not envelope_ok then
@@ -408,20 +408,6 @@ local function dispatch_payload(connection, payload)
             kind          = "error",
             code          = "PROTOCOL_VERSION",
             message       = "unsupported protocol version",
-            connection_id = connection.id,
-        }
-        )
-
-        return false
-    end
-
-    -- 当前所有客户端 Request 都要求响应；0 只留给 Server 主动消息。
-    if math.type(envelope.request_id) ~= "integer" or envelope.request_id == 0 then
-        emit(
-        {
-            kind          = "error",
-            code          = "REQUEST_ID",
-            message       = "request_id must be non-zero",
             connection_id = connection.id,
         }
         )
@@ -506,7 +492,7 @@ local function dispatch_payload(connection, payload)
             peer             = connection.peer,
             transport        = connection.transport,
             command_id       = definition.id,
-            request_id       = envelope.request_id,
+
             data             = request,
         }
     )
@@ -587,8 +573,6 @@ local function deliver_data(message)
         message.connection_id < 0 or
         math.type(message.command_id) ~= "integer" or
         message.command_id <= 0 or
-        math.type(message.request_id) ~= "integer" or
-        (message.connection_id == 0 and message.request_id ~= 0) or
         type(message.data) ~= "table" then
         state.responses_dropped = state.responses_dropped + 1
         return false
@@ -605,7 +589,6 @@ local function deliver_data(message)
         state.codec.encode_response,
         definition,
         state.config.protocol_version,
-        message.request_id,
         message.data
     )
     if not ok or #encoded > state.config.max_frame_bytes then

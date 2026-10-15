@@ -175,7 +175,6 @@ local function scenario(overrides)
         {
             protocol_version = 3,
             command          = 1001,
-            request_id       = assert(tonumber(payload)),
             body             = "",
         }
     end
@@ -184,9 +183,9 @@ local function scenario(overrides)
         return { test_id = 1, map_id = 1001 }
     end
     -- 响应结果编码为文本，fail 注入编码异常。
-    function codec.encode_response(definition, version, request_id, response)
+    function codec.encode_response(definition, version, response)
         assert(not response.fail, "encode failure")
-        return tostring(request_id)
+        return tostring(response.result)
     end
     package.loaded["skynet"] = skynet
     package.loaded["skynet.socket"] = socket
@@ -242,7 +241,7 @@ assert(e.sends[1][1] == ".test_handler", "Gateway must send to the configured se
 assert(e.sends[1][2] == "send_data")
 assert(e.sends[1][3].connection_id == 1)
 assert(e.sends[2][3].connection_id == 1)
-assert(e.sends[1][3].request_id == 1 and e.sends[2][3].request_id == 2)
+assert(e.sends[1][3].request_id == nil and e.sends[2][3].request_id == nil)
 assert(#e.writes == 0, "Gateway must not write before handler sends data")
 
 local message = e.sends[1][3]
@@ -268,7 +267,7 @@ local push =
     gateway_epoch = current_epoch,
     connection_id = 0,
     command_id = 1001,
-    request_id = 0,
+
     data = { result = 3 },
 }
 e.dispatch(0, 7, "send_data", push)
@@ -305,12 +304,12 @@ local targeted =
     gateway_epoch = e.sends[1][3].gateway_epoch,
     connection_id = e.sends[1][3].connection_id,
     command_id    = 1001,
-    request_id    = 0,
+
     data          = { result = 7 },
 }
 e.dispatch(0, 7, "send_data", targeted)
 assert(#e.writes == 1 and e.writes[1][1] == 10, "target push must not broadcast")
-assert(e.writes[1][2] == frame(0), "push preserves request_id zero")
+assert(e.writes[1][2] == frame(7), "push needs no correlation field")
 local epoch = targeted.gateway_epoch
 targeted.gateway_epoch = "old"
 e.dispatch(0, 7, "send_data", targeted)
@@ -323,11 +322,7 @@ e.ready = true
 targeted.connection_id = 0
 e.dispatch(0, 7, "send_data", targeted)
 assert(#e.writes == 3, "broadcast still reaches both ready connections")
-targeted.request_id = 1
-e.dispatch(0, 7, "send_data", targeted)
-assert(#e.writes == 3, "broadcast cannot pretend to be correlated response")
 targeted.connection_id = 1
-targeted.request_id = 0
 e.dispatch(0, 7, "close", targeted)
 resume(e.forks[4])
 e.dispatch(0, 7, "send_data", targeted)
