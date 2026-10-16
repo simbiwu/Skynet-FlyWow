@@ -1156,6 +1156,36 @@ end
 
 
 skynet.start(function()
+    skynet.info_func(function()
+        local handshaking_connections = 0
+        local reading_connections = 0
+
+        for _, connection in pairs(state.connections) do
+            if state.handshake and not state.handshake.ready(connection.handshake) then
+                handshaking_connections = handshaking_connections + 1
+            end
+            if connection.read_started then
+                reading_connections = reading_connections + 1
+            end
+        end
+
+        local config = state.config
+        return
+        {
+            phase                   = state.phase,
+            transport               = config and config.transport or "unconfigured",
+            listen_host             = config and config.host or "unbound",
+            listen_port             = config and config.port or 0,
+            connections             = state.client_count,
+            ready_clients           = state.client_count - handshaking_connections,
+            handshaking_connections = handshaking_connections,
+            reading_connections     = reading_connections,
+            responses_sent          = state.responses_sent,
+            responses_dropped       = state.responses_dropped,
+            protocol_commands       = state.registry and state.registry.count or 0,
+        }
+    end)
+
     --- LuaPanda 只连接当前 FlyWow Lua State；8820 不与 Proxy/Query/Battle Service 复用。
     luapanda_debug.start(8820)
 

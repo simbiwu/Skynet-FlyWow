@@ -74,6 +74,10 @@ local function scenario(overrides)
     function skynet.dispatch(protocol, fn)
         e.dispatch = fn
     end
+    -- 保留生产 Service 注册的诊断回调；本替身不自动执行它。
+    function skynet.info_func(fn)
+        e.info_func = fn
+    end
     -- 同步初始化入口，不执行真实调度。
     function skynet.start(fn)
         fn()
