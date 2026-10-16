@@ -78,7 +78,7 @@ TestEnvironment *environment(LuaBinding &lua_binding)
 template <typename T> int echo(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    T value{};
+    T          value{};
     if (!lua_binding.readValue(1, value))
     {
         return lua_binding.pushError();
@@ -88,7 +88,7 @@ template <typename T> int echo(lua_State *state)
 
 int conversionBoundaries(lua_State *state)
 {
-    LuaBinding lua_binding(state);
+    LuaBinding    lua_binding(state);
     auto         *env   = environment(lua_binding);
     const int     top   = lua_gettop(env->state);
     std::uint32_t value = 19;
@@ -114,10 +114,10 @@ int invalidReturn(lua_State *state)
 int tableOperations(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    auto     *env = environment(lua_binding);
-    const int top = lua_gettop(env->state);
-    LuaTable  input;
-    LuaTable  child;
+    auto      *env = environment(lua_binding);
+    const int  top = lua_gettop(env->state);
+    LuaTable   input;
+    LuaTable   child;
     require(lua_binding.readTable(input), "implicit top table read failed");
     require(input.readTable("child", child), "child read failed");
     std::uint32_t map_id = 0;
@@ -158,7 +158,7 @@ int tableOperations(lua_State *state)
 int dropTemporary(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    LuaTable weak;
+    LuaTable   weak;
     require(lua_binding.readTable(1, weak), "weak table missing");
     auto temporary = lua_binding.newTable();
     require(weak.writeValue(1, temporary), "weak write failed");
@@ -168,7 +168,7 @@ int dropTemporary(lua_State *state)
 int arrayLengths(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    LuaTable table;
+    LuaTable   table;
     if (!lua_binding.readTable(1, table))
     {
         return lua_binding.pushError();
@@ -187,9 +187,9 @@ int arrayLengths(lua_State *state)
 int iterate(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    auto     *env = environment(lua_binding);
-    const int top = lua_gettop(env->state);
-    LuaTable  table;
+    auto      *env = environment(lua_binding);
+    const int  top = lua_gettop(env->state);
+    LuaTable   table;
     require(lua_binding.readTable(1, table), "iterate input missing");
     int numeric_keys = 0;
     int children     = 0;
@@ -259,7 +259,7 @@ int countMetamethod(lua_State *state)
 int metatables(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    LuaTable meta = lua_binding.newTable();
+    LuaTable   meta = lua_binding.newTable();
     require(meta.setFunction("__index", &countMetamethod), "metamethod registration");
     LuaTable table = lua_binding.newTable();
     require(table.setMetatable(meta), "setmetatable failed");
@@ -274,8 +274,8 @@ int metatables(lua_State *state)
 int newTracked(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    auto *env = environment(lua_binding);
-    bool fail = false;
+    auto      *env  = environment(lua_binding);
+    bool       fail = false;
     if (!lua_binding.readValue(1, fail))
     {
         return lua_binding.pushError();
@@ -291,7 +291,7 @@ int newTracked(lua_State *state)
 int readTracked(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    Tracked *object = nullptr;
+    Tracked   *object = nullptr;
     if (!lua_binding.readUserdata(1, kTracked, object))
     {
         return lua_binding.pushError();
@@ -302,28 +302,38 @@ int readTracked(lua_State *state)
 int userdataGcIdempotent(lua_State *state)
 {
     LuaBinding binding(state);
+
+    // gettop 记录入口高度，不改栈。两轮调用都从 [S, arg1] 开始，最后 settop 丢弃测试临时项。
     const int top = lua_gettop(state);
+    // registry 查找压入 metatable，getfield 压入 collector，pushvalue 复制参数 1：
+    // [S, userdata] -> [S, userdata, meta, gc, userdata-copy]。
     luaL_getmetatable(state, kTracked);
     lua_getfield(state, -1, "__gc");
     lua_pushvalue(state, 1);
+    // lua_call 消耗 gc 和 1 个实参、不产生结果，回到 [S, userdata, meta]。
     lua_call(state, 1, 0);
+    // 再以同样的栈形调用一次，验证 collector 的 alive 标记使析构幂等。
     lua_getfield(state, -1, "__gc");
     lua_pushvalue(state, 1);
     lua_call(state, 1, 0);
+    // settop 移除 metatable 临时项并恢复入口高度；它不撤销已经发生的析构状态。
     lua_settop(state, top);
     Tracked *dead = nullptr;
     require(!binding.readUserdata(1, kTracked, dead), "finalized userdata must not be readable");
-    require(binding.errorCode() == "INVALID_ARGUMENT", "finalized userdata must report INVALID_ARGUMENT");
+    require(binding.errorCode() == "INVALID_ARGUMENT",
+            "finalized userdata must report INVALID_ARGUMENT");
     return binding.returnValues(true);
 }
 
 int userdataErrors(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    LuaTable meta;
+    LuaTable   meta;
     require(lua_binding.registerUserdata<Tracked>(kDuplicate, meta),
             "first userdata registration failed");
     const int stack_top = lua_gettop(state);
+    // 取回原 collector 并记录身份：[S, meta] -> [S, meta, gc]；
+    // tocfunction 只读函数指针，settop 随后移除新增项，恢复入口栈高。
     luaL_getmetatable(state, kDuplicate);
     lua_getfield(state, -1, "__gc");
     const lua_CFunction original_collector = lua_tocfunction(state, -1);
@@ -339,6 +349,7 @@ int userdataErrors(lua_State *state)
     require(lua_binding.errorCode() == "INVALID_ARGUMENT" && !duplicate.valid(),
             "different-type duplicate changed its output/error contract");
 
+    // 重读元表字段并与原函数地址比较；此段压入 meta/gc 两项，末尾 settop 会统一清理。
     luaL_getmetatable(state, kDuplicate);
     lua_getfield(state, -1, "__gc");
     const bool collector_unchanged = lua_tocfunction(state, -1) == original_collector;
@@ -350,8 +361,8 @@ int userdataErrors(lua_State *state)
     Tracked *pointer = nullptr;
     require(!lua_binding.newUserdata("missing.Type", pointer, environment(lua_binding)),
             "unregistered construction accepted");
-    int arbitrary = 0;
-    auto  table = lua_binding.newTable();
+    int  arbitrary = 0;
+    auto table     = lua_binding.newTable();
     require(!table.writeValue("arbitrary", &arbitrary), "arbitrary pointer wrapped as userdata");
     return lua_binding.returnValues(true);
 }
@@ -359,7 +370,7 @@ int userdataErrors(lua_State *state)
 int newTiny(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    Tiny *object = nullptr;
+    Tiny      *object = nullptr;
     require(lua_binding.newUserdata(kTiny, object), "tiny construction failed");
     return lua_binding.returnValues(object);
 }
@@ -367,17 +378,17 @@ int newTiny(lua_State *state)
 int counters(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    auto *env = environment(lua_binding);
+    auto      *env = environment(lua_binding);
     return lua_binding.returnValues(env->constructed, env->destroyed, Tiny::destroyed);
 }
 
 int useClosure(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    int      counter = 0;
-    LuaTable captured;
-    void    *pointer = nullptr;
-    Tracked *object  = nullptr;
+    int        counter = 0;
+    LuaTable   captured;
+    void      *pointer = nullptr;
+    Tracked   *object  = nullptr;
     if (!lua_binding.readUpvalue(1, counter) || !lua_binding.readUpvalueTable(2, captured) ||
         !lua_binding.readUpvalue(3, pointer) ||
         !lua_binding.readUpvalueUserdata(4, kTracked, object))
@@ -396,8 +407,8 @@ int useClosure(lua_State *state)
 int makeClosure(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    auto    *env    = environment(lua_binding);
-    Tracked *object = nullptr;
+    auto      *env    = environment(lua_binding);
+    Tracked   *object = nullptr;
     require(lua_binding.newUserdata(kTracked, object, env), "captured object creation");
     auto captured = lua_binding.newTable();
     require(captured.writeValue("marker", 17), "captured table setup");
@@ -410,7 +421,7 @@ int makeClosure(lua_State *state)
 
 int readMap(lua_State *state)
 {
-    LuaBinding lua_binding(state);
+    LuaBinding    lua_binding(state);
     LuaTable      request;
     std::uint32_t map_id = 0;
     if (!lua_binding.readTable(1, request) || !request.readValue("map_id", map_id))
@@ -423,14 +434,12 @@ int readMap(lua_State *state)
 int openTest(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    void *pointer = nullptr;
+    void      *pointer = nullptr;
     require(lua_binding.readValue(1, pointer), "test setup pointer missing");
     auto     module = lua_binding.newTable();
     LuaTable meta;
-    require(lua_binding.registerUserdata<Tracked>(kTracked, meta),
-            "tracked registration failed");
-    require(lua_binding.registerUserdata<Tiny>(kTiny, meta),
-            "tiny registration failed");
+    require(lua_binding.registerUserdata<Tracked>(kTracked, meta), "tracked registration failed");
+    require(lua_binding.registerUserdata<Tiny>(kTiny, meta), "tiny registration failed");
     require(module.setFunction("uint", &echo<std::uint32_t>) &&
                 module.setFunction("uint64", &echo<std::uint64_t>) &&
                 module.setFunction("signed", &echo<std::int64_t>) &&
@@ -458,26 +467,31 @@ int openTest(lua_State *state)
     return lua_binding.returnValues(module);
 }
 
-
 // 对照基线仅用于测量同一个固定参数的 raw 读取，不作为生产模块或新公开接口。
 int rawReadMap(lua_State *state)
 {
+    // [request] -> [request, key]；rawget 消耗 key 并压入字段值，不触发 __index。
     lua_pushliteral(state, "map_id");
     lua_rawget(state, 1);
+    // 类型与数值读取都不改栈；value 对应当前栈顶的 raw 字段。
     const lua_Integer value = lua_tointeger(state, -1);
     if (!lua_isinteger(state, -1) || value < 0 ||
         static_cast<std::uint64_t>(value) > std::numeric_limits<std::uint32_t>::max())
     {
+        // 失败时压入 nil 并返回 1；Lua 取栈顶 nil，底层 request/key/value 临时项随回调清理。
         lua_pushnil(state);
         return 1;
     }
+    // 成功时把栈顶字段值作为唯一结果；下方参数与临时 key 由 Lua 在回调返回时清理。
     return 1;
 }
 
 void run(lua_State *state, const char *script)
 {
+    // 本测试脚本不显式返回值，因此成功后栈高不变；失败时错误对象留在栈顶供下方读取。
     if (luaL_dostring(state, script) != LUA_OK)
     {
+        // lua_tostring(-1) 读取错误文本、不弹栈；异常由测试主流程捕获并清理 State。
         throw std::runtime_error(lua_tostring(state, -1));
     }
 }
@@ -496,10 +510,14 @@ std::unique_ptr<lua_State, StateDeleter> createState(TestEnvironment *environmen
     require(state != nullptr, "State creation failed");
     environment->state = state.get();
     luaL_openlibs(state.get());
+
+    // 建立测试模块：push 函数和借用环境指针使栈从 [] 变为 [openTest, env]；
+    // lua_call 消耗两项并压回模块 table，setglobal 消耗 table，栈恢复为空。
     lua_pushcfunction(state.get(), &openTest);
     lua_pushlightuserdata(state.get(), environment);
     lua_call(state.get(), 1, 1);
     lua_setglobal(state.get(), "binding");
+    // 注册只用于性能对照的 raw 回调：push 函数后 setglobal 消耗函数，栈仍为空。
     lua_pushcfunction(state.get(), &rawReadMap);
     lua_setglobal(state.get(), "raw_read_map");
     return state;

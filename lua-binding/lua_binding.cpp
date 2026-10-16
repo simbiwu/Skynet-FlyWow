@@ -8,7 +8,6 @@ extern "C"
 #include <lauxlib.h>
 }
 
-
 namespace flywow_lua_binding
 {
 namespace detail
@@ -137,7 +136,11 @@ int LuaBinding::pushError()
 int LuaBinding::pushError(const std::string &code, const std::string &message)
 {
     setError(code, message);
-    // 直接在当前栈顶追加 nil 和错误表；return 2 时 Lua 取这两个栈顶值作为结果。
+
+    // setfield 每次消费 value 并保留 table；完整栈变化：
+    // [S] -> [S, nil] -> [S, nil, table] -> [..., code] -> [S, nil, table]
+    //     -> [..., message] -> [S, nil, table]。
+    // return 2 让 Lua 取栈顶 nil/table；更低的临时值由 VM 在回调返回时清理。
     // 任何更低的临时值都由 Lua 在回调返回时丢弃，无需回退到回调入口栈高。
     // lua_pushnil：压入 nil：[S] -> [S, nil]；作为错误首返回值或 table 遍历起始 key，具体用途由当前操作决定。
     lua_pushnil(state_);
@@ -206,7 +209,7 @@ bool LuaBinding::readUpvalueTable(int index, LuaTable &output)
 
 bool LuaBinding::readTruthAt(int index, bool &output)
 {
-        // 显式读取 Lua 真值：只有 nil/false 为假，0/空串为真；不转换或弹出原槽。
+    // 显式读取 Lua 真值：只有 nil/false 为假，0/空串为真；不转换或弹出原槽。
     // lua_toboolean：按 Lua 真值规则读取该槽：只有 nil/false 为假，0 和空串为真；不转换原值、不改变栈。
     output = lua_toboolean(state_, index) != 0;
     return true;
@@ -261,14 +264,19 @@ bool LuaBinding::registerUserdataType(const std::string &name, lua_CFunction col
         return false;
     }
 
+    // luaL_newmetatable 从 registry 查找或创建具名 table 并压栈：[S] -> [S, metatable]；
+    // 同名已存在时也会压入原 table，保护器覆盖成功/失败两条出口的栈恢复。
     detail::StackRestore stack(state_);
     if (luaL_newmetatable(state_, name.c_str()) == 0)
     {
         setError("INVALID_ARGUMENT", "userdata metatable name is already registered");
         return false;
     }
+    // push 后为 [S, metatable, collector]；setfield 消耗 collector，元表保留在栈顶。
+    // readTableAt 复制元表到 registry；保护器随后移除临时元表，output 持有独立引用。
     lua_pushcfunction(state_, collector);
     lua_setfield(state_, -2, "__gc");
+
     return readTableAt(-1, output);
 }
 
@@ -281,7 +289,9 @@ bool LuaBinding::holdUserdata(int index, void *object)
             return true;
         }
     }
-    // 复制 userdata 并保存到 registry，确保本回调结束前对象不会被 Lua GC 回收。
+    // 复制 userdata 并保存到 registry，确保本回调结束前对象不会被 Lua GC 回收：
+    // [S] -> [S, userdata-copy] -> [S]。reference 归本回调所有，析构时 unref。
+    // 两个 API 之间没有其它压栈操作，因此 index 的正/负索引含义不变。
     lua_pushvalue(state_, index);
     const int reference = luaL_ref(state_, LUA_REGISTRYINDEX);
     try
@@ -299,14 +309,17 @@ bool LuaBinding::holdUserdata(int index, void *object)
 
 void *LuaBinding::checkUserdata(int index, const std::string &name)
 {
+    // testudata 仅比较精确 metatable 并返回借用地址，不压栈；对象内存仍归 Lua 管理。
     void *object = luaL_testudata(state_, index, name.c_str());
     if (object == nullptr)
     {
         setError("INVALID_ARGUMENT", "value must be userdata with the registered metatable");
         return nullptr;
     }
-    const int state_type = lua_getiuservalue(state_, index, 1);
-    const bool alive = state_type == LUA_TBOOLEAN && lua_toboolean(state_, -1) != 0;
+    // getiuservalue 压入生命周期槽：[S] -> [S, alive_state]；无效序号也压入 nil。
+    // 读取后 pop 恢复 [S]，不改变原参数或 userdata。
+    const int  state_type = lua_getiuservalue(state_, index, 1);
+    const bool alive      = state_type == LUA_TBOOLEAN && lua_toboolean(state_, -1) != 0;
     lua_pop(state_, 1);
     if (!alive)
     {
@@ -326,6 +339,8 @@ bool LuaBinding::pushObject(const void *object)
     {
         if (entry.object == object)
         {
+            // registry 引用由本回调继续持有；rawgeti 另压相同 userdata 供 Lua 返回/写表：
+            // [S] -> [S, userdata]。之后 unref 不会移除这个栈值或 Lua 字段引用。
             lua_rawgeti(state_, LUA_REGISTRYINDEX, entry.reference);
             return true;
         }

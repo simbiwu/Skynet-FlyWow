@@ -38,7 +38,8 @@ class StackRestore
     }
     ~StackRestore()
     {
-        // lua_settop：恢复局部操作开始时的栈高，移除本次操作留下的临时槽；registry 引用不受影响。
+        // lua_settop 恢复入口高度，移除本次新压入的临时槽，registry 引用不受影响。
+        // 本保护器要求操作不弹掉入口的既有值；settop 只能补 nil，无法恢复已弹出的原值。
         lua_settop(state_, top_);
     }
     StackRestore(const StackRestore &)            = delete;
@@ -52,17 +53,21 @@ class StackRestore
 // ValueCodec 集中处理 Lua 值与 C++ 值的转换；read 不压栈、不弹栈，失败不改 output。
 // C++17 的 if constexpr 按编译期条件选择分支，未选中的分支不会为当前 T 实例化。
 // *_v 是类型特征 ::value 的 C++17 简写；这里按 T 的类别共用数值转换逻辑。
+// read 只检查已有栈槽，成功/失败均不改变栈高；output 仅在校验成功后更新。
+// push 先完成数值范围检查：失败时净栈变化为 0，成功时恰好压入 1 个值。
 template <typename T> struct ValueCodec
 {
     static bool read(lua_State *state, int index, T &output, std::string *reason)
     {
         if constexpr (std::is_integral_v<T> && !std::is_same_v<T, bool>)
         {
+            // lua_isinteger 只检查原槽是否为 Lua 整数，不接受 1.0/数字字符串，不改变栈。
             if (!lua_isinteger(state, index))
             {
                 *reason = "value must be an integer";
                 return false;
             }
+            // 前一检查已确认整数；lua_tointeger 只读取该槽，不转换、不弹栈。
             const lua_Integer value = lua_tointeger(state, index);
             if (std::is_signed_v<T>)
             {
@@ -84,11 +89,13 @@ template <typename T> struct ValueCodec
         }
         else if constexpr (std::is_floating_point_v<T>)
         {
+            // lua_type 只读取类型标签，不转换原槽、不改变栈。
             if (lua_type(state, index) != LUA_TNUMBER)
             {
                 *reason = "value must be a number";
                 return false;
             }
+            // 已确认是 number；lua_tonumber 读取数值，不压栈、不移除原值。
             const lua_Number value = lua_tonumber(state, index);
             if (!std::isfinite(value) ||
                 std::fabs(static_cast<long double>(value)) > std::numeric_limits<T>::max())
@@ -125,6 +132,7 @@ template <typename T> struct ValueCodec
                 *reason = "integer outside Lua integer range";
                 return false;
             }
+            // 范围检查已完成；成功压入整数：[S] -> [S, integer]。
             lua_pushinteger(state, static_cast<lua_Integer>(value));
             return true;
         }
@@ -136,6 +144,7 @@ template <typename T> struct ValueCodec
                 *reason = "number must be finite and within Lua number range";
                 return false;
             }
+            // 有限值及范围检查已完成；成功压入 number：[S] -> [S, number]。
             lua_pushnumber(state, static_cast<lua_Number>(value));
             return true;
         }
@@ -165,6 +174,7 @@ template <> struct ValueCodec<void *>
 
 /// 当前同步 Lua C 回调的操作对象；由回调按需创建，不拥有 Lua State。
 /// @note LuaTable/LuaValue/借用 userdata 指针只能在本回调内使用；禁止跨 yield/线程保存。
+/// @note 会分配 Lua 值的 C API 可能按宿主 Lua 错误策略 longjmp；不要让其越过需要析构的业务 C++ 资源。
 class LuaBinding
 {
   public:
@@ -191,6 +201,8 @@ class LuaBinding
     /// @return 已省略或类型检查成功为 true；类型错误记录最近错误。
     template <typename T> bool readOptionalValue(int index, T &output)
     {
+        // lua_isnoneornil 只检查参数槽，不压栈；省略/nil 时保留默认 output。
+        // 有值时再走 readValue；两个分支都不改变回调参数栈。
         return lua_isnoneornil(state_, index) || readValue(index, output);
     }
 
@@ -216,6 +228,8 @@ class LuaBinding
     /// @param output 输出对象；失败时保留原值。
     template <typename T> bool readUpvalue(int index, T &output)
     {
+        // lua_upvalueindex 生成 C API 伪索引，不是参数栈槽，也不改变栈。
+        // readAt 读取 closure 捕获值；它与回调参数 index=1 是两个独立索引空间。
         return readAt(lua_upvalueindex(index), output);
     }
     /// 读取业务 upvalue 的 Table 引用；失败不改 output。
@@ -295,7 +309,11 @@ class LuaBinding
     template <typename T, typename... Args>
     bool newUserdata(const std::string &name, T *&output, Args &&...args)
     {
+        // 入口为 [S]；作用域保护器在所有普通返回路径移除临时 metatable/userdata。
         detail::StackRestore stack(state_);
+
+        // luaL_getmetatable 查找 registry 并压入元表：[S] -> [S, metatable]；
+        // 未注册时压入 nil。此栈项只用于设置 userdata 类型，不转移 registry 的所有权。
         luaL_getmetatable(state_, name.c_str());
         if (!lua_istable(state_, -1))
         {
@@ -304,6 +322,8 @@ class LuaBinding
         }
 
         // userdata 内存直接作为 T 的存储；先构造，成功后才挂 __gc，失败时不会析构未构造对象。
+        // 分配 Lua-owned 存储并创建 1 个 uservalue：[S, metatable] -> [S, metatable, userdata]。
+        // 此时 T 尚未构造；placement new 抛出时保护器弹出 userdata，不调用 T 析构。
         void *storage = lua_newuserdatauv(state_, sizeof(T), 1);
         T    *object  = nullptr;
         try
@@ -316,10 +336,13 @@ class LuaBinding
             return false;
         }
         // 用 userdata 自己的 uservalue 记录对象仍存活；__gc 重复运行时据此跳过析构。
+        // alive 标记供 __gc 防重复析构：push true 增一槽，setiuservalue 消耗它并恢复原栈高。
         lua_pushboolean(state_, 1);
         lua_setiuservalue(state_, -2, 1);
         // [S, metatable, userdata] -> [S, metatable, userdata, metatable] -> [S, metatable, userdata]。
         // userdata 绑定类型专属 metatable 后，Lua GC 才会用对应的 T 析构函数回收它。
+        // 当前 -2 是 metatable；复制后绑定给 userdata，setmetatable 消耗副本：
+        // [S, metatable, userdata] -> [S, metatable, userdata, metatable] -> [S, metatable, userdata]。
         lua_pushvalue(state_, -2);
         lua_setmetatable(state_, -2);
         if (!holdUserdata(-1, object))
@@ -360,15 +383,29 @@ class LuaBinding
     // Lua 自动 GC 或手动 finalize 均只析构一次；状态保存在 userdata 自己的 uservalue。
     template <typename T> static int collectUserdata(lua_State *state) noexcept
     {
+        /*
+            __gc 的参数栈为 [S, userdata]。Lua 5.4 的 getiuservalue 总会压入一项；
+            uservalue 序号无效时压入 nil 并返回 LUA_TNONE。本类型创建时固定分配了第 1 项：
+            [S, userdata] -> [S, userdata, alive_state]。
+        */
         const int state_type = lua_getiuservalue(state, 1, 1);
         if (state_type != LUA_TBOOLEAN || lua_toboolean(state, -1) == 0)
         {
+            // 状态缺失、类型不符或已清理：弹掉刚读出的 uservalue，恢复 [S, userdata]；
+            // 返回 0 表示不产生 Lua 返回值，也不重复析构对象。
             lua_pop(state, 1);
             return 0;
         }
+
+        // 先弹出 alive_state，再压入 false 并写回：[S, userdata, true]
+        // -> [S, userdata] -> [S, userdata, false] -> [S, userdata]。
+        // 先翻转状态，后续重复进入 __gc 会走上面的无操作分支。
         lua_pop(state, 1);
         lua_pushboolean(state, 0);
         lua_setiuservalue(state, 1, 1);
+
+        // lua_touserdata 读取参数 1 的 full userdata 存储地址，不改变栈。
+        // Lua 负责释放这块内存；这里仅结束 placement-new 的 T 生命周期，不能用 delete。
         static_cast<T *>(lua_touserdata(state, 1))->~T();
         return 0;
     }

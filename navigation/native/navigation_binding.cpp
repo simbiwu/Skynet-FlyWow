@@ -260,17 +260,17 @@ int loadMap(lua_State *state)
     const auto loaded = maps->Load(path, air_path);
     if (!loaded.ok())
         return lua_binding.pushError(flywow_navigation::NavErrorName(loaded.error), loaded.detail);
-    const auto &metadata = loaded.value->metadata();
+    const auto    &metadata = loaded.value->metadata();
     // 已加载快照的完整BMAP身份；在Lua边界转为64位十六进制文本，不重新读取文件。
     constexpr char digits[] = "0123456789abcdef";
-    std::string content_sha256(64, '0');
-    const auto &hash = loaded.value->airAsset().bmap_hash;
+    std::string    content_sha256(64, '0');
+    const auto    &hash = loaded.value->airAsset().bmap_hash;
     for (std::size_t i = 0; i < hash.size(); ++i)
     {
-        content_sha256[i * 2] = digits[hash[i] >> 4];
+        content_sha256[i * 2]     = digits[hash[i] >> 4];
         content_sha256[i * 2 + 1] = digits[hash[i] & 15];
     }
-    auto        table    = lua_binding.newTable();
+    auto table = lua_binding.newTable();
     if (!table.writeValue("map_id", metadata.map_id) ||
         !table.writeValue("map_version", metadata.map_version) ||
         !table.writeValue("content_sha256", content_sha256))
