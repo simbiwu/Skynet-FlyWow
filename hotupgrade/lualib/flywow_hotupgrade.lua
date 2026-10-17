@@ -49,11 +49,13 @@ local managed_modules = {}
 ---@field can_switch? fun():boolean 本 State 的同步安全条件
 ---@field timeout_ms? integer 毫秒；默认 10000，超时不意味着取消远端操作
 
---- 安装专用控制协议并注册元数据；可能 yield，注册失败不进入 READY。
----@param options flywow_hotupgrade_registration
----@return flywow_hotupgrade_result
+--- 安装本 State 的专用控制协议并向控制面注册元数据；RPC 可能 yield，失败时不能接收业务流量。
+---@param options flywow_hotupgrade_registration 注册身份、版本、控制 handle 与本地生命周期 Adapter；调用后补充 instance_id/modules。
+---@return flywow_hotupgrade_result 注册成功后 Service 才可对外 READY；失败保留可判别的 HU_ 错误。
 function M.register_service(options)
-    if runtime then return result.failure("HU_DUPLICATE_SERVICE", "当前 State 已注册") end
+    if runtime then
+        return result.failure("HU_DUPLICATE_SERVICE", "当前 State 已注册")
+    end
     if type(options) ~= "table" or type(options.controller) ~= "number"
         or type(options.service_type) ~= "string" or options.service_type == ""
         or (type(options.service_id) ~= "string" and math.type(options.service_id) ~= "integer")
@@ -61,54 +63,81 @@ function M.register_service(options)
         or math.type(options.code_version) ~= "integer" or type(options.adapter) ~= "table" then
         return result.failure("HU_INVALID_OPTIONS", "注册参数不满足合同")
     end
+    -- 实例身份在启动时生成一次，并随控制面元数据固定到本 Service 生命周期。
     if not options.instance_id then
         local instance_id, identity_error = require("flywow_hotupgrade_native").nonce()
-        if not instance_id then return result.failure(native_error.code(identity_error), "实例身份生成失败") end
+        if not instance_id then
+            return result.failure(native_error.code(identity_error), "实例身份生成失败")
+        end
         options.instance_id = instance_id
     end
+
+    -- managed_modules 记录本 State 经本入口加载的模块，注册时一次性交给控制面。
     options.modules = {}
-    for name in pairs(managed_modules) do options.modules[#options.modules + 1] = name end
+    for name in pairs(managed_modules) do
+        options.modules[#options.modules + 1] = name
+    end
     table.sort(options.modules)
+
+    -- 先准备本地运行时和私有协议，再向控制面注册；注册成功前宿主不得标记 READY。
     runtime = runtime_module.new(options)
-    if options.candidate then runtime.guard:prepare_upgrade("candidate") end
-    rpc.install(function(command, request, source) return runtime:control(command, request, source) end)
+    if options.candidate then
+        runtime.guard:prepare_upgrade("candidate")
+    end
+    rpc.install(function(command, request, source)
+        return runtime:control(command, request, source)
+    end)
 
     local metadata =
     {
-        key = registry.key(options.service_type, options.service_id),
-        service_type = options.service_type, service_id = options.service_id,
-        instance_id = options.instance_id,
-        router_handle = options.router_handle,
-        address = skynet.self(), generation = options.generation,
-        code_version = options.code_version, state_version = options.state_version or 0,
-        dependencies = options.dependencies or {}, modules = options.modules,
-        candidate = options.candidate,
+        key              = registry.key(options.service_type, options.service_id),
+        service_type     = options.service_type,
+        service_id       = options.service_id,
+        instance_id      = options.instance_id,
+        router_handle    = options.router_handle,
+        address          = skynet.self(),
+        generation       = options.generation,
+        code_version     = options.code_version,
+        state_version    = options.state_version or 0,
+        dependencies     = options.dependencies or {},
+        modules          = options.modules,
+        candidate        = options.candidate,
         replacement_mode = options.replacement_mode,
-        capabilities = {},
+        capabilities     = {},
     }
     for name, value in pairs(options.adapter or {}) do
-        if type(value) == "function" then metadata.capabilities[name] = true end
+        if type(value) == "function" then
+            metadata.capabilities[name] = true
+        end
     end
+
     return rpc.call(options.controller, "register", metadata, 10000)
 end
 
----@param name string 需要保留 table 身份的模块名
----@return table
+--- 通过稳定导出 table 加载模块；模块首次声明会同步通知控制面，因此调用可能 yield。
+---@param name string Lua 模块名；Patch 必须使用相同名称，table 身份由当前 Lua State 保留。
+---@return table 模块导出表；非 table 模块会抛出接入错误。
 function M.require(name)
     local value = require(name)
-    if type(value) ~= "table" then error("patchable module must return table") end
+    if type(value) ~= "table" then
+        error("patchable module must return table")
+    end
+
+    -- 首次加载即声明模块依赖；登记 RPC 可能 yield，所以标记先写入以保持同 State 幂等。
     if not managed_modules[name] then
         managed_modules[name] = true
         if runtime then
             local declared = rpc.call(runtime.options.controller, "register_module", {name = name}, 10000)
-            if not declared.ok then error(declared.message or declared.code) end
+            if not declared.ok then
+                error(declared.message or declared.code)
+            end
         end
     end
     return value
 end
 
----@param namespace string 当前 State 的非权威运行时命名
----@return table
+---@param namespace string 当前 Lua State 独占的稳定状态命名空间；不代表跨 Service 持久化。
+---@return table 可变状态表；Module Patch Stage 期间只读，提交后仍保留原 table 身份。
 function M.stable_state(namespace)
     assert(runtime, "register_service required")
     runtime.stable[namespace] = runtime.stable[namespace] or {}
@@ -130,9 +159,13 @@ function M.config(name)
     return runtime.config:get(name)
 end
 
-M.runtime = function() return runtime end
----@param options table 稳定 Router handle、逻辑 key 与排队策略
----@return table
+--- 返回当前 State 的运行时句柄，供宿主诊断；不应跨 Service 或跨实例保存。
+---@return table? 注册成功后的 Runtime；注册前为 nil。
+M.runtime = function()
+    return runtime
+end
+---@param options table 稳定 Router handle、逻辑 key、拒绝/排队策略与调用超时。
+---@return table 本地 Router 引用；它只转发调用，不拥有 Router Service。
 function M.router_ref(options)
     return require("flywow_hotupgrade_router_ref").new(options)
 end

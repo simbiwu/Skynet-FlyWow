@@ -3,9 +3,9 @@ local native = require "flywow_hotupgrade_native"
 local result = require "flywow_hotupgrade_error"
 local M = {}
 
----@param patch_id string 发布身份
----@param records table[] 注册目标快照
----@param selector table all/ids/percent/exclude
+---@param patch_id string 已冻结 Patch 身份；作为稳定哈希输入，不用随机数决定灰度结果。
+---@param records table[] 控制面筛选出的注册目标快照。
+---@param selector table all、ids、percent、exclude 选择条件；percent 合法范围为 0..1。
 ---@return flywow_hotupgrade_result
 function M.select(patch_id, records, selector)
     selector = selector or {all = true}
@@ -13,14 +13,20 @@ function M.select(patch_id, records, selector)
         return result.failure("HU_INVALID_SELECTOR", "percent 范围是 0..1")
     end
     local ids, excluded, chosen = {}, {}, {}
-    for _, id in ipairs(selector.ids or {}) do ids[tostring(id)] = true end
-    for _, id in ipairs(selector.exclude or {}) do excluded[tostring(id)] = true end
+    for _, id in ipairs(selector.ids or {}) do
+        ids[tostring(id)] = true
+    end
+    for _, id in ipairs(selector.exclude or {}) do
+        excluded[tostring(id)] = true
+    end
     for _, record in ipairs(records) do
         local hash = native.sha256(patch_id .. ":" .. record.key)
         local ratio = tonumber(hash:sub(1, 8), 16) / 4294967296
         local selected = selector.all or ids[tostring(record.service_id)]
             or (selector.percent and ratio < selector.percent)
-        if selected and not excluded[tostring(record.service_id)] then chosen[#chosen + 1] = record end
+        if selected and not excluded[tostring(record.service_id)] then
+            chosen[#chosen + 1] = record
+        end
     end
     table.sort(chosen, function(a, b) return a.key < b.key end)
     return result.success({records = chosen})

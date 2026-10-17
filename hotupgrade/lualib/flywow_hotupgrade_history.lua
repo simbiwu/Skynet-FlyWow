@@ -5,13 +5,18 @@ local native_error = require "flywow_hotupgrade_native_error"
 local snapshot = require "flywow_hotupgrade_snapshot"
 local M = {}
 local History = {}
+-- 历史按完整内容读取重放；64 MiB 上限同时保护启动时内存和审计恢复时间。
+local MAX_HISTORY_BYTES = 64 * 1024 * 1024
 History.__index = History
 
+-- 仅序列化 Snapshot 允许的标量和 table，输出可重放的 Lua 字面量。
 local function encode(value)
     if type(value) == "string" then
         return string.format("%q", value):gsub("\\\n", "\\n")
     end
-    if type(value) ~= "table" then return tostring(value) end
+    if type(value) ~= "table" then
+        return tostring(value)
+    end
     local parts = {}
     for key, item in pairs(value) do
         parts[#parts + 1] = "[" .. encode(key) .. "]=" .. encode(item)
@@ -19,12 +24,15 @@ local function encode(value)
     return "{" .. table.concat(parts, ",") .. "}"
 end
 
+-- records 以 txn_id 索引，每个后续阶段覆盖同一事务的最新持久化快照。
 local function replay(path)
     local records = {}
     local file = io.open(path, "rb")
-    if not file then return result.success({records = records}) end
+    if not file then
+        return result.success({records = records})
+    end
     local size = file:seek("end")
-    if not size or size > 64 * 1024 * 1024 then
+    if not size or size > MAX_HISTORY_BYTES then
         file:close()
         return result.failure("HU_HISTORY_LIMIT", "审计文件超限或无法取得长度")
     end
@@ -34,43 +42,59 @@ local function replay(path)
     end
     local bytes = file:read(size + 1)
     file:close()
-    if not bytes then return result.failure("HU_HISTORY_CORRUPT", "审计读取失败") end
-    if #bytes > 64 * 1024 * 1024 then return result.failure("HU_HISTORY_LIMIT", "审计文件超限") end
+    if not bytes then
+        return result.failure("HU_HISTORY_CORRUPT", "审计读取失败")
+    end
+    if #bytes > MAX_HISTORY_BYTES then
+        return result.failure("HU_HISTORY_LIMIT", "审计文件超限")
+    end
     if #bytes > 0 and bytes:sub(-1) ~= "\n" then
         return result.failure("HU_HISTORY_CORRUPT", "审计记录不完整，需人工恢复")
     end
     for line in bytes:gmatch("[^\n]+") do
         local chunk = load(line, "@history", "t", {})
-        if not chunk then return result.failure("HU_HISTORY_CORRUPT", "审计语法错误") end
+        if not chunk then
+            return result.failure("HU_HISTORY_CORRUPT", "审计语法错误")
+        end
         local executed = result.execute(chunk)
-        if not executed.ok then return executed end
+        if not executed.ok then
+            return executed
+        end
         local checked = snapshot.clone(executed.values[1])
-        if not checked.ok then return checked end
+        if not checked.ok then
+            return checked
+        end
         records[checked.value.txn_id] = checked.value
     end
     return result.success({records = records, size = #bytes})
 end
 
----@param path string 宿主配置的持久化文件，父目录需已存在
+---@param path string 宿主配置的持久化文件；父目录需已存在，模块不创建目录。
 ---@return flywow_hotupgrade_result
 function M.open(path)
     local replayed = replay(path)
-    if not replayed.ok then return replayed end
+    if not replayed.ok then
+        return replayed
+    end
     return result.success({history = setmetatable(
         {path = path, records = replayed.records, size = replayed.size or 0}, History)})
 end
 
----@param record table 可序列化审计记录
+---@param record table 可序列化事务快照；调用者仍持有原记录，History 保存经 Snapshot 校验的副本。
 ---@return flywow_hotupgrade_result
 function History:append(record)
     local cloned = snapshot.clone(record)
-    if not cloned.ok then return cloned end
+    if not cloned.ok then
+        return cloned
+    end
     local line = "return " .. encode(cloned.value) .. "\n"
-    if self.size + #line > 64 * 1024 * 1024 then
+    if self.size + #line > MAX_HISTORY_BYTES then
         return result.failure("HU_HISTORY_LIMIT", "审计容量耗尽")
     end
     local ok, code = native.append_sync(self.path, line)
-    if not ok then return result.failure(native_error.code(code), self.path) end
+    if not ok then
+        return result.failure(native_error.code(code), self.path)
+    end
     self.size = self.size + #line
     self.records[record.txn_id] = cloned.value
     return result.success()

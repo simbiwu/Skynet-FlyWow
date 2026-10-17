@@ -29,13 +29,16 @@ function Registry:register(record)
     end
     local instance = {record = record, visitors = {}, inflight = 0, state = "READY"}
     target.instances[record.generation] = instance
-    if not record.candidate then target.current = record.generation end
+    if not record.candidate then
+        target.current = record.generation
+    end
     self.revision = self.revision + 1
     return result.success()
 end
 
----@param caller string 注册实例身份
----@param dependencies table[] target/edge/cross_generation
+---@param caller string 注册实例身份。
+---@param dependencies table[] target/edge/cross_generation 声明列表。
+---@param generations? table target 到固定 generation 的迁移目标覆写表。
 ---@return flywow_hotupgrade_result
 function Registry:declare(caller, dependencies, generations)
     if self.callers[caller] then
@@ -72,14 +75,22 @@ function Registry:resolve(caller, key)
     end
     local target = self.targets[key]
     local instance = target and target.instances[binding.generation]
-    if not instance then return result.failure("HU_TARGET_RETIRED", key) end
+    if not instance then
+        return result.failure("HU_TARGET_RETIRED", key)
+    end
     return result.success({record = instance.record, revision = self.revision})
 end
 
 --- 显式取得一个本地引用；首次调用前的声明仍保留访问资格。
+---@param caller string 已登记的依赖调用实例身份。
+---@param key string 已声明的逻辑目标 key。
+---@param ref_id string 调用方生成的引用身份，用于幂等释放。
+---@return flywow_hotupgrade_result 当前绑定代的实例 record。
 function Registry:acquire(caller, key, ref_id)
     local resolved = self:resolve(caller, key)
-    if not resolved.ok then return resolved end
+    if not resolved.ok then
+        return resolved
+    end
     local binding = self.callers[caller][key]
     binding.leases = binding.leases or {}
     binding.leases[ref_id] = true
@@ -87,15 +98,23 @@ function Registry:acquire(caller, key, ref_id)
 end
 
 --- 目标屏障已完成才调用；最后一个引用释放时撤销本实例的依赖资格。
+---@param caller string 绑定的调用实例身份。
+---@param key string 逻辑目标 key。
+---@param ref_id string 已登记的引用身份。
+---@return flywow_hotupgrade_result 重复释放安全成功。
 function Registry:release_binding(caller, key, ref_id)
     local bindings = self.callers[caller]
     local binding = bindings and bindings[key]
-    if not binding or not binding.leases or not binding.leases[ref_id] then return result.success() end
+    if not binding or not binding.leases or not binding.leases[ref_id] then
+        return result.success()
+    end
     binding.leases[ref_id] = nil
     if next(binding.leases) == nil then
         local target = self.targets[key]
         local instance = target and target.instances[binding.generation]
-        if instance then instance.visitors[caller] = nil end
+        if instance then
+            instance.visitors[caller] = nil
+        end
         bindings[key] = nil
     end
     return result.success()
@@ -126,53 +145,65 @@ function Registry:switch(caller, key, can_switch)
         return result.failure("HU_SWITCH_BLOCKED", key)
     end
     local lease_count = 0
-    for _ in pairs(binding.leases or {}) do lease_count = lease_count + 1 end
+    for _ in pairs(binding.leases or {}) do
+        lease_count = lease_count + 1
+    end
     if lease_count > 1 then
         return result.failure("HU_SWITCH_BLOCKED", "同一依赖仍有其它引用")
     end
     local target = self.targets[key]
-    if target.current == binding.generation then return self:resolve(caller, key) end
+    if target.current == binding.generation then
+        return self:resolve(caller, key)
+    end
     if not binding.cross_generation then
         return result.failure("HU_GENERATION_INCOMPATIBLE", key)
     end
 
     target.instances[target.current].visitors[caller] = binding.edge
     local old = target.instances[binding.generation]
-    if old then old.visitors[caller] = nil end
+    if old then
+        old.visitors[caller] = nil
+    end
     binding.generation = target.current
     return self:resolve(caller, key)
 end
 
----@param caller string 身份
+---@param caller string 要撤销全部依赖资格的调用实例身份。
 ---@return flywow_hotupgrade_result
 function Registry:release(caller)
     for key, binding in pairs(self.callers[caller] or {}) do
         local instance = self.targets[key].instances[binding.generation]
-        if instance then instance.visitors[caller] = nil end
+        if instance then
+            instance.visitors[caller] = nil
+        end
     end
     self.callers[caller] = nil
     return result.success()
 end
 
----@param key string target
----@param generation integer 实例代际
----@return integer strong 引用数
+---@param key string 逻辑目标 key。
+---@param generation integer 实例代际。
+---@return integer strong visitor 数，用于判断旧代能否退休。
 function Registry:strong_count(key, generation)
     local instance = self.targets[key].instances[generation]
     local count = 0
     for _, edge in pairs(instance.visitors) do
-        if edge == "strong" then count = count + 1 end
+        if edge == "strong" then
+            count = count + 1
+        end
     end
     return count
 end
 
----@param key string target
----@param generation integer 旧实例
----@return flywow_hotupgrade_result
+---@param key string 逻辑目标 key。
+---@param generation integer 待删除的非当前实例代际。
+---@return flywow_hotupgrade_result 有强引用或在途调用时返回 HU_RETIRE_BLOCKED。
 function Registry:retire(key, generation)
     local target = self.targets[key]
     local instance = target and target.instances[generation]
-    if not instance then return result.success() end
+    if not instance then
+        return result.success()
+    end
     if target.current == generation or instance.inflight > 0 or self:strong_count(key, generation) > 0 then
         return result.failure("HU_RETIRE_BLOCKED", key)
     end

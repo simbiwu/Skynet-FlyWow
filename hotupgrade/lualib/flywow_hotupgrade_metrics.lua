@@ -14,7 +14,9 @@ end
 ---@param value number 增量
 function Metrics:add(name, value)
     self.values[name] = (self.values[name] or 0) + value
-    if self.emit then result.execute(self.emit, 100000, name, value) end
+    if self.emit then
+        result.execute(self.emit, 100000, name, value)
+    end
 end
 
 return M

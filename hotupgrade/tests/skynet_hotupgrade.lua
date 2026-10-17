@@ -14,9 +14,13 @@ end
 local function wait_finished(controller, id, expected)
     for _ = 1, 1000 do
         local record = control(controller, "status", {txn_id = id}).record
-        if record and (record.phase == "COMPLETED" or record.phase == "DRY_RUN_COMPLETED") then return record end
+        if record and (record.phase == "COMPLETED" or record.phase == "DRY_RUN_COMPLETED") then
+            return record
+        end
         if record and (record.phase == "ABORTED" or record.phase == "RECOVERY_REQUIRED" or record.phase == "COMMITTED_DRAIN_PENDING") then
-            if record.phase == expected then return record end
+            if record.phase == expected then
+                return record
+            end
             error(record.phase .. ":" .. tostring(record.error and record.error.message))
         end
         skynet.sleep(1)
@@ -35,9 +39,11 @@ local function run()
     local second = start_worker(controller, 2)
     assert(skynet.call(first, "lua", "read").value == 1)
 
+    -- Dry Run 只构建和清理候选，不应改变任一 Worker 的线上模块。
     local dry = control(controller, "dry_run", {path = "dry"})
     wait_finished(controller, dry.txn_id)
     assert(skynet.call(first, "lua", "read").value == 1)
+    -- 原地 Module Patch 更新所有声明使用该模块的 Worker。
     local applied = control(controller, "apply", {path = "module"})
     wait_finished(controller, applied.txn_id)
     assert(skynet.call(first, "lua", "read").value == 2)
@@ -45,6 +51,7 @@ local function run()
     assert(not rpc.call(controller, "apply", {path = "module"}, 2000).ok)
     print("HOTUPGRADE_SKYNET_MODULE_OK")
 
+    -- 重新启动控制面和 Router，覆盖候选失败恢复与稳定路由 DRAIN 替换。
     skynet.kill(first)
     skynet.kill(second)
     skynet.kill(controller)
@@ -71,6 +78,7 @@ local function run()
     controller = skynet.newservice("flywow_hotupgraded", "hotupgrade_test_options", skynet.self())
     router = skynet.newservice("flywow_hotupgrade_router", controller)
     first = start_worker(controller, 1, router)
+    -- MIGRATE 迁移当前权威状态；之后反向 Patch 再从新状态回滚到旧 schema。
     local migrated = control(controller, "apply", {path = "migrate"})
     wait_finished(controller, migrated.txn_id)
     routed = hotupgrade.router_ref({handle = router, key = registry.key("worker", 1)})

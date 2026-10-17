@@ -73,7 +73,9 @@ function M.initialize(fn, budget)
 
     local ok, message = pcall(fn)
     debug.sethook(previous, mask, count)
-    if not ok then return M.failure("HU_CREATE_FAILED", tostring(message)) end
+    if not ok then
+        return M.failure("HU_CREATE_FAILED", tostring(message))
+    end
     return M.success()
 end
 

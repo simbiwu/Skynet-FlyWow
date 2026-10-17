@@ -8,12 +8,15 @@ local loaded = patch.load({root = "build/hotupgrade-tests/patches", path = "modu
 assert(loaded.ok, loaded.message)
 local found_module = false
 for _, entry in ipairs(loaded.patch.modules) do
-    if entry.name == "test_worker_logic" then found_module = true end
+    if entry.name == "test_worker_logic" then
+        found_module = true
+    end
 end
 assert(found_module)
 assert(not patch.load({root = "build/hotupgrade-tests/patches", path = "../module"}).ok)
 assert(not patch.load_pure("while true do end").ok)
 
+-- Config 暂存期间当前读取者看不到新值；Abort 还原原配置视图。
 local configs = config.new()
 assert(configs:stage("x", {value = 4}, 2, "t").ok)
 assert(configs:get("x") == nil)
@@ -21,6 +24,7 @@ assert(configs:activate("t").ok)
 assert(configs:get("x").value == 4)
 assert(configs:abort("t").ok and configs:get("x") == nil)
 
+-- History 追加完成后从新实例重放，确认稳定审计字段与 UTF-8 内容完整。
 local path = "build/hotupgrade-tests/files.history"
 os.remove(path)
 local opened = history.open(path)

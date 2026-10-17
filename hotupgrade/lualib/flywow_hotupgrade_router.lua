@@ -15,7 +15,9 @@ end
 ---@param record table 地址、代际及版本
 ---@return flywow_hotupgrade_result
 function Router:bind(key, record)
-    if self.routes[key] then return result.failure("HU_ROUTE_EXISTS", key) end
+    if self.routes[key] then
+        return result.failure("HU_ROUTE_EXISTS", key)
+    end
     self.routes[key] = {current = record, queue = {}, active = 0}
     return result.success()
 end
@@ -24,7 +26,9 @@ end
 ---@return flywow_hotupgrade_result
 function Router:query(key)
     local route = self.routes[key]
-    if not route then return result.failure("HU_TARGET_MISSING", key) end
+    if not route then
+        return result.failure("HU_TARGET_MISSING", key)
+    end
     return result.success({record = route.current, paused = route.owner ~= nil})
 end
 
@@ -33,8 +37,12 @@ end
 ---@return flywow_hotupgrade_result
 function Router:pause(key, txn_id)
     local route = self.routes[key]
-    if not route then return result.failure("HU_TARGET_MISSING", key) end
-    if route.owner and route.owner ~= txn_id then return result.failure("HU_UPGRADE_BUSY", key) end
+    if not route then
+        return result.failure("HU_TARGET_MISSING", key)
+    end
+    if route.owner and route.owner ~= txn_id then
+        return result.failure("HU_UPGRADE_BUSY", key)
+    end
     route.owner = txn_id
     route.saved = route.saved or route.current
     return result.success()
@@ -54,9 +62,12 @@ function Router:switch(key, txn_id, expected, record)
     return result.success()
 end
 
+-- 暂停期间先复制并计量请求；容量检查通过后才接受队列所有权。
 local function queued(router, route, command, payload, reply)
     local cloned = snapshot.clone(payload)
-    if not cloned.ok then return cloned end
+    if not cloned.ok then
+        return cloned
+    end
     local maximum = router.options.max_queue or 256
     local byte_limit = router.options.max_bytes or 1024 * 1024
     if router.queue_count >= maximum or router.queue_bytes + cloned.bytes > byte_limit then
@@ -78,9 +89,13 @@ end
 ---@return flywow_hotupgrade_result
 function Router:submit(key, command, payload, reply, policy)
     local route = self.routes[key]
-    if not route then return result.failure("HU_TARGET_MISSING", key) end
+    if not route then
+        return result.failure("HU_TARGET_MISSING", key)
+    end
     if route.owner or route.draining then
-        if policy ~= "queue" then return result.failure("HU_UPGRADING", key) end
+        if policy ~= "queue" then
+            return result.failure("HU_UPGRADING", key)
+        end
         return queued(self, route, command, payload, reply)
     end
     route.active = route.active + 1
@@ -93,6 +108,8 @@ function Router:submit(key, command, payload, reply, policy)
     return result.success()
 end
 
+--- 按接收顺序排空已接受请求；过期项返回超时，投递项仍使用当前路由代。
+---@param route table 单个逻辑目标的当前代、队列与在途状态。
 function Router:flush(route)
     while not route.owner and #route.queue > 0 do
         local item = table.remove(route.queue, 1)
@@ -115,7 +132,9 @@ end
 ---@return flywow_hotupgrade_result
 function Router:resume(key, txn_id)
     local route = self.routes[key]
-    if not route or route.owner ~= txn_id then return result.failure("HU_STALE_TRANSACTION", key) end
+    if not route or route.owner ~= txn_id then
+        return result.failure("HU_STALE_TRANSACTION", key)
+    end
     route.owner, route.saved = nil, nil
     route.draining = true
     self.options.fork(function() self:flush(route) end)
@@ -127,7 +146,9 @@ end
 ---@return flywow_hotupgrade_result
 function Router:abort(key, txn_id)
     local route = self.routes[key]
-    if not route or route.owner ~= txn_id then return result.failure("HU_STALE_TRANSACTION", key) end
+    if not route or route.owner ~= txn_id then
+        return result.failure("HU_STALE_TRANSACTION", key)
+    end
     route.current = route.saved
     return self:resume(key, txn_id)
 end

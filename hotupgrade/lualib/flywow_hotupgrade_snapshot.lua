@@ -2,6 +2,7 @@
 local result = require "flywow_hotupgrade_error"
 local M = {}
 
+-- 仅接受可序列化标量，并累计到 Snapshot 字节预算。
 local function scalar(value, limits)
     local kind = type(value)
     if kind == "string" then
@@ -17,6 +18,7 @@ local function scalar(value, limits)
     return limits.bytes <= limits.max_bytes
 end
 
+-- 拒绝循环引用、metatable、资源对象及超限图；seen 仅追踪当前递归祖先链。
 local function copy(value, seen, limits, depth)
     limits.nodes = limits.nodes + 1
     if depth > limits.max_depth or limits.nodes > limits.max_nodes then
@@ -39,9 +41,13 @@ local function copy(value, seen, limits, depth)
             return nil, "HU_RESTART_REQUIRED"
         end
         local copied_key, key_error = copy(key, seen, limits, depth + 1)
-        if key_error then return nil, key_error end
+        if key_error then
+            return nil, key_error
+        end
         local copied_item, item_error = copy(item, seen, limits, depth + 1)
-        if item_error then return nil, item_error end
+        if item_error then
+            return nil, item_error
+        end
         output[copied_key] = copied_item
     end
     seen[value] = nil

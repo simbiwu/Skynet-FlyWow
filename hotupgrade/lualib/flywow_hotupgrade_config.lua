@@ -5,7 +5,7 @@ local M = {}
 local Config = {}
 Config.__index = Config
 
----@return table 当前 Lua State 独占配置 owner
+---@return table 当前 Lua State 独占配置 owner；不同 Service 不共享此快照。
 function M.new()
     return setmetatable({current = {}, staged = {}, undo = {}}, Config)
 end
@@ -17,7 +17,9 @@ end
 ---@return flywow_hotupgrade_result
 function Config:stage(name, value, version, txn_id)
     local cloned = snapshot.clone(value)
-    if not cloned.ok then return cloned end
+    if not cloned.ok then
+        return cloned
+    end
     self.staged[txn_id] = self.staged[txn_id] or {}
     self.staged[txn_id][name] = {value = cloned.value, version = version}
     return result.success()
@@ -37,7 +39,9 @@ end
 ---@param txn_id string owner
 ---@return flywow_hotupgrade_result
 function Config:abort(txn_id)
-    for name, saved in pairs(self.undo[txn_id] or {}) do self.current[name] = saved.entry end
+    for name, saved in pairs(self.undo[txn_id] or {}) do
+        self.current[name] = saved.entry
+    end
     self.undo[txn_id], self.staged[txn_id] = nil, nil
     return result.success()
 end
@@ -53,7 +57,9 @@ end
 ---@return integer? version
 function Config:get(name)
     local entry = self.current[name]
-    if entry then return entry.value, entry.version end
+    if entry then
+        return entry.value, entry.version
+    end
 end
 
 return M

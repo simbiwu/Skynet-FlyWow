@@ -3,8 +3,12 @@ local result = require "flywow_hotupgrade_error"
 local M = {}
 
 local function visit(key, graph, marks)
-    if marks[key] == "visiting" then return false end
-    if marks[key] == "done" then return true end
+    if marks[key] == "visiting" then
+        return false
+    end
+    if marks[key] == "done" then
+        return true
+    end
 
     marks[key] = "visiting"
     for _, edge in ipairs(graph[key] or {}) do

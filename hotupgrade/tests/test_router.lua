@@ -12,6 +12,7 @@ local router = router_module.new(
     end,
     max_queue = 2,
 })
+-- 暂停期间新请求只进入有界队列；恢复后按新代际顺序投递。
 assert(router:bind("x", {generation = 1}).ok)
 assert(router:pause("x", "t").ok)
 assert(router:submit("x", "x", "a", function() end, "queue").ok)
@@ -23,6 +24,7 @@ assert(router:resume("x", "t").ok)
 pending[1]()
 assert(table.concat(seen, ",") == "2:a,2:b")
 assert(router.queue_bytes == 0 and router.queue_count == 0)
+-- Abort 恢复暂停前的路由绑定，不留下新代际。
 assert(router:pause("x", "u").ok)
 assert(router:switch("x", "u", 2, {generation = 3}).ok)
 assert(router:abort("x", "u").ok)

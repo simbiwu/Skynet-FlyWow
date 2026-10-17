@@ -31,7 +31,9 @@ end
 ---@return flywow_hotupgrade_result
 function M.apply(state, chain, context)
     local cloned = snapshot.clone(state)
-    if not cloned.ok then return cloned end
+    if not cloned.ok then
+        return cloned
+    end
 
     for _, step in ipairs(chain) do
         local executed = result.execute(step.up, context.instruction_budget, cloned.value, context)
@@ -39,7 +41,9 @@ function M.apply(state, chain, context)
             return result.failure("HU_MIGRATION_FAILED", executed.message)
         end
         cloned = snapshot.clone(executed.values[1])
-        if not cloned.ok then return cloned end
+        if not cloned.ok then
+            return cloned
+        end
         if type(cloned.value) ~= "table" or cloned.value.schema_version ~= step.to then
             return result.failure("HU_INVALID_MIGRATION", "迁移没有输出目标 schema")
         end

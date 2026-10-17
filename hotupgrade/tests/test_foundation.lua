@@ -8,6 +8,7 @@ local registry = require "flywow_hotupgrade_registry"
 local migration = require "flywow_hotupgrade_migration"
 local dependency = require "flywow_hotupgrade_dependency"
 
+-- Snapshot 校验标量/嵌套值、深拷贝、循环、函数和字节上限。
 local cloned = snapshot.clone({schema_version = 1, nested = {value = 3}})
 assert(cloned.ok)
 local original = {x = {}}
@@ -24,12 +25,14 @@ assert(not result.execute(function() while true do end end, 2000).ok)
 assert(not result.initialize(function() while true do end end, 2000).ok)
 assert(result.initialize(function() return true end, 2000).ok)
 
+-- 状态机只接受定义过的阶段跳转。
 local txn = transaction.new("t1")
 assert(not txn:move("PUBLISHED").ok)
 for _, phase in ipairs({"VALIDATING", "PREPARING", "STAGING", "READY", "ACTIVATING", "PUBLISHED", "COMPLETED"}) do
     assert(txn:move(phase).ok)
 end
 
+-- Guard 通过可控时钟验证安全点等待、超时和异常后的计数恢复。
 local now = 0
 local g = guard.new({now = function() return now end, sleep = function(ms) now = now + ms end})
 assert(g:enter().ok)
@@ -43,13 +46,36 @@ assert(g:resume("t1").ok)
 assert(not g:run(function() error("failure") end).ok)
 assert(g.active == 0)
 
+-- Module Patch Stage 与线上 package.loaded 隔离；Commit 保留导出 table 身份，Abort 恢复旧值。
 local loaded = {a = {value = function() return 1 end}}
 local held = loaded.a
 local engine = module_patch.new({loaded = loaded})
 local staged = engine:stage(
 {
-    {name = "a", source = 'local b = require "b"; local M = {}; function M.value() return b.value() end; return M', code_version = 2},
-    {name = "b", action = "add", source = 'local M = {}; function M.value() return 2 end; return M', code_version = 1},
+    {
+        name = "a",
+        source = [[
+            local b = require "b"
+            local M = {}
+            function M.value()
+                return b.value()
+            end
+            return M
+        ]],
+        code_version = 2,
+    },
+    {
+        name = "b",
+        action = "add",
+        source = [[
+            local M = {}
+            function M.value()
+                return 2
+            end
+            return M
+        ]],
+        code_version = 1,
+    },
 })
 assert(staged.ok, staged.message)
 assert(held.value() == 1 and loaded.b == nil)
@@ -67,6 +93,7 @@ assert(good.ok)
 assert(not engine:commit(good.stage, function() return false end).ok)
 assert(held.value() == 1)
 
+-- StableState 在 Stage 阶段只读，提交后才开放写入；Abort 保留原线上状态。
 local stable = {counter = {value = 7, nested = {value = 3}}}
 local stable_engine = module_patch.new({loaded = loaded, stable = stable})
 local stable_stage = stable_engine:stage({{name = "a", source = [[
@@ -85,6 +112,7 @@ assert(not stable_engine:stage({{name = "a", source = [[
 ]]}}).ok)
 assert(stable.counter.nested.value == 3)
 
+-- 未受信的顶层副作用和延迟闭包都只能在 Commit 边界之后触达 live dependency。
 loaded.external = {mutate = function() stable.counter.value = 99 end}
 local external_stage = stable_engine:stage({{name = "a", source = [[
     require "external".mutate()
@@ -100,6 +128,7 @@ assert(stable_engine:commit(external_closure.stage).ok)
 assert(held.value() == 99 and stable.counter.value == 99)
 assert(stable_engine:abort(external_closure.stage).ok)
 
+-- Registry 声明会保留访问资格；仅释放 binding 后旧代才允许退休。
 local reg = registry.new()
 assert(reg:register({key = "B", address = 11, generation = 1}).ok)
 assert(reg:declare("A-old", {{target = "B", edge = "strong"}}).ok)
@@ -121,6 +150,7 @@ assert(reg:strong_count("B", 2) == 0)
 assert(dependency.validate({A = {{target = "B", edge = "strong"}}, B = {{target = "A", edge = "weak"}}}).ok)
 assert(not dependency.validate({A = {{target = "B", edge = "strong"}}, B = {{target = "A", edge = "strong"}}}).ok)
 
+-- Migration 对调用者状态创建副本；转换成功不修改旧代原对象。
 local chain = migration.resolve({{from = 1, to = 2, up = function(state)
     state.schema_version = 2
     state.extra = true

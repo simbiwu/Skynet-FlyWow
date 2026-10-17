@@ -4,54 +4,82 @@ local native_error = require "flywow_hotupgrade_native_error"
 local result = require "flywow_hotupgrade_error"
 local M = {}
 
+-- 与 Native 扫描器上限保持一致：单文件 2 MiB、一次 Patch 累计 16 MiB。
 local MAX_FILE_BYTES = 2 * 1024 * 1024
 local MAX_PATCH_BYTES = 16 * 1024 * 1024
 
+-- 有界读取单个已规范化文件；关闭失败也视为读取失败，避免冻结不完整内容。
 local function read(path)
     local file, message = io.open(path, "rb")
-    if not file then return result.failure("HU_FILE_NOT_FOUND", message) end
+    if not file then
+        return result.failure("HU_FILE_NOT_FOUND", message)
+    end
     local bytes = file:read(MAX_FILE_BYTES + 1)
     local closed = file:close()
-    if not bytes or not closed then return result.failure("HU_FILE_READ_FAILED", path) end
-    if #bytes > MAX_FILE_BYTES then return result.failure("HU_PATCH_LIMIT", path) end
+    if not bytes or not closed then
+        return result.failure("HU_FILE_READ_FAILED", path)
+    end
+    if #bytes > MAX_FILE_BYTES then
+        return result.failure("HU_PATCH_LIMIT", path)
+    end
     return result.success({bytes = bytes})
 end
 
+-- 将分类目录内的相对 Lua 路径映射为 require 模块名。
 local function module_name(path)
-    if path:sub(-4) ~= ".lua" or path:find("\\", 1, true) then return nil end
+    if path:sub(-4) ~= ".lua" or path:find("\\", 1, true) then
+        return nil
+    end
     return path:sub(1, -5):gsub("/", ".")
 end
 
+-- 扫描一个白名单分类，校验语法并把源码纳入同一 Patch 字节预算与身份摘要。
 local function load_category(root, patch_path, category, frozen, budget)
     local paths, code = native.list_lua(root, patch_path, category)
     code = native_error.code(code)
-    if not paths and code == "HU_PATCH_EMPTY" then return result.success({entries = {}}) end
-    if not paths then return result.failure(native_error.code(code), "Patch 目录扫描失败: " .. category) end
+    if not paths and code == "HU_PATCH_EMPTY" then
+        return result.success({entries = {}})
+    end
+    if not paths then
+        return result.failure(native_error.code(code), "Patch 目录扫描失败: " .. category)
+    end
     table.sort(paths)
 
     local entries = {}
     for _, relative in ipairs(paths) do
         local absolute = root .. "/" .. patch_path .. "/" .. category .. "/" .. relative
         local located, locate_error = native.resolve(absolute)
-        if not located then return result.failure(native_error.code(locate_error), relative) end
+        if not located then
+            return result.failure(native_error.code(locate_error), relative)
+        end
         local loaded = read(located)
-        if not loaded.ok then return loaded end
+        if not loaded.ok then
+            return loaded
+        end
         budget.bytes = budget.bytes + #loaded.bytes
-        if budget.bytes > MAX_PATCH_BYTES then return result.failure("HU_PATCH_LIMIT", "Patch 总字节数超限") end
+        if budget.bytes > MAX_PATCH_BYTES then
+            return result.failure("HU_PATCH_LIMIT", "Patch 总字节数超限")
+        end
         local chunk, syntax_error = load(loaded.bytes, "@" .. relative, "t", {})
-        if not chunk then return result.failure("HU_MODULE_SYNTAX", syntax_error) end
+        if not chunk then
+            return result.failure("HU_MODULE_SYNTAX", syntax_error)
+        end
         entries[#entries + 1] = {file = relative, source = loaded.bytes}
         frozen[#frozen + 1] = category .. "/" .. relative .. "\0" .. loaded.bytes
     end
     return result.success({entries = entries})
 end
 
+-- 汇总所有分类并建立确定排序的冻结 Patch record；不执行 Patch 源码。
 local function build_patch(root, patch_path)
+    -- frozen 用于稳定计算 Patch 身份；budget 在所有分类间累计，不在每类重新归零。
     local frozen, budget = {}, {bytes = 0}
     local loaded = {}
     for _, category in ipairs({"modules", "services", "migrations", "configs"}) do
         loaded[category] = load_category(root, patch_path, category, frozen, budget)
-        if not loaded[category].ok then return loaded[category] end
+        if not loaded[category].ok then
+            return loaded[category]
+        end
     end
 
     local modules = {}
@@ -99,15 +127,19 @@ local function build_patch(root, patch_path)
     local digest = native.sha256(patch_path .. "\0" .. table.concat(frozen, "\0"))
     local patch = {patch_id = digest, modules = {}, services = services, migrations = migrations,
         configs = configs, frozen_files = {}}
-    for _, module in pairs(modules) do patch.modules[#patch.modules + 1] = module end
+    for _, module in pairs(modules) do
+        patch.modules[#patch.modules + 1] = module
+    end
     table.sort(patch.modules, function(left, right) return left.name < right.name end)
-    for _, entry in ipairs(loaded.services.entries) do patch.frozen_files["services/" .. entry.file] = entry.source end
+    for _, entry in ipairs(loaded.services.entries) do
+        patch.frozen_files["services/" .. entry.file] = entry.source
+    end
     return result.success({patch = patch, checksum = digest})
 end
 
 --- 同步扫描 PatchRoot/<path>/modules 的 Lua 文件并冻结源码；不 yield。
----@param options table root 与 PatchRoot 下相对目录 path
----@return flywow_hotupgrade_result
+---@param options table root 是已存在的 Patch Root；path 是其下相对目录，不允许绝对路径和越界路径。
+---@return flywow_hotupgrade_result 返回冻结源码和 checksum；扫描/读取在当前调用内同步完成。
 function M.load(options)
     if type(options) ~= "table" or type(options.root) ~= "string"
         or type(options.path) ~= "string" then
@@ -115,20 +147,26 @@ function M.load(options)
     end
     local root, code = native.resolve(options.root)
     code = native_error.code(code)
-    if not root then return result.failure(native_error.code(code), "Patch Root 不存在") end
+    if not root then
+        return result.failure(native_error.code(code), "Patch Root 不存在")
+    end
     return build_patch(root, options.path)
 end
 
 --- 迁移/配置纯 Lua 文件运行在预算协程，不暴露 Skynet 或 I/O。
----@param source string 已冻结源码
----@return flywow_hotupgrade_result
+---@param source string 来自当前 Patch 快照的纯 Lua 源码，不提供 Skynet、文件或网络能力。
+---@return flywow_hotupgrade_result 函数结果经指令预算执行；错误使用稳定 HU_ code 返回。
 function M.load_pure(source)
     local env = {assert = assert, error = error, pairs = pairs, ipairs = ipairs,
         type = type, tonumber = tonumber, tostring = tostring}
     local chunk, message = load(source, "@patch_pure", "t", env)
-    if not chunk then return result.failure("HU_MODULE_SYNTAX", message) end
+    if not chunk then
+        return result.failure("HU_MODULE_SYNTAX", message)
+    end
     local executed = result.execute(chunk)
-    if not executed.ok then return executed end
+    if not executed.ok then
+        return executed
+    end
     return result.success({value = executed.values[1]})
 end
 
