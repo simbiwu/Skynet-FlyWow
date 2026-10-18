@@ -19,7 +19,17 @@ package.loaded.flywow_hotupgrade_native =
 {
     resolve = function(path) return path end,
     list_lua = function(_root, path, category)
-        if path == "module" and category == "modules" then
+        if path == "unmatched_module" and category == "modules" then
+            return {"test_worker_logic.lua", "missing_logic.lua"}
+        end
+        if path == "unmatched_service" and category == "services" then
+            return {"unused.lua"}
+        end
+        if path == "combined" and category == "services" then
+            return {"player.lua"}
+        end
+        if (path == "module" or path == "combined" or path == "unmatched_service")
+            and category == "modules" then
             return {"test_worker_logic.lua"}
         end
         return nil, {code = "HU_PATCH_EMPTY"}
@@ -37,6 +47,38 @@ assert(c:control("register_module", {name = "extra"}, 10).ok)
 assert(not c:control("register_module", {name = "extra"}, 30).ok)
 assert(not c:control("validate", {path = "module", selector = {percent = 0.5}}, 1).ok)
 assert(c:control("validate", {path = "module"}, 1).target_count == 2)
+-- 三种入口必须在整包匹配失败时拒绝启动，连 prepare 都不能发给已匹配目标。
+for _, fixture in ipairs({
+    {path = "unmatched_module", file = "modules/missing_logic.lua", reason = "声明模块"},
+    {path = "unmatched_service", file = "services/unused.lua", reason = "service_type"},
+}) do
+    for _, command in ipairs({"validate", "dry_run", "apply"}) do
+        calls = {}
+        local pending_count = #pending
+        local sequence = c.sequence
+        local rejected = c:control(command, {path = fixture.path}, 1)
+        assert(not rejected.ok and rejected.code == "HU_TARGET_MISSING")
+        assert(rejected.message:find(fixture.path .. "/" .. fixture.file, 1, true))
+        assert(rejected.message:find(fixture.reason, 1, true))
+        assert(next(calls) == nil and #pending == pending_count and not c.active and c.sequence == sequence)
+    end
+end
+-- 同一模块仍可匹配多个 Service，组合包中的 Service 脚本也必须被覆盖。
+local combined = assert(controller.new({patch_root = "build/hotupgrade-tests/patches"}).controller)
+for _, handle in ipairs({30, 40}) do
+    assert(combined:control("register", {service_type = "player", modules = {"test_worker_logic"},
+        service_patch = true}, handle).ok)
+end
+for _, command in ipairs({"validate", "dry_run", "apply"}) do
+    assert(combined:control(command, {path = "combined"}, 1).target_count == 2)
+    if command ~= "validate" then
+        pending[#pending]()
+        assert(combined.last.success == 2)
+    end
+end
+local unsupported = c:control("validate", {path = "combined"}, 1)
+assert(unsupported.code == "HU_SERVICE_PATCH_UNSUPPORTED")
+assert(unsupported.message:find("combined/services/player.lua", 1, true))
 local function run(command)
     local answer = c:control(command or "apply", {path = "module"}, 1)
     assert(answer.ok)

@@ -95,7 +95,7 @@ local function build_patch(root, patch_path)
         if not name or name == "" or modules[name] then
             return result.failure("HU_INVALID_PATCH", "Lua 模块路径重复或无效: " .. entry.file)
         end
-        modules[name] = {name = name, source = entry.source}
+        modules[name] = {name = name, entry_file = "modules/" .. entry.file, source = entry.source}
     end
 
     local services = {}
@@ -237,16 +237,22 @@ function Controller:load(request)
         return loaded
     end
     local targets = {}
+    local matched = {} -- 仅当前登记快照覆盖的 Patch 文件；全量匹配后才允许启动事务。
     for _, record in pairs(self.targets) do
         local modules = {}
         for _, entry in ipairs(loaded.patch.modules) do
             if record.modules[entry.name] then
                 modules[#modules + 1] = entry
+                matched[entry.entry_file] = true
             end
         end
         local service = loaded.patch.services[record.service_type]
         if service and not record.service_patch then
-            return result.failure("HU_SERVICE_PATCH_UNSUPPORTED", "目标未提供 Service 内部更新入口")
+            return result.failure("HU_SERVICE_PATCH_UNSUPPORTED", request.path .. "/" .. service.entry_file
+                .. ": 目标 " .. record.handle .. " 未提供 Service 内部更新入口")
+        end
+        if service then
+            matched[service.entry_file] = true
         end
         if #modules > 0 or service then
             targets[#targets + 1] =
@@ -255,6 +261,19 @@ function Controller:load(request)
                 modules = modules,
                 service_source = service and service.source,
             }
+        end
+    end
+    -- 每份文件都必须有接收者，不能因其他文件匹配成功而静默遗漏。
+    for _, entry in ipairs(loaded.patch.modules) do
+        if not matched[entry.entry_file] then
+            return result.failure("HU_TARGET_MISSING", request.path .. "/" .. entry.entry_file
+                .. ": 没有已登记目标声明模块 " .. entry.name)
+        end
+    end
+    for service_type, entry in pairs(loaded.patch.services) do
+        if not matched[entry.entry_file] then
+            return result.failure("HU_TARGET_MISSING", request.path .. "/" .. entry.entry_file
+                .. ": 没有已登记目标匹配 service_type " .. service_type)
         end
     end
     table.sort(targets, function(left, right)

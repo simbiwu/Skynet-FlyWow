@@ -87,7 +87,7 @@ Guard:run 允许业务正常 yield，捕获异常并在结束时减少在途计�
 
 两类均可单独存在。modules/ 相对路径按目录分隔转为 require 名，每份文件必须是完整模块新版本。只改一个函数也必须保留新版仍需要的全部导出字段。提交会更新所有新字段，并删除新版已去掉的字段，原导出表和 package.loaded[name] 身份保持不变。
 
-模块只导出字符串键，值为函数、数值、字符串或布尔值；不接受元表、嵌套状态表、userdata 等导出，同名字段不得改变类型。可变私有状态放在模块闭包或由 Service 持有。模块顶层只能定义代码、常量和引用已加载依赖；不得 yield、I/O、写全局、修改线上状态或启动任务。候选源码中的 require 只返回本 State 已加载的模块，不加载新增依赖。
+模块顶层是无元表普通表，只导出字符串键，值允许函数、数值、字符串、布尔值和普通嵌套表；嵌套表键允许字符串、数值或布尔值，允许共享和循环，但不得引用模块根导出表。任何层级均不接受元表、userdata 或 thread，同名顶层字段不得改变类型。嵌套表随版本整体替换，不递归合并、不保证身份；缓存的旧嵌套引用仍指向旧数据，回滚恢复旧字段及原有嵌套引用。可变私有状态放在模块闭包或由 Service 持有。模块顶层只能定义代码、常量和引用已加载依赖；不得 yield、I/O、写全局、修改线上状态或启动任务。候选源码中的 require 只返回本 State 已加载的模块，不加载新增依赖。
 
 调用方通过 logic.load(...) 读取当前函数。缓存的旧函数仍是旧函数，不会自动更新；不要对外暴露候选导出表或在业务中改写模块导出。
 
@@ -166,7 +166,7 @@ local status = skynet.call(controller_handle, "hotupgrade", "status", {txn_id = 
 assert(status.ok, status.message)
 ```
 
-validate 同步冻结源码、检查路径/语法和匹配的登记目标，不执行目标脚本。apply 和 dry_run 返回 txn_id 后异步推进，每次只运行一个发布，不排队。status 查询当前活动事务或最近一个终态；更早事务返回 HU_TRANSACTION_MISSING。状态不持久化，Controller 重启不恢复登记或事务。
+validate 同步冻结源码、检查路径/语法和匹配的登记目标，不执行目标脚本。validate、dry_run 和 apply 使用同一匹配规则：每个 Patch 文件必须至少匹配一个已登记目标；未匹配时返回 HU_TARGET_MISSING，并在 message 中给出文件路径和原因，所有目标事务均不启动。Service 类型匹配但未提供内部更新入口时返回 HU_SERVICE_PATCH_UNSUPPORTED，同样在事务启动前拒绝整包。apply 和 dry_run 返回 txn_id 后异步推进，每次只运行一个发布，不排队。status 查询当前活动事务或最近一个终态；更早事务返回 HU_TRANSACTION_MISSING。状态不持久化，Controller 重启不恢复登记或事务。
 
 各目标按 handle 顺序逐个执行：
 

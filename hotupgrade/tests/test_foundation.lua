@@ -85,4 +85,67 @@ assert(not broken:stage({{name = "a", source = [[return {
     import_state = function() error("import failed") end,
 }]]}}).ok)
 assert(not broken.active)
+-- 嵌套配置、辅助函数、共享与循环图均按完整新版本安装；回滚必须找回原引用。
+local old_config = {max_level = 50, items = {sword = {attack = 10}}}
+local old_helper = {calculate = function(value) return value end}
+local nested_live = {config = old_config, helper = old_helper, removed = true}
+local nested_name = "hotupgrade_nested_fixture"
+assert(package.loaded[nested_name] == nil)
+package.loaded[nested_name] = nested_live
+local nested_engine = patch.new()
+local nested_source = [[
+local M = {}
+M.config = {max_level = 100, items = {sword = {attack = 20}}, [1] = "index", [false] = true}
+M.config.self = M.config
+M.alias = M.config.items
+M.helper = {calculate = function(value) return value * 2 end}
+function M.get_max_level() return M.config.max_level end
+return M
+]]
+local nested_stage = nested_engine:stage({{name = nested_name, source = nested_source}})
+assert(nested_stage.ok, nested_stage.message)
+assert(nested_live.config == old_config and old_config.max_level == 50)
+assert(nested_engine:commit(nested_stage.stage).ok)
+assert(package.loaded[nested_name] == nested_live and nested_live.config ~= old_config)
+assert(nested_live.config.max_level == 100 and nested_live.config.items.sword.attack == 20)
+assert(nested_live.config.self == nested_live.config and nested_live.alias == nested_live.config.items)
+assert(nested_live.config[1] == "index" and nested_live.config[false] == true)
+assert(nested_live.helper.calculate(3) == 6 and nested_live.get_max_level() == 100)
+assert(nested_live.removed == nil and old_config.max_level == 50)
+assert(nested_engine:abort(nested_stage.stage).ok)
+assert(package.loaded[nested_name] == nested_live and nested_live.config == old_config)
+assert(nested_live.helper == old_helper and nested_live.removed and nested_live.alias == nil)
+assert(nested_live.get_max_level == nil)
+
+for _, invalid_source in ipairs({
+    "return setmetatable({}, {})",
+    "return {[1] = true}",
+    "return {config = setmetatable({}, {})}",
+    "return {config = {inner = setmetatable({}, {})}}",
+    "return {config = {[{}] = true}}",
+    "return {config = {resource = io.stdout}}",
+    "return {config = {worker = coroutine.create(function() end)}}",
+    "local M = {}; M.config = {deep = {root = M}}; return M",
+    "return {config = 100}",
+}) do
+    local invalid = nested_engine:stage({{name = nested_name, source = invalid_source}})
+    assert(not invalid.ok and not nested_engine.active)
+    assert(package.loaded[nested_name] == nested_live and nested_live.config == old_config)
+    assert(nested_live.helper == old_helper and nested_live.removed)
+end
+local root_reference = nested_engine:stage({{name = nested_name,
+    source = "local M = {}; M.config = {root = M}; return M"}})
+assert(not root_reference.ok and root_reference.message:find("根导出表", 1, true))
+-- 成功 finish 后，下一次 Stage 也能够校验并回滚已经在线的嵌套循环图。
+nested_stage = nested_engine:stage({{name = nested_name, source = nested_source}})
+assert(nested_stage.ok and nested_engine:commit(nested_stage.stage).ok)
+assert(nested_engine:finish(nested_stage.stage).ok)
+local installed_config = nested_live.config
+nested_stage = nested_engine:stage({{name = nested_name, source = "return {config = {max_level = 200}}"}})
+assert(nested_stage.ok and nested_engine:commit(nested_stage.stage).ok)
+assert(nested_live.helper == nil and nested_live.config.max_level == 200)
+assert(nested_engine:abort(nested_stage.stage).ok)
+assert(nested_live.config == installed_config and nested_live.config.self == installed_config)
+assert(nested_live.helper.calculate(3) == 6)
+package.loaded[nested_name] = nil
 print("HOTUPGRADE_FOUNDATION_OK")

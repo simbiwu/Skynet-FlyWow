@@ -59,6 +59,12 @@ local cases =
         return {functions = {load = 12}}
     end]]}},
     extra = {modules = {["hotupgrade_extra.lua"] = "return {value = function() return 2 end}"}},
+    unmatched_module = {modules = {
+        ["test_worker_logic.lua"] = module_v2,
+        ["missing_logic.lua"] = "return {value = 2}",
+    }},
+    unmatched_service = {modules = {["test_worker_logic.lua"] = module_v2},
+        services = {["unused.lua"] = service}},
     invalid = {modules = {["test_worker_logic.lua"] = "return {"}},
     invalid_category = {services = {["unused.lua"] = "return function() return {} end"}},
 }

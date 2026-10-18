@@ -60,6 +60,16 @@ local function run()
     local control = controller()
     local handle = worker(control)
     local before = original(handle)
+    -- 整包匹配失败必须在任何目标控制步骤前返回，线上代码、状态和 Guard 均保持原值。
+    for _, path in ipairs({"unmatched_module", "unmatched_service"}) do
+        for _, command in ipairs({"validate", "dry_run", "apply"}) do
+            local rejected = skynet.call(control, "hotupgrade", command, {path = path})
+            assert(not rejected.ok and rejected.code == "HU_TARGET_MISSING")
+            assert(rejected.txn_id == nil)
+            assert(original(handle).marker_token == before.marker_token)
+        end
+    end
+    print("HOTUPGRADE_SKYNET_PATCH_MATCH_OK")
     assert(skynet.call(handle, "lua", "bump", {}).values[1] == 8)
     local held = false
     skynet.fork(function()

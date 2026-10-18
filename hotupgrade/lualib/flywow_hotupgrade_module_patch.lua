@@ -51,7 +51,7 @@ function M.restore_state(live, fields)
     M.copy_state(fields, live)
 end
 
---- 原地覆盖模块导出字段；函数与标量直接安装，保留导出表身份。
+--- 原地覆盖模块导出字段；各字段引用直接安装，保留导出表身份。
 ---@param live table 已持有的线上表
 ---@param fields table 完整新字段；调用者保证与 live 隔离
 local function replace_exports(live, fields)
@@ -66,10 +66,35 @@ end
 
 local function check_exports(exports, name)
     assert(type(exports) == "table" and getmetatable(exports) == nil, name .. " 必须导出普通表")
-    for key, value in pairs(exports) do
+    local pending = {} -- 待检查的嵌套表；迭代遍历避免深层数据造成递归栈溢出。
+    local seen = {}    -- 每张嵌套表只检查一次，允许共享引用与嵌套表之间的循环。
+    local function check_value(value)
         local kind = type(value)
-        assert(type(key) == "string" and (kind == "function" or kind == "number"
-            or kind == "string" or kind == "boolean"), name .. " 只接受函数字段和标量常量")
+        if kind == "table" then
+            assert(value ~= exports, name .. " 嵌套导出不得引用模块根导出表")
+            assert(getmetatable(value) == nil, name .. " 嵌套导出必须是无元表普通表")
+            if not seen[value] then
+                seen[value] = true
+                pending[#pending + 1] = value
+            end
+        else
+            assert(kind == "function" or kind == "number" or kind == "string" or kind == "boolean",
+                name .. " 导出包含不支持的类型: " .. kind)
+        end
+    end
+
+    for key, value in pairs(exports) do
+        assert(type(key) == "string", name .. " 顶层导出字段名必须是字符串")
+        check_value(value)
+    end
+    while #pending > 0 do
+        local nested = table.remove(pending)
+        for key, value in pairs(nested) do
+            local kind = type(key)
+            assert(kind == "string" or kind == "number" or kind == "boolean",
+                name .. " 嵌套导出键必须是字符串、数字或布尔值")
+            check_value(value)
+        end
     end
     assert((exports.export_state == nil) == (exports.import_state == nil), name .. " 状态钩子须成对")
     if exports.export_state ~= nil then
