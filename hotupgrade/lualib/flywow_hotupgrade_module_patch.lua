@@ -1,158 +1,206 @@
---- 当前 Lua State 内的完整模块替换；只支持无加载副作用、状态由 Service 持有的受信模块。
+--- 本 Lua State 的完整模块更新；保留导出表身份，候选私有状态与旧版本隔离。
 local result = require "flywow_hotupgrade_error"
 local M = {}
 local Engine = {}
 Engine.__index = Engine
 
---- loaded 是本 State 的模块缓存；测试可注入独立缓存，不跨 Service 共享。
----@param options? table 可选 loaded；默认使用 package.loaded。
----@return table 模块更新器；同一时刻只持有一份可撤销更新。
+--- 复制普通数据图；保留图内共享与循环，不复制函数、userdata、线程或带元表对象。
+--- 非普通业务对象必须由所属 Service 的显式快照/恢复函数处理。
+---@param value any 要隔离的数据
+---@param destination? table 内部恢复时指定现存根表；调用前须保存独立旧快照
+---@return any snapshot 独立数据图；不支持的值抛出错误，调用边界负责转换结果。
+function M.copy_state(value, destination)
+    local seen = {} -- 当前复制过程的旧表到新表映射，不保留在线上状态中。
+    local count = 0 -- 限制一次快照的节点/字段数，避免错误状态图耗尽控制阶段资源。
+    local function copy(item, depth)
+        local kind = type(item)
+        if kind ~= "table" then
+            assert(kind == "nil" or kind == "string" or kind == "boolean" or kind == "number",
+                "状态快照只接受普通数据")
+            return item
+        end
+        assert(getmetatable(item) == nil, "状态对象需要显式快照和恢复处理")
+        if seen[item] then
+            return seen[item]
+        end
+        assert(depth <= 64, "状态快照嵌套超过 64 层")
+        local target = {}
+        if depth == 1 and destination then
+            target = destination
+            assert(target ~= item and getmetatable(target) == nil, "快照必须与线上根表隔离")
+            for key in pairs(target) do
+                rawset(target, key, nil)
+            end
+        end
+        seen[item] = target
+        for key, child in pairs(item) do
+            count = count + 1
+            assert(count <= 10000, "状态快照超过 10000 个字段")
+            assert(type(key) == "string" or type(key) == "number" or type(key) == "boolean",
+                "状态字段必须使用标量键")
+            target[key] = copy(child, depth + 1)
+        end
+        return target
+    end
+    return copy(value, 1)
+end
+
+--- 原地恢复普通数据图；根循环重新指向 live，不让候选表取代线上根身份。
+function M.restore_state(live, fields)
+    assert(type(live) == "table" and type(fields) == "table", "状态必须为表")
+    M.copy_state(fields, live)
+end
+
+--- 原地覆盖模块导出字段；函数与标量直接安装，保留导出表身份。
+---@param live table 已持有的线上表
+---@param fields table 完整新字段；调用者保证与 live 隔离
+local function replace_exports(live, fields)
+    assert(type(live) == "table" and getmetatable(live) == nil, "线上表身份或元表发生变化")
+    for key in pairs(live) do
+        rawset(live, key, nil)
+    end
+    for key, value in pairs(fields) do
+        rawset(live, key, value)
+    end
+end
+
+local function check_exports(exports, name)
+    assert(type(exports) == "table" and getmetatable(exports) == nil, name .. " 必须导出普通表")
+    for key, value in pairs(exports) do
+        local kind = type(value)
+        assert(type(key) == "string" and (kind == "function" or kind == "number"
+            or kind == "string" or kind == "boolean"), name .. " 只接受函数字段和标量常量")
+    end
+    assert((exports.export_state == nil) == (exports.import_state == nil), name .. " 状态钩子须成对")
+    if exports.export_state ~= nil then
+        assert(type(exports.export_state) == "function" and type(exports.import_state) == "function",
+            name .. " 状态钩子必须是函数")
+    end
+end
+
+---@param options? table loaded 可注入独立测试缓存；默认使用本 State package.loaded。
 function M.new(options)
-    return setmetatable({
-        loaded = options and options.loaded or package.loaded, -- 本 State 的模块缓存，可由测试注入。
-        active = nil,                                          -- 唯一未结束的 Stage；commit 后仍保留至 finish 或 abort。
+    return setmetatable(
+    {
+        loaded = options and options.loaded or package.loaded, -- 当前 State 的模块缓存。
+        active = nil,                                          -- 保留至 finish/abort 的唯一 Stage。
     }, Engine)
 end
 
---- 加载完整模块文件；不得 yield、执行 I/O、修改线上状态或启动后台任务。
---- 本接口不是不受信代码沙箱，不能撤销违反合同的顶层副作用。
----@param entries table[] 连续数组，每项只有 name 和已固定的 source。
----@return FlyWowHotUpgradeResult 成功包含 stage；失败不安装任何导出。
+--- 编译全部源码后加载候选和迁移模块私有状态；受信顶层及钩子必须同步且无外部副作用。
+---@param entries table[] 含 name/source 的完整模块源码数组
+---@return FlyWowHotUpgradeResult 成功含 stage；失败不安装线上导出。
 function Engine:stage(entries)
     if self.active then
-        return result.failure("HU_UPGRADE_BUSY", "已有未结束的模块更新")
+        return result.failure("HU_UPGRADE_BUSY", "模块 Stage 尚未结束")
     end
-    if type(entries) ~= "table" then
-        return result.failure("HU_INVALID_PATCH", "模块列表必须是连续数组")
-    end
-    for index in pairs(entries) do
-        if math.type(index) ~= "integer" or index < 1 or index > #entries then
-            return result.failure("HU_INVALID_PATCH", "模块列表必须是连续数组")
+    local state = {entries = {}, order = {}, old = {}, committed = false}
+    local ok, message = pcall(function()
+        assert(type(entries) == "table" and #entries <= 1024, "模块列表必须是最多 1024 项的数组")
+        local entry_count = 0
+        for index in pairs(entries) do
+            entry_count = entry_count + 1
+            assert(math.type(index) == "integer" and index >= 1 and index <= #entries, "模块列表有空洞")
         end
-    end
-
-    -- 先检查全部输入并编译，再执行模块；不保留调用方可修改的 entry 对象。
-    local state = {entries = {}, old = {}, committed = false}
-    for index = 1, #entries do
-        local entry = entries[index]
-        if type(entry) ~= "table" or type(entry.name) ~= "string" or entry.name == ""
-            or type(entry.source) ~= "string" or state.entries[entry.name] then
-            return result.failure("HU_INVALID_PATCH", "模块名、源码无效或模块重复")
-        end
-        local live = self.loaded[entry.name]
-        if type(live) ~= "table" or getmetatable(live) ~= nil then
-            return result.failure("HU_MODULE_NOT_REGISTERED", entry.name)
-        end
-
-        -- 旧模块同样必须符合无内存状态的导出合同，不能静默删除旧模块持有的业务表。
-        for key, value in pairs(live) do
-            local kind = type(value)
-            if type(key) ~= "string" or (kind ~= "function" and kind ~= "number"
-                and kind ~= "string" and kind ~= "boolean") then
-                return result.failure("HU_MODULE_CONTRACT", entry.name .. " 的旧导出包含状态或不支持的值")
+        assert(entry_count == #entries, "模块列表有空洞")
+        for _, item in ipairs(entries) do
+            assert(type(item) == "table" and type(item.name) == "string" and item.name ~= "" and type(item.source) == "string",
+                "模块名和源码无效")
+            assert(not state.entries[item.name], "模块重复")
+            local live = self.loaded[item.name]
+            check_exports(live, item.name)
+            local fields = {}
+            for key, value in pairs(live) do
+                fields[key] = value
             end
+            -- 只引用已加载依赖；不执行新的依赖加载链，不代表提供安全沙箱。
+            local env = setmetatable({require = function(name)
+                local dependency = self.loaded[name]
+                assert(type(dependency) == "table", "依赖尚未加载: " .. tostring(name))
+                return dependency
+            end}, {__index = _G})
+            local chunk = assert(load(item.source, "@" .. item.name, "t", env))
+            state.entries[item.name] = {live = live, chunk = chunk}
+            state.order[#state.order + 1] = item.name
+            state.old[item.name] = fields
         end
-
-        -- require 只返回已加载的普通模块表；不启动新的加载链。
-        -- 顶层只能取得依赖引用，不能调用依赖或修改它；这是受信模块的接入合同。
-        local env = setmetatable({require = function(name)
-            local dependency = self.loaded[name]
-            assert(type(dependency) == "table" and getmetatable(dependency) == nil,
-                "dependency must already be loaded: " .. tostring(name))
-            return dependency
-        end}, {__index = _G})
-        local chunk, message = load(entry.source, "@" .. entry.name, "t", env)
-        if not chunk then
-            return result.failure("HU_MODULE_SYNTAX", message)
-        end
-        state.entries[entry.name] = {live = live, chunk = chunk}
-    end
-
-    for name, entry in pairs(state.entries) do
-        local ok, candidate = pcall(entry.chunk)
-        if not ok then
-            return result.failure("HU_MODULE_LOAD_FAILED", tostring(candidate))
-        end
-        if type(candidate) ~= "table" or getmetatable(candidate) ~= nil or candidate == entry.live then
-            return result.failure("HU_MODULE_CONTRACT", name .. " 必须返回新的普通导出表")
-        end
-        for key, value in pairs(candidate) do
-            local kind = type(value)
-            if type(key) ~= "string" or (kind ~= "function" and kind ~= "number"
-                and kind ~= "string" and kind ~= "boolean") then
-                return result.failure("HU_MODULE_CONTRACT", name .. " 只允许字符串键及函数或标量导出")
+        for _, name in ipairs(state.order) do
+            local entry = state.entries[name]
+            local candidate = entry.chunk()
+            check_exports(candidate, name)
+            assert(candidate ~= entry.live, "候选须返回新的导出表")
+            for key, value in pairs(candidate) do
+                assert(entry.live[key] == nil or type(entry.live[key]) == type(value), "导出字段类型变化")
             end
-            if entry.live[key] ~= nil and type(entry.live[key]) ~= kind then
-                return result.failure("HU_MODULE_CONTRACT", name .. "." .. key .. " 导出类型变化")
+            assert((entry.live.export_state == nil) == (candidate.import_state == nil),
+                "新旧模块缺少配对状态钩子")
+            if entry.live.export_state then
+                -- 新版只能接触独立数据；旧闭包仍持有自己的状态，Abort 恢复旧导出即可。
+                local snapshot = M.copy_state(entry.live.export_state())
+                assert(candidate.import_state(snapshot) ~= false, "模块拒绝状态导入")
             end
+            entry.candidate = candidate
+            entry.chunk = nil
         end
-        entry.candidate, entry.chunk = candidate, nil
+    end)
+    if not ok then
+        return result.failure("HU_MODULE_STAGE_FAILED", tostring(message))
     end
     self.active = state
     return result.success({stage = state})
 end
 
---- 持有 Guard 且已排空时调用；安装与可选检查必须同步、无业务状态写入。
----@param state table 本更新器返回的 Stage。
----@param postcheck? function 现有控制面使用的受信检查；false/错误恢复旧导出。
----@return FlyWowHotUpgradeResult 完整安装或恢复旧字段；不会恢复任意外部副作用。
-function Engine:commit(state, postcheck)
+--- Guard 已排空后同步安装；旧导出保留至 finish，供组合 Service 提交失败时恢复。
+function Engine:commit(state)
     if self.active ~= state or state.committed then
-        return result.failure("HU_PHASE_INVALID", "Stage 不属于当前更新或已安装")
+        return result.failure("HU_PHASE_INVALID", "模块 Stage 无效或已提交")
     end
-
-    -- 先保存所有旧字段，再以 raw 操作安装，避免导出表元方法介入。
-    for name, entry in pairs(state.entries) do
-        local fields = {}
-        for key, value in pairs(entry.live) do fields[key] = value end
-        state.old[name] = fields
-    end
-    for _, entry in pairs(state.entries) do
-        for key in pairs(entry.live) do rawset(entry.live, key, nil) end
-        for key, value in pairs(entry.candidate) do rawset(entry.live, key, value) end
-    end
-    state.committed = true
-
-    if postcheck then
-        local ok, verdict = pcall(postcheck)
-        if not ok or verdict == false or (type(verdict) == "table" and verdict.ok == false) then
-            local restored = self:abort(state)
-            if not restored.ok then return restored end
-            return result.failure("HU_MODULE_COMMIT_FAILED", ok and "postcheck rejected" or tostring(verdict))
+    local ok, message = pcall(function()
+        for _, name in ipairs(state.order) do
+            local entry = state.entries[name]
+            assert(self.loaded[name] == entry.live and getmetatable(entry.live) == nil,
+                "模块身份在 Stage 后改变")
         end
-    end
-    return result.success()
+        state.committed = true
+        for _, name in ipairs(state.order) do
+            local entry = state.entries[name]
+            replace_exports(entry.live, entry.candidate)
+        end
+    end)
+    return ok and result.success() or result.failure("HU_MODULE_COMMIT_FAILED", tostring(message))
 end
 
---- 恢复原导出表字段；不替换表、不迁移闭包或业务状态。
----@param state table 当前更新的 Stage；未安装时只丢弃候选。
----@return FlyWowHotUpgradeResult 恢复完成后可释放安全点；失败必须保持暂停。
+--- 尽量恢复所有旧表；任一身份变化均报告故障并保留 Stage，以便人工核对。
 function Engine:abort(state)
     if self.active ~= state then
-        if state.aborted then return result.success() end
-        return result.failure("HU_PHASE_INVALID", "Stage 不属于当前更新")
+        return result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
     end
-    for name, fields in pairs(state.old) do
-        local live = state.entries[name].live
-        if self.loaded[name] ~= live or getmetatable(live) ~= nil then
-            return result.failure("HU_RECOVERY_REQUIRED", "模块表在更新期间被替换: " .. name)
+    local errors = {}
+    for _, name in ipairs(state.order) do
+        local entry = state.entries[name]
+        local ok, message = pcall(function()
+            assert(self.loaded[name] == entry.live and getmetatable(entry.live) == nil,
+                "模块缓存身份或元表变化: " .. name)
+            if state.committed then
+                replace_exports(entry.live, state.old[name])
+            end
+        end)
+        if not ok then
+            errors[#errors + 1] = tostring(message)
         end
-        for key in pairs(live) do rawset(live, key, nil) end
-        for key, value in pairs(fields) do rawset(live, key, value) end
     end
-    state.committed, state.aborted = false, true
-    self:finish(state)
-    return result.success()
+    if #errors > 0 then
+        return result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
+    end
+    return self:finish(state)
 end
 
---- 成功发布后释放候选和旧字段；已 finish 的更新不能再撤销。
----@param state table 当前更新的 Stage。
----@return FlyWowHotUpgradeResult 释放结果。
 function Engine:finish(state)
     if self.active ~= state then
-        return result.failure("HU_PHASE_INVALID", "Stage 不属于当前更新")
+        return result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
     end
-    state.entries, state.old, state.closed = {}, {}, true
+    state.entries = {}
+    state.old = {}
     self.active = nil
     return result.success()
 end

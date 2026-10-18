@@ -1,10 +1,10 @@
---- 热更控制 Service；宿主配置通过 Lua init 请求交付。
+--- 唯一控制 Service；宿主通过一次性 lua/init 交付配置。
 local skynet = require "skynet"
 local controller_module = require "flywow_hotupgrade_controller"
-local protocol = require "flywow_hotupgrade_protocol"
 local result = require "flywow_hotupgrade_error"
+local controller -- init 成功后持有；失败允许宿主修正配置后重试。
 
-local controller -- Controller.new 成功后由本 Service 持有；未成功打开时保持 nil。
+skynet.register_protocol({name = "hotupgrade", id = 20, pack = skynet.pack, unpack = skynet.unpack})
 
 skynet.start(function()
     skynet.dispatch("lua", function(session, _source, command, options)
@@ -12,22 +12,30 @@ skynet.start(function()
         if command ~= "init" then
             answer = result.failure("HU_UNKNOWN_COMMAND", tostring(command))
         elseif controller then
-            answer = result.failure("HU_ALREADY_INITIALIZED", "控制 Service 已初始化")
-        elseif type(options) ~= "table" then
-            answer = result.failure("HU_INVALID_OPTIONS", "init 需要配置 table")
+            answer = result.failure("HU_ALREADY_INITIALIZED", "控制面已初始化")
         else
             local opened = controller_module.new(options)
-            if not opened.ok then
-                answer = opened
-            else
+            answer = opened
+            if opened.ok then
                 controller = opened.controller
-                protocol.install_handler(function(command, request, source)
-                    return controller:control(command, request, source)
-                end)
                 answer = result.success()
             end
         end
-
+        if session ~= 0 then
+            skynet.retpack(answer)
+        end
+    end)
+    skynet.dispatch("hotupgrade", function(session, source, command, request)
+        local answer
+        if not controller then
+            answer = result.failure("HU_NOT_INITIALIZED", "宿主尚未完成 init")
+        else
+            local ok
+            ok, answer = pcall(controller.control, controller, command, request, source)
+            if not ok then
+                answer = result.failure("HU_CONTROL_FAILED", tostring(answer))
+            end
+        end
         if session ~= 0 then
             skynet.retpack(answer)
         end

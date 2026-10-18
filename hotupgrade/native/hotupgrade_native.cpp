@@ -1,4 +1,4 @@
-// 职责：提供 HotUpgrade 的路径校验、补丁枚举和审计追加能力。
+// 职责：提供 HotUpgrade 的路径校验和补丁枚举能力。
 // 边界：只处理本模块的同步文件操作；Lua 参数、结果和错误统一由 lua_binding
 // 管理。
 #define _XOPEN_SOURCE 700
@@ -9,14 +9,13 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
-#include <exception>
 #include <dirent.h>
-#include <fcntl.h>
+#include <exception>
 #include <memory>
 #include <string>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -66,47 +65,15 @@ bool resolvePath(const std::string &path, std::string &output)
     return true;
 }
 
-// 文件 fsync 只保证文件内容；再 fsync 父目录，持久化新建文件的目录项。
-// 返回 0 表示父目录同步成功；负值表示路径解析、open、fsync 或 close 失败。
-int syncParent(const std::string &path)
-{
-    if (path.size() >= PATH_MAX)
-    {
-        return -1;
-    }
-    char parent[PATH_MAX];
-    std::memcpy(parent, path.c_str(), path.size() + 1);
-    char *slash = std::strrchr(parent, '/');
-    if (slash == parent)
-    {
-        parent[1] = 0;
-    }
-    else if (slash != nullptr)
-    {
-        *slash = 0;
-    }
-    else
-    {
-        std::memcpy(parent, ".", 2);
-    }
-    const int descriptor = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (descriptor < 0)
-    {
-        return -1;
-    }
-    const int synced = fsync(descriptor);
-    const int closed = close(descriptor);
-    return synced == 0 && closed == 0 ? 0 : -1;
-}
-
 // 递归枚举受信任根目录内的普通 Lua 文件；拒绝符号链接/特殊文件，并累计资源上限。
 // 返回 0 成功，-1 路径/文件结构无效，-2 超出文件数或字节预算。
 int scanDirectory(const std::string &root, const std::string &directory,
                   const std::string &relative, FileList &files)
 {
     // DIR 归当前递归层所有；字符串/vector 分配异常也必须关闭，不泄漏祖先层的目录 fd。
-    const std::unique_ptr<DIR, int (*)(DIR *)> directory_handle(opendir(directory.c_str()), closedir);
-    DIR *handle = directory_handle.get();
+    const std::unique_ptr<DIR, int (*)(DIR *)> directory_handle(opendir(directory.c_str()),
+                                                                closedir);
+    DIR                                       *handle = directory_handle.get();
     if (handle == nullptr)
     {
         return -1;
@@ -114,7 +81,7 @@ int scanDirectory(const std::string &root, const std::string &directory,
     int status = 0;
     while (true)
     {
-        errno = 0;
+        errno         = 0;
         dirent *entry = readdir(handle);
         if (entry == nullptr)
         {
@@ -242,41 +209,6 @@ int listLuaFiles(const std::string &root_argument, const std::string &relative,
     return 0;
 }
 
-// 以仅追加、禁止跟随符号链接的方式写审计记录；文件和父目录都同步后才报告成功。
-bool appendSynchronized(const std::string &path, const std::string &bytes)
-{
-    if (path.empty() || path.size() >= PATH_MAX || path.find('\0') != std::string::npos)
-    {
-        return false;
-    }
-    const int descriptor =
-        open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (descriptor < 0)
-    {
-        return false;
-    }
-    std::size_t written = 0;
-    while (written < bytes.size())
-    {
-        const ssize_t count = write(descriptor, bytes.data() + written, bytes.size() - written);
-        if (count < 0 && errno == EINTR)
-        {
-            continue;
-        }
-        if (count <= 0)
-        {
-            close(descriptor);
-            return false;
-        }
-        written += static_cast<std::size_t>(count);
-    }
-
-    // 先同步内容再关闭文件，最后由 syncParent 同步目录项；三步任一步失败都返回 false。
-    const int synced = fsync(descriptor);
-    const int closed = close(descriptor);
-    return synced == 0 && closed == 0 && syncParent(path) == 0;
-}
-
 // 参数 1 是必须已存在的路径。成功返回规范化绝对路径；失败返回 nil/error。
 int resolve(lua_State *state)
 {
@@ -360,37 +292,6 @@ int list_lua(lua_State *state)
     }
 }
 
-// 参数依次为审计文件路径和完整记录字节。只有文件及父目录同步成功才返回 true；
-// 任何写入或同步失败均通过 nil/error 交付，不吞掉持久化失败。
-int append_sync(lua_State *state)
-{
-    try
-    {
-        // 参数保留在原栈槽；成功追加 boolean，失败追加 nil/error 并返回两个值。
-        LuaBinding  binding(state);
-        std::string path;
-        std::string bytes;
-        if (!binding.readValue(1, path) || !binding.readValue(2, bytes))
-        {
-            return binding.pushError();
-        }
-        if (!appendSynchronized(path, bytes))
-        {
-            return binding.pushError(path.empty() ? "HU_INVALID_PATH" : "HU_HISTORY_WRITE_FAILED",
-                                     "history append or synchronization failed");
-        }
-        return binding.returnValues(true);
-    }
-    catch (const std::exception &)
-    {
-        return pushNativeException(state);
-    }
-    catch (...)
-    {
-        return pushNativeException(state);
-    }
-}
-
 } // namespace
 
 // 模块加载入口只创建并返回公开函数表。LuaTable 封装在局部作用域恢复临时栈项；
@@ -404,8 +305,7 @@ extern "C" int luaopen_flywow_hotupgrade_native(lua_State *state)
         LuaBinding binding(state);
         LuaTable   module = binding.newTable();
         if (!module.valid() || !module.setFunction("resolve", resolve) ||
-            !module.setFunction("list_lua", list_lua) ||
-            !module.setFunction("append_sync", append_sync))
+            !module.setFunction("list_lua", list_lua))
         {
             return binding.pushError();
         }

@@ -1,4 +1,4 @@
-# 职责：构建 HotUpgrade Native Binding；它只提供 Patch 路径校验、文件枚举和审计同步，不替换业务 Native。
+# 职责：构建 HotUpgrade Native Binding；它只提供 Patch 路径校验和文件枚举，不替换业务 Native。
 # 调用方式：统一脚本通过 -D 传入 SKYNET_ROOT 与 FLYWOW_NATIVE_OUTPUT_DIR，通常无需手工调用。
 # CMake 变量：${NAME} 不是系统环境变量；SKYNET_ROOT 和 FLYWOW_NATIVE_OUTPUT_DIR 由统一脚本通过 -D 传入。
 # 修改指引：新增编译文件放进 add_library 源文件列表；新依赖配套 find_package 与 target_link_libraries。

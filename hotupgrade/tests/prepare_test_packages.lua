@@ -1,97 +1,75 @@
---- 测试夹具生成器：只写 build/hotupgrade-tests 下的 Patch 文件目录。
+--- 只创建测试脚本专用目录内的受信 Patch，不触碰宿主部署目录。
 local root = "build/hotupgrade-tests/patches/"
-local factory_file = assert(io.open("hotupgrade/tests/test_worker_factory.lua", "rb"))
-local factory = assert(factory_file:read("*a"))
-assert(factory_file:close())
--- 生成源码保持正常 Lua 排版，便于夹具变更时直接审阅。
-local logic = [[
+local module_v2 = [[
+local count = 0
 local M = {}
-
-function M.value()
-    return 2
+function M.value() return 2 end
+function M.bump()
+    count = count + 1
+    return count
 end
-
-function M.added()
+function M.export_state() return {count = count} end
+function M.import_state(state)
+    count = state.count
     return true
 end
-
-function M.initial_count()
-    return 42
-end
-
+M.added = true
 return M
 ]]
-local reverse_logic = [[
-return
-{
-    value = function()
-        return 1
-    end,
-}
+local service = [[
+return function(state)
+    return {
+        migrate = function(old)
+            assert(old.schema_version == 1)
+            old.equip = "剑"
+            old.schema_version = 2
+            return old
+        end,
+        functions = {
+            load = function(item)
+                return item.base_attack + (state.equip == "剑" and 20 or 0)
+            end,
+        },
+    }
+end
 ]]
-
-local function write(path, bytes)
-    local file = assert(io.open(path, "wb"))
-    assert(file:write(bytes))
-    assert(file:close())
-end
-
-local function package(name, service_type, entry_source, reverse, include_module, additional_service_types)
-    local candidate_factory = entry_source or factory
-    local module_source = reverse and reverse_logic or logic
-
-    if include_module ~= false then
-        write(root .. name .. "/modules/test_worker_logic.lua", module_source)
+local cases =
+{
+    module = {modules = {["test_worker_logic.lua"] = module_v2}},
+    combined = {modules = {["test_worker_logic.lua"] = module_v2}, services = {["player.lua"] = service}},
+    service = {services = {["player.lua"] = service}},
+    stage_failure = {services = {["player.lua"] = [[return function(state)
+        return {migrate = function(old)
+            old.equip = "坏"
+            old.nested.count = 99
+            error("migration rejected")
+        end}
+    end]]}},
+    functions = {services = {["player.lua"] = [[return function(state)
+        return {functions = {load = function(item)
+            return item.base_attack + (state.equip == "剑" and 20 or 0)
+        end}}
+    end]]}},
+    state_only = {services = {["player.lua"] = [[return function()
+        return {migrate = function(old)
+            return {equip = "剑", level = old.level, schema_version = 2}
+        end}
+    end]]}},
+    bad_functions = {services = {["player.lua"] = [[return function()
+        return {functions = {load = 12}}
+    end]]}},
+    extra = {modules = {["hotupgrade_extra.lua"] = "return {value = function() return 2 end}"}},
+    invalid = {modules = {["test_worker_logic.lua"] = "return {"}},
+    invalid_category = {services = {["unused.lua"] = "return function() return {} end"}},
+}
+for name, categories in pairs(cases) do
+    for category, entries in pairs(categories) do
+        assert(os.execute("mkdir -p " .. root .. name .. "/" .. category))
+        for file, source in pairs(entries) do
+            local output = assert(io.open(root .. name .. "/" .. category .. "/" .. file, "wb"))
+            assert(output:write(source))
+            assert(output:close())
+        end
     end
-    if service_type then
-        write(root .. name .. "/services/" .. service_type .. ".lua", candidate_factory)
-    end
-    for _, additional_type in ipairs(additional_service_types or {}) do
-        write(root .. name .. "/services/" .. additional_type .. ".lua", candidate_factory)
-    end
 end
-
-package("module")
-package("replace", "worker")
-package("rollback", "worker", nil, true)
-package("dry")
-package("failed_candidate", "worker", [[
-return function()
-    error("candidate start failure")
-end
-]])
-package("busy_candidate", "worker", [[
-return function()
-    while true do
-    end
-end
-]])
-package("missing_import", "worker_missing_import", nil, false, false)
-package("export_failure", "worker_export_failure", nil, false, false)
-package("import_failure", "worker_import_failure", nil, false, false)
-package("rebuild", "worker_rebuild", nil, false, false)
-package("partial", "worker_partial_a", nil, false, false, {"worker_partial_z"})
--- 在已注册但尚未完成 factory 的位置注入错误/等待，不能只测注册前失败。
-local registered_failure, failure_replacements = factory:gsub("    start_timer%(%)",
-    '    error("registered candidate failure")', 1)
-assert(failure_replacements == 1)
-local registered_waiting, waiting_replacements = factory:gsub("    start_timer%(%)",
-    "    skynet.sleep(2000)\n    start_timer()", 1)
-assert(waiting_replacements == 1)
-package("registered_failure", "worker", registered_failure)
-package("registered_waiting", "worker", registered_waiting)
-package("waiting", "worker", [[
-return function()
-    require "skynet".sleep(2000)
-end
-]])
-package("health", "worker_health")
-package("frozen", "worker_frozen")
-write(root .. "frozen/modules/test_candidate_only.lua", [[
-local logic = require "test_worker_logic"
-return {increment = function() return logic.value() - 1 end}
-]])
-write(root .. "frozen/modules/test_unused_candidate.lua", [[
-error("unrelated frozen module must not execute")
-]])
-print("HOTUPGRADE_TEST_PACKAGES_OK")
+print("HOTUPGRADE_PACKAGES_OK")
