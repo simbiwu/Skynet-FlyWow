@@ -1,156 +1,127 @@
---- 稳定路由 owner 的有界入口；队列属于 owner，替换目标时不迁移调用方 coroutine。
+--- origin_service_handle 到当前 Service 实例的稳定路由表；暂停期间拒绝新请求，不缓存业务 payload。
 local result = require "flywow_hotupgrade_error"
-local snapshot = require "flywow_hotupgrade_snapshot"
+local skynet = require "skynet"
 local M = {}
 local Router = {}
 Router.__index = Router
 
----@param options table deliver(record,command,payload)/fork(fn)/now()/max_queue/max_bytes
----@return table 路由 owner 独占
-function M.new(options)
-    return setmetatable({options = options, routes = {}, queue_count = 0, queue_bytes = 0}, Router)
+---@return table 由 Router Service 单独持有的路由表。
+function M.new()
+    return setmetatable(
+    {
+        -- Router Service 独占；每项保存当前目标、暂停 owner 和 Router 侧在途计数。
+        routes = {},
+    }, Router)
 end
 
----@param key string 逻辑身份
----@param record table 地址、代际及版本
----@return flywow_hotupgrade_result
-function Router:bind(key, record)
-    if self.routes[key] then
-        return result.failure("HU_ROUTE_EXISTS", key)
+---@param origin_service_handle integer 初代 Service handle 的稳定路由键，不是当前 RPC 目标。
+---@param record table 当前或候选实例记录。
+---@return FlyWowHotUpgradeResult
+function Router:bind(origin_service_handle, record)
+    local route = self.routes[origin_service_handle]
+    if route and route.record.instance_handle ~= record.instance_handle then
+        return result.failure("HU_ROUTE_CONFLICT", origin_service_handle)
     end
-    self.routes[key] = {current = record, queue = {}, active = 0}
+
+    -- Router Service 持有到 RPC 返回前的计数，pause 用它排空已转发但尚未返回的调用。
+    self.routes[origin_service_handle] =
+    {
+        record = record, -- 当前转发目标；切换时整体替换此字段。
+        paused = false,  -- true 时拒绝新业务请求。
+        txn_id = nil,    -- 暂停状态 owner；resume/abort 必须匹配。
+        active = 0,      -- 已接纳且尚未收到目标 RPC 返回的请求数。
+    }
+
     return result.success()
 end
 
----@param key string 逻辑身份
----@return flywow_hotupgrade_result
-function Router:query(key)
-    local route = self.routes[key]
-    if not route then
-        return result.failure("HU_TARGET_MISSING", key)
+---@param origin_service_handle integer 初代 Service handle 的稳定路由键，不是当前 RPC 目标。
+---@param txn_id string 当前控制事务身份。
+---@return FlyWowHotUpgradeResult 暂停后不接收新请求。
+function Router:pause(origin_service_handle, txn_id)
+    local route = self.routes[origin_service_handle]
+    if not route or (route.paused and route.txn_id ~= txn_id) then
+        return result.failure("HU_ROUTE_BUSY", origin_service_handle)
     end
-    return result.success({record = route.current, paused = route.owner ~= nil})
-end
 
----@param key string 逻辑身份
----@param txn_id string 暂停 owner
----@return flywow_hotupgrade_result
-function Router:pause(key, txn_id)
-    local route = self.routes[key]
-    if not route then
-        return result.failure("HU_TARGET_MISSING", key)
-    end
-    if route.owner and route.owner ~= txn_id then
-        return result.failure("HU_UPGRADE_BUSY", key)
-    end
-    route.owner = txn_id
-    route.saved = route.saved or route.current
+    route.paused, route.txn_id = true, txn_id
+
     return result.success()
 end
 
----@param key string 逻辑身份
----@param txn_id string owner
----@param expected integer 旧代际
----@param record table 新目标
----@return flywow_hotupgrade_result
-function Router:switch(key, txn_id, expected, record)
-    local route = self.routes[key]
-    if not route or route.owner ~= txn_id or route.current.generation ~= expected then
-        return result.failure("HU_ROUTE_SWITCH_FAILED", key)
+---@param origin_service_handle integer 初代 Service handle 的稳定路由键，不是当前 RPC 目标。
+---@param txn_id string 当前控制事务身份。
+---@param expected integer 预期旧实例的 instance_handle。
+---@param record table 已完成初始化和健康检查的候选实例。
+---@return FlyWowHotUpgradeResult 以旧实例身份比较结果切换当前实例。
+function Router:switch(origin_service_handle, txn_id, expected, record)
+    local route = self.routes[origin_service_handle]
+    if not route or not route.paused or route.txn_id ~= txn_id
+        or route.record.instance_handle ~= expected or record.instance_handle == expected then
+        return result.failure("HU_ROUTE_SWITCH_FAILED", origin_service_handle)
     end
-    route.current = record
+
+    route.record = record
+
     return result.success()
 end
 
--- 暂停期间先复制并计量请求；容量检查通过后才接受队列所有权。
-local function queued(router, route, command, payload, reply)
-    local cloned = snapshot.clone(payload)
-    if not cloned.ok then
-        return cloned
+---@param origin_service_handle integer 初代 Service handle 的稳定路由键，不是当前 RPC 目标。
+---@param txn_id string 当前控制事务身份。
+---@return FlyWowHotUpgradeResult 恢复该 origin_service_handle 对应请求的转发。
+function Router:resume(origin_service_handle, txn_id)
+    local route = self.routes[origin_service_handle]
+    if not route or not route.paused or route.txn_id ~= txn_id then
+        return result.failure("HU_ROUTE_RESUME_FAILED", origin_service_handle)
     end
-    local maximum = router.options.max_queue or 256
-    local byte_limit = router.options.max_bytes or 1024 * 1024
-    if router.queue_count >= maximum or router.queue_bytes + cloned.bytes > byte_limit then
-        return result.failure("HU_QUEUE_OVERFLOW", "入口队列超限")
-    end
-    route.queue[#route.queue + 1] = {command = command, payload = cloned.value,
-        reply = reply, bytes = cloned.bytes, admitted = router.options.now()}
-    router.queue_count = router.queue_count + 1
-    router.queue_bytes = router.queue_bytes + cloned.bytes
-    return result.success({queued = true})
+
+    route.paused, route.txn_id = false, nil
+
+    return result.success()
 end
 
---- reply 属于稳定 owner，恰好回应一次；暂停时可 queue 或明确 reject。
----@param key string 逻辑目标
----@param command string 宿主命令
----@param payload any 可序列化 record
----@param reply function 结果回调，由 owner 持有
----@param policy? string queue/reject
----@return flywow_hotupgrade_result
-function Router:submit(key, command, payload, reply, policy)
-    local route = self.routes[key]
+---@param origin_service_handle integer 初代 Service handle 的稳定路由键，不是当前 RPC 目标。
+---@param txn_id string 当前控制事务身份。
+---@return FlyWowHotUpgradeResult 取消未提交切换并恢复原路由。
+function Router:abort(origin_service_handle, txn_id)
+    local route = self.routes[origin_service_handle]
+    if not route or not route.paused or route.txn_id ~= txn_id then
+        return result.failure("HU_ROUTE_ABORT_FAILED", origin_service_handle)
+    end
+
+    route.paused, route.txn_id = false, nil
+
+    return result.success()
+end
+
+---@param origin_service_handle integer 初代 Service handle 的稳定路由键，不是当前 RPC 目标。
+---@param command string 业务命令。
+---@param payload any 业务 record。
+---@param source integer Router 调用方；保留为诊断字段。
+---@return FlyWowHotUpgradeResult 目标忙、失效或目标 Service 返回的业务结果。
+function Router:request(origin_service_handle, command, payload, source)
+    local route = self.routes[origin_service_handle]
     if not route then
-        return result.failure("HU_TARGET_MISSING", key)
+        return result.failure("HU_TARGET_MISSING", origin_service_handle)
     end
-    if route.owner or route.draining then
-        if policy ~= "queue" then
-            return result.failure("HU_UPGRADING", key)
-        end
-        return queued(self, route, command, payload, reply)
+    if route.paused then
+        return result.failure("HU_ROUTE_PAUSED", origin_service_handle)
     end
+
+    -- 内层转发不设本地超时，否则远端仍执行时会提前递减计数并误报排空。
     route.active = route.active + 1
-    local record = route.current
-    self.options.fork(function()
-        local ok, answer = pcall(self.options.deliver, record, command, payload)
-        route.active = route.active - 1
-        reply(ok and answer or result.failure("HU_DELIVERY_FAILED", tostring(answer)))
-    end)
-    return result.success()
-end
-
---- 按接收顺序排空已接受请求；过期项返回超时，投递项仍使用当前路由代。
----@param route table 单个逻辑目标的当前代、队列与在途状态。
-function Router:flush(route)
-    while not route.owner and #route.queue > 0 do
-        local item = table.remove(route.queue, 1)
-        self.queue_count = self.queue_count - 1
-        self.queue_bytes = self.queue_bytes - item.bytes
-        if self.options.now() - item.admitted > (self.options.queue_timeout_ms or 10000) then
-            item.reply(result.failure("HU_QUEUE_TIMEOUT", "排队请求已过期"))
-        else
-            route.active = route.active + 1
-            local ok, answer = pcall(self.options.deliver, route.current, item.command, item.payload)
-            route.active = route.active - 1
-            item.reply(ok and answer or result.failure("HU_DELIVERY_FAILED", tostring(answer)))
-        end
+    local ok, called = pcall(skynet.call, route.record.instance_handle, "hotupgrade", "invoke",
+        {instance_handle = route.record.instance_handle,
+            command = command, payload = payload})
+    route.active = route.active - 1
+    if not ok then
+        return result.failure("HU_RPC_FAILED", tostring(called))
     end
-    route.draining = false
-end
-
----@param key string 逻辑目标
----@param txn_id string owner
----@return flywow_hotupgrade_result
-function Router:resume(key, txn_id)
-    local route = self.routes[key]
-    if not route or route.owner ~= txn_id then
-        return result.failure("HU_STALE_TRANSACTION", key)
+    if not called.ok then
+        called.source = source
     end
-    route.owner, route.saved = nil, nil
-    route.draining = true
-    self.options.fork(function() self:flush(route) end)
-    return result.success()
-end
 
----@param key string 逻辑目标
----@param txn_id string owner
----@return flywow_hotupgrade_result
-function Router:abort(key, txn_id)
-    local route = self.routes[key]
-    if not route or route.owner ~= txn_id then
-        return result.failure("HU_STALE_TRANSACTION", key)
-    end
-    route.current = route.saved
-    return self:resume(key, txn_id)
+    return called
 end
 
 return M

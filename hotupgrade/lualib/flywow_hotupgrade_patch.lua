@@ -1,8 +1,15 @@
 --- 从 Patch Root 扫描、校验并冻结 Lua 模块文件；不执行 Patch 顶层代码。
 local native = require "flywow_hotupgrade_native"
-local native_error = require "flywow_hotupgrade_native_error"
 local result = require "flywow_hotupgrade_error"
 local M = {}
+
+-- Native 以第二返回值携带稳定 HU_ 错误；兼容历史上的裸字符串错误值。
+local function native_code(value)
+    if type(value) == "table" then
+        return value.code or "HU_NATIVE_ERROR"
+    end
+    return value or "HU_NATIVE_ERROR"
+end
 
 -- 与 Native 扫描器上限保持一致：单文件 2 MiB、一次 Patch 累计 16 MiB。
 local MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -33,15 +40,15 @@ local function module_name(path)
     return path:sub(1, -5):gsub("/", ".")
 end
 
--- 扫描一个白名单分类，校验语法并把源码纳入同一 Patch 字节预算与身份摘要。
-local function load_category(root, patch_path, category, frozen, budget)
+-- 扫描一个白名单分类，校验语法并把源码纳入同一 Patch 字节预算。
+local function load_category(root, patch_path, category, identity, budget)
     local paths, code = native.list_lua(root, patch_path, category)
-    code = native_error.code(code)
+    code = native_code(code)
     if not paths and code == "HU_PATCH_EMPTY" then
         return result.success({entries = {}})
     end
     if not paths then
-        return result.failure(native_error.code(code), "Patch 目录扫描失败: " .. category)
+        return result.failure(native_code(code), "Patch 目录扫描失败: " .. category)
     end
     table.sort(paths)
 
@@ -50,7 +57,7 @@ local function load_category(root, patch_path, category, frozen, budget)
         local absolute = root .. "/" .. patch_path .. "/" .. category .. "/" .. relative
         local located, locate_error = native.resolve(absolute)
         if not located then
-            return result.failure(native_error.code(locate_error), relative)
+            return result.failure(native_code(locate_error), relative)
         end
         local loaded = read(located)
         if not loaded.ok then
@@ -65,18 +72,17 @@ local function load_category(root, patch_path, category, frozen, budget)
             return result.failure("HU_MODULE_SYNTAX", syntax_error)
         end
         entries[#entries + 1] = {file = relative, source = loaded.bytes}
-        frozen[#frozen + 1] = category .. "/" .. relative .. "\0" .. loaded.bytes
+        identity[#identity + 1] = category .. "/" .. relative
     end
     return result.success({entries = entries})
 end
 
--- 汇总所有分类并建立确定排序的冻结 Patch record；不执行 Patch 源码。
+-- 汇总模块与 Service 文件；Patch 身份仅由路径和文件名组成。
 local function build_patch(root, patch_path)
-    -- frozen 用于稳定计算 Patch 身份；budget 在所有分类间累计，不在每类重新归零。
-    local frozen, budget = {}, {bytes = 0}
+    local identity, budget = {}, {bytes = 0}
     local loaded = {}
-    for _, category in ipairs({"modules", "services", "migrations", "configs"}) do
-        loaded[category] = load_category(root, patch_path, category, frozen, budget)
+    for _, category in ipairs({"modules", "services"}) do
+        loaded[category] = load_category(root, patch_path, category, identity, budget)
         if not loaded[category].ok then
             return loaded[category]
         end
@@ -88,7 +94,7 @@ local function build_patch(root, patch_path)
         if not name or name == "" or modules[name] then
             return result.failure("HU_INVALID_PATCH", "Lua 模块路径重复或无效: " .. entry.file)
         end
-        modules[name] = {name = name, source = entry.source, replace_all_values = true}
+        modules[name] = {name = name, source = entry.source}
     end
 
     local services = {}
@@ -97,77 +103,42 @@ local function build_patch(root, patch_path)
         if not name or services[name] then
             return result.failure("HU_INVALID_PATCH", "Service 文件名须为 <service_type>.lua")
         end
-        services[name] = {service_type = name, entry_file = "services/" .. entry.file, source = entry.source}
+        services[name] = {entry_file = "services/" .. entry.file, source = entry.source}
     end
 
-    local migrations = {}
-    for _, entry in ipairs(loaded.migrations.entries) do
-        local service_type, from, to = entry.file:match("^([%w_.%-]+)/(%d+)%-(%d+)%.lua$")
-        if not service_type or tonumber(from) == tonumber(to) then
-            return result.failure("HU_INVALID_PATCH", "迁移文件须为 <service_type>/<from>-<to>.lua")
-        end
-        migrations[#migrations + 1] =
-        {service_type = service_type, from = tonumber(from), to = tonumber(to),
-            file = "migrations/" .. entry.file, source = entry.source}
-    end
-
-    local configs = {}
-    for _, entry in ipairs(loaded.configs.entries) do
-        local service_type, name = entry.file:match("^([%w_.%-]+)/([%w_.%-]+)%.lua$")
-        if not service_type then
-            return result.failure("HU_INVALID_PATCH", "配置文件须为 configs/<service_type>/<name>.lua")
-        end
-        configs[#configs + 1] = {service_type = service_type, name = name, source = entry.source}
-    end
-
-    if next(modules) == nil and next(services) == nil and #configs == 0 then
+    if next(modules) == nil and next(services) == nil then
         return result.failure("HU_PATCH_EMPTY", "Patch 至少要有一个模块或 Service 文件")
     end
-    table.sort(frozen)
-    local digest = native.sha256(patch_path .. "\0" .. table.concat(frozen, "\0"))
-    local patch = {patch_id = digest, modules = {}, services = services, migrations = migrations,
-        configs = configs, frozen_files = {}}
+    table.sort(identity)
+    local identity_parts = {tostring(#patch_path) .. ":" .. patch_path}
+    for _, entry in ipairs(identity) do
+        identity_parts[#identity_parts + 1] = tostring(#entry) .. ":" .. entry
+    end
+    local patch = {patch_id = table.concat(identity_parts),
+        modules = {}, services = services}
     for _, module in pairs(modules) do
         patch.modules[#patch.modules + 1] = module
     end
-    table.sort(patch.modules, function(left, right) return left.name < right.name end)
-    for _, entry in ipairs(loaded.services.entries) do
-        patch.frozen_files["services/" .. entry.file] = entry.source
-    end
-    return result.success({patch = patch, checksum = digest})
+    table.sort(patch.modules, function(left, right)
+        return left.name < right.name
+    end)
+    return result.success({patch = patch})
 end
 
 --- 同步扫描 PatchRoot/<path>/modules 的 Lua 文件并冻结源码；不 yield。
 ---@param options table root 是已存在的 Patch Root；path 是其下相对目录，不允许绝对路径和越界路径。
----@return flywow_hotupgrade_result 返回冻结源码和 checksum；扫描/读取在当前调用内同步完成。
+---@return FlyWowHotUpgradeResult 返回冻结源码和文件名身份；扫描/读取在当前调用内同步完成。
 function M.load(options)
     if type(options) ~= "table" or type(options.root) ~= "string"
         or type(options.path) ~= "string" then
         return result.failure("HU_INVALID_PATCH", "Patch Root 或目录路径无效")
     end
     local root, code = native.resolve(options.root)
-    code = native_error.code(code)
+    code = native_code(code)
     if not root then
-        return result.failure(native_error.code(code), "Patch Root 不存在")
+        return result.failure(native_code(code), "Patch Root 不存在")
     end
     return build_patch(root, options.path)
-end
-
---- 迁移/配置纯 Lua 文件运行在预算协程，不暴露 Skynet 或 I/O。
----@param source string 来自当前 Patch 快照的纯 Lua 源码，不提供 Skynet、文件或网络能力。
----@return flywow_hotupgrade_result 函数结果经指令预算执行；错误使用稳定 HU_ code 返回。
-function M.load_pure(source)
-    local env = {assert = assert, error = error, pairs = pairs, ipairs = ipairs,
-        type = type, tonumber = tonumber, tostring = tostring}
-    local chunk, message = load(source, "@patch_pure", "t", env)
-    if not chunk then
-        return result.failure("HU_MODULE_SYNTAX", message)
-    end
-    local executed = result.execute(chunk)
-    if not executed.ok then
-        return executed
-    end
-    return result.success({value = executed.values[1]})
 end
 
 return M

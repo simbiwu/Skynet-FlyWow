@@ -1,4 +1,4 @@
-# 职责：构建 HotUpgrade Native Binding；它提供文件/hash 工具，不替换业务 Native。
+# 职责：构建 HotUpgrade Native Binding；它只提供 Patch 路径校验、文件枚举和审计同步，不替换业务 Native。
 # 调用方式：统一脚本通过 -D 传入 SKYNET_ROOT 与 FLYWOW_NATIVE_OUTPUT_DIR，通常无需手工调用。
 # CMake 变量：${NAME} 不是系统环境变量；SKYNET_ROOT 和 FLYWOW_NATIVE_OUTPUT_DIR 由统一脚本通过 -D 传入。
 # 修改指引：新增编译文件放进 add_library 源文件列表；新依赖配套 find_package 与 target_link_libraries。
@@ -9,8 +9,6 @@ project(flywow_hotupgrade LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-# HotUpgrade 依赖 OpenSSL 3 Crypto；更换依赖时从此声明及目标链接一起调整。
-find_package(OpenSSL 3 REQUIRED COMPONENTS Crypto)
 if(NOT EXISTS "${SKYNET_ROOT}/3rd/lua/lua.h")
     message(FATAL_ERROR "HotUpgrade 需要固定 Skynet 自带 Lua 头文件")
 endif()
@@ -24,8 +22,8 @@ add_library(flywow_hotupgrade_native MODULE hotupgrade_native.cpp)
 target_include_directories(flywow_hotupgrade_native PRIVATE "${SKYNET_ROOT}/3rd/lua")
 target_include_directories(flywow_hotupgrade_native PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lua-binding)
-# 此目标使用 Lua Binding 与 OpenSSL；新增链接库时先声明依赖，再加到这里。
-target_link_libraries(flywow_hotupgrade_native PRIVATE flywow_lua_binding OpenSSL::Crypto)
+# 此目标使用 FlyWow Lua Binding；新增链接库时先声明依赖，再加到这里。
+target_link_libraries(flywow_hotupgrade_native PRIVATE flywow_lua_binding)
 target_compile_options(flywow_hotupgrade_native PRIVATE -Wall -Wextra -Wpedantic -Werror)
 # CMake 目标名供 target_* 命令引用；PREFIX 控制文件前缀，输出目录由统一脚本传入。
 set_target_properties(flywow_hotupgrade_native PROPERTIES

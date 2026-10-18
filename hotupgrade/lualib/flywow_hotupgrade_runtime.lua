@@ -3,9 +3,6 @@ local skynet = require "skynet"
 local result = require "flywow_hotupgrade_error"
 local guard = require "flywow_hotupgrade_guard"
 local modules = require "flywow_hotupgrade_module_patch"
-local config = require "flywow_hotupgrade_config"
-local snapshot = require "flywow_hotupgrade_snapshot"
-local patch_module = require "flywow_hotupgrade_patch"
 local M = {}
 local Runtime = {}
 Runtime.__index = Runtime
@@ -15,55 +12,64 @@ local function hook(adapter, name, ...)
     if not adapter[name] then
         return result.success()
     end
-    local executed = result.execute(adapter[name], 1000000, ...)
-    if not executed.ok then
-        return executed
+    -- 回调是受信同步合同；不在裸 coroutine 中执行 Skynet API 后伪称已撤销其调度注册。
+    local values = table.pack(pcall(adapter[name], ...))
+    if not values[1] then
+        return result.failure("HU_HOOK_FAILED", tostring(values[2]))
     end
-    local value = executed.values[1]
-    if value == false then
+    local value = values[2]
+    if value == false or (name == "healthcheck" and value ~= true) then
         return result.failure("HU_HOOK_REJECTED", name)
     end
-    if type(value) == "table" and value.ok ~= nil then
+    -- export_state 返回业务数据而非 Hook 结果 record；状态可合法包含名为 ok 的字段。
+    if name ~= "export_state" and type(value) == "table" and value.ok ~= nil then
         return value
     end
     return result.success({value = value})
 end
 
 --- 创建一个 Lua State 独占的 Runtime；Adapter 函数不进入控制面消息或审计记录。
----@param options table controller、实例/代际身份、版本、候选标记和本地 Adapter。
+---@param options table controller_handle、instance_handle、候选标记和本地 Adapter。
 ---@return table 当前 Service 独占 Runtime；内部 Guard、模块缓存和访客计数不跨 State 共享。
 function M.new(options)
-    -- stable 的 table 身份只在这个 Runtime 和 Lua State 内延续，不作为跨 Service 状态迁移。
-    local stable = {}
     -- Guard 统一用毫秒计时；Skynet 的 now/sleep 单位是 10 毫秒刻度。
     local clock =
     {
-        now = function() return skynet.now() * 10 end,
-        sleep = function(ms) skynet.sleep(math.max(1, math.ceil(ms / 10))) end,
+        now = function()
+            return skynet.now() * 10
+        end,
+        sleep = function(ms)
+            skynet.sleep(math.max(1, math.ceil(ms / 10)))
+        end,
     }
     return setmetatable(
     {
-        options = options, adapter = options.adapter or {},
-        guard = guard.new(clock), stable = stable,
-        modules = modules.new({stable = stable, trusted = options.trusted_modules}),
-        config = config.new(), version = options.code_version,
-        phase = options.candidate and "CANDIDATE" or "RUNNING", completed_sequence = 0,
-        visitors = {}, visitor_active = {},
+        options = options,                                      -- 当前 instance_handle、controller_handle 与启动角色；创建后不变。
+        adapter = options.adapter or {},                        -- 当前 Lua State 的业务回调，不跨 RPC 传递。
+        guard = guard.new(clock),                               -- 本实例业务入口门禁与在途调用计数。
+        modules = modules.new(),                                -- 本实例 package.loaded 上的可撤销模块 Stage。
+        phase = options.candidate and "CANDIDATE" or "RUNNING", -- 本地热更状态机阶段。
+        completed_sequence = 0,                                 -- 已完成 txn_id 尾号，拒绝该序号及更旧控制消息。
     }, Runtime)
 end
 
 --- 建立单个事务 owner 并拒绝已完成序号；candidate 首次加入事务时转交 Guard 所有权。
----@param request table 控制面请求，必须含 txn_id 和单调 sequence。
----@return flywow_hotupgrade_result 重放、冲突事务或有效 owner 状态。
+---@param request table 控制面请求，txn_id 后缀含单调序号。
+---@return FlyWowHotUpgradeResult 重放、冲突事务或有效 owner 状态。
 function Runtime:begin(request)
-    if type(request.sequence) ~= "number" or request.sequence <= self.completed_sequence then
+    local sequence = type(request.txn_id) == "string" and tonumber(request.txn_id:match(":(%d+)$"))
+    if not sequence or sequence <= self.completed_sequence then
         return result.failure("HU_STALE_TRANSACTION", "过期事务序号")
     end
     if self.txn and self.txn ~= request.txn_id then
         return result.failure("HU_UPGRADE_BUSY", "实例已有升级")
     end
+    -- 保留同一个 Guard 的 owner 约束，避免覆盖已有安全点后留下半个事务。
+    if self.guard.owner and self.guard.owner ~= "candidate" and self.guard.owner ~= request.txn_id then
+        return result.failure("HU_UPGRADE_BUSY", "安全点正被其它更新占有")
+    end
+    -- txn 直到 finish/abort 清理；Guard owner 与此处身份共同限定当前控制事务。
     self.txn = request.txn_id
-    self.sequence = request.sequence
     if self.guard.owner == "candidate" then
         self.guard.owner = request.txn_id
     end
@@ -72,7 +78,7 @@ end
 
 --- 取得安全点并等待活动业务处理排空；wait_idle 会 yield，超时仍保持暂停状态供协调方收敛。
 ---@param request table 含本次 txn_id 与毫秒 timeout_ms。
----@return flywow_hotupgrade_result 成功进入 QUIESCED；超时保留暂停状态，须由协调者恢复或收敛。
+---@return FlyWowHotUpgradeResult 成功进入 QUIESCED；超时保留暂停状态，须由协调者恢复或收敛。
 function Runtime:prepare(request)
     local began = self:begin(request)
     if not began.ok then
@@ -91,28 +97,13 @@ function Runtime:prepare(request)
     return waited
 end
 
--- 暂存适用于当前 service_type 的配置工厂；激活前不替换线上快照。
-local function stage_configs(runtime, patch, txn_id)
-    for _, entry in ipairs(patch.configs or {}) do
-        if not entry.service_type or entry.service_type == runtime.options.service_type then
-            local loaded = patch_module.load_pure(entry.source)
-            if not loaded.ok then
-                return loaded
-            end
-            local _, current_version = runtime.config:get(entry.name)
-            local staged = runtime.config:stage(entry.name, loaded.value, (current_version or 0) + 1, txn_id)
-            if not staged.ok then
-                return staged
-            end
-        end
-    end
-    return result.success()
-end
-
---- 在安全点内暂存模块和配置；失败时撤销本次候选，不修改正在运行的配置快照。
----@param request table 含事务身份及控制面已校验/冻结的 Patch record。
----@return flywow_hotupgrade_result 暂存句柄只留在本 State，不暴露给调用方。
+--- 在安全点内暂存模块；失败时不修改正在运行的模块导出表。
+---@param request table 含事务身份及本实例已声明模块的冻结 modules 数组。
+---@return FlyWowHotUpgradeResult 暂存句柄只留在本 State，不暴露给调用方。
 function Runtime:stage(request)
+    if self.options.candidate then
+        return result.failure("HU_PHASE_INVALID", "候选已由冻结源码初始化，不执行模块 Stage")
+    end
     if self.phase ~= "QUIESCED" or self.guard.owner ~= request.txn_id then
         return result.failure("HU_SAFEPOINT_REQUIRED", "暂存需要已取得安全点")
     end
@@ -123,23 +114,19 @@ function Runtime:stage(request)
     if self.stage_data then
         return result.success()
     end
-    -- 模块引擎只构建隔离的导出表；此时 package.loaded、线上配置与 stable 状态仍不可写。
-    local staged = self.modules:stage(request.patch.modules or {})
+    -- 受信模块只能声明代码和常量；Stage 不安装线上导出，也不接管业务状态。
+    local staged = self.modules:stage(request.modules or {})
     if not staged.ok then
         return staged
     end
+    -- Stage 只在本 Lua State 保存，可恢复的旧导出不经 RPC 或控制面持有。
     self.stage_data = staged.stage
-    local configs = stage_configs(self, request.patch, request.txn_id)
-    if not configs.ok then
-        self.modules:abort(self.stage_data)
-        self.config:abort(request.txn_id)
-    end
-    return configs
+    return result.success()
 end
 
---- 在 Guard 已静止时同步导出业务状态，并复制为无共享引用的可迁移 Snapshot。
----@param request table 当前事务上下文；Adapter 只应返回可序列化业务数据。
----@return flywow_hotupgrade_result 导出副本或稳定的类型/容量错误。
+--- 在 Guard 已静止时调用 Service 自己的状态交接导出回调。
+---@param request table 当前事务上下文。
+---@return FlyWowHotUpgradeResult 交接值由 Service 定义，必须可经 Skynet 消息传递。
 function Runtime:export(request)
     if self.phase ~= "QUIESCED" or self.guard.active > 0 then
         return result.failure("HU_SAFEPOINT_REQUIRED", "状态仍可能变化")
@@ -148,13 +135,16 @@ function Runtime:export(request)
     if not exported.ok then
         return exported
     end
-    return snapshot.clone(exported.value)
+    return exported
 end
 
---- 候选实例导入独占 Snapshot 副本并重建派生资源；此时候选尚未接收生产流量。
----@param request table 含事务身份、Snapshot 和目标版本。
----@return flywow_hotupgrade_result 导入或重建失败会使候选不能 READY。
+--- 候选实例接收 Service 自己定义的交接数据并重建派生资源。
+---@param request table 含事务身份和 Service 导出的 state。
+---@return FlyWowHotUpgradeResult 导入或重建失败会使候选不能 READY。
 function Runtime:import(request)
+    if not self.options.candidate then
+        return result.failure("HU_PHASE_INVALID", "只有未发布候选可以接收状态")
+    end
     local began = self:begin(request)
     if not began.ok then
         return began
@@ -163,22 +153,26 @@ function Runtime:import(request)
     if not paused.ok then
         return paused
     end
-    local cloned = snapshot.clone(request.snapshot)
-    if not cloned.ok then
-        return cloned
-    end
-    local imported = hook(self.adapter, "import_state", cloned.value, request)
+    -- 先接管显式状态，再检查候选安全条件；控制面不必再发一次 prepare RPC。
+    local imported = hook(self.adapter, "import_state", request.state, request)
     if not imported.ok then
         return imported
     end
-    return hook(self.adapter, "rebuild_runtime", request)
+    self.phase = "QUIESCING"
+    local waited = self.guard:wait_idle(request.txn_id, request.timeout_ms or 10000, self.adapter.can_upgrade)
+    if waited.ok then
+        self.phase = "QUIESCED"
+    end
+    return waited
 end
 
---- 仅在持有安全点且活动调用为零时提交配置与模块，再切换当前代码版本。
---- 提交暂存配置和模块并更新代码版本；必须持有安全点且不允许任何活动业务调用。
----@param request table 当前事务身份和提交后的 code_version。
----@return flywow_hotupgrade_result postcheck 失败时恢复配置与导出表。
+--- 提交暂存模块；必须持有安全点且不允许任何活动业务调用。
+---@param request table 当前事务身份。
+---@return FlyWowHotUpgradeResult postcheck 失败时恢复导出表；检查必须无副作用。
 function Runtime:activate(request)
+    if self.options.candidate then
+        return result.failure("HU_PHASE_INVALID", "Service 替换不执行模块 Activate")
+    end
     if self.phase == "ACTIVATED" then
         return result.success()
     end
@@ -188,167 +182,116 @@ function Runtime:activate(request)
     if not self.stage_data then
         return result.failure("HU_PHASE_INVALID", "尚未完成 Stage")
     end
-    -- 配置先保存 undo 并激活；模块提交中的 postcheck 失败时据此精确撤销。
-    local configs = self.config:activate(request.txn_id)
-    if not configs.ok then
-        return configs
-    end
     local committed = self.modules:commit(self.stage_data, self.adapter.postcheck)
     if not committed.ok then
-        self.config:abort(request.txn_id)
         return committed
     end
-    self.old_version = self.version
-    self.version = request.new_code_version or self.version
     self.phase = "ACTIVATED"
     return result.success()
 end
 
---- 发布决定前恢复模块、配置和业务 Adapter；恢复失败时保持暂停并标记 RECOVERY_REQUIRED。
----@param request table 当前事务身份与 sequence。
----@return flywow_hotupgrade_result 完成恢复后才释放 Guard 和 Runtime 事务 owner。
+--- 发布决定前恢复模块；恢复失败时保持暂停并标记 RECOVERY_REQUIRED。
+---@param request table 当前事务身份；txn_id 后缀含单调序号。
+---@return FlyWowHotUpgradeResult 完成恢复后才释放 Guard 和 Runtime 事务 owner。
 function Runtime:abort(request)
     if self.phase == "RUNNING" and self.completed_txn == request.txn_id then
         return result.success()
     end
+    -- 撤销模块导出；失败时保留暂停状态，不推定业务外部资源已恢复。
     if self.stage_data then
-        self.modules:abort(self.stage_data)
+        local aborted = self.modules:abort(self.stage_data)
+        if not aborted.ok then
+            self.phase = "RECOVERY_REQUIRED"
+            return aborted
+        end
     end
-    self.config:abort(request.txn_id)
-    local restored = hook(self.adapter, "on_abort", request)
-    if not restored.ok then
+
+    -- 模块恢复后才释放安全点并清除本地事务 owner。
+    local resumed = self.guard:resume(request.txn_id)
+    if not resumed.ok then
         self.phase = "RECOVERY_REQUIRED"
-        return result.failure("HU_ABORT_FAILED", restored.message)
+        return resumed
     end
-    self.version = self.old_version or self.version
-    self.guard:resume(request.txn_id)
-    self.completed_sequence = request.sequence
+    self.completed_sequence = tonumber(request.txn_id:match(":(%d+)$"))
     self.completed_txn = request.txn_id
     self.txn = nil
     self.stage_data = nil
-    self.old_version = nil
     self.phase = self.options.candidate and "CANDIDATE" or "RUNNING"
     return result.success()
 end
 
---- 发布成功后释放可回滚快照，并记录已完成事务序号以拒绝迟到控制消息。
----@param request table 当前事务身份与 sequence。
----@return flywow_hotupgrade_result 本地清理完成。
+--- 发布决定后同步完成本地清理与开放，避免 resume/finish 两次 RPC 之间留下半完成状态。
+---@param request table 当前事务身份；txn_id 后缀含单调序号。
+---@return FlyWowHotUpgradeResult 仅接受已激活的原地更新或已就绪的候选。
 function Runtime:finish(request)
-    self.config:finish(request.txn_id)
-    self.completed_sequence = request.sequence
-    self.completed_txn = request.txn_id
-    self.txn = nil
-    self.stage_data = nil
-    self.old_version = nil
+    if self.guard.owner ~= request.txn_id or self.guard.active ~= 0
+        or (self.phase ~= "ACTIVATED" and not (self.options.candidate and self.phase == "QUIESCED")) then
+        return result.failure("HU_PHASE_INVALID", "参与者尚未完成发布准备")
+    end
+    if self.stage_data then
+        local finished = self.modules:finish(self.stage_data)
+        if not finished.ok then return finished end
+    end
+    local resumed = self.guard:resume(request.txn_id)
+    if not resumed.ok then return resumed end
+    self.options.candidate = false
+    self.phase = "RUNNING"
+    self.completed_sequence, self.completed_txn = tonumber(request.txn_id:match(":(%d+)$")), request.txn_id
+    self.txn, self.stage_data = nil, nil
     return result.success()
 end
 
-local hooks = {health = "healthcheck", prepare_retire = "prepare_retire",
-    cancel_retire = "cancel_retire", begin_drain = "begin_drain", can_retire = "can_retire"}
-
---- 校验访问者和代际后计入活动调用；Guard:run 在业务处理结束后释放计数，供安全点排空。
----@param request table 序列化业务 command/payload 和目标 generation。
----@param source integer 已由控制面授权的调用 Service handle。
----@return flywow_hotupgrade_result 业务 Adapter 返回值或可识别失败；调用期间可能 yield。
+--- 只接受稳定 Router 的调用；Guard:run 在业务结束后释放在途计数。
+---@param request table 序列化业务 command/payload 和目标实例身份。
+---@param source integer 注册时指定的稳定 Router Service handle。
+---@return FlyWowHotUpgradeResult 业务 Adapter 返回值或可识别失败；调用期间可能 yield。
 function Runtime:invoke(request, source)
-    if not self.visitors[source] then
-        return result.failure("HU_UNAUTHORIZED", "访问者未绑定")
+    if source ~= self.options.router_handle then
+        return result.failure("HU_UNAUTHORIZED", "业务请求必须经过稳定 Router")
     end
-    if request.generation ~= self.options.generation then
-        return result.failure("HU_STALE_GENERATION", "调用代际不匹配")
-    end
-    -- 该计数独立于 Guard：释放引用时的同源屏障要等此访问者已接纳调用返回。
-    self.visitor_active[source] = (self.visitor_active[source] or 0) + 1
-    local called = self.guard:run(self.adapter.dispatch, request.command, request.payload)
-    self.visitor_active[source] = self.visitor_active[source] - 1
-    return called
-end
-
---- 等待指定访问者已进入的调用完成；循环 sleep 会 yield，供旧路由排空后再退休实例。
----@param request table 当前实例的屏障请求。
----@param source integer 要等待的已授权访问者 handle。
----@return flywow_hotupgrade_result 访问者调用排空后返回成功。
-function Runtime:visitor_barrier(request, source)
-    if not self.visitors[source] then
-        return result.failure("HU_UNAUTHORIZED", "访问者未绑定")
-    end
-    while (self.visitor_active[source] or 0) > 0 do
-        skynet.sleep(1)
-    end
-    return result.success()
+    return self.guard:run(self.adapter.dispatch, request.command, request.payload)
 end
 
 --- 校验实例身份、控制来源和事务序号后分派内部命令；普通业务调用走 invoke。
 ---@param command string 专用 hotupgrade 协议命令。
 ---@param request table 该命令的序列化 record。
 ---@param source integer Skynet 消息来源 handle。
----@return flywow_hotupgrade_result 稳定协议结果；RPC handler 捕获未预期异常。
+---@return FlyWowHotUpgradeResult 稳定协议结果；RPC handler 捕获未预期异常。
 function Runtime:control(command, request, source)
-    if request.instance_id ~= self.options.instance_id then
+    if request.instance_handle ~= self.options.instance_handle then
         return result.failure("HU_STALE_INSTANCE", "实例身份不匹配")
     end
-    -- 两个 visitor 命令由已经授权的业务 Service 发起，不属于控制面专属命令。
+
+    -- invoke 由已经授权的业务 Service 发起，不属于控制面专属命令。
     if command == "invoke" then
         return self:invoke(request, source)
     end
-    if command == "visitor_barrier" then
-        return self:visitor_barrier(request, source)
-    end
-    if source ~= self.options.controller then
+    if source ~= self.options.controller_handle then
         return result.failure("HU_UNAUTHORIZED", "控制来源不匹配")
-    end
-    if command == "grant" then
-        self.visitors[request.visitor] = true
-        return result.success()
-    end
-    if request.generation ~= self.options.generation then
-        return result.failure("HU_STALE_GENERATION", "实例代际不匹配")
-    end
-    if command == "status" then
-        return result.success(
-        {
-            phase = self.phase,
-            txn_id = self.txn,
-            active = self.guard.active,
-            code_version = self.version,
-        })
     end
     if self.completed_txn == request.txn_id and (command == "abort" or command == "finish") then
         return result.success()
     end
-    if type(request.sequence) ~= "number" or request.sequence <= self.completed_sequence then
+    local sequence = type(request.txn_id) == "string" and tonumber(request.txn_id:match(":(%d+)$"))
+    if not sequence or sequence <= self.completed_sequence then
         return result.failure("HU_STALE_TRANSACTION", "过期控制消息")
     end
     if self.txn and request.txn_id ~= self.txn then
         return result.failure("HU_STALE_TRANSACTION", "事务不匹配")
     end
-    if command == "prepare_retire" then
-        local began = self:begin(request)
-        if not began.ok then
-            return began
+    if command == "health" then
+        if not self.options.candidate or self.phase ~= "QUIESCED" or self.guard.owner ~= request.txn_id then
+            return result.failure("HU_SAFEPOINT_REQUIRED", "候选状态尚未准备完成")
         end
-    end
-    if hooks[command] then
-        return hook(self.adapter, hooks[command], request)
-    end
-    if command == "resume" then
-        local resumed = self.guard:resume(request.txn_id)
-        if not resumed.ok then
-            return resumed
-        end
-        self.phase = "RUNNING"
-        return hook(self.adapter, "on_resume", request)
+        return hook(self.adapter, "healthcheck", request)
     end
     if command == "retire" then
-        if self.guard.active ~= 0 then
-            return result.failure("HU_RETIRE_BLOCKED", "请求仍在执行")
+        if self.guard.active ~= 0 or self.guard.owner ~= request.txn_id or self.phase ~= "QUIESCED" then
+            return result.failure("HU_RETIRE_BLOCKED", "旧实例未在本事务安全点排空")
         end
-        local retired = hook(self.adapter, "retire", request)
-        if retired.ok then
-            skynet.timeout(1, skynet.exit)
-        end
-        return retired
+        -- 成功仅确认下一 tick 退出已安排；不代表业务外部资源已释放。
+        skynet.timeout(1, skynet.exit)
+        return result.success()
     end
     local allowed = {prepare = true, stage = true, export = true, import = true,
         activate = true, abort = true, finish = true}
@@ -358,5 +301,4 @@ function Runtime:control(command, request, source)
     return self[command](self, request)
 end
 
-M.hook = hook
 return M

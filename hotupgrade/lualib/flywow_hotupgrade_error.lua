@@ -1,7 +1,7 @@
 --- 统一热更结果和受限执行；无 I/O，异常不作为跨模块控制协议。
 local M = {}
 
----@class flywow_hotupgrade_result
+---@class FlyWowHotUpgradeResult
 ---@field ok boolean 成功标记
 ---@field code? string 稳定 HU_ 错误码
 ---@field message? string 诊断文本
@@ -11,26 +11,27 @@ local M = {}
 ---@param code string 稳定错误码
 ---@param message string 诊断文本
 ---@param step? string 步骤
----@return flywow_hotupgrade_result
+---@return FlyWowHotUpgradeResult
 function M.failure(code, message, step)
     return {ok = false, code = code, message = message, step = step}
 end
 
 ---@param data? table 调用者持有的结果
----@return flywow_hotupgrade_result
+---@return FlyWowHotUpgradeResult
 function M.success(data)
     data = data or {}
     data.ok = true
     return data
 end
 
---- 同步执行不允许 yield 的 hook；捕获异常，并限制纯 Lua 指令预算。
---- 不支持抢占阻塞 C 调用；hook 必须遵守无外部副作用合同。
+--- 仅用于无法访问 Skynet API 的纯 Lua 隔离文本执行，捕获异常并限制指令预算。
+--- 不得包装业务或 Skynet 回调：拒绝 yield 不能撤销调用前已产生的外部注册。
 ---@param fn function 待执行函数
 ---@param budget? integer Lua 指令预算
 ---@param ... any 基础设施转发的固定参数
----@return flywow_hotupgrade_result
+---@return FlyWowHotUpgradeResult
 function M.execute(fn, budget, ...)
+    -- 固定参数数量以保留中间 nil；独立协程让同步 hook 的 yield 可被检测。
     local args = table.pack(...)
     local co = coroutine.create(function()
         return fn(table.unpack(args, 1, args.n))
@@ -43,6 +44,7 @@ function M.execute(fn, budget, ...)
         end
     end, "", 1000)
 
+    -- 无论成功、异常还是预算超限都先卸载本次 hook，再判断协程是否试图 yield。
     local values = table.pack(coroutine.resume(co))
     debug.sethook(co)
     if not values[1] then
@@ -59,7 +61,7 @@ end
 --- 保存并恢复已有 hook；预算耗尽先卸载自身，避免异常处理再次触发预算错误。
 ---@param fn function 初始化入口
 ---@param budget integer 整段初始化的指令上限
----@return flywow_hotupgrade_result
+---@return FlyWowHotUpgradeResult
 function M.initialize(fn, budget)
     local previous, mask, count = debug.gethook()
     local remaining = budget
@@ -71,6 +73,7 @@ function M.initialize(fn, budget)
         end
     end, "", 1000)
 
+    -- 初始化允许 yield；pcall 结束后立即恢复宿主原有 hook，避免泄漏预算状态。
     local ok, message = pcall(fn)
     debug.sethook(previous, mask, count)
     if not ok then

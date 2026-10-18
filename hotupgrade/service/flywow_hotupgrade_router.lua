@@ -1,78 +1,59 @@
---- 稳定路由 Service：持有排队回应，目标换代后继续投递；控制面不代理业务流量。
+--- 稳定路由 Service：暂停期间拒绝新请求并排空已接纳调用；控制面不代理业务流量。
 local skynet = require "skynet"
-local rpc = require "flywow_hotupgrade_rpc"
+local protocol = require "flywow_hotupgrade_protocol"
 local router_module = require "flywow_hotupgrade_router"
 local result = require "flywow_hotupgrade_error"
-local controller = tonumber(...)
+local controller_handle = tonumber(...) -- 启动参数传入的 Controller Service handle。
+-- Router 本地调用排空最多等待 10 秒；单位换算为 Skynet 的 10 毫秒 tick。
+local ROUTE_DRAIN_TIMEOUT_MS = 10000
 
-local router = router_module.new(
-{
-    fork = skynet.fork, now = function() return skynet.now() * 10 end,
-    deliver = function(record, command, payload)
-        return rpc.call(record.address, "invoke",
-            {generation = record.generation, instance_id = record.instance_id,
-                command = command, payload = payload}, 10000)
-    end,
-})
+local router = router_module.new() -- 当前 Router Service 独占的路由表与在途计数。
 
-local function request(payload)
-    local caller = coroutine.running()
-    local done, answer = false, nil
-    local admitted = router:submit(payload.key, payload.command, payload.payload, function(value)
-        answer, done = value, true
-        skynet.wakeup(caller)
-    end, payload.policy or "reject")
-    if not admitted.ok then
-        return admitted
-    end
-    if not done then
-        skynet.wait(caller)
-    end
-    return answer
+local function request(payload, source)
+    return router:request(payload.origin_service_handle, payload.command, payload.payload, source)
 end
 
 local function pause(payload)
-    local paused = router:pause(payload.key, payload.txn_id)
+    local paused = router:pause(payload.origin_service_handle, payload.txn_id)
     if not paused.ok then
         return paused
     end
-    local deadline = skynet.now() + 1000
-    while router.routes[payload.key].active > 0 do
+    -- active 统计已进入 Router 的调用直到 RPC 返回，避免暂停前的转发仍悬挂。
+    local deadline = skynet.now() + math.ceil(ROUTE_DRAIN_TIMEOUT_MS / 10)
+    while router.routes[payload.origin_service_handle].active > 0 do
         if skynet.now() >= deadline then
             return result.failure("HU_SAFEPOINT_TIMEOUT", "路由在途请求未完成")
         end
         skynet.sleep(1)
     end
+
     return result.success()
 end
 
 skynet.start(function()
-    rpc.install(function(command, payload, source)
+    protocol.install_handler(function(command, payload, source)
         -- 业务请求沿稳定 Router 路由；只有启动时注入的控制面可修改绑定与暂停状态。
         if command == "request" then
-            return request(payload)
+            return request(payload, source)
         end
-        if source ~= controller then
+        if source ~= controller_handle then
             return result.failure("HU_UNAUTHORIZED", "路由控制来源不匹配")
         end
 
         if command == "bind" then
-            return router:bind(payload.key, payload.record)
+            return router:bind(payload.origin_service_handle, payload.record)
         end
         if command == "pause" then
             return pause(payload)
         end
         if command == "switch" then
-            return router:switch(payload.key, payload.txn_id, payload.expected, payload.record)
+            return router:switch(payload.origin_service_handle, payload.txn_id, payload.expected, payload.record)
         end
         if command == "resume" then
-            return router:resume(payload.key, payload.txn_id)
+            return router:resume(payload.origin_service_handle, payload.txn_id)
         end
         if command == "abort" then
-            return router:abort(payload.key, payload.txn_id)
-        end
-        if command == "query" then
-            return router:query(payload.key)
+            return router:abort(payload.origin_service_handle, payload.txn_id)
         end
         return result.failure("HU_UNKNOWN_COMMAND", command)
     end)

@@ -1,40 +1,36 @@
 --- 基础合同测试；使用固定 Lua 运行器，不启动业务 Service。
 local result = require "flywow_hotupgrade_error"
-local snapshot = require "flywow_hotupgrade_snapshot"
-local transaction = require "flywow_hotupgrade_transaction"
 local guard = require "flywow_hotupgrade_guard"
 local module_patch = require "flywow_hotupgrade_module_patch"
 local registry = require "flywow_hotupgrade_registry"
-local migration = require "flywow_hotupgrade_migration"
-local dependency = require "flywow_hotupgrade_dependency"
 
--- Snapshot 校验标量/嵌套值、深拷贝、循环、函数和字节上限。
-local cloned = snapshot.clone({schema_version = 1, nested = {value = 3}})
-assert(cloned.ok)
-local original = {x = {}}
-local copied = snapshot.clone(original)
-copied.value.x.value = 8
-assert(original.x.value == nil)
-local cycle = {}
-cycle.self = cycle
-assert(not snapshot.clone(cycle).ok)
-assert(not snapshot.clone({f = function() end}).ok)
-assert(not snapshot.clone({a = "abcdef"}, {max_bytes = 2}).ok)
-assert(not result.execute(function() coroutine.yield() end).ok)
-assert(not result.execute(function() while true do end end, 2000).ok)
-assert(not result.initialize(function() while true do end end, 2000).ok)
-assert(result.initialize(function() return true end, 2000).ok)
-
--- 状态机只接受定义过的阶段跳转。
-local txn = transaction.new("t1")
-assert(not txn:move("PUBLISHED").ok)
-for _, phase in ipairs({"VALIDATING", "PREPARING", "STAGING", "READY", "ACTIVATING", "PUBLISHED", "COMPLETED"}) do
-    assert(txn:move(phase).ok)
-end
+-- 纯 Lua 隔离执行器验证裸 yield 和预算；不据此声称能撤销 Skynet API 的调度注册。
+assert(not result.execute(function()
+    coroutine.yield()
+end).ok)
+assert(not result.execute(function()
+    while true do
+    end
+end, 2000).ok)
+assert(not result.initialize(function()
+    while true do
+    end
+end, 2000).ok)
+assert(result.initialize(function()
+    return true
+end, 2000).ok)
 
 -- Guard 通过可控时钟验证安全点等待、超时和异常后的计数恢复。
-local now = 0
-local g = guard.new({now = function() return now end, sleep = function(ms) now = now + ms end})
+local now = 0 -- Guard 测试使用的毫秒时钟；sleep 通过累加推进时间。
+local g = guard.new(
+{
+    now = function()
+        return now
+    end,
+    sleep = function(ms)
+        now = now + ms
+    end,
+})
 assert(g:enter().ok)
 assert(g:prepare_upgrade("t1").ok)
 assert(not g:enter().ok)
@@ -43,122 +39,98 @@ assert(g:leave().ok)
 assert(g:wait_idle("t1", 20).ok)
 assert(not g:resume("stale").ok)
 assert(g:resume("t1").ok)
-assert(not g:run(function() error("failure") end).ok)
+assert(not g:run(function()
+    error("failure")
+end).ok)
 assert(g.active == 0)
 
--- Module Patch Stage 与线上 package.loaded 隔离；Commit 保留导出 table 身份，Abort 恢复旧值。
-local loaded = {a = {value = function() return 1 end}}
-local held = loaded.a
-local engine = module_patch.new({loaded = loaded})
-local staged = engine:stage(
-{
-    {
-        name = "a",
-        source = [[
-            local b = require "b"
-            local M = {}
-            function M.value()
-                return b.value()
-            end
-            return M
-        ]],
-        code_version = 2,
-    },
-    {
-        name = "b",
-        action = "add",
-        source = [[
-            local M = {}
-            function M.value()
-                return 2
-            end
-            return M
-        ]],
-        code_version = 1,
-    },
-})
-assert(staged.ok, staged.message)
-assert(held.value() == 1 and loaded.b == nil)
-assert(engine:commit(staged.stage).ok)
-assert(held == loaded.a and held.value() == 2)
-loaded.b.value = function() return 4 end
-assert(held.value() == 4, "依赖必须绑定线上 table")
-assert(engine:abort(staged.stage).ok)
-assert(held.value() == 1 and loaded.b == nil)
-
-local failed = engine:stage({{name = "a", source = "invalid lua ?"}})
-assert(not failed.ok and held.value() == 1)
-local good = engine:stage({{name = "a", source = "return {value=function() return 9 end}"}})
-assert(good.ok)
-assert(not engine:commit(good.stage, function() return false end).ok)
-assert(held.value() == 1)
-
--- StableState 在 Stage 阶段只读，提交后才开放写入；Abort 保留原线上状态。
-local stable = {counter = {value = 7, nested = {value = 3}}}
-local stable_engine = module_patch.new({loaded = loaded, stable = stable})
-local stable_stage = stable_engine:stage({{name = "a", source = [[
-    local state = require "flywow_hotupgrade".stable_state("counter")
-    return {value = function() state.value = state.value + 1; return state.value end}
-]]}})
-assert(stable_stage.ok and stable.counter.value == 7)
-assert(stable_engine:commit(stable_stage.stage).ok)
-assert(held.value() == 8 and stable.counter.value == 8)
-assert(stable_engine:abort(stable_stage.stage).ok)
-assert(held.value() == 1)
-assert(not stable_engine:stage({{name = "a", source = [[
-    local state = require "flywow_hotupgrade".stable_state("counter")
-    state.nested.value = 99
-    return {value = function() return 0 end}
-]]}}).ok)
-assert(stable.counter.nested.value == 3)
-
--- 未受信的顶层副作用和延迟闭包都只能在 Commit 边界之后触达 live dependency。
-loaded.external = {mutate = function() stable.counter.value = 99 end}
-local external_stage = stable_engine:stage({{name = "a", source = [[
-    require "external".mutate()
-    return {value = function() return 0 end}
-]]}})
-assert(not external_stage.ok and stable.counter.value == 8)
-local external_closure = stable_engine:stage({{name = "a", source = [[
-    local dependency = require "external"
-    return {value = function() dependency.mutate(); return 99 end}
-]]}})
-assert(external_closure.ok)
-assert(stable_engine:commit(external_closure.stage).ok)
-assert(held.value() == 99 and stable.counter.value == 99)
-assert(stable_engine:abort(external_closure.stage).ok)
-
--- Registry 声明会保留访问资格；仅释放 binding 后旧代才允许退休。
+-- Registry 只保留当前实例；候选不入表，发布按旧实例身份比较。
 local reg = registry.new()
-assert(reg:register({key = "B", address = 11, generation = 1}).ok)
-assert(reg:declare("A-old", {{target = "B", edge = "strong"}}).ok)
-assert(reg:register({key = "B", address = 12, generation = 2, candidate = true}).ok)
-assert(reg:publish("B", 1, 2).ok)
-assert(reg:resolve("A-old", "B").record.address == 11)
-assert(not reg:retire("B", 1).ok)
-assert(not reg:resolve("unknown", "B").ok)
-reg:release("A-old")
-assert(reg:retire("B", 1).ok)
-assert(reg:declare("A-new", {{target = "B", edge = "strong"}}).ok)
-assert(reg:acquire("A-new", "B", "one").ok)
-assert(reg:acquire("A-new", "B", "two").ok)
-assert(reg:release_binding("A-new", "B", "one").ok)
-assert(reg:release_binding("A-new", "B", "one").ok)
-assert(reg:strong_count("B", 2) == 1)
-assert(reg:release_binding("A-new", "B", "two").ok)
-assert(reg:strong_count("B", 2) == 0)
-assert(dependency.validate({A = {{target = "B", edge = "strong"}}, B = {{target = "A", edge = "weak"}}}).ok)
-assert(not dependency.validate({A = {{target = "B", edge = "strong"}}, B = {{target = "A", edge = "strong"}}}).ok)
+local initial = {origin_service_handle = 10, instance_handle = 11}
+local candidate = {origin_service_handle = 10, instance_handle = 12, candidate = true}
+assert(reg:register(initial).ok)
+assert(not reg:register(candidate).ok and reg.targets[10] == initial)
+assert(not reg:publish(10, 10, candidate).ok)
+assert(reg:publish(10, 11, candidate).ok)
+assert(reg.targets[10] == candidate and not candidate.candidate)
+assert(not reg:publish(10, 11, candidate).ok)
 
--- Migration 对调用者状态创建副本；转换成功不修改旧代原对象。
-local chain = migration.resolve({{from = 1, to = 2, up = function(state)
-    state.schema_version = 2
-    state.extra = true
-    return state
-end}}, 1, 2)
-assert(chain.ok)
-local state = {schema_version = 1}
-local upgraded = migration.apply(state, chain.chain, {})
-assert(upgraded.ok and upgraded.value.extra and state.schema_version == 1)
-assert(not migration.resolve({}, 1, 2).ok)
+-- 原地更新只替换已加载模块；业务状态通过参数传入，保留稳定导出表身份。
+local loaded =
+{
+    a = {value = function(state) return state.count end, removed = true},
+    b = {value = function() return 1 end},
+}
+local held, cached_function = loaded.a, loaded.a.value
+local business = {count = 7}
+local engine = module_patch.new({loaded = loaded})
+local function update(source)
+    return engine:stage({{name = "a", source = source}})
+end
+local staged = update([[return {value = function(state) return state.count + 1 end}]])
+assert(staged.ok and held.value(business) == 7)
+assert(not update("return {}").ok, "未完成的 Stage 不可被覆盖")
+assert(engine:commit(staged.stage).ok)
+assert(held == loaded.a and held.value(business) == 8 and held.removed == nil)
+assert(cached_function(business) == 7, "缓存的函数不会被自动替换")
+assert(business.count == 7, "框架不复制或迁移 Service 状态")
+assert(engine:abort(staged.stage).ok and engine:abort(staged.stage).ok)
+assert(held.value(business) == 7 and held.removed == true)
+
+-- 所有模块通过加载检查后才允许安装；任一文件失败不能修改其它模块。
+assert(not engine:stage({
+    {name = "a", source = "return {value = function() return 9 end}"},
+    {name = "b", source = "error('load failure')"},
+}).ok)
+assert(held.value(business) == 7 and loaded.b.value() == 1)
+assert(not update("invalid lua ?").ok)
+assert(not update("return false").ok)
+assert(not update("return setmetatable({}, {})").ok)
+assert(not update("return {state = {count = 1}}").ok)
+assert(not update("return {value = 3}").ok)
+assert(not engine:stage({{name = "missing", source = "return {}"}}).ok)
+assert(not engine:stage({{name = "a", source = "return {}"},
+    {name = "a", source = "return {}"}}).ok)
+assert(not engine:stage({[2] = {name = "a", source = "return {}"}}).ok)
+
+loaded.stateful = {state = {count = 1}}
+assert(not engine:stage({{name = "stateful", source = "return {}"}}).ok)
+assert(loaded.stateful.state.count == 1, "旧模块持有的业务状态不能被静默删除")
+
+-- 同一更新内的依赖始终持有原线上表；全部安装后才执行新业务代码。
+local paired = engine:stage({
+    {name = "a", source = 'local b = require "b"; return {value = function() return b.value() end}'},
+    {name = "b", source = "return {value = function() return 6 end}"},
+})
+assert(paired.ok and held.value(business) == 7 and loaded.b.value() == 1)
+assert(engine:commit(paired.stage).ok and held.value() == 6)
+assert(engine:abort(paired.stage).ok and held.value(business) == 7 and loaded.b.value() == 1)
+
+-- postcheck 是现有控制面的受信检查：拒绝或异常均恢复完整旧导出集合。
+for _, check in ipairs({function() return false end, function() error("rejected") end}) do
+    local candidate = update("return {value = function() return 9 end}")
+    assert(candidate.ok and not engine:commit(candidate.stage, check).ok)
+    assert(held.value(business) == 7 and held.removed == true)
+end
+
+-- 依赖只引用已有模块表；模块加载不调用依赖，后续业务通过表取得当前函数。
+loaded.hotupgrade_fixture_dependency = loaded.b
+local dependency = update([[local b = require "hotupgrade_fixture_dependency"
+    return {value = function() return b.value() end}]])
+assert(dependency.ok and engine:commit(dependency.stage).ok)
+assert(held.value() == 1)
+loaded.b.value = function() return 4 end
+assert(held.value() == 4)
+assert(engine:finish(dependency.stage).ok)
+assert(next(dependency.stage.old) == nil and next(dependency.stage.entries) == nil)
+assert(not engine:abort(dependency.stage).ok, "发布后回滚必须重新应用旧代码")
+loaded.hotupgrade_fixture_dependency = nil
+
+-- 连续更新和旧文件回滚都保留同一导出表，不依赖历史候选表或私有状态代理。
+for _, value in ipairs({2, 3, 1}) do
+    local candidate = update("return {value = function() return " .. value .. " end}")
+    assert(candidate.ok and engine:commit(candidate.stage).ok)
+    assert(engine:finish(candidate.stage).ok)
+    assert(loaded.a == held and held.value() == value)
+end
 print("HOTUPGRADE_FOUNDATION_OK")
