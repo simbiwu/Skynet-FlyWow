@@ -4,6 +4,16 @@ local hotupgrade_native = require "flywow_hotupgrade_native"
 local hotupgrade_result = require "flywow_hotupgrade_error"
 local hotupgrade_common = require "flywow_hotupgrade_common"
 
+-- 与 Native 扫描器上限保持一致：单文件 2 MiB、一次 Patch 累计 16 MiB。
+local MAX_FILE_BYTES = 2 * 1024 * 1024
+local MAX_PATCH_BYTES = 16 * 1024 * 1024
+
+local M = {}
+
+-- Controller 实例共享此方法表；各实例的登记、事务和资源状态保存在实例表中。
+local Controller = {}
+Controller.__index = Controller
+
 -- Native 以第二返回值携带稳定 HU_ 错误；兼容历史上的裸字符串错误值。
 local function native_code(value)
     if type(value) == "table" then
@@ -12,10 +22,6 @@ local function native_code(value)
 
     return value or "HU_NATIVE_ERROR"
 end
-
--- 与 Native 扫描器上限保持一致：单文件 2 MiB、一次 Patch 累计 16 MiB。
-local MAX_FILE_BYTES = 2 * 1024 * 1024
-local MAX_PATCH_BYTES = 16 * 1024 * 1024
 
 -- 有界读取单个已规范化文件；关闭失败也视为读取失败，避免冻结不完整内容。
 local function read(path)
@@ -133,13 +139,6 @@ local function build_patch(root, patch_path, service_dir)
     end)
     return hotupgrade_result.success({patch = patch})
 end
-
-
-local M = {}
-
--- 当前控制面实际持有的登记容量；同时约束目标快照与逐项结果大小。
-local Controller = {}
-Controller.__index = Controller
 
 ---@class FlyWowHotUpgradeTargetMetadata
 ---@field service_type string 由现存 Service 声明，匹配配置 service_dir 下的相对路径
