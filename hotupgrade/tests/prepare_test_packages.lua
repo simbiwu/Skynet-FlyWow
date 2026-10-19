@@ -1,5 +1,20 @@
 --- 只创建测试脚本专用目录内的受信 Patch，不触碰宿主部署目录。
 local root = "build/hotupgrade-tests/patches/"
+local host_root = "build/hotupgrade-tests/host/"
+assert(os.execute("mkdir -p " .. host_root .. "lualib/battle/state_sync " .. host_root .. "lualib/packages/demo "
+    .. host_root .. "config " .. host_root .. "service/battle " .. host_root .. "actors/zone"))
+local function write(path, source)
+    local output = assert(io.open(path, "wb"))
+    assert(output:write(source))
+    assert(output:close())
+end
+local original = assert(io.open("hotupgrade/tests/test_worker_logic.lua", "rb"))
+write(host_root .. "lualib/test_worker_logic.lua", assert(original:read("*a")))
+assert(original:close())
+write(host_root .. "lualib/hotupgrade_extra.lua", "return {value = function() return 1 end}")
+write(host_root .. "lualib/battle/state_sync/runtime.lua", "return {value = function() return 1 end}")
+write(host_root .. "lualib/packages/demo/init.lua", "return {value = function() return 1 end}")
+write(host_root .. "config/settings.lua", "return {max_level = 100}")
 local module_v2 = [[
 local count = 0
 local M = {}
@@ -35,47 +50,69 @@ end
 ]]
 local cases =
 {
-    module = {modules = {["test_worker_logic.lua"] = module_v2}},
-    combined = {modules = {["test_worker_logic.lua"] = module_v2}, services = {["player.lua"] = service}},
-    service = {services = {["player.lua"] = service}},
-    stage_failure = {services = {["player.lua"] = [[return function(state)
+    module = {lualib = {["test_worker_logic.lua"] = module_v2}},
+    combined = {lualib = {["test_worker_logic.lua"] = module_v2}, service = {["player.lua"] = service}},
+    service = {service = {["player.lua"] = service}},
+    stage_failure = {service = {["player.lua"] = [[return function(state)
         return {migrate = function(old)
             old.equip = "坏"
             old.nested.count = 99
             error("migration rejected")
         end}
     end]]}},
-    functions = {services = {["player.lua"] = [[return function(state)
+    functions = {service = {["player.lua"] = [[return function(state)
         return {functions = {load = function(item)
             return item.base_attack + (state.equip == "剑" and 20 or 0)
         end}}
     end]]}},
-    state_only = {services = {["player.lua"] = [[return function()
+    state_only = {service = {["player.lua"] = [[return function()
         return {migrate = function(old)
             return {equip = "剑", level = old.level, schema_version = 2}
         end}
     end]]}},
-    bad_functions = {services = {["player.lua"] = [[return function()
+    bad_functions = {service = {["player.lua"] = [[return function()
         return {functions = {load = 12}}
     end]]}},
-    extra = {modules = {["hotupgrade_extra.lua"] = "return {value = function() return 2 end}"}},
-    unmatched_module = {modules = {
+    extra = {lualib = {["hotupgrade_extra.lua"] = "return {value = function() return 2 end}"}},
+    unmatched_module = {lualib = {
         ["test_worker_logic.lua"] = module_v2,
         ["missing_logic.lua"] = "return {value = 2}",
     }},
-    unmatched_service = {modules = {["test_worker_logic.lua"] = module_v2},
-        services = {["unused.lua"] = service}},
-    invalid = {modules = {["test_worker_logic.lua"] = "return {"}},
-    invalid_category = {services = {["unused.lua"] = "return function() return {} end"}},
+    unmatched_service = {lualib = {["test_worker_logic.lua"] = module_v2},
+        service = {["unused.lua"] = service}},
+    invalid = {lualib = {["test_worker_logic.lua"] = "return {"}},
+    host_paths = {config = {["settings.lua"] = "return {max_level = 200}"},
+        lualib = {["battle/state_sync/runtime.lua"] = "return {value = function() return 2 end}",
+            ["packages/demo/init.lua"] = "return {value = function() return 2 end}"}},
+    nested_service = {service = {["battle/worker.lua"] = service}},
+    custom_service = {actors = {["zone/player.lua"] = service}},
+    duplicate_module = {lualib = {["battle.worker.lua"] = "return {}",
+        ["battle/worker.lua"] = "return {}"}},
+    duplicate_service = {service = {["battle.worker.lua"] = service, ["battle/worker.lua"] = service}},
 }
-for name, categories in pairs(cases) do
-    for category, entries in pairs(categories) do
-        assert(os.execute("mkdir -p " .. root .. name .. "/" .. category))
+for name, directories in pairs(cases) do
+    for directory, entries in pairs(directories) do
+        assert(os.execute("mkdir -p " .. root .. name .. "/" .. directory))
         for file, source in pairs(entries) do
-            local output = assert(io.open(root .. name .. "/" .. category .. "/" .. file, "wb"))
-            assert(output:write(source))
-            assert(output:close())
+            local path = root .. name .. "/" .. directory .. "/" .. file
+            assert(os.execute("mkdir -p " .. assert(path:match("^(.*)/"))))
+            write(path, source)
         end
     end
 end
+-- 验证扫描器对整棵 Patch 树共用数量/字节预算，数值与 Native 的现有限制对应。
+local MAX_LUA_FILES = 1024
+local MAX_FILE_BYTES = 2 * 1024 * 1024
+assert(os.execute("mkdir -p " .. root .. "count_limit/config " .. root .. "count_limit/lualib "
+    .. root .. "total_limit/config " .. root .. "total_limit/lualib " .. root .. "file_limit"))
+for index = 1, MAX_LUA_FILES + 1 do
+    local directory = index % 2 == 0 and "config" or "lualib"
+    write(root .. "count_limit/" .. directory .. "/" .. index .. ".lua", "")
+end
+local full_file = string.rep(" ", MAX_FILE_BYTES)
+for index = 1, 9 do
+    local directory = index % 2 == 0 and "config" or "lualib"
+    write(root .. "total_limit/" .. directory .. "/" .. index .. ".lua", full_file)
+end
+write(root .. "file_limit/large.lua", full_file .. " ")
 print("HOTUPGRADE_PACKAGES_OK")

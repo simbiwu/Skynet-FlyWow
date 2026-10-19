@@ -2,6 +2,7 @@
 local skynet = require "skynet"
 local hotupgrade_result = require "flywow_hotupgrade_error"
 local hotupgrade_common = require "flywow_hotupgrade_common"
+local hotupgrade_native = require "flywow_hotupgrade_native"
 local hotupgrade_module_patch = require "flywow_hotupgrade_module_patch"
 local M = {}
 local module_state =
@@ -102,7 +103,7 @@ local function stage_service(source)
     end
 
     local service = assert(module_state.registration.service, "Service 未提供内部更新入口")
-    local chunk = assert(load(source, "@services/" .. module_state.registration.service_type .. ".lua", "t", _G))
+    local chunk = assert(load(source, "=Service Patch: " .. module_state.registration.service_type, "t", _G))
     local build = chunk()
     assert(type(build) == "function", "Service Patch 必须返回构建函数")
     local patch = build(service.state)
@@ -297,7 +298,7 @@ end
 
 ---@class FlyWowHotUpgradeRegistration
 ---@field controller_handle integer 宿主已启动的控制 Service handle
----@field service_type string 对应 services/<service_type>.lua
+---@field service_type string 对应 service_dir 下的相对 Lua 路径；去掉 .lua 并将 / 转为 .
 ---@field service? FlyWowHotUpgradeServiceUpdate 可选 Service 内部状态/函数更新入口
 ---@field before_upgrade? fun():boolean|table Guard 暂停新业务且在途调用归零后反复调用；true 或 {ok=true} 才放行，否则继续等待至超时，异常立即失败。同步只读，不得 yield
 ---@field after_upgrade? fun():boolean Activate 提交模块与 Service 状态后、finish 前调用；false 或异常触发组合恢复。只检查已提交状态，不得产生外部副作用或 yield
@@ -377,24 +378,53 @@ function M.register_service(registration)
 end
 
 --- 在本 State 加载完整模块；首次登记新模块可能 yield。登记失败抛错，允许再次声明。
----@param name string 与 modules/ 相对路径对应的 require 名
+---@param name string 宿主原有 require 名；Controller 使用实际文件的根目录相对路径登记
 ---@return table 当前 State 的稳定模块导出表
 function M.require(name)
     assert(type(name) == "string" and name ~= "", "模块名无效")
-    local value = require(name)
+    local root_path = assert(skynet.getenv(hotupgrade_common.ROOT_PATH_ENV),
+        "HU_NOT_INITIALIZED: 须先初始化 Controller，再声明可更新模块")
+    local source_path = assert(package.searchpath(name, package.path),
+        "HU_INVALID_PATH: 可更新模块必须能通过 package.path 定位 Lua 文件: " .. name)
+    assert(package.preload[name] == nil, "HU_INVALID_PATH: 可更新模块不支持 package.preload: " .. name)
+    local resolved_path = assert(hotupgrade_native.resolve(source_path),
+        "HU_INVALID_PATH: 无法解析模块文件路径: " .. source_path)
+    local root_prefix = root_path == "/" and "/" or root_path .. "/"
+    assert(resolved_path:sub(1, #root_prefix) == root_prefix,
+        "HU_INVALID_PATH: 模块文件不在 root_path 内: " .. resolved_path)
+    local relative_path = resolved_path:sub(#root_prefix + 1)
+    assert(relative_path:sub(-4) == ".lua" and not relative_path:find("\\", 1, true),
+        "HU_INVALID_PATH: 模块必须对应宿主目录中的 Lua 文件: " .. relative_path)
+    local canonical_name = relative_path:sub(1, -5):gsub("/", ".")
+    assert(canonical_name ~= "", "HU_INVALID_PATH: 模块文件路径无效")
+
+    local value, loader_path = require(name)
     assert(type(value) == "table", "可更新模块必须返回 table")
-    if not module_state.declared_modules[name] then
+    if loader_path then
+        assert(hotupgrade_native.resolve(loader_path) == resolved_path,
+            "HU_INVALID_PATH: 模块加载来源与 package.path 不一致: " .. name)
+    end
+    local previous_alias = package.loaded[canonical_name]
+    assert(previous_alias == nil or previous_alias == value,
+        "HU_DUPLICATE_MODULE: 模块路径登记名已被其他模块占用: " .. canonical_name)
+    if not module_state.declared_modules[canonical_name] then
         assert(module_state.declared_module_count < hotupgrade_common.MAX_MODULES,
             "HU_MODULE_LIMIT: 模块声明已达 " .. hotupgrade_common.MAX_MODULES .. " 上限")
+        -- 登记 RPC 可能 yield；先建立同表别名，避免 Controller 随后发起更新时查不到模块。
+        package.loaded[canonical_name] = value
         if module_state.registration then
             local ok, answer = pcall(skynet.call, module_state.registration.controller_handle, "hotupgrade",
-                "register_module", {name = name})
-            assert(ok and type(answer) == "table" and answer.ok,
-                "模块登记失败: " .. tostring(type(answer) == "table" and answer.message or answer))
+                "register_module", {name = canonical_name})
+            if not (ok and type(answer) == "table" and answer.ok) then
+                if not module_state.declared_modules[canonical_name] and package.loaded[canonical_name] == value then
+                    package.loaded[canonical_name] = previous_alias
+                end
+                error("模块登记失败: " .. tostring(type(answer) == "table" and answer.message or answer))
+            end
         end
 
-        if not module_state.declared_modules[name] then
-            module_state.declared_modules[name] = true
+        if not module_state.declared_modules[canonical_name] then
+            module_state.declared_modules[canonical_name] = true
             module_state.declared_module_count = module_state.declared_module_count + 1
         end
     end

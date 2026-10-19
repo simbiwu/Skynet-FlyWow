@@ -37,7 +37,7 @@ local function read(path)
     return hotupgrade_result.success({bytes = bytes})
 end
 
--- 将分类目录内的相对 Lua 路径映射为 require 模块名。
+-- 宿主根目录相对 Lua 路径对应 Controller 使用的唯一模块登记名。
 local function module_name(path)
     if path:sub(-4) ~= ".lua" or path:find("\\", 1, true) then
         return nil
@@ -46,23 +46,23 @@ local function module_name(path)
     return path:sub(1, -5):gsub("/", ".")
 end
 
--- 扫描一个白名单分类，校验语法并把源码纳入同一 Patch 字节预算。
-local function load_category(root, patch_path, category, identity, budget)
-    local paths, code = hotupgrade_native.list_lua(root, patch_path, category)
+-- 递归扫描选定 Patch 目录，检查语法并冻结同一事务的全部源码。
+local function load_files(root, patch_path, identity, budget)
+    local paths, code = hotupgrade_native.list_lua(root, patch_path)
     code = native_code(code)
     if not paths and code == "HU_PATCH_EMPTY" then
         return hotupgrade_result.success({entries = {}})
     end
 
     if not paths then
-        return hotupgrade_result.failure(native_code(code), "Patch 目录扫描失败: " .. category)
+        return hotupgrade_result.failure(native_code(code), "Patch 目录扫描失败: " .. patch_path)
     end
 
     table.sort(paths)
 
     local entries = {}
     for _, relative in ipairs(paths) do
-        local absolute = root .. "/" .. patch_path .. "/" .. category .. "/" .. relative
+        local absolute = root .. "/" .. patch_path .. "/" .. relative
         local located, locate_error = hotupgrade_native.resolve(absolute)
         if not located then
             return hotupgrade_result.failure(native_code(locate_error), relative)
@@ -82,40 +82,34 @@ local function load_category(root, patch_path, category, identity, budget)
             return hotupgrade_result.failure("HU_MODULE_SYNTAX", syntax_error)
         end
         entries[#entries + 1] = {file = relative, source = loaded.bytes}
-        identity[#identity + 1] = category .. "/" .. relative
+        identity[#identity + 1] = relative
     end
 
     return hotupgrade_result.success({entries = entries})
 end
 
 -- 汇总模块与 Service 文件；Patch 身份仅由路径和文件名组成。
-local function build_patch(root, patch_path)
+local function build_patch(root, patch_path, service_dir)
     local identity = {}        -- 当前 Patch 的路径身份字段，不是内容 hash。
     local budget = {bytes = 0} -- 整包冻结源码累计字节数。
-    local loaded = {}
-    for _, category in ipairs({"modules", "services"}) do
-        loaded[category] = load_category(root, patch_path, category, identity, budget)
-        if not loaded[category].ok then
-            return loaded[category]
-        end
+    local loaded = load_files(root, patch_path, identity, budget)
+    if not loaded.ok then
+        return loaded
     end
 
     local modules = {}
-    for _, entry in ipairs(loaded.modules.entries) do
-        local name = module_name(entry.file)
-        if not name or name == "" or modules[name] then
-            return hotupgrade_result.failure("HU_INVALID_PATCH", "Lua 模块路径重复或无效: " .. entry.file)
-        end
-        modules[name] = {name = name, entry_file = "modules/" .. entry.file, source = entry.source}
-    end
-
     local services = {}
-    for _, entry in ipairs(loaded.services.entries) do
-        local name = entry.file:match("^([%w_.%-]+)%.lua$")
-        if not name or services[name] then
-            return hotupgrade_result.failure("HU_INVALID_PATCH", "Service 文件名须为 <service_type>.lua")
+    local service_prefix = service_dir .. "/"
+    for _, entry in ipairs(loaded.entries) do
+        local is_service = entry.file:sub(1, #service_prefix) == service_prefix
+        local relative = is_service and entry.file:sub(#service_prefix + 1) or entry.file
+        local name = module_name(relative)
+        local entries = is_service and services or modules
+        if not name or name == "" or entries[name]
+            or (is_service and not name:match("^[%w_.%-]+$")) then
+            return hotupgrade_result.failure("HU_INVALID_PATCH", "Lua 路径映射重复或无效: " .. entry.file)
         end
-        services[name] = {entry_file = "services/" .. entry.file, source = entry.source}
+        entries[name] = {name = name, entry_file = entry.file, source = entry.source}
     end
 
     if next(modules) == nil and next(services) == nil then
@@ -148,7 +142,7 @@ local Controller = {}
 Controller.__index = Controller
 
 ---@class FlyWowHotUpgradeTargetMetadata
----@field service_type string 由现存 Service 声明，匹配 services/<service_type>.lua
+---@field service_type string 由现存 Service 声明，匹配配置 service_dir 下的相对路径
 ---@field modules string[] 当前 State 已声明模块的唯一名称数组
 ---@field service_patch boolean 是否在本 State 提供私有状态及函数更新入口
 
@@ -165,26 +159,50 @@ Controller.__index = Controller
 
 ---@class FlyWowHotUpgradeControllerConfig
 ---@field patch_root string 已存在且由宿主管理的受信 Patch 根目录
+---@field root_path string 宿主项目根目录；模块登记名由其相对文件路径生成
+---@field service_dir string root_path 下的相对 Service 目录，其下 Lua 文件作为一次性 Service 更新脚本
 ---@field timeout_ms? integer Guard 排空上限；默认值见 hotupgrade_common.DEFAULT_TIMEOUT_MS，不是 RPC 取消期限
 
 --- 创建控制面；不读取持久化历史，不尝试恢复上一进程的事务。
 ---@param controller_config FlyWowHotUpgradeControllerConfig
 ---@return FlyWowHotUpgradeResult 成功含 controller
 function M.new(controller_config)
-    if type(controller_config) ~= "table" or type(controller_config.patch_root) ~= "string"
+    if type(controller_config) ~= "table" or type(controller_config.patch_root) ~= "string" or controller_config.patch_root == ""
+        or type(controller_config.root_path) ~= "string" or controller_config.root_path == ""
+        or type(controller_config.service_dir) ~= "string"
         or (controller_config.timeout_ms ~= nil and (math.type(controller_config.timeout_ms) ~= "integer"
             or controller_config.timeout_ms <= 0)) then
-        return hotupgrade_result.failure("HU_INVALID_OPTIONS", "需要 patch_root 和可选正整数 timeout_ms")
+        return hotupgrade_result.failure("HU_INVALID_OPTIONS", "需要 patch_root、root_path、service_dir 和可选正整数 timeout_ms")
     end
 
-    local root, code = hotupgrade_native.resolve(controller_config.patch_root)
+    local root, code = hotupgrade_native.resolve(controller_config.patch_root .. "/.")
     if not root then
         return hotupgrade_result.failure(native_code(code), "Patch 根目录不可用")
+    end
+
+    local root_path, root_error = hotupgrade_native.resolve(controller_config.root_path .. "/.")
+    if not root_path then
+        return hotupgrade_result.failure(native_code(root_error), "宿主项目根目录不可用")
+    end
+
+    local service_path, service_error = hotupgrade_native.resolve(root_path, controller_config.service_dir)
+    if not service_path then
+        return hotupgrade_result.failure(native_code(service_error), "Service 相对目录无效: " .. controller_config.service_dir)
+    end
+
+    -- 只发布一份宿主根路径，业务 State 可在登记前通过 require 生成相同的文件身份。
+    local published_root = skynet.getenv(hotupgrade_common.ROOT_PATH_ENV)
+    if published_root and published_root ~= root_path then
+        return hotupgrade_result.failure("HU_INVALID_OPTIONS", "同一 Skynet 进程的 Controller 必须使用相同 root_path")
+    end
+    if not published_root then
+        skynet.setenv(hotupgrade_common.ROOT_PATH_ENV, root_path)
     end
 
     return hotupgrade_result.success({controller = setmetatable(
     {
         root              = root,                                -- 固定使用已解析的受信 Patch 根目录，不随事务改变。
+        service_dir       = controller_config.service_dir,        -- Patch 中仅此目录及其子目录按 Service 脚本处理。
         timeout_ms        = controller_config.timeout_ms or hotupgrade_common.DEFAULT_TIMEOUT_MS, -- Guard 排空期限，单位毫秒；默认值见 hotupgrade_common.DEFAULT_TIMEOUT_MS。
         target_count      = 0,                                   -- 当前 Controller 生命周期内成功登记的目标数量，用于容量检查。
         targets           = {},                                  -- 以真实 Service handle 为键，保存其模块声明和 Service 更新能力。
@@ -236,7 +254,7 @@ function Controller:register(request, source)
     self.targets[source] =
     {
         handle = source,                        -- Skynet 提供的真实来源，也是后续控制目标。
-        service_type = request.service_type,    -- 匹配 services/<service_type>.lua。
+        service_type = request.service_type,    -- 匹配配置 service_dir 下的相对路径。
         module_count = #request.modules,         -- 已登记声明数，用于拒绝无界增长。
         modules = modules,                      -- 该 State 明确声明的可更新模块集合。
         service_patch = request.service_patch,  -- 是否提供本地 Service 状态/函数入口。
@@ -254,7 +272,7 @@ function Controller:load(request)
         return hotupgrade_result.failure("HU_INVALID_PATCH", "需要相对 path；不再支持灰度 selector")
     end
 
-    local loaded = build_patch(self.root, request.path)
+    local loaded = build_patch(self.root, request.path, self.service_dir)
     if not loaded.ok then
         return loaded
     end
@@ -287,6 +305,7 @@ function Controller:load(request)
                 handle = record.handle,
                 modules = modules,
                 service_source = service and service.source,
+                service_entry_file = service and service.entry_file,
             }
         end
     end
@@ -335,6 +354,9 @@ function Controller:step(txn, target, command)
         return hotupgrade_result.failure("HU_RPC_FAILED", tostring(answer), command)
     end
 
+    if not answer.ok and target.service_entry_file then
+        answer.message = target.service_entry_file .. ": " .. (answer.message or answer.code)
+    end
     return answer
 end
 

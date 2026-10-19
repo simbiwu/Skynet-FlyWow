@@ -12,6 +12,8 @@ local controller_handle = skynet.newservice("flywow_hotupgrade_service")
 local initialized = skynet.call(controller_handle, "lua", "init",
 {
     patch_root = "./config/hotupgrade",
+    root_path = ".",
+    service_dir = "service",
     timeout_ms = 10000,
 })
 assert(initialized.ok, initialized.message)
@@ -25,7 +27,11 @@ assert(initialized.ok, initialized.message)
 
 公开入口是 hotupgrade/lualib/flywow_hotupgrade.lua；控制 Service 入口是 hotupgrade/service/flywow_hotupgrade_service.lua。Controller 加载 flywow_hotupgrade_native 时，Lua 从 Native 搜索路径定位统一构建入口产出的 build/native/flywow_hotupgrade_native.so。每个发送 hotupgrade 协议管理消息的 State 都先加载公开入口以声明该协议，管理 State 无需登记为业务目标。
 
-patch_root 必须存在且可读取。timeout_ms 是目标 Guard 等待在途业务排空的毫秒上限，默认 10000；它不是远端 RPC 取消期限。init 失败可修正后重试，成功后重复 init 返回 HU_ALREADY_INITIALIZED，初始化前控制请求返回 HU_NOT_INITIALIZED。
+patch_root 必须存在且可读取。root_path 是已存在的宿主项目根目录，service_dir 是它下面已存在的相对 Service 目录；拒绝绝对路径、空路径段、.、..、反斜杠和符号链接目录。目录允许多级，例如 service/battle。
+
+Controller 初始化成功时通过现有 Skynet 共享环境发布内部键 flywow_hotupgrade_root_path。须先完成 Controller init，再启动会调用 hotupgrade.require 的业务 Service。同一 Skynet 进程的 Controller 必须使用同一规范化 root_path；不一致时初始化失败。宿主不需要另行配置此内部环境键。
+
+timeout_ms 是目标 Guard 等待在途业务排空的毫秒上限，默认 10000；它不是远端 RPC 取消期限。init 失败可修正后重试，成功后重复 init 返回 HU_ALREADY_INITIALIZED，初始化前控制请求返回 HU_NOT_INITIALIZED。
 
 在现存业务 Service 自己的 Lua State 登记：
 
@@ -55,9 +61,13 @@ local registered = hotupgrade.register_service(
 assert(registered.ok, registered.message)
 ```
 
-service_type 对应 services/<service_type>.lua。service 可省略，此时只参与普通模块更新。Controller 使用注册消息真实 source 作为目标 handle；私有状态、函数和回调留在业务 State，不经消息传给 Controller。登记成功前宿主不得宣布 Service READY；登记 RPC 失败可能有不确定结果，应终止该次启动，由宿主管理，而不是继续接收业务。
+service_type 对应 service_dir 下的相对 Lua 路径：去掉 .lua 并将 / 转为 .。例如 service_dir 为 service 时，service/player.lua 对应 player，service/battle/worker.lua 对应 battle.worker。service 可省略，此时只参与普通模块更新。Controller 使用注册消息真实 source 作为目标 handle；私有状态、函数和回调留在业务 State，不经消息传给 Controller。登记成功前宿主不得宣布 Service READY；登记 RPC 失败可能有不确定结果，应终止该次启动，由宿主管理，而不是继续接收业务。
 
-hotupgrade.require 在当前 State 加载并声明可更新模块。登记前声明随初始元数据提交；登记后首次声明通过原生 Skynet call 登记，可能 yield。失败抛错且允许重试；重复声明不重复 RPC。Controller 只更新目标已声明的模块。
+hotupgrade.require(name) 仍用宿主原有 name 加载模块，通过 package.searchpath(name, package.path) 定位 Lua 文件，再复用 Native resolve 得到规范化路径。Controller 登记名由该文件相对 root_path 的路径去掉 .lua、将 / 转为 . 得到。例如原调用 hotupgrade.require("battle.state_sync.runtime") 加载 lualib/battle/state_sync/runtime.lua，登记名为 lualib.battle.state_sync.runtime；不是给原 name 固定增加目录前缀。?/init.lua 解析出的文件也按真实路径登记，例如 lualib/battle/init.lua 对应 lualib.battle.init。
+
+原 require 名和文件登记名在 package.loaded 中指向同一个模块根表，热更和恢复都通过同一根表对两种名称生效。文件登记名若已被另一模块占用，则抛出明确冲突错误，不覆盖已有表；动态登记失败会撤销本次新建的别名。仅支持通过标准 package.path 搜索的 Lua 文件；package.preload、自定义加载器来源不一致、无法定位文件或文件位于 root_path 外时明确拒绝。宿主应保持受控模块的搜索路径稳定，不在已加载后改写其加载来源。
+
+登记前声明随初始元数据提交；登记后首次声明通过原生 Skynet call 登记，可能 yield。失败抛错且允许重试；重复声明不重复 RPC。Controller 只更新目标已声明的模块。
 
 ## 业务 Guard
 
@@ -79,13 +89,19 @@ Guard:run 允许业务正常 yield，捕获异常并在结束时减少在途计�
 
 ```text
 <patch_root>/<path>/
-  modules/
+  config/
+    settings.lua
+  lualib/
     player_logic.lua
-  services/
+    battle/state_sync/runtime.lua
+  service/
     player.lua
+    battle/worker.lua
 ```
 
-两类均可单独存在。modules/ 相对路径按目录分隔转为 require 名，每份文件必须是完整模块新版本。只改一个函数也必须保留新版仍需要的全部导出字段。提交会更新所有新字段，并删除新版已去掉的字段，原导出表和 package.loaded[name] 身份保持不变。
+Patch 内部路径对应宿主 root_path 下的实际路径。递归扫描本次 path 下所有 Lua 文件；仅配置 service_dir 及其子目录识别为 Service Patch，其余 Lua 文件都作为普通模块，包括 config、lualib 和其他宿主目录。service_dir 为 service 时，上例两个 Service 脚本分别匹配 player、battle.worker；普通模块分别匹配 config.settings、lualib.player_logic、lualib.battle.state_sync.runtime。目录中的非 Lua 普通文件忽略，符号链接和特殊文件一律拒绝；不同路径映射到同一模块名或 Service 类型时拒绝整包。
+
+两类均可单独存在。每份普通模块文件必须是完整模块新版本。只改一个函数也必须保留新版仍需要的全部导出字段。提交会更新所有新字段，并删除新版已去掉的字段，原导出表和两种 package.loaded 名称的身份保持不变。
 
 模块顶层是无元表普通表，只导出字符串键，值允许函数、数值、字符串、布尔值和普通嵌套表；嵌套表键允许字符串、数值或布尔值，允许共享和循环，但不得引用模块根导出表。任何层级均不接受元表、userdata 或 thread，同名顶层字段不得改变类型。嵌套表随版本整体替换，不递归合并、不保证身份；缓存的旧嵌套引用仍指向旧数据，回滚恢复旧字段及原有嵌套引用。可变私有状态放在模块闭包或由 Service 持有。模块顶层只能定义代码、常量和引用已加载依赖；不得 yield、I/O、写全局、修改线上状态或启动任务。候选源码中的 require 只返回本 State 已加载的模块，不加载新增依赖。
 
@@ -122,7 +138,7 @@ return M
 
 ## 一次性 Service 更新脚本
 
-services/player.lua 返回构建函数，接收现存 Service 私有 state 根表：
+service_dir 为 service 时，service/player.lua 返回构建函数，接收现存 Service 私有 state 根表：
 
 ```lua
 return function(state)
@@ -183,7 +199,7 @@ validate 同步冻结源码、检查路径/语法和匹配的登记目标，不�
 
 ## 文件边界与验证
 
-Native 仅提供 resolve/list_lua，拒绝越界路径、链接及特殊文件。扫描限制每分类最多 1024 个 Lua 文件、单文件 2 MiB，整包读取累计最多 16 MiB。宿主在扫描/冻结期间保持 Patch 目录不变；扫描和读取不是抵抗并发目录替换的原子安全边界。冻结后目标只使用本次源码，不重新读取磁盘。
+Native 提供 resolve(path[, relative_dir]) 和 list_lua(patch_root, path)；相对目录检查与递归扫描共用路径安全校验，拒绝越界路径、链接及特殊文件。扫描限制整个选定 Patch 最多 1024 个 Lua 文件、单文件 2 MiB，整包读取累计最多 16 MiB。宿主在扫描/冻结期间保持 Patch 目录不变；扫描和读取不是抵抗并发目录替换的原子安全边界。冻结后目标只使用本次源码，不重新读取磁盘。
 
 Controller 最多登记 1024 个目标，每目标最多声明 1024 个模块；达到上限返回 HU_TARGET_LIMIT/HU_MODULE_LIMIT。登记记录由当前 Controller 持有，不建立后台发现或自动注销；宿主负责保持实际 Service 生命周期与控制面一致。
 

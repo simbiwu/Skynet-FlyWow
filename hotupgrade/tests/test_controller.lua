@@ -4,10 +4,13 @@ local module_state =
 {
     pending_control_coroutines = {}, -- 测试替身排队的 Controller 控制面协程。
     last_control_command_by_handle = {}, -- 各目标最近收到的控制步骤。
+    shared_environment = {}, -- 模拟 Skynet 跨 State 的只写一次环境。
     injected_control_failure = nil, -- 当前测试注入的目标和命令失败条件。
 }
 package.loaded.skynet =
 {
+    getenv = function(key) return module_state.shared_environment[key] end,
+    setenv = function(key, value) module_state.shared_environment[key] = value end,
     self = function() return 99 end,
     fork = function(fn) module_state.pending_control_coroutines[#module_state.pending_control_coroutines + 1] = fn end,
     call = function(handle, protocol, command, request)
@@ -19,31 +22,42 @@ package.loaded.skynet =
         return {ok = true}
     end,
 }
+-- 独立 Lua 不导出 Skynet 的 allocator 符号；真实 Native 由 test_files 在 Skynet 内覆盖。
 package.loaded.flywow_hotupgrade_native =
 {
-    resolve = function(path) return path end,
-    list_lua = function(_root, path, category)
-        if path == "unmatched_module" and category == "modules" then
-            return {"test_worker_logic.lua", "missing_logic.lua"}
-        end
-        if path == "unmatched_service" and category == "services" then
-            return {"unused.lua"}
-        end
-        if path == "combined" and category == "services" then
-            return {"player.lua"}
-        end
-        if (path == "module" or path == "combined" or path == "unmatched_service")
-            and category == "modules" then
-            return {"test_worker_logic.lua"}
-        end
-        return nil, {code = "HU_PATCH_EMPTY"}
+    resolve = function(path, relative)
+        return relative and path .. "/" .. relative or (path:gsub("/%.$", ""))
+    end,
+    list_lua = function(_root, path)
+        local files =
+        {
+            module = {"lualib/test_worker_logic.lua"},
+            combined = {"lualib/test_worker_logic.lua", "service/player.lua"},
+            unmatched_module = {"lualib/test_worker_logic.lua", "lualib/missing_logic.lua"},
+            unmatched_service = {"lualib/test_worker_logic.lua", "service/unused.lua"},
+            host_paths = {"config/settings.lua", "lualib/battle/state_sync/runtime.lua",
+                "lualib/packages/demo/init.lua"},
+            nested_service = {"service/battle/worker.lua"},
+            custom_service = {"actors/zone/player.lua"},
+            duplicate_module = {"lualib/battle.worker.lua", "lualib/battle/worker.lua"},
+            duplicate_service = {"service/battle.worker.lua", "service/battle/worker.lua"},
+        }
+        return files[path], {code = "HU_PATCH_EMPTY"}
     end,
 }
 local controller = require "flywow_hotupgrade_controller"
+local function new_controller(service_dir)
+    return assert(controller.new(
+    {
+        patch_root = "build/hotupgrade-tests/patches",
+        root_path = "build/hotupgrade-tests/host",
+        service_dir = service_dir or "service",
+    }).controller)
+end
 assert(not controller.new({}).ok)
-local c = assert(controller.new({patch_root = "build/hotupgrade-tests/patches"}).controller)
+local c = new_controller()
 for _, handle in ipairs({10, 20}) do
-    assert(c:control("register", {service_type = "player", modules = {"test_worker_logic"},
+    assert(c:control("register", {service_type = "player", modules = {"lualib.test_worker_logic"},
         service_patch = false}, handle).ok)
 end
 assert(not c:control("register", {service_type = "player", modules = {}, service_patch = false}, 10).ok)
@@ -53,8 +67,8 @@ assert(not c:control("validate", {path = "module", selector = {percent = 0.5}}, 
 assert(c:control("validate", {path = "module"}, 1).target_count == 2)
 -- 三种入口必须在整包匹配失败时拒绝启动，连 prepare 都不能发给已匹配目标。
 for _, fixture in ipairs({
-    {path = "unmatched_module", file = "modules/missing_logic.lua", reason = "声明模块"},
-    {path = "unmatched_service", file = "services/unused.lua", reason = "service_type"},
+    {path = "unmatched_module", file = "lualib/missing_logic.lua", reason = "声明模块"},
+    {path = "unmatched_service", file = "service/unused.lua", reason = "service_type"},
 }) do
     for _, command in ipairs({"validate", "dry_run", "apply"}) do
         module_state.last_control_command_by_handle = {}
@@ -68,9 +82,9 @@ for _, fixture in ipairs({
     end
 end
 -- 同一模块仍可匹配多个 Service，组合包中的 Service 脚本也必须被覆盖。
-local combined = assert(controller.new({patch_root = "build/hotupgrade-tests/patches"}).controller)
+local combined = new_controller()
 for _, handle in ipairs({30, 40}) do
-    assert(combined:control("register", {service_type = "player", modules = {"test_worker_logic"},
+    assert(combined:control("register", {service_type = "player", modules = {"lualib.test_worker_logic"},
         service_patch = true}, handle).ok)
 end
 for _, command in ipairs({"validate", "dry_run", "apply"}) do
@@ -82,7 +96,26 @@ for _, command in ipairs({"validate", "dry_run", "apply"}) do
 end
 local unsupported = c:control("validate", {path = "combined"}, 1)
 assert(unsupported.code == "HU_SERVICE_PATCH_UNSUPPORTED")
-assert(unsupported.message:find("combined/services/player.lua", 1, true))
+assert(unsupported.message:find("combined/service/player.lua", 1, true))
+-- 路径映射保留宿主目录前缀，Service 目录可更换并支持多级类型名。
+local paths = new_controller()
+assert(paths:control("register",
+    {service_type = "battle.worker", modules = {"config.settings", "lualib.battle.state_sync.runtime", "lualib.packages.demo.init"},
+        service_patch = true}, 50).ok)
+local loaded = paths:load({path = "host_paths"})
+assert(loaded.ok and #loaded.patch.modules == 3)
+assert(loaded.patch.modules[1].entry_file == "config/settings.lua")
+assert(loaded.patch.modules[2].name == "lualib.battle.state_sync.runtime")
+assert(paths:control("validate", {path = "nested_service"}, 1).ok)
+local changed = new_controller("actors")
+assert(changed:control("register",
+    {service_type = "zone.player", modules = {}, service_patch = true}, 60).ok)
+assert(changed:control("validate", {path = "custom_service"}, 1).ok)
+for _, path in ipairs({"duplicate_module", "duplicate_service"}) do
+    assert(paths:control("validate", {path = path}, 1).code == "HU_INVALID_PATCH")
+end
+print("HOTUPGRADE_CONTROLLER_PATHS_OK")
+
 local function run(command)
     local answer = c:control(command or "apply", {path = "module"}, 1)
     assert(answer.ok)
@@ -110,7 +143,7 @@ assert(not c:control("apply", {path = "module"}, 1).ok)
 assert(not c:control("history", {}, 1).ok)
 -- 持有容量和只保留最近终态的合同，不能靠清空查询记录绕过恢复门禁。
 assert(c:control("status", {txn_id = "99:1"}, 1).code == "HU_TRANSACTION_MISSING")
-local bounded = assert(controller.new({patch_root = "build/hotupgrade-tests/patches"}).controller)
+local bounded = new_controller()
 for handle = 1, hotupgrade_common.MAX_TARGETS do
     assert(bounded:control("register", {service_type = "empty", modules = {}, service_patch = false}, handle).ok)
 end
@@ -120,7 +153,7 @@ local names = {}
 for index = 1, hotupgrade_common.MAX_MODULES do
     names[index] = "logic_" .. index
 end
-local limited = assert(controller.new({patch_root = "build/hotupgrade-tests/patches"}).controller)
+local limited = new_controller()
 assert(limited:control("register", {service_type = "empty", modules = names, service_patch = false}, 1).ok)
 assert(limited:control("register_module", {name = names[1]}, 1).ok)
 assert(limited:control("register_module", {name = "overflow"}, 1).code == "HU_MODULE_LIMIT")

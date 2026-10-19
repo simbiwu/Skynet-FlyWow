@@ -4,10 +4,12 @@ require "skynet.manager"
 require "flywow_hotupgrade"
 require "test_files"
 
-local function create_controller()
+local function create_controller(service_dir)
     local handle = skynet.newservice("flywow_hotupgrade_service")
     assert(skynet.call(handle, "hotupgrade", "status", {}).code == "HU_NOT_INITIALIZED")
-    assert(skynet.call(handle, "lua", "init", require "hotupgrade_test_options").ok)
+    local config = require "hotupgrade_test_options"
+    assert(skynet.call(handle, "lua", "init",
+        {patch_root = config.patch_root, root_path = config.root_path, service_dir = service_dir or config.service_dir}).ok)
     assert(skynet.call(handle, "lua", "init", {}).code == "HU_ALREADY_INITIALIZED")
     return handle
 end
@@ -60,6 +62,24 @@ local function run()
     local controller_handle = create_controller()
     local handle = worker(controller_handle)
     local before = original(handle)
+    -- 原 require 名和文件登记名共同指向同一模块；提交与 dry_run 均能通过真实路径匹配。
+    assert(before.runtime_alias_identity and before.runtime_value == 1 and before.max_level == 100)
+    wait(controller_handle, start(controller_handle, "host_paths", "dry_run"), "DRY_RUN_COMPLETED")
+    assert(read(handle).runtime_value == 1 and read(handle).max_level == 100)
+    assert(read(handle).package_value == 1 and read(handle).package_alias_identity)
+    wait(controller_handle, start(controller_handle, "host_paths"), "COMPLETED")
+    assert(read(handle).runtime_value == 2 and read(handle).max_level == 200 and read(handle).runtime_alias_identity)
+    assert(read(handle).package_value == 2 and read(handle).package_alias_identity)
+    local nested_controller = create_controller()
+    local nested_worker = worker(nested_controller, {service_type = "battle.worker"})
+    wait(nested_controller, start(nested_controller, "nested_service"), "COMPLETED")
+    assert(read(nested_worker).attack == 120)
+    local changed_controller = create_controller("actors")
+    local changed_worker = worker(changed_controller, {service_type = "zone.player"})
+    wait(changed_controller, start(changed_controller, "custom_service"), "COMPLETED")
+    assert(read(changed_worker).attack == 120)
+    print("HOTUPGRADE_SKYNET_HOST_PATHS_OK")
+
     -- 整包匹配失败必须在任何目标控制步骤前返回，线上代码、状态和 Guard 均保持原值。
     for _, path in ipairs({"unmatched_module", "unmatched_service"}) do
         for _, command in ipairs({"validate", "dry_run", "apply"}) do
@@ -114,6 +134,7 @@ local function run()
     controller_handle = create_controller()
     handle = worker(controller_handle)
     assert(skynet.call(controller_handle, "hotupgrade", "validate", {path = "extra"}).code == "HU_TARGET_MISSING")
+    assert(skynet.call(handle, "lua", "check_declarations", {}))
     assert(skynet.call(handle, "lua", "declare", {}) == 1)
     assert(skynet.call(handle, "lua", "declare", {}) == 1)
     wait(controller_handle, start(controller_handle, "extra"), "COMPLETED")

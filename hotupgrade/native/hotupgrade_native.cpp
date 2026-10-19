@@ -44,7 +44,7 @@ int pushNativeException(lua_State *state)
 
 struct FileList
 {
-    std::vector<std::string> paths; ///< 分类目录下的相对 Lua 路径，供 Lua 推导模块名并读取源码。
+    std::vector<std::string> paths; ///< Patch 目录下的相对 Lua 路径，供 Lua 推导模块名并读取源码。
     std::size_t total_bytes = 0;    ///< 已接受文件累计大小；与单文件上限共同限制扫描占用。
 };
 
@@ -112,7 +112,7 @@ int scanDirectory(const std::string &root, const std::string &directory,
         }
         if (S_ISDIR(attributes.st_mode))
         {
-            // 同一个 FileList 贯穿递归，因此数量和累计字节上限覆盖整棵分类子树。
+            // 同一个 FileList 贯穿递归，因此数量和累计字节上限覆盖整个 Patch 目录。
             status = scanDirectory(root, absolute, child_relative, files);
             if (status != 0)
             {
@@ -146,8 +146,9 @@ int scanDirectory(const std::string &root, const std::string &directory,
         }
         // realpath 复核规范化目标仍在 root 内，阻止扫描期间目录路径被替换后越界。
         const std::string canonical_path = canonical;
-        if (canonical_path.size() <= root.size() ||
-            canonical_path.compare(0, root.size(), root) != 0 || canonical_path[root.size()] != '/')
+        if (root != "/" && (canonical_path.size() <= root.size() ||
+                            canonical_path.compare(0, root.size(), root) != 0 ||
+                            canonical_path[root.size()] != '/'))
         {
             status = -1;
             break;
@@ -158,43 +159,68 @@ int scanDirectory(const std::string &root, const std::string &directory,
     return status;
 }
 
-// 校验补丁目录必须位于 root 下，再扫描白名单分类；1 表示分类目录或内容为空。
-int listLuaFiles(const std::string &root_argument, const std::string &relative,
-                 const std::string &category, std::vector<std::string> &output)
+// 与扫描和 Controller 配置共用的相对目录检查；逐级拒绝链接和特殊文件。
+bool resolveDirectory(const std::string &root_argument, const std::string &relative,
+                      std::string &root, std::string &directory)
 {
-    if (root_argument.empty() || relative.empty() || root_argument.size() >= PATH_MAX ||
-        relative.size() >= PATH_MAX || root_argument.find('\0') != std::string::npos ||
+    if (!resolvePath(root_argument, root) || relative.empty() || relative.size() >= PATH_MAX ||
         relative.find('\0') != std::string::npos || relative[0] == '/' ||
-        relative.find("..") != std::string::npos)
+        relative.find('\\') != std::string::npos)
     {
-        return -1;
+        return false;
     }
+
+    directory = root;
+    std::size_t offset = 0;
+    while (offset < relative.size())
+    {
+        const std::size_t separator = relative.find('/', offset);
+        const std::string component = relative.substr(offset, separator - offset);
+        if (component.empty() || component == "." || component == "..")
+        {
+            return false;
+        }
+        directory += "/" + component;
+        struct stat attributes;
+        if (directory.size() >= PATH_MAX || lstat(directory.c_str(), &attributes) != 0 ||
+            !S_ISDIR(attributes.st_mode) || S_ISLNK(attributes.st_mode))
+        {
+            return false;
+        }
+        if (separator == std::string::npos)
+        {
+            break;
+        }
+        offset = separator + 1;
+        if (offset == relative.size())
+        {
+            return false;
+        }
+    }
+
+    std::string canonical;
+    if (!resolvePath(directory, canonical) ||
+        (root != "/" && (canonical.size() <= root.size() ||
+                        canonical.compare(0, root.size(), root) != 0 ||
+                        canonical[root.size()] != '/')))
+    {
+        return false;
+    }
+    directory = canonical;
+    return true;
+}
+
+// 一次扫描整个选定 Patch 目录，数量和字节预算覆盖全部 Lua 文件。
+int listLuaFiles(const std::string &root_argument, const std::string &relative,
+                 std::vector<std::string> &output)
+{
     std::string root;
-    if (!resolvePath(root_argument, root))
+    std::string directory;
+    if (!resolveDirectory(root_argument, relative, root, directory))
     {
         return -1;
     }
-    std::string patch;
-    if (!resolvePath(root + "/" + relative, patch) || patch.size() <= root.size() ||
-        patch.compare(0, root.size(), root) != 0 || patch[root.size()] != '/')
-    {
-        return -1;
-    }
-    if (category != "modules" && category != "services")
-    {
-        return -1;
-    }
-    const std::string directory = patch + "/" + category;
-    struct stat       attributes;
-    if (lstat(directory.c_str(), &attributes) != 0)
-    {
-        // 只有确实缺省的分类允许为空；权限/I/O 错误不能把 Patch 静默裁成另一半。
-        return errno == ENOENT ? 1 : -1;
-    }
-    if (S_ISLNK(attributes.st_mode) || !S_ISDIR(attributes.st_mode))
-    {
-        return -1;
-    }
+
     FileList  files;
     const int status = scanDirectory(root, directory, "", files);
     if (status != 0)
@@ -209,13 +235,14 @@ int listLuaFiles(const std::string &root_argument, const std::string &relative,
     return 0;
 }
 
-// 参数 1 是必须已存在的路径。成功返回规范化绝对路径；失败返回 nil/error。
+// 参数 1 是已存在的路径；可选参数 2 是其下的相对目录，复用扫描器的包含关系和链接检查。
+// 成功返回规范化绝对路径；失败返回 nil/error。
 int resolve(lua_State *state)
 {
     try
     {
         // 参数读取不改变原栈槽；成功压入路径，失败追加 nil/error 两个结果。
-        // [S, input] -> [S, input, canonical_path] 或 [S, input, nil, error]；VM 取回调返回数。
+        // [S, input, relative?] -> [..., canonical_path] 或 [..., nil, error]；VM 取回调返回数。
         LuaBinding  binding(state);
         std::string input;
         if (!binding.readValue(1, input))
@@ -223,9 +250,24 @@ int resolve(lua_State *state)
             return binding.pushError();
         }
         std::string output;
-        if (!resolvePath(input, output))
+        bool resolved = false;
+        if (lua_gettop(state) >= 2)
         {
-            return binding.pushError(input.empty() ? "HU_INVALID_PATH" : "HU_FILE_NOT_FOUND",
+            std::string relative;
+            std::string root;
+            if (!binding.readValue(2, relative))
+            {
+                return binding.pushError();
+            }
+            resolved = resolveDirectory(input, relative, root, output);
+        }
+        else
+        {
+            resolved = resolvePath(input, output);
+        }
+        if (!resolved)
+        {
+            return binding.pushError((input.empty() || lua_gettop(state) >= 2) ? "HU_INVALID_PATH" : "HU_FILE_NOT_FOUND",
                                      "path cannot be resolved");
         }
         return binding.returnValues(output);
@@ -240,27 +282,25 @@ int resolve(lua_State *state)
     }
 }
 
-// 参数依次为 Patch Root、相对 Patch 目录和允许的分类名；readValue 不改变参数栈。
+// 参数依次为 Patch Root、相对 Patch 目录；readValue 不改变参数栈。
 // LuaTable 以 registry 引用临时持有结果 table；returnValues 压入它并返回 1，
 // C++ 句柄析构只释放自身引用，不移除 Lua 返回栈中已压入的 table。
 int list_lua(lua_State *state)
 {
     try
     {
-        // 三个 readValue 只读取原参数槽；临时 table 由 registry 引用持有，不占用工作栈。
-        // returnValues 压入 table 后：[S, root, relative, category] -> [..., result_table]；
+        // 两个 readValue 只读取原参数槽；临时 table 由 registry 引用持有，不占用工作栈。
+        // returnValues 压入 table 后：[S, root, relative] -> [..., result_table]；
         // 返回 1 时 VM 保留最顶层 table，LuaTable 析构 unref 不弹栈或移除它。
         LuaBinding  binding(state);
         std::string root;
         std::string relative;
-        std::string category;
-        if (!binding.readValue(1, root) || !binding.readValue(2, relative) ||
-            !binding.readValue(3, category))
+        if (!binding.readValue(1, root) || !binding.readValue(2, relative))
         {
             return binding.pushError();
         }
         std::vector<std::string> paths;
-        const int                status = listLuaFiles(root, relative, category, paths);
+        const int                status = listLuaFiles(root, relative, paths);
         if (status != 0)
         {
             return binding.pushError(status == 1    ? "HU_PATCH_EMPTY"
