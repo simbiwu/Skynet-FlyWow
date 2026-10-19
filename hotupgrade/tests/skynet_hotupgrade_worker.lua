@@ -104,12 +104,62 @@ skynet.start(function()
             }
         elseif command == "check_declarations" then
             assert(hotupgrade.require("test_worker_logic") == logic)
-            local conflicting = {}
+            assert(hotupgrade.require("config.settings") == settings)
+
+            -- 原名就是规范名时，未知缓存仍须拒绝，不能凭名称相同认定文件来源。
+            local original_settings = package.loaded["config.settings"] -- 本测试结束后恢复已登记模块缓存。
+            local conflicting       = {}                                -- 模拟来源不明的占位表，不得被覆盖或登记。
+            package.loaded["config.settings"] = conflicting
+            local ok, message = pcall(hotupgrade.require, "config.settings")
+            assert(not ok and tostring(message):find("HU_INVALID_PATH", 1, true))
+            assert(package.loaded["config.settings"] == conflicting)
+            package.loaded["config.settings"] = original_settings
+            assert(hotupgrade.require("config.settings") == settings)
+
+            -- 规范名被缓存或 preload 占用时，连原名缓存也不能新增。
             package.loaded["lualib.hotupgrade_extra"] = conflicting
-            local ok, message = pcall(hotupgrade.require, "hotupgrade_extra")
+            ok, message = pcall(hotupgrade.require, "hotupgrade_extra")
             assert(not ok and tostring(message):find("HU_DUPLICATE_MODULE", 1, true))
             assert(package.loaded["lualib.hotupgrade_extra"] == conflicting)
+            assert(package.loaded.hotupgrade_extra == nil)
             package.loaded["lualib.hotupgrade_extra"] = nil
+
+            local preload_loader = function() return conflicting end
+            package.preload["lualib.hotupgrade_extra"] = preload_loader
+            ok, message = pcall(hotupgrade.require, "hotupgrade_extra")
+            assert(not ok and tostring(message):find("HU_DUPLICATE_MODULE", 1, true))
+            assert(package.preload["lualib.hotupgrade_extra"] == preload_loader)
+            assert(package.loaded.hotupgrade_extra == nil and package.loaded["lualib.hotupgrade_extra"] == nil)
+            package.preload["lualib.hotupgrade_extra"] = nil
+            package.preload["lualib.test_worker_logic"] = preload_loader
+            ok, message = pcall(hotupgrade.require, "test_worker_logic")
+            assert(not ok and tostring(message):find("HU_DUPLICATE_MODULE", 1, true))
+            assert(package.loaded.test_worker_logic == logic and package.loaded["lualib.test_worker_logic"] == logic)
+            assert(package.preload["lualib.test_worker_logic"] == preload_loader)
+            package.preload["lualib.test_worker_logic"] = nil
+
+            -- 普通 require 先加载的表没有本入口的来源记录；拒绝时必须保留原缓存且不建别名。
+            local ordinarily_loaded = require("hotupgrade_extra")
+            ok, message = pcall(hotupgrade.require, "hotupgrade_extra")
+            assert(not ok and tostring(message):find("HU_INVALID_PATH", 1, true))
+            assert(package.loaded.hotupgrade_extra == ordinarily_loaded)
+            assert(package.loaded["lualib.hotupgrade_extra"] == nil)
+            package.loaded.hotupgrade_extra = nil
+
+            -- 未知加载器省略来源或返回其他文件时，恢复它刚建立的原名缓存，不留下别名。
+            local original_require = _G.require
+            for _, loader_path in ipairs({false, assert(package.searchpath("test_worker_logic", package.path))}) do
+                _G.require = function(name)
+                    assert(name == "hotupgrade_extra")
+                    package.loaded[name] = conflicting
+                    return conflicting, loader_path or nil
+                end
+                ok, message = pcall(hotupgrade.require, "hotupgrade_extra")
+                _G.require = original_require
+                assert(not ok and tostring(message):find("HU_INVALID_PATH", 1, true))
+                assert(package.loaded.hotupgrade_extra == nil and package.loaded["lualib.hotupgrade_extra"] == nil)
+            end
+
             for _, name in ipairs({"hotupgrade_test_options", "missing_module"}) do
                 ok, message = pcall(hotupgrade.require, name)
                 assert(not ok and tostring(message):find("HU_INVALID_PATH", 1, true))

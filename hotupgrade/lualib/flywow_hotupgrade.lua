@@ -1,5 +1,6 @@
 --- 现存 Service 的登记与原地更新；所有业务对象、快照和模块表仅留在本 Lua State。
 local skynet = require "skynet"
+local skynet_require = require "skynet.require"
 local hotupgrade_result = require "flywow_hotupgrade_error"
 local hotupgrade_common = require "flywow_hotupgrade_common"
 local hotupgrade_native = require "flywow_hotupgrade_native"
@@ -7,14 +8,15 @@ local hotupgrade_module_patch = require "flywow_hotupgrade_module_patch"
 local M = {}
 local module_state =
 {
-    registration = nil, -- 本 Lua State 登记配置；私有表和函数不发送给 Controller。
-    business_guard = nil, -- 注册前创建的业务 Guard 在注册后继续复用。
-    module_patch_engine = nil, -- 本 State 唯一完整模块更新器。
-    active_transaction = nil, -- 当前事务的撤销数据保留至 finish/abort 确认完成。
-    completed_sequence = 0, -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
-    last_transaction_id = nil, -- 最近完成事务，用于 finish/abort 幂等响应。
-    declared_module_count = 0, -- 本 State 已成功声明模块数，受 hotupgrade_common.MAX_MODULES 限制。
-    declared_modules = {}, -- hotupgrade.require 已登记的模块集合。
+    registration          = nil,                              -- 本 Lua State 登记配置；私有表和函数不发送给 Controller。
+    business_guard        = nil,                              -- 注册前创建的业务 Guard 在注册后继续复用。
+    module_patch_engine   = nil,                              -- 本 State 唯一完整模块更新器。
+    active_transaction    = nil,                              -- 当前事务的撤销数据保留至 finish/abort 确认完成。
+    completed_sequence    = 0,                                -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
+    last_transaction_id   = nil,                              -- 最近完成事务，用于 finish/abort 幂等响应。
+    declared_module_count = 0,                                -- 本 State 已成功声明模块数，受 hotupgrade_common.MAX_MODULES 限制。
+    declared_modules      = {},                               -- hotupgrade.require 已登记的模块集合。
+    module_sources        = setmetatable({}, {__mode = "k"}), -- 仅保存本入口确认的模块表与文件路径；弱键不延长模块生命周期。
 }
 
 
@@ -378,6 +380,7 @@ function M.register_service(registration)
 end
 
 --- 在本 State 加载完整模块；首次登记新模块可能 yield。登记失败抛错，允许再次声明。
+--- 仅复用本入口确认过来源的缓存；普通 require 先加载的未知缓存会被明确拒绝。
 ---@param name string 宿主原有 require 名；Controller 使用实际文件的根目录相对路径登记
 ---@return table 当前 State 的稳定模块导出表
 function M.require(name)
@@ -398,18 +401,57 @@ function M.require(name)
     local canonical_name = relative_path:sub(1, -5):gsub("/", ".")
     assert(canonical_name ~= "", "HU_INVALID_PATH: 模块文件路径无效")
 
-    local value, loader_path = require(name)
-    assert(type(value) == "table", "可更新模块必须返回 table")
-    if loader_path then
-        assert(hotupgrade_native.resolve(loader_path) == resolved_path,
-            "HU_INVALID_PATH: 模块加载来源与 package.path 不一致: " .. name)
-    end
+    -- 缓存只证明名称已被占用，不能证明它来自当前文件；只复用本入口确认过的同表来源。
+    local cached_value = package.loaded[name]
+    assert(cached_value == nil or (type(cached_value) == "table"
+        and module_state.module_sources[cached_value] == resolved_path),
+        "HU_INVALID_PATH: 无法确认缓存模块来源，须先通过 hotupgrade.require 加载: " .. name)
     local previous_alias = package.loaded[canonical_name]
-    assert(previous_alias == nil or previous_alias == value,
+    assert(package.preload[canonical_name] == nil,
+        "HU_DUPLICATE_MODULE: 模块路径登记名已被 package.preload 占用: " .. canonical_name)
+    assert(previous_alias == nil or (rawequal(previous_alias, cached_value)
+        and module_state.module_sources[previous_alias] == resolved_path),
         "HU_DUPLICATE_MODULE: 模块路径登记名已被其他模块占用: " .. canonical_name)
     if not module_state.declared_modules[canonical_name] then
         assert(module_state.declared_module_count < hotupgrade_common.MAX_MODULES,
             "HU_MODULE_LIMIT: 模块声明已达 " .. hotupgrade_common.MAX_MODULES .. " 上限")
+    end
+
+    local value = cached_value
+    if value == nil then
+        local ok
+        ok, value = pcall(function()
+            local loaded_value, loader_path = require(name)
+            assert(type(loaded_value) == "table", "可更新模块必须返回 table")
+            if loader_path ~= nil then
+                assert(type(loader_path) == "string" and hotupgrade_native.resolve(loader_path) == resolved_path,
+                    "HU_INVALID_PATH: 模块加载来源与 package.path 不一致: " .. name)
+            else
+                -- Skynet 协程 require 不返回路径；它对可编译的 Lua 文件固定走 searchpath/loadfile。
+                -- 仅认可这个已知加载器；重新编译但不执行，以排除它退回其他加载器的分支。
+                assert(require == skynet_require.require and loadfile(source_path, "t") ~= nil,
+                    "HU_INVALID_PATH: 加载器未提供可确认的模块来源: " .. name)
+            end
+            assert(module_state.module_sources[loaded_value] == nil
+                or module_state.module_sources[loaded_value] == resolved_path,
+                "HU_DUPLICATE_MODULE: 同一模块表已对应其他文件: " .. name)
+            assert(package.preload[name] == nil and package.preload[canonical_name] == nil,
+                "HU_DUPLICATE_MODULE: 模块名称已被 package.preload 占用: " .. canonical_name)
+            assert(package.loaded[canonical_name] == nil
+                or rawequal(package.loaded[canonical_name], loaded_value),
+                "HU_DUPLICATE_MODULE: 模块路径登记名已被其他模块占用: " .. canonical_name)
+            return loaded_value
+        end)
+        if not ok then
+            package.loaded[name] = cached_value
+            package.loaded[canonical_name] = previous_alias
+            error(value)
+        end
+
+        module_state.module_sources[value] = resolved_path
+    end
+
+    if not module_state.declared_modules[canonical_name] then
         -- 登记 RPC 可能 yield；先建立同表别名，避免 Controller 随后发起更新时查不到模块。
         package.loaded[canonical_name] = value
         if module_state.registration then
