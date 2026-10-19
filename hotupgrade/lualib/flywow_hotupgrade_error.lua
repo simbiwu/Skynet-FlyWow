@@ -15,12 +15,12 @@ function M.failure(code, message, step)
     return {ok = false, code = code, message = message, step = step}
 end
 
----@param data? table 要补充成功标记的结果 record
+---@param result_payload? table 要补充成功标记的结果 record
 ---@return FlyWowHotUpgradeResult
-function M.success(data)
-    data = data or {}
-    data.ok = true
-    return data
+function M.success(result_payload)
+    result_payload = result_payload or {}
+    result_payload.ok = true
+    return result_payload
 end
 
 return M

@@ -1,5 +1,6 @@
 --- 本 Lua State 的完整模块更新；保留导出表身份，候选私有状态与旧版本隔离。
-local result = require "flywow_hotupgrade_error"
+local hotupgrade_result = require "flywow_hotupgrade_error"
+local hotupgrade_common = require "flywow_hotupgrade_common"
 local M = {}
 local Engine = {}
 Engine.__index = Engine
@@ -19,10 +20,12 @@ function M.copy_state(value, destination)
                 "状态快照只接受普通数据")
             return item
         end
+
         assert(getmetatable(item) == nil, "状态对象需要显式快照和恢复处理")
         if seen[item] then
             return seen[item]
         end
+
         assert(depth <= 64, "状态快照嵌套超过 64 层")
         local target = {}
         if depth == 1 and destination then
@@ -40,8 +43,10 @@ function M.copy_state(value, destination)
                 "状态字段必须使用标量键")
             target[key] = copy(child, depth + 1)
         end
+
         return target
     end
+
     return copy(value, 1)
 end
 
@@ -59,6 +64,7 @@ local function replace_exports(live, fields)
     for key in pairs(live) do
         rawset(live, key, nil)
     end
+
     for key, value in pairs(fields) do
         rawset(live, key, value)
     end
@@ -87,6 +93,7 @@ local function check_exports(exports, name)
         assert(type(key) == "string", name .. " 顶层导出字段名必须是字符串")
         check_value(value)
     end
+
     while #pending > 0 do
         local nested = table.remove(pending)
         for key, value in pairs(nested) do
@@ -96,6 +103,7 @@ local function check_exports(exports, name)
             check_value(value)
         end
     end
+
     assert((exports.export_state == nil) == (exports.import_state == nil), name .. " 状态钩子须成对")
     if exports.export_state ~= nil then
         assert(type(exports.export_state) == "function" and type(exports.import_state) == "function",
@@ -103,11 +111,11 @@ local function check_exports(exports, name)
     end
 end
 
----@param options? table loaded 可注入独立测试缓存；默认使用本 State package.loaded。
-function M.new(options)
+---@param module_patch_config? table loaded 可注入独立测试缓存；默认使用本 State package.loaded。
+function M.new(module_patch_config)
     return setmetatable(
     {
-        loaded = options and options.loaded or package.loaded, -- 当前 State 的模块缓存。
+        loaded = module_patch_config and module_patch_config.loaded or package.loaded, -- 当前 State 的模块缓存。
         active = nil,                                          -- 保留至 finish/abort 的唯一 Stage。
     }, Engine)
 end
@@ -117,21 +125,25 @@ end
 ---@return FlyWowHotUpgradeResult 成功含 stage；失败不安装线上导出。
 function Engine:stage(entries)
     if self.active then
-        return result.failure("HU_UPGRADE_BUSY", "模块 Stage 尚未结束")
+        return hotupgrade_result.failure("HU_UPGRADE_BUSY", "模块 Stage 尚未结束")
     end
-    local state = {entries = {}, order = {}, old = {}, committed = false}
+
+    local module_stage = {entries = {}, order = {}, old = {}, committed = false}
     local ok, message = pcall(function()
-        assert(type(entries) == "table" and #entries <= 1024, "模块列表必须是最多 1024 项的数组")
+        assert(type(entries) == "table" and #entries <= hotupgrade_common.MAX_MODULES,
+            "模块列表必须是最多 " .. hotupgrade_common.MAX_MODULES .. " 项的数组")
         local entry_count = 0
         for index in pairs(entries) do
             entry_count = entry_count + 1
             assert(math.type(index) == "integer" and index >= 1 and index <= #entries, "模块列表有空洞")
         end
+
         assert(entry_count == #entries, "模块列表有空洞")
+        -- 先编译全部 Patch 并保存每个线上模块的旧字段。
         for _, item in ipairs(entries) do
             assert(type(item) == "table" and type(item.name) == "string" and item.name ~= "" and type(item.source) == "string",
                 "模块名和源码无效")
-            assert(not state.entries[item.name], "模块重复")
+            assert(not module_stage.entries[item.name], "模块重复")
             local live = self.loaded[item.name]
             check_exports(live, item.name)
             local fields = {}
@@ -145,18 +157,21 @@ function Engine:stage(entries)
                 return dependency
             end}, {__index = _G})
             local chunk = assert(load(item.source, "@" .. item.name, "t", env))
-            state.entries[item.name] = {live = live, chunk = chunk}
-            state.order[#state.order + 1] = item.name
-            state.old[item.name] = fields
+            module_stage.entries[item.name] = {live = live, chunk = chunk}
+            module_stage.order[#module_stage.order + 1] = item.name
+            module_stage.old[item.name] = fields
         end
-        for _, name in ipairs(state.order) do
-            local entry = state.entries[name]
+
+        -- 再执行候选模块，检查导出并迁移隔离的私有状态。
+        for _, name in ipairs(module_stage.order) do
+            local entry = module_stage.entries[name]
             local candidate = entry.chunk()
             check_exports(candidate, name)
             assert(candidate ~= entry.live, "候选须返回新的导出表")
             for key, value in pairs(candidate) do
                 assert(entry.live[key] == nil or type(entry.live[key]) == type(value), "导出字段类型变化")
             end
+
             assert((entry.live.export_state == nil) == (candidate.import_state == nil),
                 "新旧模块缺少配对状态钩子")
             if entry.live.export_state then
@@ -169,65 +184,72 @@ function Engine:stage(entries)
         end
     end)
     if not ok then
-        return result.failure("HU_MODULE_STAGE_FAILED", tostring(message))
+        return hotupgrade_result.failure("HU_MODULE_STAGE_FAILED", tostring(message))
     end
-    self.active = state
-    return result.success({stage = state})
+
+    self.active = module_stage
+    return hotupgrade_result.success({stage = module_stage})
 end
 
 --- Guard 已排空后同步安装；旧导出保留至 finish，供组合 Service 提交失败时恢复。
-function Engine:commit(state)
-    if self.active ~= state or state.committed then
-        return result.failure("HU_PHASE_INVALID", "模块 Stage 无效或已提交")
+function Engine:commit(module_stage)
+    if self.active ~= module_stage or module_stage.committed then
+        return hotupgrade_result.failure("HU_PHASE_INVALID", "模块 Stage 无效或已提交")
     end
+
     local ok, message = pcall(function()
-        for _, name in ipairs(state.order) do
-            local entry = state.entries[name]
+        for _, name in ipairs(module_stage.order) do
+            local entry = module_stage.entries[name]
             assert(self.loaded[name] == entry.live and getmetatable(entry.live) == nil,
                 "模块身份在 Stage 后改变")
         end
-        state.committed = true
-        for _, name in ipairs(state.order) do
-            local entry = state.entries[name]
+
+        module_stage.committed = true
+        for _, name in ipairs(module_stage.order) do
+            local entry = module_stage.entries[name]
             replace_exports(entry.live, entry.candidate)
         end
     end)
-    return ok and result.success() or result.failure("HU_MODULE_COMMIT_FAILED", tostring(message))
+    return ok and hotupgrade_result.success() or hotupgrade_result.failure("HU_MODULE_COMMIT_FAILED", tostring(message))
 end
 
 --- 尽量恢复所有旧表；任一身份变化均报告故障并保留 Stage，以便人工核对。
-function Engine:abort(state)
-    if self.active ~= state then
-        return result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
+function Engine:abort(module_stage)
+    if self.active ~= module_stage then
+        return hotupgrade_result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
     end
+
     local errors = {}
-    for _, name in ipairs(state.order) do
-        local entry = state.entries[name]
+    for _, name in ipairs(module_stage.order) do
+        local entry = module_stage.entries[name]
         local ok, message = pcall(function()
             assert(self.loaded[name] == entry.live and getmetatable(entry.live) == nil,
                 "模块缓存身份或元表变化: " .. name)
-            if state.committed then
-                replace_exports(entry.live, state.old[name])
+            if module_stage.committed then
+                replace_exports(entry.live, module_stage.old[name])
             end
         end)
         if not ok then
             errors[#errors + 1] = tostring(message)
         end
     end
+
     if #errors > 0 then
-        return result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
+        return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
     end
-    return self:finish(state)
+
+    return self:finish(module_stage)
 end
 
-function Engine:finish(state)
-    if self.active ~= state then
-        return result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
+function Engine:finish(module_stage)
+    if self.active ~= module_stage then
+        return hotupgrade_result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
     end
-    state.entries = {}
-    state.old = {}
+
+    module_stage.entries = {}
+    module_stage.old = {}
     self.active = nil
-    return result.success()
+    return hotupgrade_result.success()
 end
 
 return M

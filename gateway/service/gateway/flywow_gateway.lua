@@ -19,7 +19,7 @@ local codec_factory = require "codec"
 ---@field closed boolean 是否已从连接表摘除。
 local handshake_factory = require "handshake"
 
-local state =
+local module_state =
 {
     phase              = "created", -- Service 生命周期；created/starting/running/stopping/stopped。
     config             = nil, -- 通过 start 校验后的只读配置；owner 是当前 Lua State。
@@ -213,8 +213,8 @@ local function emit(event)
                  " command=", tostring(event.command or "-"),
                  " code=", tostring(event.code or "-"),
                  " message=", tostring(event.message or "-"))
-    if state.config.observer_service then
-        skynet.send(state.config.observer_service, "lua", "gateway_event", event)
+    if module_state.gateway_config.observer_service then
+        skynet.send(module_state.gateway_config.observer_service, "lua", "gateway_event", event)
     end
 end
 
@@ -228,7 +228,7 @@ end
 ---@return GatewayConnection|nil connection，或容量/身份/握手资源不足。
 local function create_connection(fd, peer, transport)
     -- 参数/状态检查：容量、连接身份和握手名额必须可用。
-    if state.client_count >= state.config.max_clients then
+    if module_state.client_count >= module_state.gateway_config.max_clients then
         emit(
         {
             kind      = "warning",
@@ -242,7 +242,7 @@ local function create_connection(fd, peer, transport)
         return nil
     end
 
-    if state.next_connection_id == math.maxinteger then
+    if module_state.next_connection_id == math.maxinteger then
         emit(
         {
             kind    = "error",
@@ -254,7 +254,7 @@ local function create_connection(fd, peer, transport)
         return nil
     end
 
-    local handshake, handshake_error = state.handshake.accept()
+    local handshake, handshake_error = module_state.handshake.accept()
     if not handshake then
         emit(
         {
@@ -268,12 +268,12 @@ local function create_connection(fd, peer, transport)
     end
 
     -- 数据准备：创建当前连接独占的上下文。
-    state.next_connection_id = state.next_connection_id + 1
+    module_state.next_connection_id = module_state.next_connection_id + 1
 
     local connection =
     {
         handshake       = handshake, -- 握手模块拥有内部状态；连接关闭时释放。
-        id              = state.next_connection_id, -- Gateway 内部连接标识，不暴露底层 fd。
+        id              = module_state.next_connection_id, -- Gateway 内部连接标识，不暴露底层 fd。
         fd              = fd, -- Gateway 私有底层 fd；业务 Service 不接收。
         peer            = peer, -- 对端地址字符串；只用于日志和业务上下文。
         transport       = transport, -- tcp 或 websocket。
@@ -287,9 +287,9 @@ local function create_connection(fd, peer, transport)
     }
 
     -- 状态修改：连接同时登记到两个索引，再增加在线计数。
-    state.connections[connection.id] = connection
-    state.connections_by_fd[fd] = connection
-    state.client_count = state.client_count + 1
+    module_state.connections[connection.id] = connection
+    module_state.connections_by_fd[fd] = connection
+    module_state.client_count = module_state.client_count + 1
 
     -- 持久化/消息发送：通知观测方连接已建立。
     emit(
@@ -317,13 +317,13 @@ local function detach(connection, reason)
         return false
     end
     connection.closed = true
-    state.handshake.close(connection.handshake)
-    state.connections[connection.id] = nil
-    state.connections_by_fd[connection.fd] = nil
-    state.client_count = state.client_count - 1
-    skynet.send(state.config.handler_service, "lua", "gateway_disconnect",
+    module_state.handshake.close(connection.handshake)
+    module_state.connections[connection.id] = nil
+    module_state.connections_by_fd[connection.fd] = nil
+    module_state.client_count = module_state.client_count - 1
+    skynet.send(module_state.gateway_config.handler_service, "lua", "gateway_disconnect",
     {
-        gateway_epoch = state.epoch,
+        gateway_epoch = module_state.epoch,
         connection_id = connection.id,
     }
     )
@@ -347,7 +347,7 @@ local function close_transport(connection, code, reason)
         return false
     end
 
-    local current = state.connections_by_fd[connection.fd]
+    local current = module_state.connections_by_fd[connection.fd]
     if current and current ~= connection then
         return false
     end
@@ -371,7 +371,7 @@ end
 ---@return boolean 是否成功投递给 handler；失败由 transport 层关闭连接。
 local function dispatch_payload(connection, payload)
     -- 参数/状态检查：拒绝关闭连接、空帧和超限帧。
-    if connection.closed or #payload == 0 or #payload > state.config.max_frame_bytes then
+    if connection.closed or #payload == 0 or #payload > module_state.gateway_config.max_frame_bytes then
         emit(
         {
             kind          = "error",
@@ -386,7 +386,7 @@ local function dispatch_payload(connection, payload)
 
     -- 核心计算：解码 Envelope、校验协议版本；业务关联由消息 body 定义。
     --- pcall 把不可信网络字节导致的解码异常限制在当前请求，便于统一发事件并关闭连接。
-    local envelope_ok, envelope = pcall(state.codec.decode_envelope, payload)
+    local envelope_ok, envelope = pcall(module_state.codec.decode_envelope, payload)
     if not envelope_ok then
         emit(
         {
@@ -400,7 +400,7 @@ local function dispatch_payload(connection, payload)
         return false
     end
 
-    if envelope.protocol_version ~= state.config.protocol_version then
+    if envelope.protocol_version ~= module_state.gateway_config.protocol_version then
         emit(
         {
             kind          = "error",
@@ -414,7 +414,7 @@ local function dispatch_payload(connection, payload)
     end
 
     -- 核心计算：根据 CommandId 查找定义并解码 Request。
-    local definition = registry_loader.find(state.registry, envelope.command)
+    local definition = registry_loader.find(module_state.registry, envelope.command)
     if definition == nil then
         emit(
         {
@@ -429,7 +429,7 @@ local function dispatch_payload(connection, payload)
     end
 
     local request_ok, request = pcall(
-        state.codec.decode_request,
+        module_state.codec.decode_request,
         definition,
         envelope.body
     )
@@ -453,12 +453,12 @@ local function dispatch_payload(connection, payload)
         connection.rate_started, connection.rate_count = now, 0
     end
 
-    if (now - state.rate_started) % 0x100000000 >= 100 then
-        state.rate_started, state.rate_count = now, 0
+    if (now - module_state.rate_started) % 0x100000000 >= 100 then
+        module_state.rate_started, module_state.rate_count = now, 0
     end
 
-    if connection.rate_count >= state.config.max_requests_per_second or
-        state.rate_count >= state.config.max_total_requests_per_second then
+    if connection.rate_count >= module_state.gateway_config.max_requests_per_second or
+        module_state.rate_count >= module_state.gateway_config.max_total_requests_per_second then
         emit(
         {
             kind          = "warning",
@@ -473,7 +473,7 @@ local function dispatch_payload(connection, payload)
 
     -- 状态修改：记录本次已接纳的请求。
     connection.rate_count = connection.rate_count + 1
-    state.rate_count = state.rate_count + 1
+    module_state.rate_count = module_state.rate_count + 1
     connection.request_count = connection.request_count + 1
     connection.last_message = now
 
@@ -481,11 +481,11 @@ local function dispatch_payload(connection, payload)
     --- 只传递连接身份、command_id 和已解码数据；Gateway 不缓存业务请求。
     local sent, err = pcall(
         skynet.send,
-        state.config.handler_service,
+        module_state.gateway_config.handler_service,
         "lua",
         "send_data",
         {
-            gateway_epoch    = state.epoch,
+            gateway_epoch    = module_state.epoch,
             connection_id    = connection.id,
             peer             = connection.peer,
             transport        = connection.transport,
@@ -554,16 +554,16 @@ local function write_connection(connection, encoded)
         return false
     end
 
-    state.responses_sent = state.responses_sent + 1
+    module_state.responses_sent = module_state.responses_sent + 1
     return true
 end
 
 local function deliver_data(message)
     -- 参数/状态检查：只接受当前 Gateway 实例的有效消息；发送方由宿主信任边界管理。
-    if not state.config or type(message) ~= "table" or
-        message.gateway_epoch ~= state.epoch or
-        state.phase ~= "running" then
-        state.responses_dropped = state.responses_dropped + 1
+    if not module_state.gateway_config or type(message) ~= "table" or
+        message.gateway_epoch ~= module_state.epoch or
+        module_state.phase ~= "running" then
+        module_state.responses_dropped = module_state.responses_dropped + 1
         return false
     end
 
@@ -572,24 +572,24 @@ local function deliver_data(message)
         math.type(message.command_id) ~= "integer" or
         message.command_id <= 0 or
         type(message.data) ~= "table" then
-        state.responses_dropped = state.responses_dropped + 1
+        module_state.responses_dropped = module_state.responses_dropped + 1
         return false
     end
 
     -- 数据准备：根据 command_id 找到 response 类型并完成一次编码。
-    local definition = registry_loader.find(state.registry, message.command_id)
+    local definition = registry_loader.find(module_state.registry, message.command_id)
     if not definition or definition.response_type == nil then
-        state.responses_dropped = state.responses_dropped + 1
+        module_state.responses_dropped = module_state.responses_dropped + 1
         return false
     end
 
     local ok, encoded = pcall(
-        state.codec.encode_response,
+        module_state.codec.encode_response,
         definition,
-        state.config.protocol_version,
+        module_state.gateway_config.protocol_version,
         message.data
     )
-    if not ok or #encoded > state.config.max_frame_bytes then
+    if not ok or #encoded > module_state.gateway_config.max_frame_bytes then
         emit(
         {
             kind          = "error",
@@ -606,9 +606,9 @@ local function deliver_data(message)
     if message.connection_id == 0 then
         local sent_any = false
 
-        for _, connection in pairs(state.connections) do
+        for _, connection in pairs(module_state.connections) do
             if not connection.closed and
-                state.handshake.ready(connection.handshake) then
+                module_state.handshake.ready(connection.handshake) then
                 sent_any = write_connection(connection, encoded) or sent_any
             end
         end
@@ -616,10 +616,10 @@ local function deliver_data(message)
         return sent_any
     end
 
-    local connection = state.connections[message.connection_id]
+    local connection = module_state.connections[message.connection_id]
     if not connection or connection.closed or
-        not state.handshake.ready(connection.handshake) then
-        state.responses_dropped = state.responses_dropped + 1
+        not module_state.handshake.ready(connection.handshake) then
+        module_state.responses_dropped = module_state.responses_dropped + 1
         return false
     end
 
@@ -632,13 +632,13 @@ end
 --- 先摘除连接，再 fork transport 关闭；消息入口不 yield，关闭任务可能 yield。
 local function request_close(message)
     -- 参数/状态检查：只接受当前 Gateway 实例和有效连接的关闭请求。
-    if not state.config or state.phase ~= "running" or
-        type(message) ~= "table" or message.gateway_epoch ~= state.epoch or
+    if not module_state.gateway_config or module_state.phase ~= "running" or
+        type(message) ~= "table" or message.gateway_epoch ~= module_state.epoch or
         math.type(message.connection_id) ~= "integer" then
         return false
     end
 
-    local connection = state.connections[message.connection_id]
+    local connection = module_state.connections[message.connection_id]
     if not connection or not detach(connection, "closed by handler") then
         return false
     end
@@ -689,7 +689,7 @@ end
 ---@return boolean 是否成功写出 response 并在最后阶段提交 ready。
 local function process_handshake(connection, bytes)
     -- 核心计算：把完整握手帧交给握手模块。
-    local response, code, confirm = state.handshake.receive(
+    local response, code, confirm = module_state.handshake.receive(
     {
         context = connection.handshake, -- 本连接独占的握手状态。
         bytes   = bytes, -- 当前完整网络帧，只读借用。
@@ -731,7 +731,7 @@ local function process_handshake(connection, bytes)
     end
 
     if confirm then
-        if not state.handshake.confirm(connection.handshake) then
+        if not module_state.handshake.confirm(connection.handshake) then
             return false
         end
 
@@ -771,7 +771,7 @@ local function run_tcp(connection)
     --- pinned socket.start 成功无返回值；错误返回 false，不能依赖它返回 true。
     assert(opened ~= false, tostring(open_error))
 
-    socket.limit(fd, state.config.max_frame_bytes + 2)
+    socket.limit(fd, module_state.gateway_config.max_frame_bytes + 2)
     socket.warning(fd, function(_, size)
         emit(
         {
@@ -783,14 +783,14 @@ local function run_tcp(connection)
         }
         )
 
-        if size >= state.config.write_warning_close_kb then
+        if size >= module_state.gateway_config.write_warning_close_kb then
             detach(connection, "write backpressure")
             close_transport(connection, 1013, "write backpressure")
         end
     end)
 
     -- 核心计算：循环读取帧头、读取帧体，再按握手状态分发。
-    while not connection.closed and state.phase == "running" do
+    while not connection.closed and module_state.phase == "running" do
         local header, err = read_exact(connection, 2)
         if not header then
             break
@@ -798,10 +798,10 @@ local function run_tcp(connection)
 
         --- >I2 表示网络字节序 uint16；先拒绝 0 或超限长度，再按该值读取 body。
         local size = string.unpack(">I2", header)
-        local ready = state.handshake.ready(connection.handshake)
+        local ready = module_state.handshake.ready(connection.handshake)
 
-        if (not ready and size ~= state.handshake.expected_size(connection.handshake)) or
-            (ready and (size < 1 or size > state.config.max_frame_bytes)) then
+        if (not ready and size ~= module_state.handshake.expected_size(connection.handshake)) or
+            (ready and (size < 1 or size > module_state.gateway_config.max_frame_bytes)) then
             emit(
             {
                 kind          = "error",
@@ -840,7 +840,7 @@ local ws_handler = {}
 --- id 是 Skynet connection id，payload 是单条完整消息 bytes，opcode 标识文本或 binary；payload 不跨回调保存。
 --- 仅接受 binary 且受 max_frame_bytes 限制；函数无返回值，失败时发事件并关闭当前连接。
 function ws_handler.message(id, payload, opcode)
-    local connection = state.connections_by_fd[id]
+    local connection = module_state.connections_by_fd[id]
     if not connection or connection.closed then
         return
     end
@@ -859,7 +859,7 @@ function ws_handler.message(id, payload, opcode)
     end
 
     local ok
-    if state.handshake.ready(connection.handshake) then
+    if module_state.handshake.ready(connection.handshake) then
         ok = dispatch_payload(connection, payload)
     else
         ok = process_handshake(connection, payload)
@@ -875,7 +875,7 @@ end
 --- id 是 Skynet connection id；header/url 由底层拥有且本函数不保存；peer 使用 accept 的实际对端地址。
 --- 无返回值，不执行跨 Service 调用或 yield；超过 max_clients 的连接在握手前拒绝。
 function ws_handler.handshake(id, header, url)
-    local connection = state.connections_by_fd[id]
+    local connection = module_state.connections_by_fd[id]
     if not connection or connection.closed then
         return
     end
@@ -887,13 +887,13 @@ end
 --- WebSocket 关闭回调中移除连接；底层库负责释放 Socket，本函数只清理 Gateway 索引。
 --- id 是 Skynet WebSocket connection id；迟到或重复回调由 detach 的幂等性处理。无返回值，不执行 I/O/yield。
 function ws_handler.close(id)
-    detach(state.connections_by_fd[id], "websocket closed")
+    detach(module_state.connections_by_fd[id], "websocket closed")
 end
 
 --- 将 WebSocket 底层传输错误转为统一 Gateway error 事件并摘除连接。
 --- id 是 Skynet connection id，message 是底层诊断文本；不包含业务 payload。无返回值，只修改本 Service 的连接索引。
 function ws_handler.error(id, message)
-    local connection = state.connections_by_fd[id]
+    local connection = module_state.connections_by_fd[id]
 
     emit(
     {
@@ -909,7 +909,7 @@ end
 --- 处理 WebSocket 写队列增长通知；size 是待写字节数，按 Skynet warning 回调的单位比较关闭阈值（KB）。
 --- ws_object 提供底层 connection id；只对仍登记的连接发事件，达到 write_warning_close_kb 时关闭以限制队列增长。无返回值。
 function ws_handler.warning(ws_object, size)
-    local connection = state.connections_by_fd[ws_object.id]
+    local connection = module_state.connections_by_fd[ws_object.id]
     if connection then
         emit(
         {
@@ -920,7 +920,7 @@ function ws_handler.warning(ws_object, size)
             pending_kb    = size,
         }
         )
-        if size >= state.config.write_warning_close_kb then
+        if size >= module_state.gateway_config.write_warning_close_kb then
             detach(connection, "write backpressure")
             close_transport(connection, 1013, "server backpressure")
         end
@@ -935,7 +935,7 @@ end
 ---@return nil 连接由 Gateway 协程接管或立即关闭。
 local function accept_client(fd, peer)
     -- 参数/状态检查：按配置选择 WebSocket 或 TCP 接入路径。
-    if state.config.transport == "websocket" then
+    if module_state.gateway_config.transport == "websocket" then
         local accepted = create_connection(fd, peer, "websocket")
         if not accepted then
             socket.close_fd(fd)
@@ -951,10 +951,10 @@ local function accept_client(fd, peer)
             local ok, err = websocket.accept(
                 fd,
                 ws_handler,
-                state.config.websocket_protocol,
+                module_state.gateway_config.websocket_protocol,
                 peer
             )
-            local connection = state.connections_by_fd[fd]
+            local connection = module_state.connections_by_fd[fd]
 
             if not ok and err then
                 emit(
@@ -1004,19 +1004,19 @@ end
 --- 无参数；最多扫描 max_clients 个连接，tick 回绕用模运算；detach 后关闭会 yield。
 local function timeout_loop()
     -- 核心计算：周期扫描正在握手或正在读数据的连接。
-    while state.phase == "running" do
+    while module_state.phase == "running" do
         skynet.sleep(10)
 
         local now = skynet.now()
         local expired = {}
 
-        for _, connection in pairs(state.connections) do
+        for _, connection in pairs(module_state.connections) do
             local since = connection.read_started or connection.last_message
             local limit = connection.read_started
-                and state.config.read_timeout_ticks
-                or state.config.idle_timeout_ticks
+                and module_state.gateway_config.read_timeout_ticks
+                or module_state.gateway_config.idle_timeout_ticks
 
-            if state.handshake.expired(connection.handshake) or
+            if module_state.handshake.expired(connection.handshake) or
                 (now - since) % 0x100000000 >= limit then
                 expired[#expired + 1] = connection
             end
@@ -1040,7 +1040,7 @@ end
 ---@return table 实际监听地址、端口、transport 和 registry command_count；失败抛错，可能 yield。
 local function start(input)
     -- 参数/状态检查：Gateway 只能从 created 状态启动一次。
-    assert(state.phase == "created", "gateway can only start once")
+    assert(module_state.phase == "created", "gateway can only start once")
 
     -- 数据准备：读取配置并加载生成的协议 registry。
     local config = normalize_config(input)
@@ -1051,16 +1051,16 @@ local function start(input)
     local registry = registry_loader.load(generated)
 
     -- 状态修改：安装当前 Lua State 独占的运行时对象。
-    state.config = config    state.registry = registry
-    state.codec = codec_factory.new(
+    module_state.gateway_config = config    module_state.registry = registry
+    module_state.codec = codec_factory.new(
         {
             descriptor_path = config.descriptor_path,
             registry        = registry,
         }
     )
 
-    state.epoch = tostring(skynet.self()) .. ":" .. tostring(skynet.hpc())
-    state.handshake = handshake_factory.new(
+    module_state.epoch = tostring(skynet.self()) .. ":" .. tostring(skynet.hpc())
+    module_state.handshake = handshake_factory.new(
     {
         crypto        = require "flywow_gateway_crypto", -- 固定native绑定，缺少时启动失败。
         now           = skynet.now, -- 显式时钟，不创建额外协程。
@@ -1070,19 +1070,19 @@ local function start(input)
     )
 
     -- 状态修改：进入 starting，随后绑定监听 Socket。
-    state.rate_started = skynet.now()    state.rate_count = 0
-    state.phase = "starting"
+    module_state.rate_started = skynet.now()    module_state.rate_count = 0
+    module_state.phase = "starting"
 
     local listen_fd, address, port = socket.listen(
         config.host,
         config.port,
         config.backlog
     )
-    state.listen_fd = listen_fd
+    module_state.listen_fd = listen_fd
 
     -- 持久化/消息发送：注册监听回调并发布 ready 日志。
     socket.start(listen_fd, accept_client)
-    state.phase = "running"
+    module_state.phase = "running"
     skynet.fork(timeout_loop)
 
     skynet.error(
@@ -1111,7 +1111,7 @@ end
 --- 连接数受 max_clients 限制；先快照索引再 detach，避免遍历期间删 key 漏关或重复关闭。
 local function stop()
     -- 参数/状态检查：重复停止直接返回，不重复触碰监听和连接。
-    if state.phase == "stopped" then
+    if module_state.phase == "stopped" then
         return
         {
             closed_connections = 0,
@@ -1119,19 +1119,19 @@ local function stop()
     end
 
     -- 状态修改：先进入 stopping，阻止新的业务读取。
-    state.phase = "stopping"
+    module_state.phase = "stopping"
 
     -- 持久化/消息发送：关闭监听 Socket，不再接受新连接。
-    if state.listen_fd then
-        socket.close(state.listen_fd)
-        state.listen_fd = nil
+    if module_state.listen_fd then
+        socket.close(module_state.listen_fd)
+        module_state.listen_fd = nil
     end
 
     -- 数据准备：先复制连接快照，避免遍历时删除连接表。
     local closed = 0
     local snapshot = {}
 
-    for _, connection in pairs(state.connections) do
+    for _, connection in pairs(module_state.connections) do
         snapshot[#snapshot + 1] = connection
     end
 
@@ -1146,7 +1146,7 @@ local function stop()
     end
 
     -- 收尾：所有连接处理完成后发布 stopped 状态。
-    state.phase = "stopped"
+    module_state.phase = "stopped"
 
     return
     {
@@ -1160,8 +1160,8 @@ skynet.start(function()
         local handshaking_connections = 0
         local reading_connections = 0
 
-        for _, connection in pairs(state.connections) do
-            if state.handshake and not state.handshake.ready(connection.handshake) then
+        for _, connection in pairs(module_state.connections) do
+            if module_state.handshake and not module_state.handshake.ready(connection.handshake) then
                 handshaking_connections = handshaking_connections + 1
             end
             if connection.read_started then
@@ -1169,20 +1169,20 @@ skynet.start(function()
             end
         end
 
-        local config = state.config
+        local config = module_state.gateway_config
         return
         {
-            phase                   = state.phase,
+            phase                   = module_state.phase,
             transport               = config and config.transport or "unconfigured",
             listen_host             = config and config.host or "unbound",
             listen_port             = config and config.port or 0,
-            connections             = state.client_count,
-            ready_clients           = state.client_count - handshaking_connections,
+            connections             = module_state.client_count,
+            ready_clients           = module_state.client_count - handshaking_connections,
             handshaking_connections = handshaking_connections,
             reading_connections     = reading_connections,
-            responses_sent          = state.responses_sent,
-            responses_dropped       = state.responses_dropped,
-            protocol_commands       = state.registry and state.registry.count or 0,
+            responses_sent          = module_state.responses_sent,
+            responses_dropped       = module_state.responses_dropped,
+            protocol_commands       = module_state.registry and module_state.registry.count or 0,
         }
     end)
 
@@ -1214,11 +1214,11 @@ skynet.start(function()
         if command == "stats" then
             skynet.retpack(
                 {
-                    phase             = state.phase,
-                    clients           = state.client_count,
-                    responses_sent    = state.responses_sent,
-                    responses_dropped = state.responses_dropped,
-                    command_count     = state.registry and state.registry.count or 0,
+                    phase             = module_state.phase,
+                    clients           = module_state.client_count,
+                    responses_sent    = module_state.responses_sent,
+                    responses_dropped = module_state.responses_dropped,
+                    command_count     = module_state.registry and module_state.registry.count or 0,
                 }
             )
             return

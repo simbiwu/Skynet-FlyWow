@@ -13,7 +13,7 @@ local M = {}
 ---@class HandshakeManager
 ---@field accept fun(): HandshakeContext|nil, string|nil
 ---@field expected_size fun(context: HandshakeContext): integer
----@field receive fun(input: table): string|nil, string|nil, boolean|nil
+---@field receive fun(handshake_input: table): string|nil, string|nil, boolean|nil
 ---@field confirm fun(context: HandshakeContext): boolean
 ---@field ready fun(context: HandshakeContext): boolean
 ---@field expired fun(context: HandshakeContext): boolean
@@ -21,13 +21,13 @@ local M = {}
 
 --- 创建握手管理器；具名参数crypto/now显式注入，timeout_ticks单位10ms，max_pending为并发上限。
 --- 返回manager；分配少量Lua状态，不执行I/O/yield。无效配置由调用方启动校验。
----@param options table 握手配置；crypto/now/max_pending/timeout_ticks 由启动阶段注入。
+---@param handshake_config table 握手配置；crypto/now/max_pending/timeout_ticks 由启动阶段注入。
 ---@return HandshakeManager 只拥有 pending 握手状态；不执行 I/O 或 yield。
-function M.new(options)
-    local crypto = assert(options.crypto)
-    local now = assert(options.now)
-    local max_pending = assert(options.max_pending)
-    local timeout_ticks = assert(options.timeout_ticks)
+function M.new(handshake_config)
+    local crypto = assert(handshake_config.crypto)
+    local now = assert(handshake_config.now)
+    local max_pending = assert(handshake_config.max_pending)
+    local timeout_ticks = assert(handshake_config.timeout_ticks)
     assert(math.type(max_pending) == "integer" and max_pending > 0)
     assert(math.type(timeout_ticks) == "integer" and timeout_ticks > 0 and timeout_ticks < 0x80000000)
     local pending = 0
@@ -94,14 +94,14 @@ function M.new(options)
         return 0
     end
 
-    --- input.context为Gateway独占状态，input.bytes为当前帧只读字节；
+    --- handshake_input.context为Gateway独占状态，handshake_input.bytes为当前帧只读字节；
     --- 处理一条完整握手消息；成功返回bytes/nil/是否待确认，失败返回nil/错误并释放context。
     --- Native错误只映射稳定码，不暴露EVP详情；不I/O/yield，不缓存提前业务包。
     ---@param input table 包含 context 与当前完整 frame bytes；调用方拥有 bytes。
     ---@return string|nil, string|nil, boolean|nil 响应帧、稳定错误码、是否等待确认。
-    function manager.receive(input)
-        local context = input.context
-        local bytes   = input.bytes
+    function manager.receive(handshake_input)
+        local context = handshake_input.context
+        local bytes   = handshake_input.bytes
         if manager.expired(context) then
             manager.close(context)
             return nil, "HANDSHAKE_TIMEOUT"

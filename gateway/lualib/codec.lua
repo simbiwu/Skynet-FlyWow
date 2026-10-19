@@ -19,17 +19,17 @@ local function read_file(path)
 end
 
 -- 创建一个已加载 descriptor 的 codec。
--- 参数 options.descriptor_path：Server 运行目录下的 descriptor 文件；options.registry：registry 索引。
+-- 参数 codec_config.descriptor_path：Server 运行目录下的 descriptor 文件；codec_config.registry：registry 索引。
 -- 返回值：独立 codec 对象；对象只在当前 Lua State 使用，不跨 Service 传递。
 -- 失败：文件不存在、descriptor 损坏或 protobuf 类型不存在时抛错；执行文件 I/O，不 yield。
-function M.new(options)
-    assert(type(options) == "table", "gateway codec options are required")
-    assert(type(options.descriptor_path) == "string" and options.descriptor_path ~= "",
+function M.new(codec_config)
+    assert(type(codec_config) == "table", "gateway codec config is required")
+    assert(type(codec_config.descriptor_path) == "string" and codec_config.descriptor_path ~= "",
            "gateway descriptor_path is required")
-    assert(type(options.registry) == "table", "gateway registry is required")
-    local descriptor_bytes = read_file(options.descriptor_path)
+    assert(type(codec_config.registry) == "table", "gateway registry is required")
+    local descriptor_bytes = read_file(codec_config.descriptor_path)
     assert(pb.load(descriptor_bytes),
-           "cannot load protobuf descriptor: " .. options.descriptor_path)
+           "cannot load protobuf descriptor: " .. codec_config.descriptor_path)
 
     local codec = {}
 
@@ -37,7 +37,7 @@ function M.new(options)
     -- 返回新 Lua table，由当前 Service 拥有；payload 格式错误或类型不匹配时抛错。
     -- 不执行 I/O、yield 或跨 Service 调用。
     function codec.decode_envelope(payload)
-        return assert(pb.decode(options.registry.envelope_type, payload))
+        return assert(pb.decode(codec_config.registry.envelope_type, payload))
     end
 
     -- 根据已校验 registry definition 解码 Envelope.body；body 是单条 request 的 Protobuf bytes。
@@ -65,7 +65,7 @@ function M.new(options)
             body             = body,
         }
 
-        return assert(pb.encode(options.registry.envelope_type, envelope))
+        return assert(pb.encode(codec_config.registry.envelope_type, envelope))
     end
 
     return codec

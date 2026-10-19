@@ -19,7 +19,7 @@ local levels =
     error  = 2,
 }
 
-local installed = false
+local logger_is_installed = false
 
 -- Service 名称在登记消息中的最大长度；日志正文由 Native Logger 统一限制。
 local max_service_name_size = 128
@@ -55,10 +55,10 @@ end
 local function make_adapter(minimum)
     return function(...) -- VARARG_ALLOWED WHY: 保持 skynet.error 的未知参数个数与 nil 兼容。
         -- 取出可选等级；等级参数不再作为正文发送。
-        local args = table.pack(...)
-        local level = levels[args[args.n]]
+        local log_arguments = table.pack(...)
+        local level = levels[log_arguments[log_arguments.n]]
         if level ~= nil then
-            args.n = args.n - 1
+            log_arguments.n = log_arguments.n - 1
         else
             level = levels.error
         end
@@ -69,8 +69,8 @@ local function make_adapter(minimum)
 
         -- 先得到正文，再一次性拼成 L+等级+正文，避免 Skynet 多参数拼接产生额外空格。
         local parts = {}
-        for i = 1, args.n do
-            parts[i] = tostring(args[i])
+        for i = 1, log_arguments.n do
+            parts[i] = tostring(log_arguments[i])
         end
 
         local body = table.concat(parts, " ")
@@ -82,7 +82,7 @@ end
 --- Service 名来自标准 loader 的 SERVICE_NAME；注销在正常 skynet.exit 时发送。
 --- 不 yield，不修改其他 Service 的 Lua State；异常退出记录由有界登记表限制内存。
 function logger.install()
-    if installed then
+    if logger_is_installed then
         return
     end
 
@@ -110,7 +110,7 @@ function logger.install()
         return exit()
     end
 
-    installed = true
+    logger_is_installed = true
 end
 
 --- 刷新 Logger 已接收的日志；唯一全局发现是 Skynet 标准 .logger 启动链名字。

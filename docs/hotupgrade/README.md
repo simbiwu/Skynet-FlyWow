@@ -48,7 +48,7 @@ local registered = hotupgrade.register_service(
     controller_handle = controller_handle,
     service_type = "player",
     service = {state = state, functions = M},
-    postcheck = function()
+    after_upgrade = function()
         return state.level >= 0
     end,
 })
@@ -73,7 +73,7 @@ if answer.ok then
 end
 ```
 
-Guard:run 允许业务正常 yield，捕获异常并在结束时减少在途计数；成功结果的 values 保留 nil 和返回值数量。更新时先关闭新入口，新调用返回 HU_UPGRADING，再等待已接纳协程排空。可选 can_upgrade() 是额外的同步、只读安全条件。排空超时由 Controller 请求 abort，确认恢复后才重开入口。
+Guard:run 允许业务正常 yield，捕获异常并在结束时减少在途计数；成功结果的 values 保留 nil 和返回值数量。更新时先关闭新入口，新调用返回 HU_UPGRADING，再等待已接纳协程排空。可选 before_upgrade() 是额外的同步、只读安全条件。排空超时由 Controller 请求 abort，确认恢复后才重开入口。
 
 ## Patch 布局与普通模块
 
@@ -172,7 +172,7 @@ validate 同步冻结源码、检查路径/语法和匹配的登记目标，不�
 
 1. prepare 关闭 Guard 并排空业务。
 2. stage 检查所有目标模块、迁移私有模块状态并准备可选 Service 更新，线上代码和状态不变。
-3. activate 在目标一次同步处理内提交全部模块和 Service 更新，执行可选 postcheck；false/异常触发立即组合恢复。
+3. activate 在目标一次同步处理内提交全部模块和 Service 更新，执行可选 after_upgrade；false/异常触发立即组合恢复。
 4. apply 达到 PUBLISH_DECIDED 后执行 finish，释放旧快照并开放入口；dry_run 则实际提交后 abort，验证恢复并回到旧代码/状态。
 
 发布决定前可请求 abort，Controller 在当前步骤返回后恢复目标；已完成目标不会自动撤销，跨 Service 不承诺全局原子性。结果 phase 为 COMPLETED、DRY_RUN_COMPLETED、ABORTED、PARTIAL 或 RECOVERY_REQUIRED；success/failed 表示处理成功和失败目标数，results 给出实际尝试目标的逐项结果。未尝试的目标不计入成功/失败。dry_run 的 success 表示更新及恢复验证成功。

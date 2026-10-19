@@ -1,8 +1,8 @@
 --- 职责：宿主通过此入口创建 UTF-8 词库，查询命中或替换文本；聊天处置由业务决定。
 --- 查询同步、无 I/O、无 yield；创建 file 词库时会同步读取文件。对象和返回数据属于当前 Lua State。
---- Native 来源 word_filter/native/；构建：bash scripts/build_flywow.sh SKYNET_ROOT word_filter。
---- package.path 加载本文件，package.cpath 加载 build/native/flywow_word_filter_native.so。
-local native = require "flywow_word_filter_native"
+--- Native 来源 word_filter/word_filter_native/；构建：bash scripts/build_flywow.sh SKYNET_ROOT word_filter。
+--- package.path 加载本文件，package.cpath 加载 build/word_filter_native/flywow_word_filter_native.so。
+local word_filter_native = require "flywow_word_filter_native"
 
 local MAX_KEYWORDS              = 16384
 local MAX_REPLACEMENT_BYTES     = 256
@@ -28,7 +28,7 @@ local M = {}
 ---@field offset integer 原文的 1-based byte 起点，可直接交给 string.sub
 ---@field length integer 原文字节跨度；compact 时包含中间被忽略的分隔符
 
----@class flywow_word_filter_options
+---@class flywow_word_filter_config
 ---@field keywords string[] 宿主提供的连续数组，创建时复制；空词库合法
 ---@field file? string UTF-8 外部词库路径；每行一个词，空行忽略；与 keywords 二选一
 ---@field compact? boolean 默认 false；true 时忽略固定类别分隔符，可能增加误报
@@ -49,35 +49,35 @@ end
 --- 统一做 ASCII 小写、全角 ASCII 折叠和开头 BOM 去除。
 --- 原词库在成功创建后可由宿主修改，不影响此对象；更新词库需创建新对象。
 --- 容量和编码错误返回 nil,error；Lua 分配错误仍遵循 Lua 自身异常语义。
----@param options flywow_word_filter_options
+---@param word_filter_config flywow_word_filter_config
 ---@return flywow_word_filter? filter
 ---@return flywow_word_filter_error? error
-function M.new(options)
-    if type(options) ~= "table" then
+function M.new(word_filter_config)
+    if type(word_filter_config) ~= "table" then
         return nil, "invalid_options"
     end
-    if options.keywords ~= nil and type(options.keywords) ~= "table"
-        or options.file ~= nil and type(options.file) ~= "string"
-        or (options.compact ~= nil and type(options.compact) ~= "boolean") then
+    if word_filter_config.keywords ~= nil and type(word_filter_config.keywords) ~= "table"
+        or word_filter_config.file ~= nil and type(word_filter_config.file) ~= "string"
+        or (word_filter_config.compact ~= nil and type(word_filter_config.compact) ~= "boolean") then
         return nil, "invalid_options"
     end
 
-    for key in pairs(options) do
+    for key in pairs(word_filter_config) do
         if key ~= "keywords" and key ~= "file" and key ~= "compact" then
             return nil, "invalid_options"
         end
     end
 
-    if options.keywords ~= nil and options.file ~= nil then
+    if word_filter_config.keywords ~= nil and word_filter_config.file ~= nil then
         return nil, "invalid_options"
     end
-    if options.keywords == nil and options.file == nil then
+    if word_filter_config.keywords == nil and word_filter_config.file == nil then
         return nil, "invalid_options"
     end
 
-    local keywords = options.keywords
-    if options.file ~= nil then
-        local file = io.open(options.file, "rb")
+    local keywords = word_filter_config.keywords
+    if word_filter_config.file ~= nil then
+        local file = io.open(word_filter_config.file, "rb")
         if not file then
             return nil, "dictionary_io"
         end
@@ -113,7 +113,7 @@ function M.new(options)
         end
     end
 
-    local native_handle, error_value = native.new(keywords, options.compact == true)
+    local native_handle, error_value = word_filter_native.new(keywords, word_filter_config.compact == true)
     if not native_handle then
         return nil, native_error_code(error_value)
     end
@@ -130,7 +130,7 @@ end
 ---@return flywow_word_filter_match[]? matches
 ---@return flywow_word_filter_error? error
 function Filter:find(text)
-    local matches, error_value = native.find(self.native_handle, text)
+    local matches, error_value = word_filter_native.find(self.native_handle, text)
     if not matches then
         return nil, native_error_code(error_value)
     end

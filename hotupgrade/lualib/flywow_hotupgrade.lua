@@ -1,39 +1,30 @@
 --- 现存 Service 的登记与原地更新；所有业务对象、快照和模块表仅留在本 Lua State。
 local skynet = require "skynet"
-local result = require "flywow_hotupgrade_error"
-local module_patch = require "flywow_hotupgrade_module_patch"
+local hotupgrade_result = require "flywow_hotupgrade_error"
+local hotupgrade_common = require "flywow_hotupgrade_common"
+local hotupgrade_module_patch = require "flywow_hotupgrade_module_patch"
 local M = {}
-local options           -- 本 State 的登记配置；函数和私有表不发送给 Controller。
-local guard             -- 注册前创建的业务 Guard 在注册后继续复用。
-local engine            -- 本 State 唯一完整模块更新器。
-local transaction       -- 当前事务；保留撤销数据直到 finish/abort 确认完成。
-local completed = 0     -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
-local last_id           -- 最近完成事务，用于 finish/abort 幂等响应。
-local declared_count = 0 -- 本 State 已成功声明模块数，与控制面 1024 上限一致。
-local declared = {}     -- hotupgrade.require 已登记的模块集合。
+local module_state =
+{
+    registration = nil, -- 本 Lua State 登记配置；私有表和函数不发送给 Controller。
+    business_guard = nil, -- 注册前创建的业务 Guard 在注册后继续复用。
+    module_patch_engine = nil, -- 本 State 唯一完整模块更新器。
+    active_transaction = nil, -- 当前事务的撤销数据保留至 finish/abort 确认完成。
+    completed_sequence = 0, -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
+    last_transaction_id = nil, -- 最近完成事务，用于 finish/abort 幂等响应。
+    declared_module_count = 0, -- 本 State 已成功声明模块数，受 hotupgrade_common.MAX_MODULES 限制。
+    declared_modules = {}, -- hotupgrade.require 已登记的模块集合。
+}
+
 
 -- 与 Controller Service 使用同一原生消息协议；不建立独立协议/RPC 模块。
-skynet.register_protocol({name = "hotupgrade", id = 20, pack = skynet.pack, unpack = skynet.unpack})
-
----@class FlyWowHotUpgradeServiceUpdate
----@field state table 现存 Service 私有状态表，整个更新期间保持身份
----@field functions table Service 原有业务函数表；直接替换指定字段，不增加函数注册表
----@field snapshot? fun(state:table):table 非普通对象的独立快照；与 commit/restore 成组提供
----@field commit? fun(state:table, next_state:table) 同步原地提交；不替换 state，不写外部权威数据
----@field restore? fun(state:table, old_state:table) 同步恢复；抛错或 false 均使 Guard 保持关闭
-
----@class FlyWowHotUpgradeRegistration
----@field controller_handle integer 宿主已启动的控制 Service handle
----@field service_type string 对应 services/<service_type>.lua
----@field service? FlyWowHotUpgradeServiceUpdate 可选 Service 内部状态/函数更新入口
----@field postcheck? fun():boolean 同步无副作用检查；false/异常触发组合恢复
----@field can_upgrade? fun():boolean Guard 排空后的同步附加安全条件
+skynet.register_protocol({name = "hotupgrade", id = hotupgrade_common.PROTOCOL_ID, pack = skynet.pack, unpack = skynet.unpack})
 
 --- 当前 Service 的唯一 Guard；业务请求和会写状态的后台任务都须经过它。
 ---@return table Guard:run 可执行正常 yield 的业务回调。
 function M.guard()
-    if not guard then
-        guard = require("flywow_hotupgrade_guard").new(
+    if not module_state.business_guard then
+        module_state.business_guard = require("flywow_hotupgrade_guard").new(
         {
             now = function()
                 return skynet.now() * 10
@@ -43,7 +34,8 @@ function M.guard()
             end,
         })
     end
-    return guard
+
+    return module_state.business_guard
 end
 
 local function restore_service(txn)
@@ -51,20 +43,22 @@ local function restore_service(txn)
     if not staged or not staged.touched then
         return
     end
-    local service = options.service
+
+    local service = module_state.registration.service
     -- 自定义恢复只处理 Service 自己的对象；即使它失败也继续尝试还原函数字段。
     local ok, message = pcall(function()
         if staged.old_state then
             if service.restore then
                 assert(service.restore(service.state, staged.old_state) ~= false, "Service 拒绝恢复")
             else
-                module_patch.restore_state(service.state, staged.old_state)
+                hotupgrade_module_patch.restore_state(service.state, staged.old_state)
             end
         end
     end)
     for name, fn in pairs(staged.old_functions) do
         rawset(service.functions, name, fn)
     end
+
     assert(ok, message)
 end
 
@@ -74,27 +68,31 @@ local function abort(txn)
     if not ok then
         errors[#errors + 1] = tostring(message)
     end
+
     if txn.modules then
-        local restored = engine:abort(txn.modules)
+        local restored = module_state.module_patch_engine:abort(txn.modules)
         if not restored.ok then
             errors[#errors + 1] = restored.message
         else
             txn.modules = nil
         end
     end
+
     if #errors > 0 then
         txn.phase = "RECOVERY_REQUIRED"
-        return result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
+        return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
     end
-    local resumed = guard:resume(txn.id)
+
+    local resumed = module_state.business_guard:resume(txn.id)
     if not resumed.ok then
         txn.phase = "RECOVERY_REQUIRED"
         return resumed
     end
-    completed = txn.sequence
-    last_id = txn.id
-    transaction = nil
-    return result.success()
+
+    module_state.completed_sequence = txn.sequence
+    module_state.last_transaction_id = txn.id
+    module_state.active_transaction = nil
+    return hotupgrade_result.success()
 end
 
 -- 只在 Guard 已排空时执行受信同步脚本；此函数不提供安全沙箱或副作用撤销。
@@ -102,8 +100,9 @@ local function stage_service(source)
     if not source then
         return nil
     end
-    local service = assert(options.service, "Service 未提供内部更新入口")
-    local chunk = assert(load(source, "@services/" .. options.service_type .. ".lua", "t", _G))
+
+    local service = assert(module_state.registration.service, "Service 未提供内部更新入口")
+    local chunk = assert(load(source, "@services/" .. module_state.registration.service_type .. ".lua", "t", _G))
     local build = chunk()
     assert(type(build) == "function", "Service Patch 必须返回构建函数")
     local patch = build(service.state)
@@ -123,6 +122,7 @@ local function stage_service(source)
             and type(rawget(service.functions, name)) == "function", "只能直接替换现有业务函数")
         staged.old_functions[name] = rawget(service.functions, name)
     end
+
     if patch.migrate then
         if service.snapshot then
             staged.old_state = service.snapshot(service.state)
@@ -132,13 +132,15 @@ local function stage_service(source)
                 and isolated ~= service.state, "自定义快照必须独立")
             staged.next_state = patch.migrate(isolated)
         else
-            staged.old_state = module_patch.copy_state(service.state)
-            staged.next_state = patch.migrate(module_patch.copy_state(staged.old_state))
-            staged.next_state = module_patch.copy_state(staged.next_state)
+            staged.old_state = hotupgrade_module_patch.copy_state(service.state)
+            staged.next_state = patch.migrate(hotupgrade_module_patch.copy_state(staged.old_state))
+            staged.next_state = hotupgrade_module_patch.copy_state(staged.next_state)
         end
+
         assert(type(staged.next_state) == "table" and staged.next_state ~= service.state,
             "迁移须返回完整独立候选状态")
     end
+
     return staged
 end
 
@@ -149,182 +151,229 @@ end
 ---@param source integer 由 Skynet 提供的真实调用来源
 ---@return FlyWowHotUpgradeResult 恢复不确定时保持 Guard 关闭
 local function control(command, request, source)
-    if not options or source ~= options.controller_handle then
-        return result.failure("HU_UNAUTHORIZED", "控制来源不匹配")
-    end
-    if type(request) ~= "table" or type(request.txn_id) ~= "string"
-        or math.type(request.sequence) ~= "integer" then
-        return result.failure("HU_INVALID_REQUEST", "事务身份无效")
-    end
-    if last_id == request.txn_id and (command == "abort" or command == "finish") then
-        return result.success()
-    end
-    if request.sequence <= completed or (transaction and transaction.id ~= request.txn_id) then
-        return result.failure("HU_STALE_TRANSACTION", "过期或冲突事务")
+    if not module_state.registration or source ~= module_state.registration.controller_handle then
+        return hotupgrade_result.failure("HU_UNAUTHORIZED", "控制来源不匹配")
     end
 
+    if type(request) ~= "table" or type(request.txn_id) ~= "string"
+        or math.type(request.sequence) ~= "integer" then
+        return hotupgrade_result.failure("HU_INVALID_REQUEST", "事务身份无效")
+    end
+
+    if module_state.last_transaction_id == request.txn_id and (command == "abort" or command == "finish") then
+        return hotupgrade_result.success()
+    end
+
+    if request.sequence <= module_state.completed_sequence or (module_state.active_transaction and module_state.active_transaction.id ~= request.txn_id) then
+        return hotupgrade_result.failure("HU_STALE_TRANSACTION", "过期或冲突事务")
+    end
+
+    -- prepare 建立事务安全点并等待在途业务排空；等待过程可能 yield。
     if command == "prepare" then
-        if transaction then
-            return result.failure("HU_UPGRADE_BUSY", "当前事务已在处理中")
+        if module_state.active_transaction then
+            return hotupgrade_result.failure("HU_UPGRADE_BUSY", "当前事务已在处理中")
         end
-        transaction = {id = request.txn_id, sequence = request.sequence, phase = "QUIESCING"}
-        local paused = guard:prepare_upgrade(request.txn_id)
+        module_state.active_transaction = {id = request.txn_id, sequence = request.sequence, phase = "QUIESCING"}
+        local paused = module_state.business_guard:prepare_upgrade(request.txn_id)
         if not paused.ok then
-            transaction = nil
+            module_state.active_transaction = nil
             return paused
         end
-        local waited = guard:wait_idle(request.txn_id, request.timeout_ms or 10000, options.can_upgrade)
+
+        local waited = module_state.business_guard:wait_idle(request.txn_id, request.timeout_ms or hotupgrade_common.DEFAULT_TIMEOUT_MS, module_state.registration.before_upgrade)
         -- wait_idle 可以 yield；恢复后须重新确认事务仍由当前请求持有。
-        if not transaction or transaction.id ~= request.txn_id then
-            return result.failure("HU_STALE_TRANSACTION", "等待时事务已结束")
+        if not module_state.active_transaction or module_state.active_transaction.id ~= request.txn_id then
+            return hotupgrade_result.failure("HU_STALE_TRANSACTION", "等待时事务已结束")
         end
+
         if waited.ok then
-            transaction.phase = "QUIESCED"
+            module_state.active_transaction.phase = "QUIESCED"
         end
+
         return waited
     end
-    local txn = transaction
-    if not txn or txn.sequence ~= request.sequence or guard.owner ~= txn.id then
-        return result.failure("HU_STALE_TRANSACTION", "未取得本事务安全点")
+
+    local txn = module_state.active_transaction
+    if not txn or txn.sequence ~= request.sequence or module_state.business_guard.owner ~= txn.id then
+        return hotupgrade_result.failure("HU_STALE_TRANSACTION", "未取得本事务安全点")
     end
+
     if command == "abort" then
         return abort(txn)
     end
-    if guard.active ~= 0 then
-        return result.failure("HU_SAFEPOINT_REQUIRED", "在途业务尚未排空")
+
+    if module_state.business_guard.active ~= 0 then
+        return hotupgrade_result.failure("HU_SAFEPOINT_REQUIRED", "在途业务尚未排空")
     end
+
+    -- Stage 只准备候选模块和 Service 更新，不写线上导出或状态。
     if command == "stage" and txn.phase == "QUIESCED" then
         for _, entry in ipairs(request.modules or {}) do
-            if not declared[entry.name] then
-                return result.failure("HU_MODULE_NOT_REGISTERED", tostring(entry.name))
+            if not module_state.declared_modules[entry.name] then
+                return hotupgrade_result.failure("HU_MODULE_NOT_REGISTERED", tostring(entry.name))
             end
         end
-        local staged = engine:stage(request.modules or {})
+
+        local staged = module_state.module_patch_engine:stage(request.modules or {})
         if not staged.ok then
             return staged
         end
+
         txn.modules = staged.stage
         local ok, service = pcall(stage_service, request.service_source)
         if not ok then
-            return result.failure("HU_SERVICE_STAGE_FAILED", tostring(service))
+            return hotupgrade_result.failure("HU_SERVICE_STAGE_FAILED", tostring(service))
         end
+
         txn.service = service
         txn.phase = "STAGED"
-        return result.success()
+        return hotupgrade_result.success()
     end
+
+    -- Activate 在 Guard 内同步提交；任一步失败都会调用组合恢复。
     if command == "activate" and txn.phase == "STAGED" then
-        local installed = engine:commit(txn.modules)
+        local installed = module_state.module_patch_engine:commit(txn.modules)
         local ok, message = pcall(function()
             assert(installed.ok, installed.message)
             local staged = txn.service
             if staged then
-                local service = options.service
+                local service = module_state.registration.service
                 staged.touched = true
                 if staged.next_state then
                     if service.commit then
                         assert(service.commit(service.state, staged.next_state) ~= false, "Service 拒绝提交")
                     else
-                        module_patch.restore_state(service.state, staged.next_state)
+                        hotupgrade_module_patch.restore_state(service.state, staged.next_state)
                     end
                 end
+
                 for name, fn in pairs(staged.patch.functions or {}) do
                     rawset(service.functions, name, fn)
                 end
             end
-            if options.postcheck then
-                assert(options.postcheck() ~= false, "postcheck 拒绝更新")
+
+            if module_state.registration.after_upgrade then
+                assert(module_state.registration.after_upgrade() ~= false, "after_upgrade 拒绝更新")
             end
         end)
         if not ok then
             local restored = abort(txn)
-            return restored.ok and result.failure("HU_ACTIVATE_FAILED", tostring(message)) or restored
+            return restored.ok and hotupgrade_result.failure("HU_ACTIVATE_FAILED", tostring(message)) or restored
         end
+
         txn.phase = "ACTIVATED"
-        return result.success()
+        return hotupgrade_result.success()
     end
+
+    -- finish 确认提交后才清理旧快照并重新开放业务入口。
     if command == "finish" and txn.phase == "ACTIVATED" then
-        local finished = engine:finish(txn.modules)
+        local finished = module_state.module_patch_engine:finish(txn.modules)
         if not finished.ok then
             txn.phase = "RECOVERY_REQUIRED"
             return finished
         end
-        local resumed = guard:resume(txn.id)
+
+        local resumed = module_state.business_guard:resume(txn.id)
         if not resumed.ok then
             txn.phase = "RECOVERY_REQUIRED"
             return resumed
         end
-        completed = txn.sequence
-        last_id = txn.id
-        transaction = nil
-        return result.success()
+
+        module_state.completed_sequence = txn.sequence
+        module_state.last_transaction_id = txn.id
+        module_state.active_transaction = nil
+        return hotupgrade_result.success()
     end
-    return result.failure("HU_PHASE_INVALID", "当前阶段不能执行 " .. tostring(command))
+
+    return hotupgrade_result.failure("HU_PHASE_INVALID", "当前阶段不能执行 " .. tostring(command))
 end
+
+---@class FlyWowHotUpgradeServiceUpdate
+---@field state table 现存 Service 私有状态表；更新只改其字段，不替换该表。
+---@field functions table Service 原有业务函数表；Patch 只替换本次列出的现有函数字段。
+---@field snapshot? fun(state:table):table Stage 开始迁移前生成与线上对象隔离的快照；与 commit、restore 成组提供。
+---@field commit? fun(state:table, next_state:table) Activate 内同步原地应用候选状态；不得 yield 或写外部权威数据。
+---@field restore? fun(state:table, old_state:table) 提交失败时同步恢复快照；返回 false 或抛错会保持 Guard 关闭。
+
+---@class FlyWowHotUpgradeRegistration
+---@field controller_handle integer 宿主已启动的控制 Service handle
+---@field service_type string 对应 services/<service_type>.lua
+---@field service? FlyWowHotUpgradeServiceUpdate 可选 Service 内部状态/函数更新入口
+---@field before_upgrade? fun():boolean|table Guard 暂停新业务且在途调用归零后反复调用；true 或 {ok=true} 才放行，否则继续等待至超时，异常立即失败。同步只读，不得 yield
+---@field after_upgrade? fun():boolean Activate 提交模块与 Service 状态后、finish 前调用；false 或异常触发组合恢复。只检查已提交状态，不得产生外部副作用或 yield
 
 --- 登记现存 Service；仅元数据跨 Service 传递。可能 yield，成功前宿主不能宣布 READY。
 ---@param registration FlyWowHotUpgradeRegistration 本 State 配置及可选 Service 内部入口
 ---@return FlyWowHotUpgradeResult 登记结果
 function M.register_service(registration)
-    if options then
-        return result.failure("HU_DUPLICATE_SERVICE", "当前 State 已登记")
+    if module_state.registration then
+        return hotupgrade_result.failure("HU_DUPLICATE_SERVICE", "当前 State 已登记")
     end
+
     if type(registration) ~= "table" or math.type(registration.controller_handle) ~= "integer"
         or type(registration.service_type) ~= "string"
         or not registration.service_type:match("^[%w_.%-]+$") then
-        return result.failure("HU_INVALID_OPTIONS", "Controller handle 或 Service 类型无效")
+        return hotupgrade_result.failure("HU_INVALID_OPTIONS", "Controller handle 或 Service 类型无效")
     end
-    for _, name in ipairs({"postcheck", "can_upgrade"}) do
-        if registration[name] ~= nil and type(registration[name]) ~= "function" then
-            return result.failure("HU_INVALID_OPTIONS", name .. " 必须为函数")
-        end
+
+    if registration.before_upgrade ~= nil and type(registration.before_upgrade) ~= "function" then
+        return hotupgrade_result.failure("HU_INVALID_OPTIONS", "before_upgrade 必须为函数")
     end
+
+    if registration.after_upgrade ~= nil and type(registration.after_upgrade) ~= "function" then
+        return hotupgrade_result.failure("HU_INVALID_OPTIONS", "after_upgrade 必须为函数")
+    end
+
     local service = registration.service
     if service then
         if type(service) ~= "table" or type(service.state) ~= "table"
             or type(service.functions) ~= "table" or getmetatable(service.functions) ~= nil then
-            return result.failure("HU_INVALID_OPTIONS", "Service 内部入口需要私有 state 与现有函数表")
+            return hotupgrade_result.failure("HU_INVALID_OPTIONS", "Service 内部入口需要私有 state 与现有函数表")
         end
+
         local custom = service.snapshot or service.commit or service.restore
         if custom and (type(service.snapshot) ~= "function" or type(service.commit) ~= "function"
             or type(service.restore) ~= "function") then
-            return result.failure("HU_INVALID_OPTIONS", "自定义快照、提交、恢复必须成组提供")
+            return hotupgrade_result.failure("HU_INVALID_OPTIONS", "自定义快照、提交、恢复必须成组提供")
         end
+
         if not custom and getmetatable(service.state) ~= nil then
-            return result.failure("HU_INVALID_OPTIONS", "特殊状态对象需要自定义快照与恢复")
+            return hotupgrade_result.failure("HU_INVALID_OPTIONS", "特殊状态对象需要自定义快照与恢复")
         end
     end
 
-    options = registration
-    engine = module_patch.new()
+    module_state.registration = registration
+    module_state.module_patch_engine = hotupgrade_module_patch.new()
     M.guard()
     skynet.dispatch("hotupgrade", function(session, source, command, request)
         local ok, answer = pcall(control, command, request, source)
         if not ok then
             -- 未预期异常可能发生在写入后；保留本地事务与 Guard，不能伪称恢复成功。
-            if transaction then
-                transaction.phase = "RECOVERY_REQUIRED"
+            if module_state.active_transaction then
+                module_state.active_transaction.phase = "RECOVERY_REQUIRED"
             end
-            answer = result.failure("HU_RECOVERY_REQUIRED", tostring(answer))
+            answer = hotupgrade_result.failure("HU_RECOVERY_REQUIRED", tostring(answer))
         end
+
         if session ~= 0 then
             skynet.retpack(answer)
         end
     end)
     local names = {}
-    for name in pairs(declared) do
+    for name in pairs(module_state.declared_modules) do
         names[#names + 1] = name
     end
     table.sort(names)
     ---@type FlyWowHotUpgradeTargetMetadata
     local metadata =
     {
-        service_type = options.service_type,
+        service_type = module_state.registration.service_type,
         modules = names,
         service_patch = service ~= nil,
     }
-    local ok, answer = pcall(skynet.call, options.controller_handle, "hotupgrade", "register", metadata)
+    local ok, answer = pcall(skynet.call, module_state.registration.controller_handle, "hotupgrade", "register", metadata)
     -- RPC 失败可能意味着 Controller 已登记；保持本 State 配置，要求宿主终止未 READY 的启动。
-    return ok and answer or result.failure("HU_RPC_FAILED", tostring(answer))
+    return ok and answer or hotupgrade_result.failure("HU_RPC_FAILED", tostring(answer))
 end
 
 --- 在本 State 加载完整模块；首次登记新模块可能 yield。登记失败抛错，允许再次声明。
@@ -334,19 +383,22 @@ function M.require(name)
     assert(type(name) == "string" and name ~= "", "模块名无效")
     local value = require(name)
     assert(type(value) == "table", "可更新模块必须返回 table")
-    if not declared[name] then
-        assert(declared_count < 1024, "HU_MODULE_LIMIT: 模块声明已达 1024 上限")
-        if options then
-            local ok, answer = pcall(skynet.call, options.controller_handle, "hotupgrade",
+    if not module_state.declared_modules[name] then
+        assert(module_state.declared_module_count < hotupgrade_common.MAX_MODULES,
+            "HU_MODULE_LIMIT: 模块声明已达 " .. hotupgrade_common.MAX_MODULES .. " 上限")
+        if module_state.registration then
+            local ok, answer = pcall(skynet.call, module_state.registration.controller_handle, "hotupgrade",
                 "register_module", {name = name})
             assert(ok and type(answer) == "table" and answer.ok,
                 "模块登记失败: " .. tostring(type(answer) == "table" and answer.message or answer))
         end
-        if not declared[name] then
-            declared[name] = true
-            declared_count = declared_count + 1
+
+        if not module_state.declared_modules[name] then
+            module_state.declared_modules[name] = true
+            module_state.declared_module_count = module_state.declared_module_count + 1
         end
     end
+
     return value
 end
 

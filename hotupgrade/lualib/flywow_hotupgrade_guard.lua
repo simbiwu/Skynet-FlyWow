@@ -1,5 +1,5 @@
 --- 当前 Service 的事务安全点；暂停阻止新任务，已进入任务自然排空。
-local result = require "flywow_hotupgrade_error"
+local hotupgrade_result = require "flywow_hotupgrade_error"
 local M = {}
 local Guard = {}
 Guard.__index = Guard
@@ -17,85 +17,95 @@ end
 ---@return FlyWowHotUpgradeResult
 function Guard:enter()
     if self.owner then
-        return result.failure("HU_UPGRADING", "入口已暂停")
+        return hotupgrade_result.failure("HU_UPGRADING", "入口已暂停")
     end
+
     self.active = self.active + 1
-    return result.success()
+    return hotupgrade_result.success()
 end
 
 ---@return FlyWowHotUpgradeResult
 function Guard:leave()
     if self.active == 0 then
-        return result.failure("HU_GUARD_UNBALANCED", "没有已进入事务")
+        return hotupgrade_result.failure("HU_GUARD_UNBALANCED", "没有已进入事务")
     end
+
     self.active = self.active - 1
-    return result.success()
+    return hotupgrade_result.success()
 end
 
 --- handler 可 yield；异常也释放计数。转发未知签名时固定参数与 nil 数量。
 ---@param fn function 业务处理函数；可 yield，异常会转成 HU_HANDLER_FAILED。
 ---@param ... any 仅在本 Service 调用栈内转发的参数，保留中间 nil。
----@return FlyWowHotUpgradeResult values 保留函数返回值数量；每个成功 enter 都在返回前 leave。
+---@return FlyWowHotUpgradeResult protected_call_results 保留函数返回值数量；每个成功 enter 都在返回前 leave。
 function Guard:run(fn, ...)
     local entered = self:enter()
     if not entered.ok then
         return entered
     end
 
-    local values = table.pack(pcall(fn, ...))
+    local protected_call_results = table.pack(pcall(fn, ...))
     self:leave()
-    if not values[1] then
-        return result.failure("HU_HANDLER_FAILED", tostring(values[2]))
+    if not protected_call_results[1] then
+        return hotupgrade_result.failure("HU_HANDLER_FAILED", tostring(protected_call_results[2]))
     end
-    return result.success({values = table.pack(table.unpack(values, 2, values.n))})
+
+    return hotupgrade_result.success({values = table.pack(table.unpack(protected_call_results, 2, protected_call_results.n))})
 end
 
 ---@param txn_id string|table 当前升级身份
 ---@return FlyWowHotUpgradeResult
 function Guard:prepare_upgrade(txn_id)
     if self.owner and self.owner ~= txn_id then
-        return result.failure("HU_UPGRADE_BUSY", "另一个事务占有安全点")
+        return hotupgrade_result.failure("HU_UPGRADE_BUSY", "另一个事务占有安全点")
     end
+
     self.owner = txn_id
-    return result.success()
+    return hotupgrade_result.success()
 end
 
 --- 可 yield；每次醒来重新核对 owner，超时不放行新请求。
 ---@param txn_id string|table 已通过 prepare_upgrade 获取的唯一安全点 owner。
 ---@param timeout_ms integer 最大等待毫秒数；到期时仍保持入口暂停，不自动释放 owner。
----@param can_upgrade? function 受信同步附加安全条件；不得 yield 或修改业务状态。
+---@param before_upgrade? function Guard 暂停新业务且在途调用归零后检查；未放行会继续等待至超时，异常返回 HU_HOOK_FAILED。必须同步只读，不得 yield。
 ---@return FlyWowHotUpgradeResult
-function Guard:wait_idle(txn_id, timeout_ms, can_upgrade)
+function Guard:wait_idle(txn_id, timeout_ms, before_upgrade)
     local deadline = self.clock.now() + timeout_ms
     while self.owner == txn_id do
         if self.active == 0 then
-            if not can_upgrade then
-                return result.success()
+            if not before_upgrade then
+                return hotupgrade_result.success()
             end
-            local ok, verdict = pcall(can_upgrade)
+
+            local ok, verdict = pcall(before_upgrade)
             if not ok then
-                return result.failure("HU_HOOK_FAILED", tostring(verdict))
+                return hotupgrade_result.failure("HU_HOOK_FAILED", tostring(verdict))
             end
+
             if verdict == true or (type(verdict) == "table" and verdict.ok == true) then
-                return result.success()
+                return hotupgrade_result.success()
             end
         end
+
         if self.clock.now() >= deadline then
-            return result.failure("HU_SAFEPOINT_TIMEOUT", "事务未排空")
+            return hotupgrade_result.failure("HU_SAFEPOINT_TIMEOUT", "事务未排空")
         end
+
         self.clock.sleep(10)
     end
-    return result.failure("HU_STALE_TRANSACTION", "安全点 owner 已变化")
+
+    return hotupgrade_result.failure("HU_STALE_TRANSACTION", "安全点 owner 已变化")
 end
 
 ---@param txn_id string|table owner
 ---@return FlyWowHotUpgradeResult
 function Guard:resume(txn_id)
     if self.owner and self.owner ~= txn_id then
-        return result.failure("HU_STALE_TRANSACTION", "不能释放其它事务安全点")
+        return hotupgrade_result.failure("HU_STALE_TRANSACTION", "不能释放其它事务安全点")
     end
+
     self.owner = nil
-    return result.success()
+    return hotupgrade_result.success()
 end
 
 return M
