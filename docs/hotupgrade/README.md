@@ -7,7 +7,7 @@ HotUpgrade 在现存 Skynet Service、现存 Lua State 内更新受信 Lua 代�
 宿主从 composition root 启动控制面，保存 handle，再通过 init 交付配置：
 
 ```lua
-require "flywow_hotupgrade" -- 声明当前管理 State 的原生控制协议。
+local hotupgrade = require "flywow_hotupgrade" -- 声明当前管理 State 的原生控制协议。
 local controller_handle = skynet.newservice("flywow_hotupgrade_service")
 local initialized = skynet.call(controller_handle, "lua", "init",
 {
@@ -33,7 +33,27 @@ Controller 初始化成功时通过现有 Skynet 共享环境发布内部键 fly
 
 timeout_ms 是目标 Guard 等待在途业务排空的毫秒上限，默认 10000；它不是远端 RPC 取消期限。init 失败可修正后重试，成功后重复 init 返回 HU_ALREADY_INITIALIZED，初始化前控制请求返回 HU_NOT_INITIALIZED。
 
-在现存业务 Service 自己的 Lua State 登记：
+纳入 HotUpgrade 管理的 Service 必须由创建者使用受管理入口启动；Controller 自身和非受管理 Service 继续使用原生入口：
+
+```lua
+local handle = hotupgrade.newservice(controller_handle, "player", "原有启动参数")
+-- newservice 仅转交原生启动参数，返回后不额外等待业务 init 或 register_service。
+local called, initialized = pcall(skynet.call, handle, "lua", "init", player_config)
+if not called or type(initialized) ~= "table" or not initialized.ok then
+    -- 只可取消尚未登记的 Service；Controller 核验创建者、终止 Service 并清理待创建记录。
+    local cancelled = hotupgrade.cancel_service_creation(controller_handle, handle)
+    assert(cancelled.ok, tostring(cancelled.code) .. ": " .. tostring(cancelled.message))
+    error(type(initialized) == "table" and initialized.message or tostring(initialized))
+end
+```
+
+hotupgrade.newservice 会 yield，成功返回原生 handle，失败抛出含 HU_SERVICE_CREATE_FAILED（或入口拒绝码）的异常。原生创建失败自动释放记录；创建成功后的业务 init 由调用方负责。业务 init 应在所有可能失败的初始化工作完成后，最后调用 register_service，并把登记结果作为 init 的结果；成功后再宣布 READY。业务初始化在登记前失败时，原创建者必须显式调用 cancel_service_creation，不能仅丢弃 handle。取消返回统一结果，非创建者返回 HU_UNAUTHORIZED，未知/已取消的 handle 返回 HU_CREATION_MISSING，已登记 Service 返回 HU_SERVICE_ALREADY_REGISTERED 且不会被终止。若登记 RPC 结果不明或登记后又失败，取消可能被拒绝，须由宿主核对真实登记状态并处理受控终止/重启，不能把它当成仍未登记。
+
+Controller 在调用原生 newservice 前建立待创建记录和不复用的进程内创建标识，实际启动内部 flywow_hotupgrade_bootstrap。引导在同一个 Lua State 内绑定创建身份，随后复用宿主配置的 Skynet loader 加载真实 Service，交付原业务参数以及正确的 SERVICE_NAME/SERVICE_PATH，不启动代理 Service、不接管业务 init。register_service 自动携带该内部身份；Controller 用它找到本次创建记录，以消息头真实 source 绑定 handle，并在原生调用返回时核对同一 handle。登记和原生启动都完成后才释放记录。若原生调用先返回，记录按返回 handle 保留至该来源登记或创建者取消。未知来源的 register 返回 HU_CREATION_MISSING，重复登记返回 HU_DUPLICATE_SERVICE。记录不会自动超时清除，漏掉登记或取消会持续关闭发布入口。
+
+内部文件为 hotupgrade/service/flywow_hotupgrade_bootstrap.lua 和 hotupgrade/lualib/flywow_hotupgrade_creation.lua，沿用已有 Service/Lua 搜索路径，无新增运行配置。创建身份只用于受信进程内关联，不是远程认证。launcher 的启动诊断会显示内部引导及目标名。引导复用现有 lualoader；首轮 loader 已执行的 preload 不会再次执行，其看到的是内部引导参数。若宿主定制 loader 或 preload 依赖 Service 名/参数、修改加载语义，接入前须验证该引导合同；当前测试覆盖标准 Skynet loader。
+
+在受管理业务 Service 自己的 Lua State 登记：
 
 ```lua
 local hotupgrade = require "flywow_hotupgrade"
@@ -65,9 +85,11 @@ service_module 对应 service_dir 下的相对 Lua 路径：去掉 .lua 并将 /
 
 hotupgrade.require(name) 仍用宿主原有 name 加载模块，通过 package.searchpath(name, package.path) 定位 Lua 文件，再复用 Native resolve 得到规范化路径。Controller 登记名由该文件相对 root_path 的路径去掉 .lua、将 / 转为 . 得到。例如原调用 hotupgrade.require("battle.state_sync.runtime") 加载 lualib/battle/state_sync/runtime.lua，登记名为 lualib.battle.state_sync.runtime；不是给原 name 固定增加目录前缀。?/init.lua 解析出的文件也按真实路径登记，例如 lualib/battle/init.lua 对应 lualib.battle.init。
 
-原 require 名和文件登记名在 package.loaded 中指向同一个模块根表，热更和恢复都通过同一根表对两种名称生效。只有首次通过 hotupgrade.require 确认加载来源的模块表才允许复用；先经普通 require 加载而没有来源记录的缓存模块会被明确拒绝，即使原名恰好等于文件登记名。须从首次加载时就使用 hotupgrade.require，不要清空已有业务缓存来绕过检查。建立别名前同时检查原名来源、文件登记名缓存和 package.preload；冲突时明确拒绝，不覆盖已有缓存或预加载器。加载来源检查失败会恢复本次涉及的缓存，动态登记失败会撤销本次新建的别名并保留已确认来源，允许重试。仅支持通过标准 package.path 搜索的 Lua 文件；package.preload、自定义加载器来源不一致、无法定位文件或文件位于 root_path 外时明确拒绝。宿主应保持受控模块的搜索路径稳定，不在已加载后改写其加载来源。
+原 require 名和文件登记名在 package.loaded 中指向同一个模块根表，热更和恢复都通过同一根表对两种名称生效。只有首次通过 hotupgrade.require 确认加载来源的模块表才允许复用；先经普通 require 加载而没有来源记录的缓存模块会被明确拒绝，即使原名恰好等于文件登记名。须从首次加载时就使用 hotupgrade.require，不要清空已有业务缓存来绕过检查。建立别名前同时检查原名来源、文件登记名缓存和 package.preload；冲突时明确拒绝，不覆盖已有缓存或预加载器。加载、来源验证或动态登记失败会恢复本次涉及的原名缓存和规范别名，撤销本次新增的来源映射及声明计数，保留操作前已有的合法缓存，允许重试。仅支持通过标准 package.path 搜索的 Lua 文件；package.preload、自定义加载器来源不一致、无法定位文件或文件位于 root_path 外时明确拒绝。宿主应保持受控模块的搜索路径稳定，不在已加载后改写其加载来源。
 
-登记前声明随初始元数据提交；登记后首次声明通过原生 Skynet call 登记，可能 yield。失败抛错且允许重试；重复声明不重复 RPC。Controller 只更新目标已声明的模块。
+登记前声明随初始元数据提交，由待创建记录保护。register_service 会拒绝本 State 尚在执行的首次声明（HU_LIFECYCLE_PENDING），调用方须待声明完成后登记；登记 RPC 期间的新声明等待登记结果，避免落在初始模块快照之外。
+
+已登记 Service 首次声明模块时，先向 Controller 请求 begin_module_load 许可，再执行实际 require、校验来源并建立缓存、别名、来源映射和本地声明，最后携许可 ID 调用 register_module。许可绑定真实来源及规范模块名，不能转用或重复消费；失败时回退本地新增状态，并通过 cancel_module_load 释放尚未完成的许可。许可未完成前禁止启动新批次，覆盖模块执行及登记的整个关键区间。同一 State 内并发首次声明同一规范模块会等待前一项成功或完整回退；已声明模块不重复请求许可。Controller 只更新目标已声明的模块。活动批次期间，新的受管理创建、未登记 Service 的 register 和首次加载许可请求返回 HU_UPGRADE_BUSY，实际模块代码不会因此执行。
 
 ## 业务 Guard
 
@@ -182,6 +204,20 @@ local status = skynet.call(controller_handle, "hotupgrade", "status", {batch_id 
 assert(status.ok, status.message)
 ```
 
+无 batch_id 的 status 返回生命周期概览：
+
+```lua
+local status = skynet.call(controller_handle, "hotupgrade", "status", {})
+assert(status.ok, status.message)
+-- status.lifecycle:
+-- pending_creations：原生启动或首次登记尚未完成的 Service 数。
+-- pending_module_loads：已授权、尚未登记或取消的模块加载数。
+-- active_batch_id：活动批次 ID；没有活动批次时为 nil。
+-- recovery_required：恢复门禁是否关闭。
+```
+
+带 batch_id 的 status 保留原批次 record，并附带同一 lifecycle 概览；未知或过旧批次仍返回 HU_BATCH_MISSING。validate、dry_run 和 apply 在冻结/建立目标快照前统一检查生命周期屏障：有任一待创建或待模块加载操作时，返回 HU_LIFECYCLE_PENDING，message 给出两类未完成数，不生成 batch_id、不递增批次序号、不发送 prepare 等目标 RPC。正常完成登记或显式取消后可重试。
+
 validate 同步冻结源码、检查路径/语法和匹配的登记目标，不执行目标脚本。validate、dry_run 和 apply 使用同一匹配规则：每个 Patch 文件必须至少匹配一个已登记目标；未匹配时返回 HU_TARGET_MISSING，并在 message 中给出文件路径和原因，本批次不会启动任何目标更新。Service 模块匹配但未提供内部更新入口时返回 HU_SERVICE_PATCH_UNSUPPORTED，同样在批次启动前拒绝整包。apply 和 dry_run 返回 batch_id 后异步推进，每次只运行一个发布，不排队。status 查询当前活动批次或最近一个终态；更早批次返回 HU_BATCH_MISSING。状态不持久化，Controller 重启不恢复登记或批次。
 
 各目标按 handle 顺序逐个执行：
@@ -201,7 +237,7 @@ validate 同步冻结源码、检查路径/语法和匹配的登记目标，不�
 
 Native 提供 resolve(path[, relative_dir]) 和 list_lua(patch_root, path)；相对目录检查与递归扫描共用路径安全校验，拒绝越界路径、链接及特殊文件。扫描限制整个选定 Patch 最多 1024 个 Lua 文件、单文件 2 MiB，整包读取累计最多 16 MiB。宿主在扫描/冻结期间保持 Patch 目录不变；扫描和读取不是抵抗并发目录替换的原子安全边界。冻结后目标只使用本次源码，不重新读取磁盘。
 
-Controller 最多登记 1024 个目标，每目标最多声明 1024 个模块；达到上限返回 HU_TARGET_LIMIT/HU_MODULE_LIMIT。登记记录由当前 Controller 持有，不建立后台发现或自动注销；宿主负责保持实际 Service 生命周期与控制面一致。
+Controller 最多登记 1024 个目标，每目标最多声明 1024 个模块；达到上限返回 HU_TARGET_LIMIT/HU_MODULE_LIMIT。待创建记录也占用目标容量；每目标同时最多保留 1024 项模块加载许可，同一模块同时只保留一项。登记和许可记录由当前 Controller 持有，不建立后台发现、自动超时清理或持久化恢复；宿主负责保持实际 Service 生命周期与控制面一致。Service 或调用方在关键区间异常退出、许可取消 RPC 无法送达时，屏障会保留；须核对实际状态并受控重启，不得假定操作已完成。
 
 从 FlyWow 根目录执行：
 
@@ -210,4 +246,4 @@ bash scripts/build_flywow.sh ../skynet hotupgrade
 bash hotupgrade/scripts/run_hotupgrade_tests.sh ../skynet
 ```
 
-脚本测试 Guard、完整模块增改删、私有状态迁移、Service 状态/函数组合提交、真实 handle/State/表身份保持、dry_run、Stage/Activate 失败恢复、部分成功和恢复门禁。Skynet 集成只启动测试专用进程，不监听业务端口；结果不替代宿主真实业务状态与数据库验证。
+脚本测试创建中/待登记屏障、两种登记时序、启动与业务初始化失败、创建者取消权限、模块许可匹配/消费/失败清理、并发首次声明、活动批次拒绝，以及 Guard、完整模块增改删、私有状态迁移、Service 状态/函数组合提交、真实 handle/State/表身份保持、dry_run、Stage/Activate 失败恢复、部分成功和恢复门禁。Skynet 集成只启动测试专用进程，不监听业务端口；结果不替代宿主真实业务状态与数据库验证。

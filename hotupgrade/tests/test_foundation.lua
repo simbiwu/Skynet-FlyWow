@@ -148,4 +148,82 @@ assert(nested_engine:abort(nested_stage.stage).ok)
 assert(nested_live.config == installed_config and nested_live.config.self == installed_config)
 assert(nested_live.helper.calculate(3) == 6)
 package.loaded[nested_name] = nil
+-- 独立 Lua 验证首次声明的本地事务：许可先于模块执行，失败回退缓存/来源/声明并释放许可。
+local original_path = package.path
+package.path = "build/hotupgrade-tests/host/lualib/?.lua;" .. package.path
+local original_require = require
+local permits = {}
+local permit_sequence = 0
+local begin_count = 0
+local fail_registration = false
+local last_loaded_value
+package.loaded.skynet =
+{
+    register_protocol = function() end,
+    dispatch = function() end,
+    pack = function() end,
+    unpack = function() end,
+    getenv = function() return "build/hotupgrade-tests/host" end,
+    call = function(_handle, _protocol, command, request)
+        if command == "register" then
+            return {ok = true}
+        elseif command == "begin_module_load" then
+            begin_count = begin_count + 1
+            permit_sequence = permit_sequence + 1
+            local id = tostring(permit_sequence)
+            permits[id] = request.name
+            return {ok = true, permit_id = id}
+        elseif command == "register_module" then
+            assert(permits[request.permit_id] == request.name)
+            assert(package.loaded.hotupgrade_extra == package.loaded[request.name])
+            last_loaded_value = package.loaded.hotupgrade_extra
+            if fail_registration == "rpc" then
+                error("injected registration RPC failure")
+            elseif fail_registration == "register" then
+                return {ok = false, message = "injected registration failure"}
+            end
+            permits[request.permit_id] = nil
+            return {ok = true}
+        elseif command == "cancel_module_load" then
+            assert(permits[request.permit_id] == request.name)
+            permits[request.permit_id] = nil
+            return {ok = true}
+        end
+        error("unexpected mock command: " .. command)
+    end,
+}
+package.loaded["skynet.require"] = {require = original_require}
+package.loaded.flywow_hotupgrade_native = {resolve = function(path) return path end}
+local hotupgrade = require "flywow_hotupgrade"
+assert(hotupgrade.register_service({controller_handle = 99, service_module = "fixture"}).ok)
+for _, failure in ipairs({"execute", "path", "register", "rpc"}) do
+    _G.require = function(name)
+        assert(next(permits), "实际模块执行前必须已取得许可")
+        if failure == "execute" then
+            package.loaded[name] = {}
+            error("injected module failure")
+        end
+        local value, path = original_require(name)
+        return value, failure == "path" and "other.lua" or path
+    end
+    fail_registration = failure
+    local loaded_ok = pcall(hotupgrade.require, "hotupgrade_extra")
+    _G.require = original_require
+    assert(not loaded_ok and next(permits) == nil)
+    assert(package.loaded.hotupgrade_extra == nil and package.loaded["lualib.hotupgrade_extra"] == nil)
+end
+-- 登记失败后新增的来源记录也必须撤销；不能把留下的表当成合法既有缓存。
+package.loaded.hotupgrade_extra = last_loaded_value
+local loaded_ok, load_error = pcall(hotupgrade.require, "hotupgrade_extra")
+assert(not loaded_ok and tostring(load_error):find("HU_INVALID_PATH", 1, true))
+assert(package.loaded.hotupgrade_extra == last_loaded_value and next(permits) == nil)
+package.loaded.hotupgrade_extra = nil
+fail_registration = false
+local declarations_before = begin_count
+local extra = hotupgrade.require("hotupgrade_extra")
+assert(extra.value() == 1 and begin_count == declarations_before + 1 and next(permits) == nil)
+assert(hotupgrade.require("hotupgrade_extra") == extra and begin_count == declarations_before + 1)
+assert(package.loaded["lualib.hotupgrade_extra"] == extra)
+package.path = original_path
+print("HOTUPGRADE_FOUNDATION_LIFECYCLE_OK")
 print("HOTUPGRADE_FOUNDATION_OK")

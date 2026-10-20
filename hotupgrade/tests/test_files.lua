@@ -10,8 +10,18 @@ local hotupgrade = require "flywow_hotupgrade"
 local early_ok, early_error = pcall(hotupgrade.require, "test_worker_logic")
 assert(not early_ok and tostring(early_error):find("HU_NOT_INITIALIZED", 1, true))
 local c = assert(controller.new(config).controller)
-assert(c:control("register", {service_module = "unused", modules = {"lualib.test_worker_logic"},
-    service_patch = false}, 10).ok)
+-- 此文件只测扫描/路径；以原生创建替身为虚拟目标建立合法的待登记记录。
+local function register_fixture(instance, handle, metadata)
+    local skynet = require "skynet"
+    local original_newservice = skynet.newservice
+    skynet.newservice = function() return handle end
+    local created = instance:control("newservice", {service_name = "path_fixture", arguments = {n = 0}}, 1)
+    skynet.newservice = original_newservice
+    assert(created.ok)
+    return instance:control("register", metadata, handle)
+end
+assert(register_fixture(c, 10, {service_module = "unused", modules = {"lualib.test_worker_logic"},
+    service_patch = false}).ok)
 assert(c:control("validate", {path = "module"}, 1).ok)
 assert(not c:control("validate", {path = "invalid"}, 1).ok)
 for _, path in ipairs({"../module", "/module", "module/../module", "module//lualib",
@@ -66,7 +76,7 @@ assert(os.remove(service_link))
 assert(not rejected.ok and rejected.code == "HU_INVALID_PATH")
 local nested = assert(controller.new(
     {patch_root = root, root_path = config.root_path, service_dir = "actors/zone"}).controller)
-assert(nested:control("register",
-    {service_module = "player", modules = {}, service_patch = true}, 20).ok)
+assert(register_fixture(nested, 20,
+    {service_module = "player", modules = {}, service_patch = true}).ok)
 assert(nested:control("validate", {path = "custom_service"}, 1).ok)
 print("HOTUPGRADE_FILES_OK")

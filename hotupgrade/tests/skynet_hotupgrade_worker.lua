@@ -1,4 +1,13 @@
 --- 现存 Service 夹具：所有业务状态和函数保持在自己的 Lua State。
+local startup_arguments = table.pack(...)
+local startup_controller, startup_mode = ...
+assert(SERVICE_NAME == "skynet_hotupgrade_worker")
+assert(SERVICE_PATH:sub(-#"hotupgrade/tests/") == "hotupgrade/tests/")
+if startup_mode == "auto" then
+    assert(startup_arguments.n == 3 and startup_arguments[3] == "original_tail")
+elseif not startup_controller then
+    assert(startup_arguments.n == 0)
+end
 local skynet = require "skynet"
 local hotupgrade = require "flywow_hotupgrade"
 local logic = hotupgrade.require("test_worker_logic")
@@ -24,59 +33,77 @@ function business.save()
 end
 local original_save = business.save
 
+local function initialize(request)
+    worker_test_config = request
+    local service_update = {state = service_state, functions = business}
+    if worker_test_config.custom then
+        service_update.snapshot = function(value)
+            return require("flywow_hotupgrade_module_patch").copy_state(value)
+        end
+        service_update.commit = function(value, candidate)
+            value.equip = candidate.equip
+            error("partial service commit")
+        end
+        service_update.restore = function(value, snapshot)
+            if worker_test_config.restore_failure then
+                error("service restore failed")
+            end
+            require("flywow_hotupgrade_module_patch").restore_state(value, snapshot)
+        end
+    end
+    if worker_test_config.custom_success then
+        -- 模拟不可直接复制的业务对象，快照只包含它可迁移的普通数据。
+        setmetatable(service_state.nested, {})
+        service_update.snapshot = function(value)
+            return {equip = value.equip, level = value.level, schema_version = value.schema_version,
+                nested = {count = value.nested.count}}
+        end
+        service_update.commit = function(value, next_state)
+            value.equip = next_state.equip
+            value.level = next_state.level
+            value.schema_version = next_state.schema_version
+            value.nested.count = next_state.nested.count
+        end
+        service_update.restore = service_update.commit
+    end
+    return hotupgrade.register_service(
+    {
+        controller_handle = worker_test_config.controller_handle,
+        service_module = worker_test_config.service_module or "player",
+        service_update = service_update,
+        after_upgrade = function()
+            if worker_test_config.after_upgrade_failure then
+                error("after_upgrade failed")
+            end
+            if worker_test_config.break_module then
+                package.loaded["lualib.test_worker_logic"] = {}
+                error("module identity corrupted")
+            end
+            return true
+        end,
+    })
+end
+
 skynet.start(function()
+    if startup_controller then
+        if startup_mode == "fail" then
+            error("injected startup failure")
+        end
+        local initialized = initialize({controller_handle = assert(tonumber(startup_controller))})
+        assert(initialized.ok, initialized.message)
+        if startup_mode == "fail_after_register" then
+            error("injected failure after early registration")
+        end
+    end
     skynet.dispatch("lua", function(session, _source, command, request)
         request = request or {}
         local answer
         if command == "init" then
-            worker_test_config = request
-            local service_update = {state = service_state, functions = business}
-            if worker_test_config.custom then
-                service_update.snapshot = function(value)
-                    return require("flywow_hotupgrade_module_patch").copy_state(value)
-                end
-                service_update.commit = function(value, candidate)
-                    value.equip = candidate.equip
-                    error("partial service commit")
-                end
-                service_update.restore = function(value, snapshot)
-                    if worker_test_config.restore_failure then
-                        error("service restore failed")
-                    end
-                    require("flywow_hotupgrade_module_patch").restore_state(value, snapshot)
-                end
+            if request.init_failure then
+                answer = {ok = false, code = "HU_FIXTURE_INIT_FAILED", message = "business init failed"}
+            else
+                answer = initialize(request)
             end
-            if worker_test_config.custom_success then
-                -- 模拟不可直接复制的业务对象，快照只包含它可迁移的普通数据。
-                setmetatable(service_state.nested, {})
-                service_update.snapshot = function(value)
-                    return {equip = value.equip, level = value.level, schema_version = value.schema_version,
-                        nested = {count = value.nested.count}}
-                end
-                service_update.commit = function(value, next_state)
-                    value.equip = next_state.equip
-                    value.level = next_state.level
-                    value.schema_version = next_state.schema_version
-                    value.nested.count = next_state.nested.count
-                end
-                service_update.restore = service_update.commit
-            end
-            answer = hotupgrade.register_service(
-            {
-                controller_handle = worker_test_config.controller_handle,
-                service_module = worker_test_config.service_module or "player",
-                service_update = service_update,
-                after_upgrade = function()
-                    if worker_test_config.after_upgrade_failure then
-                        error("after_upgrade failed")
-                    end
-                    if worker_test_config.break_module then
-                        package.loaded["lualib.test_worker_logic"] = {}
-                        error("module identity corrupted")
-                    end
-                    return true
-                end,
-            })
         elseif command == "read" then
             -- 仅测试诊断用的只读观察，不是可绕过 Guard 的生产业务入口。
             answer =
@@ -167,11 +194,55 @@ skynet.start(function()
 
             -- 动态登记失败必须清理本次别名；随后 declare 仍能沿真实 RPC 重试。
             local original_call = skynet.call
-            skynet.call = function() return {ok = false, message = "injected declaration failure"} end
+            skynet.call = function(target, protocol, operation, declaration)
+                if operation == "register_module" then
+                    return {ok = false, message = "injected declaration failure"}
+                end
+                return original_call(target, protocol, operation, declaration)
+            end
             ok, message = pcall(hotupgrade.require, "hotupgrade_extra")
             skynet.call = original_call
             assert(not ok and tostring(message):find("injected declaration failure", 1, true))
-            assert(package.loaded["lualib.hotupgrade_extra"] == nil)
+            assert(package.loaded["lualib.hotupgrade_extra"] == nil and package.loaded.hotupgrade_extra == nil)
+            assert(skynet.call(worker_test_config.controller_handle, "hotupgrade", "status", {}).lifecycle.pending_module_loads == 0)
+            answer = true
+        elseif command == "cancel_creation" then
+            answer = hotupgrade.cancel_service_creation(request.controller_handle, request.handle)
+        elseif command == "declare_slow" then
+            -- 仅测试暂停实际模块执行，形成可观察的许可窗口；生产模块顶层仍须同步。
+            local original_require = _G.require
+            local path = assert(package.searchpath("hotupgrade_extra", package.path))
+            _G.require = function(name)
+                if name == "hotupgrade_extra" then
+                    skynet.sleep(10)
+                    local value = original_require(name)
+                    return value, path
+                end
+                return original_require(name)
+            end
+            local loaded_ok, loaded_value = pcall(hotupgrade.require, "hotupgrade_extra")
+            _G.require = original_require
+            assert(loaded_ok, loaded_value)
+            extra_logic = loaded_value
+            answer = extra_logic.value()
+        elseif command == "declare_failure" then
+            local original_require = _G.require
+            _G.require = function(name)
+                if name == "hotupgrade_extra" then
+                    package.loaded[name] = {}
+                    error("injected execution failure")
+                end
+                return original_require(name)
+            end
+            local loaded_ok = pcall(hotupgrade.require, "hotupgrade_extra")
+            _G.require = original_require
+            assert(not loaded_ok and package.loaded.hotupgrade_extra == nil
+                and package.loaded["lualib.hotupgrade_extra"] == nil)
+            answer = true
+        elseif command == "try_declare" then
+            local declared, message = pcall(hotupgrade.require, "hotupgrade_extra")
+            assert(not declared and tostring(message):find("HU_UPGRADE_BUSY", 1, true))
+            assert(package.loaded.hotupgrade_extra == nil and package.loaded["lualib.hotupgrade_extra"] == nil)
             answer = true
         elseif command == "declare" then
             extra_logic = hotupgrade.require("hotupgrade_extra")

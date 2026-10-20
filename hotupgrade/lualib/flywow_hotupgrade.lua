@@ -5,9 +5,13 @@ local hotupgrade_result = require "flywow_hotupgrade_error"
 local hotupgrade_common = require "flywow_hotupgrade_common"
 local hotupgrade_native = require "flywow_hotupgrade_native"
 local hotupgrade_module_patch = require "flywow_hotupgrade_module_patch"
+local hotupgrade_creation = require "flywow_hotupgrade_creation"
 local M = {}
 local module_state =
 {
+    registered            = false,                            -- Controller 已确认首次登记；配置建立早于此确认。
+    registration_complete = false,                            -- 首次登记 RPC 已返回；失败后不得继续本 State 的业务启动。
+    registration_waiters  = {},                               -- 首次登记 RPC 期间的声明等待者，避免遗漏初始元数据快照。
     registration          = nil,                              -- 本 Lua State 登记配置；私有表和函数不发送给 Controller。
     business_guard        = nil,                              -- 注册前创建的业务 Guard 在注册后继续复用。
     module_patch_engine   = nil,                              -- 本 State 唯一完整模块更新器。
@@ -16,12 +20,38 @@ local module_state =
     last_batch_id         = nil,                              -- 最近完成的批次，用于 finish/abort 幂等响应。
     declared_module_count = 0,                                -- 本 State 已成功声明模块数，受 hotupgrade_common.MAX_MODULES 限制。
     declared_modules      = {},                               -- hotupgrade.require 已登记的模块集合。
+    module_loads          = {},                               -- 同一规范模块的首次声明串行完成，等待者不能观察半完成的本地状态。
     module_sources        = setmetatable({}, {__mode = "k"}), -- 仅保存本入口确认的模块表与文件路径；弱键不延长模块生命周期。
 }
 
 
 -- 与 Controller Service 使用同一原生消息协议；不建立独立协议/RPC 模块。
 skynet.register_protocol({name = "hotupgrade", id = hotupgrade_common.PROTOCOL_ID, pack = skynet.pack, unpack = skynet.unpack})
+
+--- 创建受管理 Service；会 yield，成功直接返回原生 handle，不等待调用方后续业务 init。
+--- 启动参数遵循 skynet.newservice 的原有约束；失败抛出含 HU_ 错误码的异常。
+---@param controller_handle integer 已初始化的 Controller
+---@param service_name string 原生 Skynet Service 入口名
+---@param ... any 原样转交原生 newservice 的启动参数
+---@return integer handle
+function M.newservice(controller_handle, service_name, ...)
+    -- 基础设施转发未知启动签名，固定 n 以保留参数个数和 nil。
+    local answer = skynet.call(controller_handle, "hotupgrade", "newservice",
+        {service_name = service_name, arguments = table.pack(...)})
+    assert(type(answer) == "table" and answer.ok,
+        tostring(type(answer) == "table" and answer.code) .. ": " ..
+        tostring(type(answer) == "table" and answer.message or answer))
+    return answer.handle
+end
+
+--- 创建者在业务 init 失败后取消尚未登记的 Service；Controller 负责终止并解除屏障。
+--- 已登记、未知 handle 或非创建者请求均明确拒绝；可能 yield。
+---@param controller_handle integer 原创建入口使用的 Controller
+---@param handle integer newservice 返回的待登记 Service
+---@return FlyWowHotUpgradeResult
+function M.cancel_service_creation(controller_handle, handle)
+    return skynet.call(controller_handle, "hotupgrade", "cancel_service_creation", {handle = handle})
+end
 
 --- 当前 Service 的唯一 Guard；业务请求和会写状态的后台任务都须经过它。
 ---@return table Guard:run 可执行正常 yield 的业务回调。
@@ -345,6 +375,15 @@ function M.register_service(registration)
         end
     end
 
+    if next(module_state.module_loads) then
+        return hotupgrade_result.failure("HU_LIFECYCLE_PENDING", "本 State 仍有模块首次加载，完成后再登记 Service")
+    end
+
+    local creation = hotupgrade_creation.get()
+    if creation and creation.controller_handle ~= registration.controller_handle then
+        return hotupgrade_result.failure("HU_UNAUTHORIZED", "登记 Controller 与受管理创建身份不一致")
+    end
+
     module_state.registration = registration
     module_state.module_patch_engine = hotupgrade_module_patch.new()
     M.guard()
@@ -371,10 +410,17 @@ function M.register_service(registration)
     local metadata =
     {
         service_module = module_state.registration.service_module,
+        creation_id = creation and creation.creation_id,
         modules = names,
         service_patch = service_update ~= nil,
     }
     local ok, answer = pcall(skynet.call, module_state.registration.controller_handle, "hotupgrade", "register", metadata)
+    module_state.registration_complete = true
+    module_state.registered = ok and type(answer) == "table" and answer.ok == true
+    for _, thread in ipairs(module_state.registration_waiters) do
+        skynet.wakeup(thread)
+    end
+    module_state.registration_waiters = {}
     -- RPC 失败可能意味着 Controller 已登记；保持本 State 配置，要求宿主终止未 READY 的启动。
     return ok and answer or hotupgrade_result.failure("HU_RPC_FAILED", tostring(answer))
 end
@@ -401,76 +447,127 @@ function M.require(name)
     local canonical_name = relative_path:sub(1, -5):gsub("/", ".")
     assert(canonical_name ~= "", "HU_INVALID_PATH: 模块文件路径无效")
 
-    -- 缓存只证明名称已被占用，不能证明它来自当前文件；只复用本入口确认过的同表来源。
-    local cached_value = package.loaded[name]
-    assert(cached_value == nil or (type(cached_value) == "table"
-        and module_state.module_sources[cached_value] == resolved_path),
-        "HU_INVALID_PATH: 无法确认缓存模块来源，须先通过 hotupgrade.require 加载: " .. name)
-    local previous_alias = package.loaded[canonical_name]
-    assert(package.preload[canonical_name] == nil,
-        "HU_DUPLICATE_MODULE: 模块路径登记名已被 package.preload 占用: " .. canonical_name)
-    assert(previous_alias == nil or (rawequal(previous_alias, cached_value)
-        and module_state.module_sources[previous_alias] == resolved_path),
-        "HU_DUPLICATE_MODULE: 模块路径登记名已被其他模块占用: " .. canonical_name)
-    if not module_state.declared_modules[canonical_name] then
-        assert(module_state.declared_module_count < hotupgrade_common.MAX_MODULES,
-            "HU_MODULE_LIMIT: 模块声明已达 " .. hotupgrade_common.MAX_MODULES .. " 上限")
+    if module_state.registration and not module_state.registered then
+        if not module_state.registration_complete then
+            local thread = coroutine.running()
+            module_state.registration_waiters[#module_state.registration_waiters + 1] = thread
+            skynet.wait(thread)
+        end
+        assert(module_state.registered, "HU_SERVICE_NOT_REGISTERED: 首次登记失败，须终止本次启动")
     end
 
-    local value = cached_value
-    if value == nil then
-        local ok
-        ok, value = pcall(function()
+    local loading = module_state.module_loads[canonical_name]
+    if loading then
+        local thread = coroutine.running()
+        assert(loading.owner ~= thread, "HU_MODULE_LOADING: 不支持循环声明 " .. canonical_name)
+        loading.waiters[#loading.waiters + 1] = thread
+        skynet.wait(thread)
+        return M.require(name)
+    end
+
+    loading = {owner = coroutine.running(), waiters = {}}
+    module_state.module_loads[canonical_name] = loading
+    local permit_id                 -- 仅已登记 Service 的首次声明持有，完成登记或失败取消后释放。
+    local cached_value              -- 许可恢复后读取的原名缓存，失败时原样恢复。
+    local previous_alias            -- 许可恢复后读取的规范别名，不清除合法既有缓存。
+    local value                     -- 本次加载或复用的模块根表。
+    local snapshot_taken = false    -- 许可失败时尚未触碰本地缓存，无需回退。
+    local added_source = false      -- 只撤销本次新建的来源映射。
+    local added_declaration = false -- 只回退本次新增的声明及计数。
+    local ok, message = pcall(function()
+        if module_state.registration and not module_state.declared_modules[canonical_name] then
+            local answer = skynet.call(module_state.registration.controller_handle, "hotupgrade",
+                "begin_module_load", {name = canonical_name})
+            assert(type(answer) == "table" and answer.ok and type(answer.permit_id) == "string",
+                tostring(type(answer) == "table" and answer.code) .. ": " ..
+                tostring(type(answer) == "table" and answer.message or answer))
+            permit_id = answer.permit_id
+        end
+
+        -- 申请许可会 yield；恢复后再读取快照，等待者须等本次登记成功或完整回退。
+        cached_value = package.loaded[name]
+        previous_alias = package.loaded[canonical_name]
+        value = cached_value
+        snapshot_taken = true
+        -- 缓存占用不能证明来源；仅复用本入口确认过的同表来源。
+        assert(cached_value == nil or (type(cached_value) == "table"
+            and module_state.module_sources[cached_value] == resolved_path),
+            "HU_INVALID_PATH: 无法确认缓存模块来源，须先通过 hotupgrade.require 加载: " .. name)
+        assert(package.preload[canonical_name] == nil and package.preload[name] == nil,
+            "HU_DUPLICATE_MODULE: 模块名称已被 package.preload 占用: " .. canonical_name)
+        assert(previous_alias == nil or (rawequal(previous_alias, cached_value)
+            and module_state.module_sources[previous_alias] == resolved_path),
+            "HU_DUPLICATE_MODULE: 模块路径登记名已被其他模块占用: " .. canonical_name)
+        if not module_state.declared_modules[canonical_name] then
+            assert(module_state.declared_module_count < hotupgrade_common.MAX_MODULES,
+                "HU_MODULE_LIMIT: 模块声明已达 " .. hotupgrade_common.MAX_MODULES .. " 上限")
+        end
+
+        if value == nil then
             local loaded_value, loader_path = require(name)
-            assert(type(loaded_value) == "table", "可更新模块必须返回 table")
+            value = loaded_value
+            assert(type(value) == "table", "可更新模块必须返回 table")
             if loader_path ~= nil then
                 assert(type(loader_path) == "string" and hotupgrade_native.resolve(loader_path) == resolved_path,
                     "HU_INVALID_PATH: 模块加载来源与 package.path 不一致: " .. name)
             else
-                -- Skynet 协程 require 不返回路径；它对可编译的 Lua 文件固定走 searchpath/loadfile。
-                -- 仅认可这个已知加载器；重新编译但不执行，以排除它退回其他加载器的分支。
+                -- Skynet 协程 require 不返回路径；固定走 searchpath/loadfile，只认可此已知加载器。
                 assert(require == skynet_require.require and loadfile(source_path, "t") ~= nil,
                     "HU_INVALID_PATH: 加载器未提供可确认的模块来源: " .. name)
             end
-            assert(module_state.module_sources[loaded_value] == nil
-                or module_state.module_sources[loaded_value] == resolved_path,
+            assert(module_state.module_sources[value] == nil
+                or module_state.module_sources[value] == resolved_path,
                 "HU_DUPLICATE_MODULE: 同一模块表已对应其他文件: " .. name)
             assert(package.preload[name] == nil and package.preload[canonical_name] == nil,
                 "HU_DUPLICATE_MODULE: 模块名称已被 package.preload 占用: " .. canonical_name)
-            assert(package.loaded[canonical_name] == nil
-                or rawequal(package.loaded[canonical_name], loaded_value),
+            assert(package.loaded[canonical_name] == nil or rawequal(package.loaded[canonical_name], value),
                 "HU_DUPLICATE_MODULE: 模块路径登记名已被其他模块占用: " .. canonical_name)
-            return loaded_value
-        end)
-        if not ok then
-            package.loaded[name] = cached_value
-            package.loaded[canonical_name] = previous_alias
-            error(value)
-        end
-
-        module_state.module_sources[value] = resolved_path
-    end
-
-    if not module_state.declared_modules[canonical_name] then
-        -- 登记 RPC 可能 yield；先建立同表别名，避免 Controller 随后发起更新时查不到模块。
-        package.loaded[canonical_name] = value
-        if module_state.registration then
-            local ok, answer = pcall(skynet.call, module_state.registration.controller_handle, "hotupgrade",
-                "register_module", {name = canonical_name})
-            if not (ok and type(answer) == "table" and answer.ok) then
-                if not module_state.declared_modules[canonical_name] and package.loaded[canonical_name] == value then
-                    package.loaded[canonical_name] = previous_alias
-                end
-                error("模块登记失败: " .. tostring(type(answer) == "table" and answer.message or answer))
+            if module_state.module_sources[value] == nil then
+                module_state.module_sources[value] = resolved_path
+                added_source = true
             end
         end
 
+        -- 登记 RPC 前建立全部本地状态；许可阻止 Controller 在此关键区间启动批次。
+        package.loaded[canonical_name] = value
         if not module_state.declared_modules[canonical_name] then
             module_state.declared_modules[canonical_name] = true
             module_state.declared_module_count = module_state.declared_module_count + 1
+            added_declaration = true
+        end
+        if permit_id then
+            local answer = skynet.call(module_state.registration.controller_handle, "hotupgrade",
+                "register_module", {name = canonical_name, permit_id = permit_id})
+            assert(type(answer) == "table" and answer.ok,
+                "模块登记失败: " .. tostring(type(answer) == "table" and answer.message or answer))
+        end
+    end)
+    if not ok then
+        if snapshot_taken then
+            package.loaded[name] = cached_value
+            package.loaded[canonical_name] = previous_alias
+        end
+        if added_source then
+            module_state.module_sources[value] = nil
+        end
+        if added_declaration then
+            module_state.declared_modules[canonical_name] = nil
+            module_state.declared_module_count = module_state.declared_module_count - 1
+        end
+        if permit_id then
+            -- 登记响应丢失时许可可能已消费；重复取消不会改变其他操作的许可。
+            pcall(skynet.call, module_state.registration.controller_handle, "hotupgrade",
+                "cancel_module_load", {name = canonical_name, permit_id = permit_id})
         end
     end
 
+    module_state.module_loads[canonical_name] = nil
+    for _, thread in ipairs(loading.waiters) do
+        skynet.wakeup(thread)
+    end
+    if not ok then
+        error(message, 0)
+    end
     return value
 end
 
