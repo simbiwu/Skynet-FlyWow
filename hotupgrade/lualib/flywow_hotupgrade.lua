@@ -47,19 +47,19 @@ local function restore_service(txn)
         return
     end
 
-    local service = module_state.registration.service
+    local service_update = module_state.registration.service_update
     -- 自定义恢复只处理 Service 自己的对象；即使它失败也继续尝试还原函数字段。
     local ok, message = pcall(function()
         if staged.old_state then
-            if service.restore then
-                assert(service.restore(service.state, staged.old_state) ~= false, "Service 拒绝恢复")
+            if service_update.restore then
+                assert(service_update.restore(service_update.state, staged.old_state) ~= false, "Service 拒绝恢复")
             else
-                hotupgrade_module_patch.restore_state(service.state, staged.old_state)
+                hotupgrade_module_patch.restore_state(service_update.state, staged.old_state)
             end
         end
     end)
     for name, fn in pairs(staged.old_functions) do
-        rawset(service.functions, name, fn)
+        rawset(service_update.functions, name, fn)
     end
 
     assert(ok, message)
@@ -104,11 +104,11 @@ local function stage_service(source)
         return nil
     end
 
-    local service = assert(module_state.registration.service, "Service 未提供内部更新入口")
+    local service_update = assert(module_state.registration.service_update, "Service 未提供内部更新入口")
     local chunk = assert(load(source, "=Service Patch: " .. module_state.registration.service_module, "t", _G))
     local build = chunk()
     assert(type(build) == "function", "Service Patch 必须返回构建函数")
-    local patch = build(service.state)
+    local patch = build(service_update.state)
     assert(type(patch) == "table" and getmetatable(patch) == nil, "Service 构建结果必须是普通表")
     assert(patch.migrate == nil or type(patch.migrate) == "function", "migrate 必须是函数")
     assert(patch.functions == nil or (type(patch.functions) == "table"
@@ -122,25 +122,25 @@ local function stage_service(source)
     }
     for name, fn in pairs(patch.functions or {}) do
         assert(type(name) == "string" and type(fn) == "function"
-            and type(rawget(service.functions, name)) == "function", "只能直接替换现有业务函数")
-        staged.old_functions[name] = rawget(service.functions, name)
+            and type(rawget(service_update.functions, name)) == "function", "只能直接替换现有业务函数")
+        staged.old_functions[name] = rawget(service_update.functions, name)
     end
 
     if patch.migrate then
-        if service.snapshot then
-            staged.old_state = service.snapshot(service.state)
-            local isolated = service.snapshot(service.state)
+        if service_update.snapshot then
+            staged.old_state = service_update.snapshot(service_update.state)
+            local isolated = service_update.snapshot(service_update.state)
             assert(type(staged.old_state) == "table" and type(isolated) == "table"
-                and staged.old_state ~= service.state and isolated ~= staged.old_state
-                and isolated ~= service.state, "自定义快照必须独立")
+                and staged.old_state ~= service_update.state and isolated ~= staged.old_state
+                and isolated ~= service_update.state, "自定义快照必须独立")
             staged.next_state = patch.migrate(isolated)
         else
-            staged.old_state = hotupgrade_module_patch.copy_state(service.state)
+            staged.old_state = hotupgrade_module_patch.copy_state(service_update.state)
             staged.next_state = patch.migrate(hotupgrade_module_patch.copy_state(staged.old_state))
             staged.next_state = hotupgrade_module_patch.copy_state(staged.next_state)
         end
 
-        assert(type(staged.next_state) == "table" and staged.next_state ~= service.state,
+        assert(type(staged.next_state) == "table" and staged.next_state ~= service_update.state,
             "迁移须返回完整独立候选状态")
     end
 
@@ -240,18 +240,18 @@ local function control(command, request, source)
             assert(installed.ok, installed.message)
             local staged = txn.service
             if staged then
-                local service = module_state.registration.service
+                local service_update = module_state.registration.service_update
                 staged.touched = true
                 if staged.next_state then
-                    if service.commit then
-                        assert(service.commit(service.state, staged.next_state) ~= false, "Service 拒绝提交")
+                    if service_update.commit then
+                        assert(service_update.commit(service_update.state, staged.next_state) ~= false, "Service 拒绝提交")
                     else
-                        hotupgrade_module_patch.restore_state(service.state, staged.next_state)
+                        hotupgrade_module_patch.restore_state(service_update.state, staged.next_state)
                     end
                 end
 
                 for name, fn in pairs(staged.patch.functions or {}) do
-                    rawset(service.functions, name, fn)
+                    rawset(service_update.functions, name, fn)
                 end
             end
 
@@ -301,12 +301,12 @@ end
 ---@class FlyWowHotUpgradeRegistration
 ---@field controller_handle integer 宿主已启动的控制 Service handle
 ---@field service_module string 对应 service_dir 下的相对 Lua 路径；去掉 .lua 并将 / 转为 .
----@field service? FlyWowHotUpgradeServiceUpdate 可选 Service 内部状态/函数更新入口
+---@field service_update? FlyWowHotUpgradeServiceUpdate 可选 Service 内部状态/函数更新入口
 ---@field before_upgrade? fun():boolean|table Guard 暂停新业务且在途调用归零后反复调用；true 或 {ok=true} 才放行，否则继续等待至超时，异常立即失败。同步只读，不得 yield
 ---@field after_upgrade? fun():boolean Activate 提交模块与 Service 状态后、finish 前调用；false 或异常触发组合恢复。只检查已提交状态，不得产生外部副作用或 yield
 
 --- 登记现存 Service；仅元数据跨 Service 传递。可能 yield，成功前宿主不能宣布 READY。
----@param registration FlyWowHotUpgradeRegistration 本 State 配置及可选 Service 内部入口
+---@param registration FlyWowHotUpgradeRegistration 本 State 配置及可选 Service 更新入口
 ---@return FlyWowHotUpgradeResult 登记结果
 function M.register_service(registration)
     if module_state.registration then
@@ -327,20 +327,20 @@ function M.register_service(registration)
         return hotupgrade_result.failure("HU_INVALID_OPTIONS", "after_upgrade 必须为函数")
     end
 
-    local service = registration.service
-    if service then
-        if type(service) ~= "table" or type(service.state) ~= "table"
-            or type(service.functions) ~= "table" or getmetatable(service.functions) ~= nil then
-            return hotupgrade_result.failure("HU_INVALID_OPTIONS", "Service 内部入口需要私有 state 与现有函数表")
+    local service_update = registration.service_update
+    if service_update then
+        if type(service_update) ~= "table" or type(service_update.state) ~= "table"
+            or type(service_update.functions) ~= "table" or getmetatable(service_update.functions) ~= nil then
+            return hotupgrade_result.failure("HU_INVALID_OPTIONS", "Service 更新入口需要私有 state 与现有函数表")
         end
 
-        local custom = service.snapshot or service.commit or service.restore
-        if custom and (type(service.snapshot) ~= "function" or type(service.commit) ~= "function"
-            or type(service.restore) ~= "function") then
+        local custom = service_update.snapshot or service_update.commit or service_update.restore
+        if custom and (type(service_update.snapshot) ~= "function" or type(service_update.commit) ~= "function"
+            or type(service_update.restore) ~= "function") then
             return hotupgrade_result.failure("HU_INVALID_OPTIONS", "自定义快照、提交、恢复必须成组提供")
         end
 
-        if not custom and getmetatable(service.state) ~= nil then
+        if not custom and getmetatable(service_update.state) ~= nil then
             return hotupgrade_result.failure("HU_INVALID_OPTIONS", "特殊状态对象需要自定义快照与恢复")
         end
     end
@@ -372,7 +372,7 @@ function M.register_service(registration)
     {
         service_module = module_state.registration.service_module,
         modules = names,
-        service_patch = service ~= nil,
+        service_patch = service_update ~= nil,
     }
     local ok, answer = pcall(skynet.call, module_state.registration.controller_handle, "hotupgrade", "register", metadata)
     -- RPC 失败可能意味着 Controller 已登记；保持本 State 配置，要求宿主终止未 READY 的启动。

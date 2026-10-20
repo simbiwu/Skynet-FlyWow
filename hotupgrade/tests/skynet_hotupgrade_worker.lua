@@ -30,16 +30,16 @@ skynet.start(function()
         local answer
         if command == "init" then
             worker_test_config = request
-            local service = {state = service_state, functions = business}
+            local service_update = {state = service_state, functions = business}
             if worker_test_config.custom then
-                service.snapshot = function(value)
+                service_update.snapshot = function(value)
                     return require("flywow_hotupgrade_module_patch").copy_state(value)
                 end
-                service.commit = function(value, candidate)
+                service_update.commit = function(value, candidate)
                     value.equip = candidate.equip
                     error("partial service commit")
                 end
-                service.restore = function(value, snapshot)
+                service_update.restore = function(value, snapshot)
                     if worker_test_config.restore_failure then
                         error("service restore failed")
                     end
@@ -49,23 +49,23 @@ skynet.start(function()
             if worker_test_config.custom_success then
                 -- 模拟不可直接复制的业务对象，快照只包含它可迁移的普通数据。
                 setmetatable(service_state.nested, {})
-                service.snapshot = function(value)
+                service_update.snapshot = function(value)
                     return {equip = value.equip, level = value.level, schema_version = value.schema_version,
                         nested = {count = value.nested.count}}
                 end
-                service.commit = function(value, next_state)
+                service_update.commit = function(value, next_state)
                     value.equip = next_state.equip
                     value.level = next_state.level
                     value.schema_version = next_state.schema_version
                     value.nested.count = next_state.nested.count
                 end
-                service.restore = service.commit
+                service_update.restore = service_update.commit
             end
             answer = hotupgrade.register_service(
             {
                 controller_handle = worker_test_config.controller_handle,
                 service_module = worker_test_config.service_module or "player",
-                service = service,
+                service_update = service_update,
                 after_upgrade = function()
                     if worker_test_config.after_upgrade_failure then
                         error("after_upgrade failed")
