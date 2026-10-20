@@ -1,7 +1,7 @@
 --- 现存 Service 夹具：所有业务状态和函数保持在自己的 Lua State。
 local startup_arguments = table.pack(...)
 local startup_controller, startup_mode = ...
-assert(SERVICE_NAME == "skynet_hotupgrade_worker")
+assert(SERVICE_NAME == "skynet_hotupgrade_worker" or SERVICE_NAME:match("^skynet_hotupgrade_unique_[ab]$"))
 assert(SERVICE_PATH:sub(-#"hotupgrade/tests/") == "hotupgrade/tests/")
 if startup_mode == "auto" then
     assert(startup_arguments.n == 3 and startup_arguments[3] == "original_tail")
@@ -98,7 +98,9 @@ skynet.start(function()
     skynet.dispatch("lua", function(session, _source, command, request)
         request = request or {}
         local answer
-        if command == "init" then
+        if command == "preload_seen" then
+            answer = hotupgrade_preload_seen == true
+        elseif command == "init" then
             if request.init_failure then
                 answer = {ok = false, code = "HU_FIXTURE_INIT_FAILED", message = "business init failed"}
             else

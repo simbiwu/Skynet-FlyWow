@@ -28,7 +28,8 @@ local module_state =
 -- 与 Controller Service 使用同一原生消息协议；不建立独立协议/RPC 模块。
 skynet.register_protocol({name = "hotupgrade", id = hotupgrade_common.PROTOCOL_ID, pack = skynet.pack, unpack = skynet.unpack})
 
---- 创建受管理 Service；会 yield，成功直接返回原生 handle，不等待调用方后续业务 init。
+--- 创建受管理 Service；发布期间等待成功终态，失败锁定则抛出 HU_DEPLOYMENT_BLOCKED。
+--- 会 yield，成功直接返回原生 handle，不等待调用方后续业务 init。
 --- 启动参数遵循 skynet.newservice 的原有约束；失败抛出含 HU_ 错误码的异常。
 ---@param controller_handle integer 已初始化的 Controller
 ---@param service_name string 原生 Skynet Service 入口名
@@ -38,6 +39,27 @@ function M.newservice(controller_handle, service_name, ...)
     -- 基础设施转发未知启动签名，固定 n 以保留参数个数和 nil。
     local answer = skynet.call(controller_handle, "hotupgrade", "newservice",
         {service_name = service_name, arguments = table.pack(...)})
+    assert(type(answer) == "table" and answer.ok,
+        tostring(type(answer) == "table" and answer.code) .. ": " ..
+        tostring(type(answer) == "table" and answer.message or answer))
+    return answer.handle
+end
+
+--- 受管理唯一服务，保留原生 local/global 重载及参数；可能等待发布结束。
+---@param controller_handle integer 已初始化的 Controller
+---@param name_or_global string|boolean 逻辑名，或 true 表示后续首参为全局逻辑名
+---@param ... any 原生 uniqueservice 的启动参数
+---@return integer handle
+function M.uniqueservice(controller_handle, name_or_global, ...)
+    local arguments = table.pack(...)
+    local global = name_or_global == true
+    local name = name_or_global
+    if global then
+        name = arguments[1]
+        arguments = table.pack(table.unpack(arguments, 2, arguments.n))
+    end
+    local answer = skynet.call(controller_handle, "hotupgrade", "uniqueservice",
+        {service_name = name, global = global, arguments = arguments})
     assert(type(answer) == "table" and answer.ok,
         tostring(type(answer) == "table" and answer.code) .. ": " ..
         tostring(type(answer) == "table" and answer.message or answer))
@@ -179,13 +201,18 @@ end
 
 --- 当前 State 的控制入口；请求只携带源码与批次号，不传递业务状态、函数或私有表。
 --- prepare 允许等待在途业务；stage/activate/abort/finish 的脚本和回调必须同步。
----@param command string prepare/stage/activate/abort/finish
+---@param command string prepare/stage/activate/abort/finish/deployment_status
 ---@param request table batch_id、sequence；stage 另含 modules 和可选 service_source
 ---@param source integer 由 Skynet 提供的真实调用来源
 ---@return FlyWowHotUpgradeResult 恢复不确定时保持 Guard 关闭
 local function control(command, request, source)
     if not module_state.registration or source ~= module_state.registration.controller_handle then
         return hotupgrade_result.failure("HU_UNAUTHORIZED", "控制来源不匹配")
+    end
+
+    if command == "deployment_status" then
+        return hotupgrade_result.success({pending = module_state.active_transaction ~= nil
+            or module_state.business_guard.owner ~= nil})
     end
 
     if type(request) ~= "table" or type(request.batch_id) ~= "string"

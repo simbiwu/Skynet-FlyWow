@@ -16,7 +16,7 @@ end
 LUA_PATH = business_path
 LUA_CPATH = package.cpath
 LUA_SERVICE = skynet.getenv("luaservice") or "./service/?.lua"
--- preload 已由首轮 loader 执行，不重复执行其副作用；定制 loader/preload 须按引导合同核对。
+-- Controller 已在原生启动前拒绝非空 preload；此处不执行第二次 preload。
 LUA_PRELOAD = nil
 local loader = assert(loadfile(skynet.getenv("lualoader") or "./lualib/loader.lua"))
 -- 原生 newservice 本来就把参数转成空白分隔 token；这里仅移除三个内部身份参数。
