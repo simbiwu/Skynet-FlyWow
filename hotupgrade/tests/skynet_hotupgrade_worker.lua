@@ -1,21 +1,21 @@
 --- 现存 Service 夹具：所有业务状态和函数保持在自己的 Lua State。
 local startup_arguments = table.pack(...)
-local startup_controller, startup_mode = ...
+local startup_mode = ...
 assert(SERVICE_NAME == "skynet_hotupgrade_worker" or SERVICE_NAME:match("^skynet_hotupgrade_unique_[ab]$"))
 assert(SERVICE_PATH:sub(-#"hotupgrade/tests/") == "hotupgrade/tests/")
 if startup_mode == "auto" then
-    assert(startup_arguments.n == 3 and startup_arguments[3] == "original_tail")
-elseif not startup_controller then
+    assert(startup_arguments.n == 2 and startup_arguments[2] == "original_tail")
+elseif not startup_mode then
     assert(startup_arguments.n == 0)
 end
 local skynet = require "skynet"
-local hotupgrade = require "flywow_hotupgrade"
-local logic = hotupgrade.require("test_worker_logic")
-local runtime = hotupgrade.require("battle.state_sync.runtime")
-local package_logic = hotupgrade.require("packages.demo")
-local settings = hotupgrade.require("config.settings")
-local cached = logic.value
-local module_identity = logic
+local hotupgrade
+local logic
+local runtime
+local package_logic
+local settings
+local cached
+local module_identity
 local service_state = {equip = "刀", level = 50, schema_version = 1, nested = {count = 7}}
 local nested_identity = service_state.nested
 local service_state_identity = service_state
@@ -69,7 +69,6 @@ local function initialize(request)
     end
     return hotupgrade.register_service(
     {
-        controller_handle = worker_test_config.controller_handle,
         service_module = worker_test_config.service_module or "player",
         service_update = service_update,
         after_upgrade = function()
@@ -86,13 +85,20 @@ local function initialize(request)
 end
 
 skynet.start(function()
-    if startup_controller then
+    hotupgrade = require "flywow_hotupgrade"
+    logic = hotupgrade.require("test_worker_logic")
+    runtime = hotupgrade.require("battle.state_sync.runtime")
+    package_logic = hotupgrade.require("packages.demo")
+    settings = hotupgrade.require("config.settings")
+    cached = logic.value
+    module_identity = logic
+    if startup_mode then
         if startup_mode == "fail" then
             error("injected startup failure")
         end
         -- 原生 newservice 等待 start 回调结束；登记必须在独立协程执行，避免相互等待。
         skynet.fork(function()
-            startup_registration = initialize({controller_handle = assert(tonumber(startup_controller))})
+            startup_registration = initialize({})
             assert(startup_registration.ok, startup_registration.message)
         end)
     end
@@ -108,7 +114,7 @@ skynet.start(function()
                 answer = initialize(request)
             end
         elseif command == "read" then
-            while startup_controller and not startup_registration do skynet.sleep(1) end
+            while startup_mode and not startup_registration do skynet.sleep(1) end
             assert(not startup_registration or startup_registration.ok)
             -- 仅测试诊断用的只读观察，不是可绕过 Guard 的生产业务入口。
             answer =
@@ -209,10 +215,10 @@ skynet.start(function()
             skynet.call = original_call
             assert(not ok and tostring(message):find("injected declaration failure", 1, true))
             assert(package.loaded["lualib.hotupgrade_extra"] == nil and package.loaded.hotupgrade_extra == nil)
-            assert(skynet.call(worker_test_config.controller_handle, "hotupgrade", "status", {}).lifecycle.pending_module_loads == 0)
+            assert(skynet.call(skynet.uniqueservice("flywow_hotupgrade_service"), "hotupgrade", "status", {}).lifecycle.pending_module_loads == 0)
             answer = true
         elseif command == "cancel_creation" then
-            answer = hotupgrade.cancel_service_creation(request.controller_handle, request.handle)
+            answer = hotupgrade.cancel_service_creation(request.handle)
         elseif command == "declare_slow" then
             -- 仅测试暂停实际模块执行，形成可观察的许可窗口；生产模块顶层仍须同步。
             local original_require = _G.require

@@ -15,9 +15,14 @@ mkdir -p build/hotupgrade-tests/patches
 "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_foundation.lua
 "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_controller.lua
 cd "$FRAMEWORK_DIR/../.."
-timeout 45 "$SKYNET_ROOT/skynet" ./third_party/skynet-flywow/hotupgrade/tests/skynet_config.lua \
-    2>&1 | tee ./third_party/skynet-flywow/build/hotupgrade-tests/skynet.log
-grep -q HOTUPGRADE_SKYNET_ALL_OK ./third_party/skynet-flywow/build/hotupgrade-tests/skynet.log
-if grep -q HOTUPGRADE_SKYNET_FAILED ./third_party/skynet-flywow/build/hotupgrade-tests/skynet.log; then
+LOG="$FRAMEWORK_DIR/build/hotupgrade-tests/skynet.log"
+: > "$LOG"
+for group in lifecycle preload host_paths custom_paths patch_match identity_guard dry_run optional_service declaration bad_functions stage_failure activation_after_failure activation_custom_failure activation_custom_success activation_custom_success_failure multiple_targets partial abort recovery_restore recovery_module; do
+    HOTUPGRADE_TEST_GROUP="$group" timeout 45 "$SKYNET_ROOT/skynet" \
+        ./third_party/skynet-flywow/hotupgrade/tests/skynet_config.lua \
+        2>&1 | tee -a "$LOG"
+done
+test "$(grep -c HOTUPGRADE_SKYNET_GROUP_OK "$LOG")" -eq 20
+if grep -q HOTUPGRADE_SKYNET_FAILED "$LOG"; then
     exit 1
 fi

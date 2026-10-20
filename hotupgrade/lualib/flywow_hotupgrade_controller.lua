@@ -218,7 +218,6 @@ function M.new(controller_config)
         timeout_ms           = timeout_ms,                       -- Guard 排空期限，单位毫秒；默认值见 hotupgrade_common.DEFAULT_TIMEOUT_MS。
         target_count         = 0,                                -- 当前 Controller 生命周期内成功登记的目标数量，用于容量检查。
         targets              = {},                               -- 以真实 Service handle 为键，保存其模块声明和 Service 更新能力。
-        creation_sequence    = 0,                                -- 本 Controller 内递增且不复用的创建记录索引序号。
         pending_creations    = {},                               -- 创建协程拥有的记录；原生启动返回且登记完成后才移除。
         creation_handles     = {},                               -- 真实 handle 到待创建记录的索引，不用名称或延迟关联。
         registration_waiters = {},                               -- 等待原生返回 handle 后按真实来源重新关联的登记协程。
@@ -238,8 +237,8 @@ end
 
 -- 移除同一条创建记录；创建失败、登记完成和创建者取消共用此释放路径。
 function Controller:finish_creation(creation)
-    if self.pending_creations[creation.creation_id] == creation then
-        self.pending_creations[creation.creation_id] = nil
+    if self.pending_creations[creation] == creation then
+        self.pending_creations[creation] = nil
         if creation.handle then
             self.creation_handles[creation.handle] = nil
         end
@@ -361,17 +360,14 @@ function Controller:newservice(request, source, unique_name)
         return hotupgrade_result.failure("HU_TARGET_LIMIT", "登记目标及待创建 Service 已达上限")
     end
 
-    self.creation_sequence = self.creation_sequence + 1
-    local creation_id = tostring(skynet.self()) .. ":creation:" .. self.creation_sequence
     local creation =
     {
-        creation_id = creation_id, -- 仅 Controller 内部索引，不传入目标 Service。
         owner       = source,      -- 原创建者拥有返回后未登记 Service 的取消权。
         handle      = nil,         -- 仅由原生返回值建立真实来源索引。
         unique_name = unique_name, -- 本地唯一预留的逻辑名，非唯一创建为 nil。
         returned    = false,       -- 原生返回前，早到登记只能让出执行权等待。
     }
-    self.pending_creations[creation.creation_id] = creation
+    self.pending_creations[creation] = creation
     self.creation_count = self.creation_count + 1
     -- 打包参数的 n 保留包括中间 nil 在内的完整签名；启动行约束仍由原生 Skynet 决定。
     local ok, handle = pcall(function()

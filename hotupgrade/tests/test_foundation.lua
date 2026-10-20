@@ -156,16 +156,30 @@ local permits = {}
 local permit_sequence = 0
 local begin_count = 0
 local fail_registration = false
+local unique_calls = 0
 local last_loaded_value
+local forwarded = {}
 package.loaded.skynet =
 {
+    uniqueservice = function(name)
+        assert(name == "flywow_hotupgrade_service")
+        unique_calls = unique_calls + 1
+        return 99
+    end,
     register_protocol = function() end,
     dispatch = function() end,
     pack = function() end,
     unpack = function() end,
     getenv = function() return "build/hotupgrade-tests/host" end,
-    call = function(_handle, _protocol, command, request)
+    call = function(handle, _protocol, command, request)
+        assert(handle == 99)
         if command == "register" then
+            return {ok = true}
+        elseif command == "newservice" or command == "uniqueservice" then
+            forwarded[command] = request
+            return {ok = true, handle = command == "newservice" and 101 or 102}
+        elseif command == "cancel_service_creation" then
+            forwarded.cancel = request
             return {ok = true}
         elseif command == "begin_module_load" then
             begin_count = begin_count + 1
@@ -195,7 +209,20 @@ package.loaded.skynet =
 package.loaded["skynet.require"] = {require = original_require}
 package.loaded.flywow_hotupgrade_native = {resolve = function(path) return path end}
 local hotupgrade = require "flywow_hotupgrade"
-assert(hotupgrade.register_service({controller_handle = 99, service_module = "fixture"}).ok)
+assert(unique_calls == 1)
+assert(hotupgrade.newservice("fixture_service", "first", nil, "last") == 101)
+assert(forwarded.newservice.service_name == "fixture_service")
+assert(forwarded.newservice.arguments.n == 3 and forwarded.newservice.arguments[1] == "first"
+    and forwarded.newservice.arguments[2] == nil and forwarded.newservice.arguments[3] == "last")
+assert(hotupgrade.uniqueservice("fixture_unique", "one", nil, "three") == 102)
+assert(forwarded.uniqueservice.service_name == "fixture_unique" and not forwarded.uniqueservice.global)
+assert(forwarded.uniqueservice.arguments.n == 3 and forwarded.uniqueservice.arguments[2] == nil)
+assert(hotupgrade.uniqueservice(true, "global_name", "arg") == 102)
+assert(forwarded.uniqueservice.global and forwarded.uniqueservice.service_name == "global_name")
+assert(forwarded.uniqueservice.arguments.n == 1 and forwarded.uniqueservice.arguments[1] == "arg")
+assert(hotupgrade.cancel_service_creation(101).ok and forwarded.cancel.handle == 101)
+assert(unique_calls == 1, "controller lookup happens exactly once per Lua State")
+assert(hotupgrade.register_service({service_module = "fixture"}).ok)
 for _, failure in ipairs({"execute", "path", "register", "rpc"}) do
     _G.require = function(name)
         assert(next(permits), "实际模块执行前必须已取得许可")

@@ -7,16 +7,19 @@ HotUpgrade 在现存 Skynet Service、现存 Lua State 内更新受信 Lua 代�
 宿主从 composition root 启动控制面，保存 handle，再通过 init 交付配置：
 
 ```lua
-local hotupgrade = require "flywow_hotupgrade" -- 声明当前管理 State 的原生控制协议。
-local controller_handle = skynet.newservice("flywow_hotupgrade_service")
-local initialized = skynet.call(controller_handle, "lua", "init",
-{
-    patch_root = "./config/hotupgrade",
-    root_path = ".",
-    service_dir = "service",
-    timeout_ms = 10000,
-})
-assert(initialized.ok, initialized.message)
+skynet.start(function()
+    local controller_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+    local hotupgrade = require "flywow_hotupgrade" -- 必须在协程内加载；模块顶部的唯一服务查询会 yield。
+    local initialized = skynet.call(controller_handle, "lua", "init",
+    {
+        patch_root = "./config/hotupgrade",
+        root_path = ".",
+        service_dir = "service",
+        timeout_ms = 10000,
+    })
+    assert(initialized.ok, initialized.message)
+    -- 在此之后再启动受管理业务 Service。
+end)
 ```
 
 以宿主 server 为工作目录时，在现有 Skynet 配置的 luaservice、lua_path、lua_cpath 中分别加入以下相对搜索项，并保留宿主原有路径：
@@ -25,7 +28,7 @@ assert(initialized.ok, initialized.message)
 - lua_path：./third_party/skynet-flywow/hotupgrade/lualib/?.lua
 - lua_cpath：./third_party/skynet-flywow/build/native/?.so
 
-公开入口是 hotupgrade/lualib/flywow_hotupgrade.lua；控制 Service 入口是 hotupgrade/service/flywow_hotupgrade_service.lua。Controller 加载 flywow_hotupgrade_native 时，Lua 从 Native 搜索路径定位统一构建入口产出的 build/native/flywow_hotupgrade_native.so。每个发送 hotupgrade 协议管理消息的 State 都先加载公开入口以声明该协议，管理 State 无需登记为业务目标。
+公开入口是 hotupgrade/lualib/flywow_hotupgrade.lua；控制 Service 入口是 hotupgrade/service/flywow_hotupgrade_service.lua。Controller 加载 flywow_hotupgrade_native 时，Lua 从 Native 搜索路径定位统一构建入口产出的 build/native/flywow_hotupgrade_native.so。每个加载公开入口的 State 会在模块加载时调用一次原生 skynet.uniqueservice("flywow_hotupgrade_service")，并缓存 handle。该调用会 yield，因此须从 Skynet 协程内（例如 skynet.start 回调）首次 require 公开入口。宿主仍负责在启动受管理业务 Service 前初始化 Controller。管理 State 无需登记为业务目标。
 
 patch_root 必须存在且可读取。root_path 是已存在的宿主项目根目录，service_dir 是它下面已存在的相对 Service 目录；拒绝绝对路径、空路径段、.、..、反斜杠和符号链接目录。目录允许多级，例如 service/battle。
 
@@ -33,15 +36,15 @@ Controller 初始化成功时通过现有 Skynet 共享环境发布内部键 fly
 
 timeout_ms 是目标 Guard 等待在途业务排空的毫秒上限，默认 10000；它不是远端 RPC 取消期限。init 失败可修正后重试，成功后重复 init 返回 HU_ALREADY_INITIALIZED，初始化前控制请求返回 HU_NOT_INITIALIZED。
 
-纳入 HotUpgrade 管理的 Service 必须由创建者使用受管理入口启动；Controller 自身和非受管理 Service 继续使用原生入口：
+纳入 HotUpgrade 管理的 Service 必须由创建者使用受管理入口启动；Controller 自身和非受管理 Service 继续使用原生入口。宿主可通过原生 uniqueservice 获取相同 handle，用于 begin/status/apply 等管理命令；业务 Service 的 HotUpgrade API 不再接收 handle：
 
 ```lua
-local handle = hotupgrade.newservice(controller_handle, "player", "原有启动参数")
+local handle = hotupgrade.newservice("player", "原有启动参数")
 -- newservice 仅转交原生启动参数，返回后不额外等待业务 init 或 register_service。
 local called, initialized = pcall(skynet.call, handle, "lua", "init", player_config)
 if not called or type(initialized) ~= "table" or not initialized.ok then
     -- 只可取消尚未登记的 Service；Controller 核验创建者、终止 Service 并清理待创建记录。
-    local cancelled = hotupgrade.cancel_service_creation(controller_handle, handle)
+    local cancelled = hotupgrade.cancel_service_creation(handle)
     assert(cancelled.ok, tostring(cancelled.code) .. ": " .. tostring(cancelled.message))
     error(type(initialized) == "table" and initialized.message or tostring(initialized))
 end
@@ -58,9 +61,9 @@ register_service 只发送原有元数据，Controller 仅按消息头真实 sou
 ### 受管理本地唯一服务
 
 ```lua
-local handle = hotupgrade.uniqueservice(controller_handle, "player", zone_id)
+local handle = hotupgrade.uniqueservice("player", zone_id)
 -- 明确拒绝：抛出含 HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED 的异常，不启动 Service。
-local global_handle = hotupgrade.uniqueservice(controller_handle, true, "player", zone_id)
+local global_handle = hotupgrade.uniqueservice(true, "player", zone_id)
 ```
 
 唯一键是本 Controller 内的原始逻辑 Service 名称。首次创建先建立该名称的在途预留，再复用受管理 newservice 流程；同名并发请求等待同一创建结果，原生创建返回后一起取得相同 handle。只有首次请求的启动参数生效，后续重复请求的参数不改变实例。不同名称可启动不同 Service；已有 handle 即使在发布期间也直接返回，尚未创建的新逻辑键须等待发布成功。
@@ -69,9 +72,10 @@ local global_handle = hotupgrade.uniqueservice(controller_handle, true, "player"
 
 首次创建失败时释放创建记录和唯一名预留，唤醒同一次创建的等待者返回错误，后续请求可重试。原创建者合法取消尚未登记的 Service 时，在原生终止成功后释放该唯一名。成功登记后不能取消创建。本地唯一入口不进行死亡监控或自动重建；已登记 Service 的受控终止和替换须由宿主管理。FlyWow 仅使用现有 Skynet 公开接口，不要求修改、复制、覆盖或生成任何 Skynet 框架源码。
 
-在受管理业务 Service 自己的 Lua State 登记：
+在受管理业务 Service 自己的 Lua State 登记。由于公开模块首次加载会调用可 yield 的原生 `skynet.uniqueservice()`，以下初始化应放在 Skynet 协程内：
 
 ```lua
+skynet.start(function()
 local hotupgrade = require "flywow_hotupgrade"
 local logic = hotupgrade.require("player_logic")
 local state = {equip = "刀", level = 50, schema_version = 1}
@@ -87,7 +91,6 @@ end
 
 local registered = hotupgrade.register_service(
 {
-    controller_handle = controller_handle,
     service_module = "player",
     service_update = {state = state, functions = M},
     after_upgrade = function()
@@ -95,6 +98,7 @@ local registered = hotupgrade.register_service(
     end,
 })
 assert(registered.ok, registered.message)
+end)
 ```
 
 service_module 对应 service_dir 下的相对 Lua 路径：去掉 .lua 并将 / 转为 .。例如 service_dir 为 service 时，service/player.lua 对应 player，service/battle/worker.lua 对应 battle.worker。service_update 可省略，此时该 Service 只参与普通模块更新。Controller 使用注册消息真实 source 作为目标 handle；私有状态、函数和回调留在业务 State，不经消息传给 Controller。登记成功前宿主不得宣布 Service READY；登记 RPC 失败可能有不确定结果，应终止该次启动，由宿主管理，而不是继续接收业务。
