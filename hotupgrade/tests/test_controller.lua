@@ -105,13 +105,13 @@ end
 local metadata = {service_module = "player", modules = {"lualib.test_worker_logic"}, service_patch = false}
 local lifecycle = new_controller()
 local function blocked(instance)
-    for _, command in ipairs({"validate", "dry_run", "apply"}) do
-        local sequence = instance.sequence
+    for _, command in ipairs({"unknown_command", "dry_run", "apply"}) do
         local calls = #module_state.pending_control_coroutines
         module_state.last_control_command_by_handle = {}
         local answer = instance:control(command, {path = "module"}, 1)
-        assert(answer.code == (command == "validate" and "HU_LIFECYCLE_PENDING" or "HU_BATCH_MISSING") and answer.batch_id == nil)
-        assert(instance.sequence == sequence and #module_state.pending_control_coroutines == calls)
+        local expected = command == "unknown_command" and "HU_UNKNOWN_COMMAND" or "HU_BATCH_MISSING"
+        assert(answer.code == expected and answer.batch_id == nil)
+        assert(#module_state.pending_control_coroutines == calls)
         assert(next(module_state.last_control_command_by_handle) == nil and not instance.active)
     end
 end
@@ -148,7 +148,9 @@ assert((early_registered.ok and duplicate_registered.code == "HU_DUPLICATE_SERVI
     or (duplicate_registered.ok and early_registered.code == "HU_DUPLICATE_SERVICE"))
 assert(unknown_registered.code == "HU_CREATION_MISSING")
 assert(lifecycle.creation_count == 0 and lifecycle.targets[70] and next(lifecycle.registration_waiters) == nil)
-assert(lifecycle:control("validate", {path = "module"}, 1).ok)
+local lifecycle_patch = lifecycle:load({path = "module"})
+assert(lifecycle_patch.ok and #lifecycle_patch.targets == 1)
+assert(lifecycle:control("unknown_command", {path = "module"}, 1).code == "HU_UNKNOWN_COMMAND")
 assert(lifecycle:control("cancel_service_creation", {handle = 70}, 1).code == "HU_SERVICE_ALREADY_REGISTERED")
 
 -- 多项原生创建交错返回；早到登记只按 source 匹配，另一项在途时未知来源继续等待。
@@ -258,45 +260,44 @@ end
 assert(c:control("register", {service_module = "player", modules = {}, service_patch = false}, 10).code == "HU_DUPLICATE_SERVICE")
 assert(register_module(c, "extra", 10).ok)
 assert(not register_module(c, "extra", 30).ok)
-assert(not c:control("validate", {path = "module", selector = {percent = 0.5}}, 1).ok)
-assert(c:control("validate", {path = "module"}, 1).target_count == 2)
--- 三种入口必须在整包匹配失败时拒绝启动，连 prepare 都不能发给已匹配目标。
+local module_patch = c:load({path = "module"})
+assert(module_patch.ok and #module_patch.targets == 2)
+assert(not c:load({path = "module", selector = {percent = 0.5}}).ok)
+-- dry_run 与正式 apply 均在任何目标 RPC 前拒绝不匹配的整包 Patch。
 for _, fixture in ipairs({
     {path = "unmatched_module", file = "lualib/missing_logic.lua", reason = "声明模块"},
     {path = "unmatched_service", file = "service/unused.lua", reason = "service_module"},
 }) do
-    for _, command in ipairs({"validate", "dry_run", "apply"}) do
+    for _, command in ipairs({"dry_run", "apply"}) do
         module_state.last_control_command_by_handle = {}
-        local pending_count = #module_state.pending_control_coroutines
-        local sequence = c.sequence
-        local rejected = command == "validate" and c:control(command, {path = fixture.path}, 1)
-            or publish(c, command, {path = fixture.path})
+        local rejected = publish(c, command, {path = fixture.path})
         assert(not rejected.ok and rejected.code == "HU_TARGET_MISSING")
         assert(rejected.message:find(fixture.path .. "/" .. fixture.file, 1, true))
         assert(rejected.message:find(fixture.reason, 1, true))
         assert(next(module_state.last_control_command_by_handle) == nil and not c.active)
-        if c.phase == "FAILED_LOCKED" then
+        if command == "dry_run" then
+            assert(c.phase == "IDLE" and c.last.phase == "ABORTED")
+        else
+            assert(c.phase == "FAILED_LOCKED" and c.last.phase == "ABORTED")
+            assert(c.last.error.code == "HU_TARGET_MISSING" and not c.last.control_started)
             assert(c:control("resolve_deployment", {batch_id = c.last.batch_id,
-                confirmed = true, confirmation = "CONVERGED_CACHE_CLEARED"}, 1).ok)
+                confirmed = true, confirmation = "UNCHANGED"}, 1).ok)
         end
     end
 end
--- 同一模块仍可匹配多个 Service，组合包中的 Service 脚本也必须被覆盖。
+-- 同一模块仍可匹配多个 Service，组合包中的 Service 脚本也必须覆盖所有目标。
 local combined = new_controller()
 for _, handle in ipairs({30, 40}) do
     assert(managed_register(combined, {service_module = "player", modules = {"lualib.test_worker_logic"},
         service_patch = true}, handle).ok)
 end
-for _, command in ipairs({"validate", "dry_run", "apply"}) do
-    local answer = command == "validate" and combined:control(command, {path = "combined"}, 1)
-        or publish(combined, command, {path = "combined"})
-    assert(answer.target_count == 2)
-    if command ~= "validate" then
-        module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-        assert(combined.last.success == 2)
-    end
+for _, command in ipairs({"dry_run", "apply"}) do
+    local answer = publish(combined, command, {path = "combined"})
+    assert(answer.ok and answer.target_count == 2)
+    module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+    assert(combined.last.success == 2)
 end
-local unsupported = c:control("validate", {path = "combined"}, 1)
+local unsupported = c:load({path = "combined"})
 assert(unsupported.code == "HU_SERVICE_PATCH_UNSUPPORTED")
 assert(unsupported.message:find("combined/service/player.lua", 1, true))
 -- 路径映射保留宿主目录前缀，Service 目录可更换并支持多级类型名。
@@ -308,13 +309,13 @@ local loaded = paths:load({path = "host_paths"})
 assert(loaded.ok and #loaded.patch.modules == 3)
 assert(loaded.patch.modules[1].entry_file == "config/settings.lua")
 assert(loaded.patch.modules[2].name == "lualib.battle.state_sync.runtime")
-assert(paths:control("validate", {path = "nested_service"}, 1).ok)
+assert(paths:load({path = "nested_service"}).ok)
 local changed = new_controller("actors")
 assert(managed_register(changed,
     {service_module = "zone.player", modules = {}, service_patch = true}, 60).ok)
-assert(changed:control("validate", {path = "custom_service"}, 1).ok)
+assert(changed:load({path = "custom_service"}).ok)
 for _, path in ipairs({"duplicate_module", "duplicate_service"}) do
-    assert(paths:control("validate", {path = path}, 1).code == "HU_INVALID_PATCH")
+    assert(paths:load({path = path}).code == "HU_INVALID_PATCH")
 end
 print("HOTUPGRADE_CONTROLLER_PATHS_OK")
 
@@ -362,11 +363,11 @@ module_state.launch_handle = 84
 assert(waiting:control("newservice", {service_name = "fixture", arguments = {n = 0}}, 1).ok)
 local begun = waiting:control("begin", {}, 1)
 assert(begun.ok and waiting.phase == "WAITING_CREATIONS")
-assert(waiting:control("validate", {path = "invalid"}, 1).code == "HU_UPGRADE_BUSY")
+assert(waiting:control("unknown_command", {path = "invalid"}, 1).code == "HU_UNKNOWN_COMMAND")
 assert(waiting:control("begin", {}, 1).code == "HU_UPGRADE_BUSY")
 assert(waiting:control("apply", {batch_id = begun.batch_id, path = "module"}, 1).code == "HU_LIFECYCLE_PENDING")
 assert(waiting:control("register", metadata, 84).ok and waiting.phase == "DEPLOYING")
-assert(waiting:control("validate", {path = "invalid"}, 1).code == "HU_UPGRADE_BUSY")
+assert(waiting:control("unknown_command", {path = "invalid"}, 1).code == "HU_UNKNOWN_COMMAND")
 assert(waiting:control("apply", {batch_id = "stale", path = "module"}, 1).code == "HU_BATCH_MISSING")
 assert(waiting:control("resolve_deployment", {batch_id = begun.batch_id}, 1).code == "HU_RECOVERY_CONFIRMATION_REQUIRED")
 assert(waiting:control("resolve_deployment", {batch_id = begun.batch_id, confirmed = true, confirmation = "UNCHANGED"}, 1).ok)
@@ -379,7 +380,7 @@ assert(module_batch.ok and waiting.phase == "WAITING_CREATIONS")
 assert(waiting:control("register_module", {name = "later", permit_id = allowed.permit_id}, 84).ok)
 assert(waiting.phase == "DEPLOYING")
 assert(waiting:control("dry_run", {batch_id = module_batch.batch_id, path = "module"}, 1).ok)
-assert(waiting:control("validate", {path = "invalid"}, 1).code == "HU_UPGRADE_BUSY")
+assert(waiting:control("unknown_command", {path = "invalid"}, 1).code == "HU_UNKNOWN_COMMAND")
 assert(waiting:control("dry_run", {batch_id = module_batch.batch_id, path = "module"}, 1).code == "HU_DEPLOYMENT_PHASE")
 module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
 assert(waiting.phase == "DRY_RUN_COMPLETED")

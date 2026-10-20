@@ -154,7 +154,7 @@ end
 ---@field service_source? string stage 使用的可选一次性 Service 脚本源码
 
 ---@class FlyWowHotUpgradeManagementRequest
----@field path? string validate/apply/dry_run 的 Patch Root 相对目录
+---@field path? string apply/dry_run 的 Patch Root 相对目录
 ---@field batch_id? string apply/dry_run/status/abort/resolve_deployment 使用 begin 返回的身份
 ---@field confirmed? boolean 宿主明确确认恢复完成
 ---@field confirmation? string UNCHANGED 或 CONVERGED_CACHE_CLEARED
@@ -883,7 +883,7 @@ function Controller:resolve_deployment(request)
 end
 
 --- 管理命令不做远程认证；宿主掌握 Controller handle，登记来源由消息头确定。
----@param command string begin/resolve_deployment/newservice/uniqueservice/cancel_service_creation/register/begin_module_load/register_module/cancel_module_load/validate/apply/dry_run/status/abort
+---@param command string begin/resolve_deployment/newservice/uniqueservice/cancel_service_creation/register/begin_module_load/register_module/cancel_module_load/apply/dry_run/status/abort
 ---@param request FlyWowHotUpgradeManagementRequest|FlyWowHotUpgradeTargetMetadata|table 命令请求
 ---@param source integer Skynet 真实调用方
 ---@return FlyWowHotUpgradeResult 可判别的管理结果；目标控制调用可能 yield
@@ -919,21 +919,6 @@ function Controller:control(command, request, source)
 
     if command == "register_module" or command == "cancel_module_load" then
         return self:complete_module_load(request, source, command == "cancel_module_load")
-    end
-
-    if command == "validate" then
-        if self.phase == "FAILED_LOCKED" then
-            return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "失败发布尚未恢复")
-        end
-        if self.phase == "WAITING_CREATIONS" or self.phase == "DEPLOYING" or self.phase == "APPLYING" then
-            return hotupgrade_result.failure("HU_UPGRADE_BUSY", "发布生命周期内不能 validate")
-        end
-        local loaded = self:load(request)
-        if not loaded.ok then
-            return loaded
-        end
-
-        return hotupgrade_result.success({target_count = #loaded.targets, patch_id = loaded.patch.patch_id})
     end
 
     if command == "apply" or command == "dry_run" then

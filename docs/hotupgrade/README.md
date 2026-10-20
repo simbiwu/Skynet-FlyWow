@@ -248,7 +248,7 @@ WAITING_CREATIONS、DEPLOYING、APPLYING 期间的新创建、未建立实例的
 
 apply/dry_run 必须携带当前 begin 的 batch_id，且仅在 DEPLOYING 接受一次；过期或缺失身份返回 HU_BATCH_MISSING，阶段不匹配返回 HU_DEPLOYMENT_PHASE，WAITING_CREATIONS 返回 HU_LIFECYCLE_PENDING。重复 begin 返回 HU_UPGRADE_BUSY；FAILED_LOCKED 统一拒绝新发布和创建。apply 接受时冻结 Patch 源码并固定已登记目标集合，沿用现有事务执行。正式 apply 的 Patch 路径/匹配等校验失败同样锁定发布：宿主可能已部署文件，不能静默重新放行创建。
 
-validate 仅同步冻结/校验 Patch，不创建发布批次、不向目标发控制 RPC。WAITING_CREATIONS、DEPLOYING、APPLYING 均在任何 Patch 加载前返回 HU_UPGRADE_BUSY；FAILED_LOCKED 返回 HU_DEPLOYMENT_BLOCKED。其他正常阶段沿用原有校验：待创建或待许可时为 HU_LIFECYCLE_PENDING，每个 Patch 文件都必须匹配已登记目标，否则 HU_TARGET_MISSING；Service 不支持内部更新时返回 HU_SERVICE_PATCH_UNSUPPORTED。validate 应在 begin 之前预检，其成功不能替代 begin 屏障。
+正式发布只使用 begin → 等待 DEPLOYING → 部署完整文件 → 清理 Skynet 代码缓存 → apply → 查询 status。dry_run 使用 begin → 等待 DEPLOYING → dry_run → 查询 status，不部署宿主文件，也不清理宿主代码缓存。apply 和 dry_run 在调用时都会通过现有 Controller:load() 完整读取、冻结并校验 Patch，包含路径、语法、目标匹配和整包完整性；不再提供独立 Patch 预检管理命令。
 
 **dry_run** 使用 begin → 等待 DEPLOYING → dry_run，携带同一批次号；宿主不得部署新版文件或清理宿主代码缓存。路径、读取、语法、匹配等前置失败若尚未向目标发控制命令，会返回原始错误，保存 ABORTED 诊断并直接回到 IDLE，释放等待请求，不要求宿主作版本收敛确认。已经发送目标命令后，沿用现有 Stage/Abort 流程：正常完成且全部恢复时为 DRY_RUN_COMPLETED；更新失败但所有尝试目标均已确认恢复时保留 ABORTED/PARTIAL 原始诊断并回到 IDLE。任一恢复失败进入 FAILED_LOCKED，结果保留 original_error 和 recovery_error，不自动开放创建。正式 apply 不使用这些 dry-run 特例。
 

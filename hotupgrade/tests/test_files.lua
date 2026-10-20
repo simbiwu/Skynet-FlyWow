@@ -22,15 +22,15 @@ local function register_fixture(instance, handle, metadata)
 end
 assert(register_fixture(c, 10, {service_module = "unused", modules = {"lualib.test_worker_logic"},
     service_patch = false}).ok)
-assert(c:control("validate", {path = "module"}, 1).ok)
-assert(not c:control("validate", {path = "invalid"}, 1).ok)
+assert(c:load({path = "module"}).ok)
+assert(not c:load({path = "invalid"}).ok)
 for _, path in ipairs({"../module", "/module", "module/../module", "module//lualib",
     "module/", "module/./lualib", "module\\lualib", "module" .. string.char(0)}) do
     assert(not hotupgrade_native.list_lua(root, path), path)
 end
 
 for _, path in ipairs({"duplicate_module", "duplicate_service"}) do
-    assert(c:control("validate", {path = path}, 1).code == "HU_INVALID_PATCH")
+    assert(c:load({path = path}).code == "HU_INVALID_PATCH")
 end
 for _, path in ipairs({"count_limit", "file_limit", "total_limit"}) do
     local listed, failure = hotupgrade_native.list_lua(root, path)
@@ -78,5 +78,5 @@ local nested = assert(controller.new(
     {patch_root = root, root_path = config.root_path, service_dir = "actors/zone"}).controller)
 assert(register_fixture(nested, 20,
     {service_module = "player", modules = {}, service_patch = true}).ok)
-assert(nested:control("validate", {path = "custom_service"}, 1).ok)
+assert(nested:load({path = "custom_service"}).ok)
 print("HOTUPGRADE_FILES_OK")

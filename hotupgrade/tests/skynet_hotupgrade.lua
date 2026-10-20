@@ -84,9 +84,10 @@ local function lifecycle_status(controller_handle)
 end
 
 local function lifecycle_blocked(controller_handle)
-    for _, command in ipairs({"validate", "dry_run", "apply"}) do
+    for _, command in ipairs({"unknown_command", "dry_run", "apply"}) do
         local rejected = skynet.call(controller_handle, "hotupgrade", command, {path = "module"})
-        assert(rejected.code == (command == "validate" and "HU_LIFECYCLE_PENDING" or "HU_BATCH_MISSING") and rejected.batch_id == nil)
+        local expected = command == "unknown_command" and "HU_UNKNOWN_COMMAND" or "HU_BATCH_MISSING"
+        assert(rejected.code == expected and rejected.batch_id == nil)
     end
     assert(lifecycle_status(controller_handle).active_batch_id == nil)
 end
@@ -133,7 +134,8 @@ local function creation_lifecycle_tests()
     assert(skynet.call(concurrent_late, "lua", "init", {}).ok)
     assert(lifecycle_status(controller_handle).pending_creations == 0)
     original(concurrent_early)
-    local target_count = skynet.call(controller_handle, "hotupgrade", "validate", {path = "module"}).target_count
+    local target_count = wait(controller_handle, start(controller_handle, "module", "dry_run"),
+        "DRY_RUN_COMPLETED").target_count
     for _, fixture in ipairs({
         {name = "hotupgrade_missing_service"},
         {name = "skynet_hotupgrade_worker", mode = "fail"},
@@ -142,7 +144,9 @@ local function creation_lifecycle_tests()
             fixture.mode)
         assert(not created and tostring(message):find("HU_SERVICE_CREATE_FAILED", 1, true))
         assert(lifecycle_status(controller_handle).pending_creations == 0)
-        assert(skynet.call(controller_handle, "hotupgrade", "validate", {path = "module"}).target_count == target_count)
+        local measured = wait(controller_handle, start(controller_handle, "module", "dry_run"),
+            "DRY_RUN_COMPLETED")
+        assert(measured.target_count == target_count)
     end
     print("HOTUPGRADE_SKYNET_CREATION_LIFECYCLE_OK")
 end
@@ -177,7 +181,8 @@ local function module_lifecycle_tests()
         skynet.sleep(1)
     end
     assert(loaded and concurrent_loaded and lifecycle_status(controller_handle).pending_module_loads == 0)
-    assert(skynet.call(controller_handle, "hotupgrade", "validate", {path = "extra"}).target_count == 1)
+    local extra_batch = start(controller_handle, "extra", "dry_run")
+    assert(wait(controller_handle, extra_batch, "DRY_RUN_COMPLETED").target_count == 1)
 
     -- 活动批次的 Guard 排空窗口中，创建和首次模块执行等待成功终态。
     controller_handle = create_controller()
@@ -250,7 +255,7 @@ local function unique_lifecycle_tests()
     assert(queued == nil)
     assert(skynet.call(second, "lua", "init", {}).ok)
     while lifecycle_status(controller_handle).phase ~= "DEPLOYING" do skynet.sleep(1) end
-    assert(skynet.call(controller_handle, "hotupgrade", "validate", {path = "module"}).code == "HU_UPGRADE_BUSY")
+    assert(skynet.call(controller_handle, "hotupgrade", "unknown_command", {path = "module"}).code == "HU_UNKNOWN_COMMAND")
     assert(skynet.call(controller_handle, "hotupgrade", "dry_run", {batch_id = begun.batch_id, path = "module"}).ok)
     wait(controller_handle, begun.batch_id, "DRY_RUN_COMPLETED")
     while not queued do skynet.sleep(1) end
@@ -316,24 +321,37 @@ local function run()
         controller = create_controller()
         handle = worker()
         local before = original(handle)
-        for _, path in ipairs({"unmatched_module", "unmatched_service"}) do
-            for _, command in ipairs({"validate", "dry_run", "apply"}) do
-                local request = {path = path}
-                if command ~= "validate" then
-                    local begun = skynet.call(controller, "hotupgrade", "begin", {})
-                    assert(begun.ok)
-                    request.batch_id = begun.batch_id
-                    while lifecycle_status(controller).phase ~= "DEPLOYING" do skynet.sleep(1) end
-                end
-                local rejected = skynet.call(controller, "hotupgrade", command, request)
-                assert(not rejected.ok and rejected.code == "HU_TARGET_MISSING")
-                if command == "apply" then
+        local fixtures = {
+            {path = "../module", code = "HU_INVALID_PATH"},
+            {path = "invalid", code = "HU_MODULE_SYNTAX"},
+            {path = "unmatched_module", code = "HU_TARGET_MISSING"},
+            {path = "unmatched_service", code = "HU_TARGET_MISSING"},
+        }
+        for _, fixture in ipairs(fixtures) do
+            for _, command in ipairs({"dry_run", "apply"}) do
+                local begun = skynet.call(controller, "hotupgrade", "begin", {})
+                assert(begun.ok)
+                while lifecycle_status(controller).phase ~= "DEPLOYING" do skynet.sleep(1) end
+                local rejected = skynet.call(controller, "hotupgrade", command,
+                    {batch_id = begun.batch_id, path = fixture.path})
+                assert(not rejected.ok and rejected.code == fixture.code)
+                assert(rejected.message and #rejected.message > 0)
+                local status = skynet.call(controller, "hotupgrade", "status", {batch_id = begun.batch_id})
+                assert(status.ok and status.record.phase == "ABORTED")
+                assert(status.record.error.code == fixture.code and not status.record.control_started)
+                assert(original(handle).marker_token == before.marker_token)
+                if command == "dry_run" then
+                    assert(status.lifecycle.phase == "IDLE")
+                else
+                    assert(status.lifecycle.phase == "FAILED_LOCKED")
+                    local unresolved = skynet.call(controller, "hotupgrade", "begin", {})
+                    assert(unresolved.code == "HU_DEPLOYMENT_BLOCKED")
                     assert(skynet.call(controller, "hotupgrade", "resolve_deployment",
-                        {batch_id = request.batch_id, confirmed = true, confirmation = "UNCHANGED"}).ok)
+                        {batch_id = begun.batch_id, confirmed = true, confirmation = "UNCHANGED"}).ok)
                 end
-                assert(rejected.batch_id == nil and original(handle).marker_token == before.marker_token)
             end
         end
+        assert(skynet.call(controller, "hotupgrade", "unknown_command", {path = "module"}).code == "HU_UNKNOWN_COMMAND")
         print("HOTUPGRADE_SKYNET_PATCH_MATCH_OK")
     elseif group == "identity_guard" then
         controller = create_controller()
@@ -378,7 +396,7 @@ local function run()
     elseif group == "declaration" then
         controller = create_controller()
         handle = worker()
-        assert(skynet.call(controller, "hotupgrade", "validate", {path = "extra"}).code == "HU_TARGET_MISSING")
+        assert(skynet.call(controller, "hotupgrade", "unknown_command", {path = "extra"}).code == "HU_UNKNOWN_COMMAND")
         assert(skynet.call(handle, "lua", "check_declarations", {}))
         assert(skynet.call(handle, "lua", "declare", {}) == 1)
         assert(skynet.call(handle, "lua", "declare", {}) == 1)
