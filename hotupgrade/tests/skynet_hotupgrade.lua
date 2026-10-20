@@ -173,7 +173,7 @@ local function module_lifecycle_tests()
     assert(loaded and concurrent_loaded and lifecycle_status(controller_handle).pending_module_loads == 0)
     assert(skynet.call(controller_handle, "hotupgrade", "validate", {path = "extra"}).target_count == 1)
 
-    -- 活动批次的 Guard 排空窗口中，创建和首次模块执行必须在入口被拒绝。
+    -- 活动批次的 Guard 排空窗口中，创建和首次模块执行等待成功终态。
     controller_handle = create_controller()
     handle = worker(controller_handle)
     skynet.fork(function()
@@ -189,66 +189,67 @@ local function module_lifecycle_tests()
     end)
     skynet.sleep(1)
     assert(queued_handle == nil)
-    assert(skynet.call(handle, "lua", "try_declare", {}))
+    local declared = false
+    skynet.fork(function()
+        assert(skynet.call(handle, "lua", "declare", {}) == 1)
+        declared = true
+    end)
+    skynet.sleep(1)
+    assert(not declared)
     local status = lifecycle_status(controller_handle)
     assert(status.pending_creations == 0 and status.pending_module_loads == 0 and status.active_batch_id == id)
     wait(controller_handle, id, "COMPLETED")
-    while not queued_handle do skynet.sleep(1) end
+    while not queued_handle or not declared do skynet.sleep(1) end
     assert(hotupgrade.cancel_service_creation(controller_handle, queued_handle).ok)
     print("HOTUPGRADE_SKYNET_MODULE_LIFECYCLE_OK")
 end
 
 local function unique_lifecycle_tests()
     local controller_handle = create_controller()
-    for _, global in ipairs({false, true}) do
-        local function unique(name, ...)
-            if global then
-                return hotupgrade.uniqueservice(controller_handle, true, name, ...)
-            end
-            return hotupgrade.uniqueservice(controller_handle, name, ...)
-        end
-        local first
-        local concurrent
-        skynet.fork(function()
-            first = unique("skynet_hotupgrade_unique_a", controller_handle, "auto", "original_tail")
-        end)
-        skynet.fork(function()
-            concurrent = unique("skynet_hotupgrade_unique_a", controller_handle, "auto", "original_tail")
-        end)
-        while not first or not concurrent do skynet.sleep(1) end
-        assert(concurrent == first and unique("skynet_hotupgrade_unique_a") == first)
-        local second = unique("skynet_hotupgrade_unique_b")
-        assert(second ~= first)
-        assert(hotupgrade.cancel_service_creation(controller_handle, second).ok)
-        local failed = pcall(unique, "skynet_hotupgrade_unique_b", controller_handle, "fail")
-        assert(not failed and lifecycle_status(controller_handle).pending_creations == 0)
-        second = unique("skynet_hotupgrade_unique_b")
-        assert(second ~= first)
-        local begun = skynet.call(controller_handle, "hotupgrade", "begin", {})
-        assert(begun.ok)
-        assert(lifecycle_status(controller_handle).phase == "WAITING_CREATIONS")
-        local returned
-        local finished = false
-        local created
-        skynet.fork(function()
-            created, returned = pcall(unique, "skynet_hotupgrade_unique_a")
-            finished = true
-        end)
-        skynet.sleep(1)
-        assert(not finished)
-        assert(skynet.call(second, "lua", "init",
-            {controller_handle = controller_handle, after_upgrade_failure = global}).ok)
-        while lifecycle_status(controller_handle).phase ~= "DEPLOYING" do skynet.sleep(1) end
-        assert(skynet.call(controller_handle, "hotupgrade", "dry_run",
-            {batch_id = begun.batch_id, path = "module"}).ok)
-        wait(controller_handle, begun.batch_id, global and "PARTIAL" or "DRY_RUN_COMPLETED")
-        while not finished do skynet.sleep(1) end
-        if global then
-            assert(not created and tostring(returned):find("HU_DEPLOYMENT_BLOCKED", 1, true))
-        else
-            assert(created and returned == first)
-        end
+    local global_ok, global_error = pcall(hotupgrade.uniqueservice, controller_handle, true, "skynet_hotupgrade_unique_a")
+    assert(not global_ok and tostring(global_error):find("HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED", 1, true))
+    local special_ok, special_error = pcall(hotupgrade.uniqueservice, controller_handle, "snaxd", "fixture")
+    assert(not special_ok and tostring(special_error):find("HU_SPECIAL_SERVICE_UNSUPPORTED", 1, true))
+    assert(lifecycle_status(controller_handle).pending_creations == 0)
+
+    local first
+    local concurrent
+    skynet.fork(function()
+        first = hotupgrade.uniqueservice(controller_handle, "skynet_hotupgrade_unique_a",
+            controller_handle, "auto", "original_tail")
+    end)
+    skynet.fork(function()
+        concurrent = hotupgrade.uniqueservice(controller_handle, "skynet_hotupgrade_unique_a",
+            controller_handle, "auto", "original_tail")
+    end)
+    while not first or not concurrent do skynet.sleep(1) end
+    assert(concurrent == first and hotupgrade.uniqueservice(controller_handle, "skynet_hotupgrade_unique_a") == first)
+    local second = hotupgrade.uniqueservice(controller_handle, "skynet_hotupgrade_unique_b")
+    assert(second ~= first)
+    assert(hotupgrade.cancel_service_creation(controller_handle, second).ok)
+    for _, mode in ipairs({"fail", "fail_after_register"}) do
+        local ok = pcall(hotupgrade.uniqueservice, controller_handle, "skynet_hotupgrade_unique_b", controller_handle, mode)
+        assert(not ok and lifecycle_status(controller_handle).pending_creations == 0)
     end
+    second = hotupgrade.uniqueservice(controller_handle, "skynet_hotupgrade_unique_b")
+    local begun = skynet.call(controller_handle, "hotupgrade", "begin", {})
+    assert(begun.ok and lifecycle_status(controller_handle).phase == "WAITING_CREATIONS")
+    -- 已存在 handle 直接复用，新的逻辑键必须等待发布完成。
+    assert(hotupgrade.uniqueservice(controller_handle, "skynet_hotupgrade_unique_a") == first)
+    local queued
+    skynet.fork(function()
+        queued = hotupgrade.uniqueservice(controller_handle, "skynet_hotupgrade_worker")
+    end)
+    skynet.sleep(1)
+    assert(queued == nil)
+    assert(skynet.call(second, "lua", "init", {controller_handle = controller_handle}).ok)
+    while lifecycle_status(controller_handle).phase ~= "DEPLOYING" do skynet.sleep(1) end
+    assert(skynet.call(controller_handle, "hotupgrade", "validate", {path = "module"}).code == "HU_UPGRADE_BUSY")
+    assert(skynet.call(controller_handle, "hotupgrade", "dry_run", {batch_id = begun.batch_id, path = "module"}).ok)
+    wait(controller_handle, begun.batch_id, "DRY_RUN_COMPLETED")
+    while not queued do skynet.sleep(1) end
+    assert(queued ~= first and queued ~= second)
+    assert(hotupgrade.cancel_service_creation(controller_handle, queued).ok)
     print("HOTUPGRADE_SKYNET_UNIQUE_LIFECYCLE_OK")
 end
 
@@ -259,7 +260,6 @@ local function preload_contract_tests()
     for _, create in ipairs({
         function() return hotupgrade.newservice(controller_handle, "skynet_hotupgrade_worker") end,
         function() return hotupgrade.uniqueservice(controller_handle, "skynet_hotupgrade_unique_a") end,
-        function() return hotupgrade.uniqueservice(controller_handle, true, "skynet_hotupgrade_unique_a") end,
     }) do
         local ok, message = pcall(create)
         assert(not ok and tostring(message):find("HU_PRELOAD_UNSUPPORTED", 1, true))
@@ -427,7 +427,7 @@ local function run()
         assert(read(handle).paused)
         local locked = lifecycle_status(controller_handle)
         assert(skynet.call(controller_handle, "hotupgrade", "resolve_deployment",
-            {batch_id = locked.batch_id, confirmed = true, confirmation = "CONVERGED_CACHE_CLEARED"}).code == "HU_RECOVERY_REQUIRED")
+            {batch_id = locked.batch_id, confirmed = true, confirmation = "UNCHANGED"}).code == "HU_RECOVERY_CONFIRMATION_REQUIRED")
         local answer = skynet.call(controller_handle, "hotupgrade", "apply", {path = "module"})
         assert(not answer.ok and answer.code == "HU_DEPLOYMENT_BLOCKED")
     end

@@ -228,7 +228,8 @@ function M.new(controller_config)
         module_sequence   = 0,                             -- 本 Controller 内不复用的许可序号，拒绝重复消费。
         sequence          = 0,                             -- 当前 Controller 生命周期内递增的批次序号，用于拒绝迟到控制消息。
         phase             = "IDLE",                        -- 发布门禁独立于事务协程，失败后保持关闭。
-        creation_waiters  = {},                            -- 发布期间等待的新创建协程，终态统一唤醒。
+        lifecycle_waiters = {},                            -- 发布期间等待的创建和首次模块加载请求，终态统一唤醒。
+        unique_services   = {},                            -- 仅本 Controller 内的逻辑唯一名、在途结果和 handle，不提供全局发现。
         active            = nil,                           -- begin 持有的唯一发布批次，事务结束后失败门禁仍由 phase 保持。
         last              = nil,                           -- 最近结束的批次结果；更早批次不保留，查询返回缺失。
         recovery_required = false,                         -- 恢复结果未确认时关闭后续发布，需先由宿主处理恢复。
@@ -265,15 +266,88 @@ end
 ---@class FlyWowHotUpgradeServiceCreationRequest
 ---@field service_name string 原生 Service 入口，不改写调用方业务初始化参数
 ---@field arguments table 带 n 的启动参数数组；按原生 newservice 约束传递
----@field unique? boolean 内部命令路由指定使用原生唯一服务管理器
----@field global? boolean true 使用原生全局唯一作用域
+---@field global? boolean true 明确拒绝；不支持跨节点全局唯一
+
+--- 等待发布门禁；只有成功终态或显式恢复确认后重新检查接纳条件。
+--- 等待中的请求不计入在途创建/许可，避免阻塞当前批次排空。
+function Controller:wait_lifecycle()
+    while self.phase == "WAITING_CREATIONS" or self.phase == "DEPLOYING" or self.phase == "APPLYING" do
+        local waiter = coroutine.running()
+        local waiting = {}
+        self.lifecycle_waiters[waiter] = waiting
+        skynet.wait(waiter)
+        self.lifecycle_waiters[waiter] = nil
+        if waiting.blocked then
+            return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "等待期间发布失败，操作未开始")
+        end
+    end
+    if self.phase == "FAILED_LOCKED" then
+        return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "发布失败，须显式确认版本恢复一致")
+    end
+    return hotupgrade_result.success()
+end
+
+--- 只协调本 Controller 内的逻辑唯一名，不调用原生唯一服务管理器。
+--- 在途重复请求等待同一创建结果；失败释放预留，既有 handle 在发布期间也可直接返回。
+---@param request FlyWowHotUpgradeServiceCreationRequest
+---@param source integer 原请求者的真实消息来源；仅首次创建者拥有取消权
+---@return FlyWowHotUpgradeResult 成功含 handle，全局和特殊启动合同明确拒绝
+function Controller:uniqueservice(request, source)
+    if request.global == true then
+        return hotupgrade_result.failure("HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED", "受管理唯一服务只支持本 Controller 内的本地唯一")
+    end
+    if math.type(source) ~= "integer" or source <= 0 or type(request.service_name) ~= "string"
+        or not request.service_name:match("^%S+$") or type(request.arguments) ~= "table"
+        or math.type(request.arguments.n) ~= "integer" or request.arguments.n < 0
+        or (request.global ~= nil and type(request.global) ~= "boolean") then
+        return hotupgrade_result.failure("HU_INVALID_REQUEST", "需要创建者、逻辑 Service 名和完整启动参数")
+    end
+    if request.service_name == "snaxd" then
+        return hotupgrade_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "Bootstrap 不支持 Snax 专用启动合同")
+    end
+
+    local unique = self.unique_services[request.service_name]
+    if unique then
+        if unique.handle then
+            return hotupgrade_result.success({handle = unique.handle})
+        end
+        if self.phase == "FAILED_LOCKED" then
+            return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "发布失败，唯一创建请求未开始")
+        end
+        local waiter = coroutine.running()
+        unique.waiters[waiter] = true
+        skynet.wait(waiter)
+        unique.waiters[waiter] = nil
+        return unique.error or hotupgrade_result.success({handle = unique.handle})
+    end
+
+    unique = {waiters = {}}
+    self.unique_services[request.service_name] = unique
+    local ok, answer = pcall(self.newservice, self, request, source, request.service_name)
+    if not ok then
+        answer = hotupgrade_result.failure("HU_SERVICE_CREATE_FAILED", tostring(answer))
+    end
+    if answer.ok then
+        unique.handle = answer.handle
+    else
+        unique.error = answer
+        if self.unique_services[request.service_name] == unique then
+            self.unique_services[request.service_name] = nil
+        end
+    end
+    for waiter in pairs(unique.waiters) do
+        skynet.wakeup(waiter)
+    end
+    return answer
+end
 
 --- 受管理 Service 的启动入口；参数原样转交原生 newservice，不接管业务 init。
 --- 原生调用会 yield；返回 handle 后仍未登记的 Service 继续持有屏障。
 ---@param request FlyWowHotUpgradeServiceCreationRequest
 ---@param source integer 创建者的真实消息来源
+---@param unique_name? string 仅本地唯一入口在内部传入的逻辑预留名
 ---@return FlyWowHotUpgradeResult 成功含 handle
-function Controller:newservice(request, source)
+function Controller:newservice(request, source, unique_name)
     if math.type(source) ~= "integer" or source <= 0 or type(request.service_name) ~= "string"
         or not request.service_name:match("^%S+$") or request.service_name == "flywow_hotupgrade_bootstrap"
         or type(request.arguments) ~= "table"
@@ -282,27 +356,20 @@ function Controller:newservice(request, source)
         return hotupgrade_result.failure("HU_INVALID_REQUEST", "需要创建者、Service 名和启动参数")
     end
 
+    if request.service_name == "snaxd" then
+        return hotupgrade_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "Bootstrap 不支持 Snax 专用启动合同")
+    end
+
     -- preload 先于引导执行，必须在建立记录及原生启动之前拒绝。
     local preload = skynet.getenv("preload")
     if preload and preload ~= "" then
         return hotupgrade_result.failure("HU_PRELOAD_UNSUPPORTED", "受管理启动不支持非空 preload")
     end
-    while self.phase == "WAITING_CREATIONS" or self.phase == "DEPLOYING" or self.phase == "APPLYING" do
-        local waiter = coroutine.running()
-        local waiting = {}
-        self.creation_waiters[waiter] = waiting
-        skynet.wait(waiter)
-        self.creation_waiters[waiter] = nil
-        if waiting.blocked then
-            return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "等待期间发布失败，创建未启动")
-        end
+    local admitted = self:wait_lifecycle()
+    if not admitted.ok then
+        return admitted
     end
-    if self.phase == "FAILED_LOCKED" then
-        return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "发布失败，须显式确认版本恢复一致")
-    end
-
-    local allow_create = self.target_count + self.creation_count < hotupgrade_common.MAX_TARGETS
-    if not request.unique and not allow_create then
+    if self.target_count + self.creation_count >= hotupgrade_common.MAX_TARGETS then
         return hotupgrade_result.failure("HU_TARGET_LIMIT", "登记目标及待创建 Service 已达上限")
     end
 
@@ -310,43 +377,19 @@ function Controller:newservice(request, source)
     local creation_id = tostring(skynet.self()) .. ":creation:" .. self.creation_sequence
     local creation =
     {
-        creation_id    = creation_id,                                              -- 仅引导携带的进程内创建标识。
-        owner          = source,                                                   -- 原创建者拥有返回后未登记 Service 的取消权。
-        handle         = nil,                                                      -- 登记消息头绑定，原生返回时再次核对。
-        unique_subname = request.service_name == "snaxd" and request.arguments[1], -- 原生 snaxd 唯一键的子名。
-        unique_name    = request.unique and request.service_name,                  -- 原生唯一管理器的逻辑预留名。
-        global         = request.global == true,                                   -- 全局预留由 SERVICE 节点管理。
-        returned       = false,                                                    -- 早登记时继续覆盖原生启动剩余代码。
+        creation_id = creation_id, -- 仅引导携带的进程内创建标识。
+        owner       = source,      -- 原创建者拥有返回后未登记 Service 的取消权。
+        handle      = nil,         -- 登记消息头绑定，原生返回时再次核对。
+        unique_name = unique_name, -- 本地唯一预留的逻辑名，非唯一创建为 nil。
+        returned    = false,       -- 早登记时继续覆盖原生启动剩余代码。
     }
     self.pending_creations[creation.creation_id] = creation
     self.creation_count = self.creation_count + 1
-    local ok, handle
-    if request.unique then
-        local answer
-        local manager_error
-        ok, answer, manager_error = pcall(skynet.call, ".service", "lua",
-            request.global and "GMANAGED_LAUNCH" or "MANAGED_LAUNCH",
-            request.service_name, skynet.self(), creation.creation_id, request.arguments, allow_create)
-        if ok and type(answer) == "table" and answer.ok == false then
-            self:remove_failed_creation(creation)
-            return hotupgrade_result.failure(answer.code, answer.message)
-        end
-        if ok and type(answer) == "table" and answer.controller_handle == skynet.self()
-            and math.type(answer.handle) == "integer" and answer.handle > 0 then
-            handle = answer.handle
-            if answer.creation_id ~= creation.creation_id then
-                self:finish_creation(creation)
-                return hotupgrade_result.success({handle = handle})
-            end
-        else
-            ok = false
-            handle = type(answer) == "table" and "唯一服务属于其他 Controller" or tostring(manager_error or answer)
-        end
-    else
-        ok, handle = pcall(skynet.newservice, "flywow_hotupgrade_bootstrap",
-            skynet.self(), creation.creation_id, request.service_name,
-            table.unpack(request.arguments, 1, request.arguments.n))
-    end
+    -- 打包参数的 n 保留包括中间 nil 在内的完整签名；启动行约束仍由原生 Skynet 决定。
+    local ok, handle = pcall(function()
+        return skynet.newservice("flywow_hotupgrade_bootstrap", skynet.self(), creation.creation_id,
+            request.service_name, table.unpack(request.arguments, 1, request.arguments.n))
+    end)
     if not ok or math.type(handle) ~= "integer" or handle <= 0 then
         self:remove_failed_creation(creation)
         return hotupgrade_result.failure("HU_SERVICE_CREATE_FAILED", tostring(handle))
@@ -387,20 +430,14 @@ function Controller:cancel_service_creation(request, source)
         return hotupgrade_result.failure("HU_UNAUTHORIZED", "只有创建者可以取消该 Service")
     end
 
-    -- 唯一管理器 RPC 会 yield，先关闭该记录的登记入口，避免登记与远端终止交错。
-    creation.cancelling = true
+    local ok, message = pcall(skynet.kill, request.handle)
+    if not ok then
+        return hotupgrade_result.failure("HU_SERVICE_CANCEL_FAILED", tostring(message))
+    end
     if creation.unique_name then
-        -- 全局唯一服务可能位于另一节点，由持有预留的原生管理器就地终止并释放。
-        local released, answer = pcall(skynet.call, ".service", "lua",
-            creation.global and "GMANAGED_RELEASE" or "MANAGED_RELEASE",
-            creation.unique_name, request.handle, skynet.self(), creation.unique_subname, creation.creation_id)
-        if not released or answer ~= true then
-            return hotupgrade_result.failure("HU_SERVICE_CANCEL_FAILED", "唯一服务终止及预留释放尚未确认")
-        end
-    else
-        local ok, message = pcall(skynet.kill, request.handle)
-        if not ok then
-            return hotupgrade_result.failure("HU_SERVICE_CANCEL_FAILED", tostring(message))
+        local unique = self.unique_services[creation.unique_name]
+        if unique and unique.handle == request.handle then
+            self.unique_services[creation.unique_name] = nil
         end
     end
     self:finish_creation(creation)
@@ -416,11 +453,9 @@ end
 ---@param source integer 已登记 Service 的真实消息来源
 ---@return FlyWowHotUpgradeResult 成功含 permit_id
 function Controller:begin_module_load(request, source)
-    if self.phase == "FAILED_LOCKED" then
-        return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "失败发布尚未恢复")
-    end
-    if self.active then
-        return hotupgrade_result.failure("HU_UPGRADE_BUSY", "发布屏障期间不能首次加载模块")
+    local admitted = self:wait_lifecycle()
+    if not admitted.ok then
+        return admitted
     end
 
     local target = self.targets[source]
@@ -505,10 +540,6 @@ function Controller:register(request, source)
         or (creation.handle and creation.handle ~= source)
         or (request.creation_id and request.creation_id ~= creation.creation_id) then
         return hotupgrade_result.failure("HU_CREATION_MISSING", "来源不是受管理入口创建的待登记 Service")
-    end
-
-    if creation.cancelling then
-        return hotupgrade_result.failure("HU_CREATION_CANCELLED", "创建者已经发起终止，不能再登记该 Service")
     end
 
     if self.phase == "DEPLOYING" or self.phase == "APPLYING" or self.phase == "FAILED_LOCKED" then
@@ -650,6 +681,7 @@ function Controller:step(batch, target, command)
         request.service_source = target.service_source
     end
 
+    batch.control_started = true
     local ok, answer = pcall(skynet.call, target.handle, "hotupgrade", command, request)
     if not ok or type(answer) ~= "table" or type(answer.ok) ~= "boolean" then
         return hotupgrade_result.failure("HU_RPC_FAILED", tostring(answer), command)
@@ -668,7 +700,11 @@ function Controller:run_target(batch, target, dry_run)
         if not answer.ok or batch.cancelled then
             local restored = self:step(batch, target, "abort")
             if not restored.ok then
-                return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", restored.message, command)
+                local failed = hotupgrade_result.failure("HU_RECOVERY_REQUIRED", restored.message, command)
+                failed.original_error = not answer.ok and answer or
+                    hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
+                failed.recovery_error = restored
+                return failed
             end
 
             if batch.cancelled then
@@ -686,7 +722,13 @@ function Controller:run_target(batch, target, dry_run)
 
     if dry_run then
         local restored = self:step(batch, target, "abort")
-        return restored.ok and restored or hotupgrade_result.failure("HU_RECOVERY_REQUIRED", restored.message, "abort")
+        if restored.ok then
+            return restored
+        end
+        local failed = hotupgrade_result.failure("HU_RECOVERY_REQUIRED", restored.message, "abort")
+        failed.original_error = restored
+        failed.recovery_error = restored
+        return failed
     end
 
     -- 当前目标已同步提交；发布决定后 finish 结果不明不能伪称已恢复。
@@ -707,8 +749,11 @@ function Controller:run(batch, dry_run)
         local ok, answer = pcall(self.run_target, self, batch, target, dry_run)
         if not ok then
             local restored = not target.decided and self:step(batch, target, "abort")
+            local original = hotupgrade_result.failure("HU_CONTROL_FAILED", tostring(answer))
             answer = hotupgrade_result.failure(restored and restored.ok and "HU_CONTROL_FAILED" or "HU_RECOVERY_REQUIRED",
-                tostring(answer))
+                original.message)
+            answer.original_error = original
+            answer.recovery_error = restored and not restored.ok and restored or nil
         end
 
         batch.results[#batch.results + 1] = {handle = target.handle, hotupgrade_result = answer}
@@ -734,8 +779,13 @@ function Controller:run(batch, dry_run)
     batch.targets = nil
     self.last = batch
     self.active = nil
-    self.phase = batch.error and "FAILED_LOCKED" or batch.phase
-    self:wake_creations()
+    if dry_run and batch.error and batch.error.code ~= "HU_RECOVERY_REQUIRED" then
+        -- dry-run 失败但所有尝试目标均已恢复，不需要宿主进行版本收敛。
+        self.phase = "IDLE"
+    else
+        self.phase = batch.error and "FAILED_LOCKED" or batch.phase
+    end
+    self:wake_lifecycle()
 end
 
 -- 完成回调推进等待阶段，不轮询或超时删除创建记录。
@@ -746,8 +796,8 @@ function Controller:advance_deployment()
     end
 end
 
-function Controller:wake_creations()
-    for waiter, waiting in pairs(self.creation_waiters) do
+function Controller:wake_lifecycle()
+    for waiter, waiting in pairs(self.lifecycle_waiters) do
         waiting.blocked = waiting.blocked or self.phase == "FAILED_LOCKED"
         skynet.wakeup(waiter)
     end
@@ -794,7 +844,7 @@ function Controller:apply(request, dry_run)
     if self.phase == "WAITING_CREATIONS" then
         return hotupgrade_result.failure("HU_LIFECYCLE_PENDING", "已有创建或许可尚未完成")
     end
-    if batch.resolving or self.phase ~= "DEPLOYING" then
+    if self.phase ~= "DEPLOYING" then
         return hotupgrade_result.failure("HU_DEPLOYMENT_PHASE", "仅 DEPLOYING 可以执行 apply/dry_run")
     end
 
@@ -804,8 +854,8 @@ function Controller:apply(request, dry_run)
         batch.phase = "ABORTED"
         self.last = batch
         self.active = nil
-        self.phase = "FAILED_LOCKED"
-        self:wake_creations()
+        self.phase = dry_run and "IDLE" or "FAILED_LOCKED"
+        self:wake_lifecycle()
         return loaded
     end
     batch.targets = loaded.targets
@@ -818,7 +868,7 @@ function Controller:apply(request, dry_run)
     return hotupgrade_result.success({batch_id = batch.batch_id, target_count = batch.target_count})
 end
 
---- 仅核验宿主恢复确认和目标 Guard，不执行恢复、不强制打开目标入口。
+--- 仅校验宿主的显式恢复确认；不发送目标 RPC，也不恢复或强制开启目标 Guard。
 function Controller:resolve_deployment(request)
     local batch = self.active or self.last
     if not batch or request.batch_id ~= batch.batch_id then
@@ -829,33 +879,18 @@ function Controller:resolve_deployment(request)
     end
     if request.confirmed ~= true or (request.confirmation ~= "UNCHANGED"
         and request.confirmation ~= "CONVERGED_CACHE_CLEARED") then
-        return hotupgrade_result.failure("HU_RECOVERY_CONFIRMATION_REQUIRED", "须确认文件未变更，或已收敛运行版本与宿主文件并清理 cache")
+        return hotupgrade_result.failure("HU_RECOVERY_CONFIRMATION_REQUIRED", "须确认文件及运行时未变更，或已完成版本收敛和必要缓存清理")
     end
-    if self.phase == "FAILED_LOCKED" and request.confirmation ~= "CONVERGED_CACHE_CLEARED" then
-        return hotupgrade_result.failure("HU_RECOVERY_CONFIRMATION_REQUIRED", "失败后必须确认运行版本与宿主文件已收敛")
-    end
-    if batch.resolving then
-        return hotupgrade_result.failure("HU_UPGRADE_BUSY", "恢复核验正在进行")
+    if request.confirmation == "UNCHANGED" and batch.control_started then
+        return hotupgrade_result.failure("HU_RECOVERY_CONFIRMATION_REQUIRED", "已向目标发送控制命令，不能声明运行时未发生变更")
     end
 
-    batch.resolving = true
-    for _, target in pairs(self.targets) do
-        local ok, answer = pcall(skynet.call, target.handle, "hotupgrade", "deployment_status", {})
-        if not ok or type(answer) ~= "table" or not answer.ok or answer.pending then
-            batch.resolving = nil
-            return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", "目标 " .. target.handle .. " 尚未完成 Guard/事务恢复")
-        end
-    end
-    batch.resolving = nil
-    if (self.active or self.last) ~= batch or self.phase == "APPLYING" then
-        return hotupgrade_result.failure("HU_DEPLOYMENT_PHASE", "恢复核验期间阶段发生变化")
-    end
     self.active = nil
     self.last = batch
     batch.resolved = true
     self.recovery_required = false
     self.phase = "IDLE"
-    self:wake_creations()
+    self:wake_lifecycle()
     return hotupgrade_result.success()
 end
 
@@ -880,8 +915,7 @@ function Controller:control(command, request, source)
         return self:resolve_deployment(request)
     end
     if command == "uniqueservice" then
-        request.unique = true
-        return self:newservice(request, source)
+        return self:uniqueservice(request, source)
     end
     if command == "newservice" then
         return self:newservice(request, source)
@@ -903,8 +937,8 @@ function Controller:control(command, request, source)
         if self.phase == "FAILED_LOCKED" then
             return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "失败发布尚未恢复")
         end
-        if self.phase == "APPLYING" then
-            return hotupgrade_result.failure("HU_DEPLOYMENT_PHASE", "更新中不能 validate")
+        if self.phase == "WAITING_CREATIONS" or self.phase == "DEPLOYING" or self.phase == "APPLYING" then
+            return hotupgrade_result.failure("HU_UPGRADE_BUSY", "发布生命周期内不能 validate")
         end
         local loaded = self:load(request)
         if not loaded.ok then
@@ -942,7 +976,7 @@ function Controller:control(command, request, source)
         {
             batch_id = batch.batch_id, phase = batch.phase, success = batch.success, failed = batch.failed,
             target_count = batch.target_count, current_handle = batch.current_handle,
-            results = batch.results, error = batch.error, resolved = batch.resolved,
+            results = batch.results, error = batch.error, resolved = batch.resolved, control_started = batch.control_started == true,
         }, lifecycle = lifecycle, recovery_required = self.recovery_required})
     end
 

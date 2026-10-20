@@ -241,11 +241,6 @@ skynet.start(function()
             assert(not loaded_ok and package.loaded.hotupgrade_extra == nil
                 and package.loaded["lualib.hotupgrade_extra"] == nil)
             answer = true
-        elseif command == "try_declare" then
-            local declared, message = pcall(hotupgrade.require, "hotupgrade_extra")
-            assert(not declared and tostring(message):find("HU_UPGRADE_BUSY", 1, true))
-            assert(package.loaded.hotupgrade_extra == nil and package.loaded["lualib.hotupgrade_extra"] == nil)
-            answer = true
         elseif command == "declare" then
             extra_logic = hotupgrade.require("hotupgrade_extra")
             answer = extra_logic.value()

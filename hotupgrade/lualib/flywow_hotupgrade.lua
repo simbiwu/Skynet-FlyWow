@@ -45,10 +45,11 @@ function M.newservice(controller_handle, service_name, ...)
     return answer.handle
 end
 
---- 受管理唯一服务，保留原生 local/global 重载及参数；可能等待发布结束。
+--- 仅本 Controller 内的本地唯一服务；可能等待发布或在途唯一创建。
+--- true 重载明确抛出 HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED，不启动 Service。
 ---@param controller_handle integer 已初始化的 Controller
 ---@param name_or_global string|boolean 逻辑名，或 true 表示后续首参为全局逻辑名
----@param ... any 原生 uniqueservice 的启动参数
+---@param ... any 完整启动参数；首次请求的参数生效
 ---@return integer handle
 function M.uniqueservice(controller_handle, name_or_global, ...)
     local arguments = table.pack(...)
@@ -201,18 +202,13 @@ end
 
 --- 当前 State 的控制入口；请求只携带源码与批次号，不传递业务状态、函数或私有表。
 --- prepare 允许等待在途业务；stage/activate/abort/finish 的脚本和回调必须同步。
----@param command string prepare/stage/activate/abort/finish/deployment_status
+---@param command string prepare/stage/activate/abort/finish
 ---@param request table batch_id、sequence；stage 另含 modules 和可选 service_source
 ---@param source integer 由 Skynet 提供的真实调用来源
 ---@return FlyWowHotUpgradeResult 恢复不确定时保持 Guard 关闭
 local function control(command, request, source)
     if not module_state.registration or source ~= module_state.registration.controller_handle then
         return hotupgrade_result.failure("HU_UNAUTHORIZED", "控制来源不匹配")
-    end
-
-    if command == "deployment_status" then
-        return hotupgrade_result.success({pending = module_state.active_transaction ~= nil
-            or module_state.business_guard.owner ~= nil})
     end
 
     if type(request) ~= "table" or type(request.batch_id) ~= "string"

@@ -55,24 +55,19 @@ Controller 在调用原生 newservice 前建立待创建记录和不复用的进
 
 **非空 preload 不受支持。** 原生 loader 会在 Bootstrap 入口执行前运行 LUA_PRELOAD，此时它只能看到内部引导名称与参数。Controller 因此在建立创建记录和实际启动 Service 之前检查 skynet.getenv("preload")，非空时返回 HU_PRELOAD_UNSUPPORTED；不会先执行错误的 preload 再跳过真实业务初始化。普通原生 Service 不受影响。自定义 lualoader 仍须由宿主核对兼容性，本模块只保证标准 Skynet loader 合同。
 
-### 受管理唯一服务
+### 受管理本地唯一服务
 
 ```lua
-local local_handle = hotupgrade.uniqueservice(controller_handle, "player", "原生启动参数")
-local global_handle = hotupgrade.uniqueservice(controller_handle, true, "player", "原生启动参数")
+local handle = hotupgrade.uniqueservice(controller_handle, "player", zone_id)
+-- 明确拒绝：抛出含 HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED 的异常，不启动 Service。
+local global_handle = hotupgrade.uniqueservice(controller_handle, true, "player", zone_id)
 ```
 
-两种入口会 yield，并遵循与 newservice 相同的登记、业务 init 失败取消和发布排队合同。本地逻辑名与全局逻辑名分别对应原生 service_mgr 中的 name 和 @name；snaxd 沿用原生子名键和 snax init 参数交付语义；重复调用返回同一 handle，首次调用的启动参数生效，不同逻辑名可启动不同 Service。唯一性不使用内部 Bootstrap 名作为键，也不由 Controller 的 Lua 表模拟全局注册表。一个逻辑唯一键只能属于一个 Controller；其他 Controller 不能接管该目标。不要用普通原生入口提前占用同一逻辑名。
+唯一键是本 Controller 内的原始逻辑 Service 名称。首次创建先建立该名称的在途预留，再复用受管理 newservice 流程；同名并发请求等待同一创建结果，原生创建返回后一起取得相同 handle。只有首次请求的启动参数生效，后续重复请求的参数不改变实例。不同名称可启动不同 Service；已有 handle 即使在发布期间也直接返回，尚未创建的新逻辑键须等待发布成功。
 
-受管理唯一服务要求在启动 Skynet 前，对固定 Skynet v1.8.0 的 service/service_mgr.lua 应用随模块交付的最小补丁：
+该映射仅属于一个 Controller，不与原生 uniqueservice 的名称空间互通，不承诺跨 Controller、跨进程或跨节点唯一。全局 true 重载始终在实际启动前拒绝。snaxd 等需要专用启动合同的入口返回 HU_SPECIAL_SERVICE_UNSUPPORTED，不增加 Snax 专用初始化流程；newservice 同样拒绝 snaxd。
 
-```bash
-patch -d <Skynet根目录> -p1 < <FlyWow根目录>/hotupgrade/patches/skynet_service_mgr.patch
-```
-
-补丁增加 MANAGED_LAUNCH/GMANAGED_LAUNCH 和配对释放命令，复用原生注册表、等待协程及 SERVICE 全局节点路由，将逻辑唯一键与实际启动入口分离。普通 LAUNCH/GLAUNCH/QUERY 的既有入口保留。受管理启动失败会撤销唯一名预留；创建者合法取消未登记 Service 时，由实际承载该预留的管理器就地终止 Service 并释放预留，允许重试；Controller 不会在本地误用远端 handle 执行 kill。取消发起后，该创建记录先禁止登记（HU_CREATION_CANCELLED），覆盖远端终止 RPC 的 yield 窗口；确认失败时保留记录供原创建者重试，不自动放行。不能只修改一个节点：涉及全局唯一服务时，所有参与节点必须使用此补丁、相同框架/业务搜索路径和部署版本，并在实际承载业务 Service 的节点完成 root_path 配置。跨节点行为依赖现有 Skynet harbor/SERVICE 拓扑，不新增全局协调系统。宿主部署和 cache.clear 必须覆盖所有实际承载目标或后续创建的节点，单个进程的 cache.clear 不会清除另一节点的缓存。
-
-原生唯一服务允许已有 QUERY 等待者先等待逻辑名；补丁复用该等待记录。管理器支持未安装或版本不匹配时会导致受管理唯一创建明确失败，Controller 清理本次创建意图；不会回退成非唯一 newservice。集成测试脚本只在自己的 build 目录生成应用补丁的 service_mgr 副本，不修改外部 Skynet 工作树。
+首次创建失败时释放创建记录和唯一名预留，唤醒同一次创建的等待者返回错误，后续请求可重试。原创建者合法取消尚未登记的 Service 时，在原生终止成功后释放该唯一名。成功登记后不能取消创建。本地唯一入口不进行死亡监控或自动重建；已登记 Service 的受控终止和替换须由宿主管理。FlyWow 仅使用现有 Skynet 公开接口，不要求修改、复制、覆盖或生成任何 Skynet 框架源码。
 
 在受管理业务 Service 自己的 Lua State 登记：
 
@@ -110,7 +105,7 @@ hotupgrade.require(name) 仍用宿主原有 name 加载模块，通过 package.s
 
 登记前声明随初始元数据提交，由待创建记录保护。register_service 会拒绝本 State 尚在执行的首次声明（HU_LIFECYCLE_PENDING），调用方须待声明完成后登记；登记 RPC 期间的新声明等待登记结果，避免落在初始模块快照之外。
 
-已登记 Service 首次声明模块时，先向 Controller 请求 begin_module_load 许可，再执行实际 require、校验来源并建立缓存、别名、来源映射和本地声明，最后携许可 ID 调用 register_module。许可绑定真实来源及规范模块名，不能转用或重复消费；失败时回退本地新增状态，并通过 cancel_module_load 释放尚未完成的许可。许可未完成前禁止启动新批次，覆盖模块执行及登记的整个关键区间。同一 State 内并发首次声明同一规范模块会等待前一项成功或完整回退；已声明模块不重复请求许可。Controller 只更新目标已声明的模块。begin 之后不再批准新的首次加载许可（HU_UPGRADE_BUSY；失败锁定时为 HU_DEPLOYMENT_BLOCKED）。既有许可仍可完成或取消，既有创建仍可在 WAITING_CREATIONS 登记；新的受管理创建进入等待队列，不会实际启动。
+已登记 Service 首次声明模块时，先向 Controller 请求 begin_module_load 许可，再执行实际 require、校验来源并建立缓存、别名、来源映射和本地声明，最后携许可 ID 调用 register_module。许可绑定真实来源及规范模块名，不能转用或重复消费；失败时回退本地新增状态，并通过 cancel_module_load 释放尚未完成的许可。许可未完成前禁止启动新批次，覆盖模块执行及登记的整个关键区间。同一 State 内并发首次声明同一规范模块会等待前一项成功或完整回退；已声明模块不重复请求许可。Controller 只更新目标已声明的模块。begin 之后的首次加载请求与新创建请求一起等待发布终态，等待期间不发放许可、不执行模块代码，也不增加当前排空计数；失败锁定时返回 HU_DEPLOYMENT_BLOCKED。既有许可仍可完成或取消，既有创建仍可在 WAITING_CREATIONS 登记。同一逻辑模块等待者仍复用本 State 的并发声明协调。首次声明应在启动初始化或 Guard 之外的受控阶段完成，不要在尚未排空的 Guard 业务协程内等待发布结束，否则该业务无法在当前发布的 prepare 中排空。
 
 ## 业务 Guard
 
@@ -245,19 +240,19 @@ assert(started.ok, tostring(started.code) .. ": " .. tostring(started.message))
 
 begin 分配唯一批次号，立即返回 WAITING_CREATIONS；异步等待 creation_count 和 module_load_count 均为零后才进入 DEPLOYING。不会等待同步创建完成，不自动超时删除记录。begin 前已经接纳的创建允许登记，许可允许完成或取消。遗漏登记/取消时会持续等待，必须由原创建者处理，宿主此时不能部署文件。
 
-WAITING_CREATIONS、DEPLOYING、APPLYING 期间的新建及唯一服务请求排队，尚未进入原生启动。成功后唤醒等待者再启动；发布失败时唤醒并返回 HU_DEPLOYMENT_BLOCKED，即使稍后完成恢复，也不会把已经经历失败的等待请求自动重试。业务调用方必须处理此异常。成功终态允许下一次 begin，也允许新的创建和首次模块声明。
+WAITING_CREATIONS、DEPLOYING、APPLYING 期间的新创建、未建立实例的本地唯一请求及首次模块加载请求排队，尚未进入原生启动或模块执行。成功后唤醒等待者再启动；发布失败时唤醒并返回 HU_DEPLOYMENT_BLOCKED，即使稍后完成恢复，也不会把已经经历失败的等待请求自动重试。业务调用方必须处理此异常。成功终态允许下一次 begin，也允许新的创建和首次模块声明。
 
-apply/dry_run 必须携带当前 begin 的 batch_id，且仅在 DEPLOYING 接受一次；过期或缺失身份返回 HU_BATCH_MISSING，阶段不匹配返回 HU_DEPLOYMENT_PHASE，WAITING_CREATIONS 返回 HU_LIFECYCLE_PENDING。重复 begin 返回 HU_UPGRADE_BUSY；FAILED_LOCKED 统一拒绝新发布和创建。apply 接受时冻结 Patch 源码并固定已登记目标集合，沿用现有事务执行。Patch 路径/匹配等校验失败同样锁定发布：宿主可能已部署文件，不能静默重新放行创建。
+apply/dry_run 必须携带当前 begin 的 batch_id，且仅在 DEPLOYING 接受一次；过期或缺失身份返回 HU_BATCH_MISSING，阶段不匹配返回 HU_DEPLOYMENT_PHASE，WAITING_CREATIONS 返回 HU_LIFECYCLE_PENDING。重复 begin 返回 HU_UPGRADE_BUSY；FAILED_LOCKED 统一拒绝新发布和创建。apply 接受时冻结 Patch 源码并固定已登记目标集合，沿用现有事务执行。正式 apply 的 Patch 路径/匹配等校验失败同样锁定发布：宿主可能已部署文件，不能静默重新放行创建。
 
-validate 仅同步冻结/校验 Patch，不创建发布批次、不向目标发控制 RPC。它在待创建或待许可时返回 HU_LIFECYCLE_PENDING，APPLYING 时返回 HU_DEPLOYMENT_PHASE，失败锁定时返回 HU_DEPLOYMENT_BLOCKED。每个 Patch 文件都必须匹配已登记目标，否则 HU_TARGET_MISSING；Service 不支持内部更新时返回 HU_SERVICE_PATCH_UNSUPPORTED。validate 可在 IDLE 预检，也可在当前 DEPLOYING 阶段预检，但其成功不能替代 begin 屏障。
+validate 仅同步冻结/校验 Patch，不创建发布批次、不向目标发控制 RPC。WAITING_CREATIONS、DEPLOYING、APPLYING 均在任何 Patch 加载前返回 HU_UPGRADE_BUSY；FAILED_LOCKED 返回 HU_DEPLOYMENT_BLOCKED。其他正常阶段沿用原有校验：待创建或待许可时为 HU_LIFECYCLE_PENDING，每个 Patch 文件都必须匹配已登记目标，否则 HU_TARGET_MISSING；Service 不支持内部更新时返回 HU_SERVICE_PATCH_UNSUPPORTED。validate 应在 begin 之前预检，其成功不能替代 begin 屏障。
 
-**dry_run** 使用同样的 begin → 等待 DEPLOYING → dry_run 流程，携带同一批次号；宿主不得在其中部署新版文件或调用 skynet.cache.clear()。dry-run 真正执行目标更新和 abort 恢复，只有所有目标确认恢复、进入 DRY_RUN_COMPLETED 后才解除创建屏障。任何失败均进入 FAILED_LOCKED。
+**dry_run** 使用 begin → 等待 DEPLOYING → dry_run，携带同一批次号；宿主不得部署新版文件或清理宿主代码缓存。路径、读取、语法、匹配等前置失败若尚未向目标发控制命令，会返回原始错误，保存 ABORTED 诊断并直接回到 IDLE，释放等待请求，不要求宿主作版本收敛确认。已经发送目标命令后，沿用现有 Stage/Abort 流程：正常完成且全部恢复时为 DRY_RUN_COMPLETED；更新失败但所有尝试目标均已确认恢复时保留 ABORTED/PARTIAL 原始诊断并回到 IDLE。任一恢复失败进入 FAILED_LOCKED，结果保留 original_error 和 recovery_error，不自动开放创建。正式 apply 不使用这些 dry-run 特例。
 
 status 不带 batch_id 返回生命周期概览；带 batch_id 还返回 record。lifecycle 包含 phase、batch_id、pending_creations、pending_module_loads、failed_locked、active_batch_id、recovery_required。record.phase 表示具体事务步骤或终态；lifecycle.phase 表示发布门禁。仅保留活动与最近终态批次，未知/过旧身份仍为 HU_BATCH_MISSING。进程内状态不持久化；Controller 重启不是恢复确认手段。
 
 ### 显式恢复确认
 
-COMPLETED 和 DRY_RUN_COMPLETED 自动开放创建。PARTIAL、ABORTED、RECOVERY_REQUIRED 均保持 FAILED_LOCKED，不自动重试更新，也不声称运行中的 Service 已同版本。宿主必须先检查逐目标结果、真实版本、宿主文件和外部业务数据，完成实际恢复或版本收敛，并在文件回滚/收敛后执行 skynet.cache.clear()。随后才可以请求：
+COMPLETED 和 DRY_RUN_COMPLETED 自动开放创建。除上述没有运行时遗留的 dry-run 特例，PARTIAL、ABORTED、RECOVERY_REQUIRED 均保持 FAILED_LOCKED，不自动重试更新，也不声称运行中的 Service 已同版本。宿主必须先检查逐目标结果、真实版本、宿主文件和外部业务数据，完成实际恢复或版本收敛，并在文件回滚/收敛后执行 skynet.cache.clear()。随后才可以请求：
 
 ```lua
 local resolved = skynet.call(controller_handle, "hotupgrade", "resolve_deployment",
@@ -269,9 +264,9 @@ local resolved = skynet.call(controller_handle, "hotupgrade", "resolve_deploymen
 assert(resolved.ok, tostring(resolved.code) .. ": " .. tostring(resolved.message))
 ```
 
-该命令要求匹配批次和明确确认，随后向已登记目标查询内部 deployment_status；任何目标仍有未完成事务、Guard owner，或状态无法取得时，返回 HU_RECOVERY_REQUIRED 并保持门禁。它不会执行 abort/finish、强制清除目标 Guard、修复业务数据或验证文件内容；宿主确认是管理者对实际版本一致性的明确承诺。目标恢复失败必须先由宿主修复其实际状态；若需要受控进程重启，必须按宿主完整启动与版本恢复流程重建管理状态，不能只重启 Controller 绕过失败。确认成功将生命周期回到 IDLE，并标注最近 record.resolved，保留原失败诊断。
+该命令只校验批次号、当前门禁状态、confirmed 和 confirmation，不向目标发送状态/恢复 RPC，也不验证宿主文件或业务数据。CONVERGED_CACHE_CLEARED 是宿主对实际运行版本、文件及必要缓存清理已完成的明确承诺，不能代替实际恢复。确认不会执行 abort/finish 或清除目标 Guard；任何尚未完成的目标恢复必须由宿主先处理。确认成功将生命周期回到 IDLE、唤醒等待请求并标注最近 record.resolved，保留原失败诊断。
 
-发布前取消（WAITING_CREATIONS/DEPLOYING）也通过 resolve_deployment，或携同样确认字段调用 abort：宿主文件确实未变更时使用 confirmed=true、confirmation="UNCHANGED"；如果已经部署过文件，必须先回滚并清理 cache，再使用 "CONVERGED_CACHE_CLEARED"。缺少确认返回 HU_RECOVERY_CONFIRMATION_REQUIRED。APPLYING 中的 abort 沿用原事务取消语义；其 ABORTED/PARTIAL 结果仍锁定，必须实际恢复后再确认。
+发布前取消（WAITING_CREATIONS/DEPLOYING）也通过 resolve_deployment，或携同样确认字段调用 abort。UNCHANGED 仅适用于宿主文件未变更、尚未向任何目标发控制命令、运行时未发生变更的情况；Controller 拒绝对 control_started=true 的批次使用此确认。文件确实未变更由宿主负责确认；已经覆盖过文件时，须先恢复/收敛版本并清理必要缓存，再使用 CONVERGED_CACHE_CLEARED。缺少确认返回 HU_RECOVERY_CONFIRMATION_REQUIRED。APPLYING 中的 abort 沿用原事务取消语义；正式 apply 的 ABORTED/PARTIAL 结果仍锁定，实际恢复后再确认。
 
 各目标按 handle 顺序逐个执行：
 

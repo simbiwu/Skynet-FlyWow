@@ -7,8 +7,7 @@ local module_state =
     shared_environment = {}, -- 模拟 Skynet 跨 State 的只写一次环境。
     launch_handle = nil, -- 原生创建替身将返回的真实 handle。
     launch_hook = nil, -- 在原生创建尚未返回时注入登记或启动失败。
-    release_hook = nil, -- 在远端唯一服务终止 RPC 中模拟到达的登记消息。
-    recovery_pending = false, -- 模拟仍持有目标 Guard。
+    launches = {}, -- 记录实际进入原生创建的逻辑名和完整参数。
     killed = {}, -- 验证只有创建者取消时才终止对应待登记 Service。
     injected_control_failure = nil, -- 当前测试注入的目标和命令失败条件。
 }
@@ -18,7 +17,8 @@ package.loaded.skynet =
     setenv = function(key, value) module_state.shared_environment[key] = value end,
     self = function() return 99 end,
     newservice = function(name, controller_handle, creation_id, service_name, ...)
-        assert(name == "flywow_hotupgrade_bootstrap" and controller_handle == 99 and service_name == "fixture")
+        assert(name == "flywow_hotupgrade_bootstrap" and controller_handle == 99)
+        module_state.launches[#module_state.launches + 1] = {name = service_name, arguments = table.pack(...)}
         if module_state.launch_hook then
             module_state.launch_hook(creation_id, ...)
         end
@@ -29,14 +29,6 @@ package.loaded.skynet =
     kill = function(handle) module_state.killed[handle] = true end,
     fork = function(fn) module_state.pending_control_coroutines[#module_state.pending_control_coroutines + 1] = fn end,
     call = function(handle, protocol, command, request)
-        if handle == ".service" and command == "MANAGED_RELEASE" then
-            assert(protocol == "lua" and module_state.release_hook)
-            module_state.release_hook()
-            return true
-        end
-        if command == "deployment_status" then
-            return {ok = true, pending = module_state.recovery_pending}
-        end
         assert(protocol == "hotupgrade" and request.sequence > 0)
         module_state.last_control_command_by_handle[handle] = command
         if module_state.injected_control_failure and module_state.injected_control_failure.handle == handle and module_state.injected_control_failure.command == command then
@@ -197,10 +189,16 @@ module_state.launch_handle = 83
 assert(coroutine.resume(queued) and queued_result == nil)
 assert(lifecycle.creation_count == 0)
 assert(lifecycle:control("register", metadata, 90).code == "HU_CREATION_MISSING")
-assert(lifecycle:control("begin_module_load", {name = "late"}, 70).code == "HU_UPGRADE_BUSY")
+local queued_module
+local module_waiter = coroutine.create(function()
+    queued_module = lifecycle:control("begin_module_load", {name = "late"}, 70)
+end)
+assert(coroutine.resume(module_waiter) and queued_module == nil)
 local view = lifecycle:control("status", {}, 1).lifecycle
 assert(view.pending_creations == 0 and view.pending_module_loads == 0 and view.active_batch_id == started_lifecycle.batch_id)
 module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+assert(queued_module.ok and lifecycle.module_load_count == 1)
+assert(lifecycle:control("register_module", {name = "late", permit_id = queued_module.permit_id}, 70).ok)
 assert(queued_result.ok and queued_result.handle == 83)
 assert(lifecycle:control("cancel_service_creation", {handle = 83}, 1).ok)
 assert(lifecycle:control("status", {batch_id = "unknown"}, 1).code == "HU_BATCH_MISSING")
@@ -302,24 +300,28 @@ assert(not c:control("apply", {path = "module"}, 1).ok)
 assert(not c:control("history", {}, 1).ok)
 -- 持有容量和只保留最近终态的合同，不能靠清空查询记录绕过恢复门禁。
 assert(c:control("status", {batch_id = "99:1"}, 1).code == "HU_BATCH_MISSING")
--- 失败门禁与恢复核验：宿主确认不能越过尚未恢复的目标 Guard。
+-- 恢复命令只接受管理者明确确认，不发送目标状态 RPC 或替代实际恢复。
 assert(c.phase == "FAILED_LOCKED")
 assert(c:control("newservice", {service_name = "fixture", arguments = {n = 0}}, 1).code == "HU_DEPLOYMENT_BLOCKED")
+assert(c:control("begin_module_load", {name = "late"}, 10).code == "HU_DEPLOYMENT_BLOCKED")
 assert(c:control("begin", {}, 1).code == "HU_DEPLOYMENT_BLOCKED")
-local recovery = {batch_id = c.last.batch_id, confirmed = true, confirmation = "CONVERGED_CACHE_CLEARED"}
-module_state.recovery_pending = true
-assert(c:control("resolve_deployment", recovery, 1).code == "HU_RECOVERY_REQUIRED")
-module_state.recovery_pending = false
-assert(c:control("resolve_deployment", recovery, 1).ok and c.phase == "IDLE")
+assert(c:control("resolve_deployment", {batch_id = c.last.batch_id, confirmed = true,
+    confirmation = "UNCHANGED"}, 1).code == "HU_RECOVERY_CONFIRMATION_REQUIRED")
+module_state.last_control_command_by_handle = {}
+assert(c:control("resolve_deployment", {batch_id = c.last.batch_id, confirmed = true,
+    confirmation = "CONVERGED_CACHE_CLEARED"}, 1).ok)
+assert(c.phase == "IDLE" and next(module_state.last_control_command_by_handle) == nil)
 
 local waiting = new_controller()
 module_state.launch_handle = 84
 assert(waiting:control("newservice", {service_name = "fixture", arguments = {n = 0}}, 1).ok)
 local begun = waiting:control("begin", {}, 1)
 assert(begun.ok and waiting.phase == "WAITING_CREATIONS")
+assert(waiting:control("validate", {path = "invalid"}, 1).code == "HU_UPGRADE_BUSY")
 assert(waiting:control("begin", {}, 1).code == "HU_UPGRADE_BUSY")
 assert(waiting:control("apply", {batch_id = begun.batch_id, path = "module"}, 1).code == "HU_LIFECYCLE_PENDING")
 assert(waiting:control("register", metadata, 84).ok and waiting.phase == "DEPLOYING")
+assert(waiting:control("validate", {path = "invalid"}, 1).code == "HU_UPGRADE_BUSY")
 assert(waiting:control("apply", {batch_id = "stale", path = "module"}, 1).code == "HU_BATCH_MISSING")
 assert(waiting:control("resolve_deployment", {batch_id = begun.batch_id}, 1).code == "HU_RECOVERY_CONFIRMATION_REQUIRED")
 assert(waiting:control("resolve_deployment", {batch_id = begun.batch_id, confirmed = true, confirmation = "UNCHANGED"}, 1).ok)
@@ -332,6 +334,7 @@ assert(module_batch.ok and waiting.phase == "WAITING_CREATIONS")
 assert(waiting:control("register_module", {name = "later", permit_id = allowed.permit_id}, 84).ok)
 assert(waiting.phase == "DEPLOYING")
 assert(waiting:control("dry_run", {batch_id = module_batch.batch_id, path = "module"}, 1).ok)
+assert(waiting:control("validate", {path = "invalid"}, 1).code == "HU_UPGRADE_BUSY")
 assert(waiting:control("dry_run", {batch_id = module_batch.batch_id, path = "module"}, 1).code == "HU_DEPLOYMENT_PHASE")
 module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
 assert(waiting.phase == "DRY_RUN_COMPLETED")
@@ -348,18 +351,6 @@ assert(waiting.phase == "FAILED_LOCKED" and denied_creation.code == "HU_DEPLOYME
 assert(waiting:control("resolve_deployment", {batch_id = failed_batch, confirmed = true,
     confirmation = "CONVERGED_CACHE_CLEARED"}, 1).ok)
 
--- 远端唯一服务取消在 yield 前占有取消状态，迟到登记不得变成已登记死目标。
-module_state.launch_handle = 85
-assert(waiting:control("newservice", {service_name = "fixture", arguments = {n = 0}}, 1).ok)
-waiting.creation_handles[85].unique_name = "fixture"
-module_state.release_hook = function()
-    assert(waiting:control("register", metadata, 85).code == "HU_CREATION_CANCELLED")
-    assert(waiting.creation_count == 1 and not waiting.targets[85])
-end
-assert(waiting:control("cancel_service_creation", {handle = 85}, 1).ok)
-assert(waiting.creation_count == 0 and not waiting.targets[85])
-module_state.release_hook = nil
-
 -- preload 拒绝早于实际启动及创建计数；测试环境可直接撤销共享环境替身。
 module_state.shared_environment.preload = "fixture_preload.lua"
 module_state.launch_hook = function() error("preload must reject before native launch") end
@@ -370,6 +361,88 @@ end
 module_state.launch_hook = nil
 module_state.shared_environment.preload = nil
 print("HOTUPGRADE_CONTROLLER_DEPLOYMENT_OK")
+
+-- 本地唯一创建在原生启动期间合并并发请求；中间 nil 不得丢失。
+local unique = new_controller()
+local first_unique
+local second_unique
+local first_co = coroutine.create(function()
+    first_unique = unique:control("uniqueservice", {service_name = "fixture", arguments = table.pack("first", nil, "last")}, 1)
+end)
+module_state.launch_hook = function() coroutine.yield() end
+local launch_count = #module_state.launches
+assert(coroutine.resume(first_co))
+local duplicate_co = coroutine.create(function()
+    second_unique = unique:control("uniqueservice", {service_name = "fixture", arguments = table.pack("ignored")}, 2)
+end)
+assert(coroutine.resume(duplicate_co) and first_unique == nil and second_unique == nil)
+assert(#module_state.launches == launch_count + 1)
+local forwarded = module_state.launches[#module_state.launches].arguments
+assert(forwarded.n == 3 and forwarded[1] == "first" and forwarded[2] == nil and forwarded[3] == "last")
+module_state.launch_handle = 90
+module_state.launch_hook = nil
+assert(coroutine.resume(first_co))
+assert(first_unique.handle == 90 and second_unique.handle == 90 and unique.creation_count == 1)
+assert(unique:control("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 1).handle == 90)
+assert(unique:control("cancel_service_creation", {handle = 90}, 2).code == "HU_UNAUTHORIZED")
+assert(unique:control("cancel_service_creation", {handle = 90}, 1).ok and not unique.unique_services.fixture)
+
+-- 在途失败让所有等待者返回同一错误，释放预留后允许重试。
+first_unique, second_unique = nil, nil
+module_state.launch_hook = function()
+    coroutine.yield()
+    error("startup failed")
+end
+first_co = coroutine.create(function()
+    first_unique = unique:control("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 1)
+end)
+duplicate_co = coroutine.create(function()
+    second_unique = unique:control("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 2)
+end)
+assert(coroutine.resume(first_co) and coroutine.resume(duplicate_co))
+assert(coroutine.resume(first_co))
+assert(first_unique.code == "HU_SERVICE_CREATE_FAILED" and second_unique.code == first_unique.code)
+assert(unique.creation_count == 0 and not unique.unique_services.fixture)
+module_state.launch_hook = nil
+module_state.launch_handle = 91
+assert(unique:control("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 1).handle == 91)
+assert(unique:control("register", metadata, 91).ok)
+local unique_batch = begin_deployment(unique)
+assert(unique:control("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 2).handle == 91)
+local new_unique
+local unique_waiter = coroutine.create(function()
+    new_unique = unique:control("uniqueservice", {service_name = "fixture_other", arguments = {n = 0}}, 2)
+end)
+launch_count = #module_state.launches
+assert(coroutine.resume(unique_waiter) and new_unique == nil and #module_state.launches == launch_count)
+module_state.launch_handle = 92
+assert(unique:control("dry_run", {batch_id = unique_batch, path = "missing"}, 1).code == "HU_PATCH_EMPTY")
+assert(unique.phase == "IDLE" and new_unique.handle == 92 and unique.creation_count == 1)
+assert(unique:control("cancel_service_creation", {handle = 92}, 2).ok)
+
+launch_count = #module_state.launches
+assert(unique:control("uniqueservice", {global = true}, 1).code == "HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED")
+for _, command in ipairs({"newservice", "uniqueservice"}) do
+    assert(unique:control(command, {service_name = "snaxd", arguments = {n = 0}}, 1).code == "HU_SPECIAL_SERVICE_UNSUPPORTED")
+end
+assert(#module_state.launches == launch_count and unique.creation_count == 0)
+
+-- dry-run 前置失败和目标失败后的成功恢复都释放屏障；恢复失败保留两份错误。
+local dry = new_controller()
+assert(managed_register(dry, metadata, 93).ok)
+local dry_id = begin_deployment(dry)
+assert(dry:control("dry_run", {batch_id = dry_id, path = "unmatched_module"}, 1).code == "HU_TARGET_MISSING")
+assert(dry.phase == "IDLE" and dry.last.error.code == "HU_TARGET_MISSING" and not dry.last.control_started)
+module_state.injected_control_failure = {handle = 93, command = "stage"}
+assert(publish(dry, "dry_run", {path = "module"}).ok)
+module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+assert(dry.phase == "IDLE" and dry.last.error.code == "HU_FIXTURE_FAILED")
+module_state.injected_control_failure = {handle = 93, command = "abort"}
+assert(publish(dry, "dry_run", {path = "module"}).ok)
+module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+assert(dry.phase == "FAILED_LOCKED" and dry.last.error.recovery_error.code == "HU_FIXTURE_FAILED")
+module_state.injected_control_failure = nil
+print("HOTUPGRADE_CONTROLLER_LOCAL_UNIQUE_OK")
 
 local bounded = new_controller()
 for handle = 1, hotupgrade_common.MAX_TARGETS do

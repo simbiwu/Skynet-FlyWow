@@ -11,10 +11,6 @@ export LUA_PATH="$FRAMEWORK_DIR/hotupgrade/lualib/?.lua;$FRAMEWORK_DIR/hotupgrad
 export LUA_CPATH="$FRAMEWORK_DIR/build/native/?.so;;"
 rm -rf build/hotupgrade-tests/patches build/hotupgrade-tests/host
 mkdir -p build/hotupgrade-tests/patches
-# 仅生成测试自己的 service_mgr 副本，验证随模块交付的最小 Skynet 补丁。
-mkdir -p build/hotupgrade-tests/skynet-service
-cp "$SKYNET_ROOT/service/service_mgr.lua" build/hotupgrade-tests/skynet-service/service_mgr.lua
-patch build/hotupgrade-tests/skynet-service/service_mgr.lua < hotupgrade/patches/skynet_service_mgr.patch
 "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/prepare_test_packages.lua
 "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_foundation.lua
 "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_controller.lua
