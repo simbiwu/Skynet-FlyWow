@@ -10,7 +10,7 @@ local hotupgrade = require "flywow_hotupgrade"
 local early_ok, early_error = pcall(hotupgrade.require, "test_worker_logic")
 assert(not early_ok and tostring(early_error):find("HU_NOT_INITIALIZED", 1, true))
 local c = assert(controller.new(config).controller)
-assert(c:control("register", {service_type = "unused", modules = {"lualib.test_worker_logic"},
+assert(c:control("register", {service_module = "unused", modules = {"lualib.test_worker_logic"},
     service_patch = false}, 10).ok)
 assert(c:control("validate", {path = "module"}, 1).ok)
 assert(not c:control("validate", {path = "invalid"}, 1).ok)
@@ -67,6 +67,6 @@ assert(not rejected.ok and rejected.code == "HU_INVALID_PATH")
 local nested = assert(controller.new(
     {patch_root = root, root_path = config.root_path, service_dir = "actors/zone"}).controller)
 assert(nested:control("register",
-    {service_type = "player", modules = {}, service_patch = true}, 20).ok)
+    {service_module = "player", modules = {}, service_patch = true}, 20).ok)
 assert(nested:control("validate", {path = "custom_service"}, 1).ok)
 print("HOTUPGRADE_FILES_OK")

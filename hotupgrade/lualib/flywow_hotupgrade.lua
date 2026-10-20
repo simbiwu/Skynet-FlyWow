@@ -105,7 +105,7 @@ local function stage_service(source)
     end
 
     local service = assert(module_state.registration.service, "Service 未提供内部更新入口")
-    local chunk = assert(load(source, "=Service Patch: " .. module_state.registration.service_type, "t", _G))
+    local chunk = assert(load(source, "=Service Patch: " .. module_state.registration.service_module, "t", _G))
     local build = chunk()
     assert(type(build) == "function", "Service Patch 必须返回构建函数")
     local patch = build(service.state)
@@ -300,7 +300,7 @@ end
 
 ---@class FlyWowHotUpgradeRegistration
 ---@field controller_handle integer 宿主已启动的控制 Service handle
----@field service_type string 对应 service_dir 下的相对 Lua 路径；去掉 .lua 并将 / 转为 .
+---@field service_module string 对应 service_dir 下的相对 Lua 路径；去掉 .lua 并将 / 转为 .
 ---@field service? FlyWowHotUpgradeServiceUpdate 可选 Service 内部状态/函数更新入口
 ---@field before_upgrade? fun():boolean|table Guard 暂停新业务且在途调用归零后反复调用；true 或 {ok=true} 才放行，否则继续等待至超时，异常立即失败。同步只读，不得 yield
 ---@field after_upgrade? fun():boolean Activate 提交模块与 Service 状态后、finish 前调用；false 或异常触发组合恢复。只检查已提交状态，不得产生外部副作用或 yield
@@ -314,9 +314,9 @@ function M.register_service(registration)
     end
 
     if type(registration) ~= "table" or math.type(registration.controller_handle) ~= "integer"
-        or type(registration.service_type) ~= "string"
-        or not registration.service_type:match("^[%w_.%-]+$") then
-        return hotupgrade_result.failure("HU_INVALID_OPTIONS", "Controller handle 或 Service 类型无效")
+        or type(registration.service_module) ~= "string"
+        or not registration.service_module:match("^[%w_.%-]+$") then
+        return hotupgrade_result.failure("HU_INVALID_OPTIONS", "Controller handle 或 Service 模块名无效")
     end
 
     if registration.before_upgrade ~= nil and type(registration.before_upgrade) ~= "function" then
@@ -370,7 +370,7 @@ function M.register_service(registration)
     ---@type FlyWowHotUpgradeTargetMetadata
     local metadata =
     {
-        service_type = module_state.registration.service_type,
+        service_module = module_state.registration.service_module,
         modules = names,
         service_patch = service ~= nil,
     }

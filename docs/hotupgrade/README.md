@@ -52,7 +52,7 @@ end
 local registered = hotupgrade.register_service(
 {
     controller_handle = controller_handle,
-    service_type = "player",
+    service_module = "player",
     service = {state = state, functions = M},
     after_upgrade = function()
         return state.level >= 0
@@ -61,7 +61,7 @@ local registered = hotupgrade.register_service(
 assert(registered.ok, registered.message)
 ```
 
-service_type 对应 service_dir 下的相对 Lua 路径：去掉 .lua 并将 / 转为 .。例如 service_dir 为 service 时，service/player.lua 对应 player，service/battle/worker.lua 对应 battle.worker。service 可省略，此时只参与普通模块更新。Controller 使用注册消息真实 source 作为目标 handle；私有状态、函数和回调留在业务 State，不经消息传给 Controller。登记成功前宿主不得宣布 Service READY；登记 RPC 失败可能有不确定结果，应终止该次启动，由宿主管理，而不是继续接收业务。
+service_module 对应 service_dir 下的相对 Lua 路径：去掉 .lua 并将 / 转为 .。例如 service_dir 为 service 时，service/player.lua 对应 player，service/battle/worker.lua 对应 battle.worker。service 可省略，此时只参与普通模块更新。Controller 使用注册消息真实 source 作为目标 handle；私有状态、函数和回调留在业务 State，不经消息传给 Controller。登记成功前宿主不得宣布 Service READY；登记 RPC 失败可能有不确定结果，应终止该次启动，由宿主管理，而不是继续接收业务。
 
 hotupgrade.require(name) 仍用宿主原有 name 加载模块，通过 package.searchpath(name, package.path) 定位 Lua 文件，再复用 Native resolve 得到规范化路径。Controller 登记名由该文件相对 root_path 的路径去掉 .lua、将 / 转为 . 得到。例如原调用 hotupgrade.require("battle.state_sync.runtime") 加载 lualib/battle/state_sync/runtime.lua，登记名为 lualib.battle.state_sync.runtime；不是给原 name 固定增加目录前缀。?/init.lua 解析出的文件也按真实路径登记，例如 lualib/battle/init.lua 对应 lualib.battle.init。
 

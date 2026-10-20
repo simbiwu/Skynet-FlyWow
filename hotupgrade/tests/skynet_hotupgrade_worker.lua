@@ -64,7 +64,7 @@ skynet.start(function()
             answer = hotupgrade.register_service(
             {
                 controller_handle = worker_test_config.controller_handle,
-                service_type = worker_test_config.service_type or "player",
+                service_module = worker_test_config.service_module or "player",
                 service = service,
                 after_upgrade = function()
                     if worker_test_config.after_upgrade_failure then

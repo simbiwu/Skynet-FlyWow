@@ -57,10 +57,10 @@ end
 assert(not controller.new({}).ok)
 local c = new_controller()
 for _, handle in ipairs({10, 20}) do
-    assert(c:control("register", {service_type = "player", modules = {"lualib.test_worker_logic"},
+    assert(c:control("register", {service_module = "player", modules = {"lualib.test_worker_logic"},
         service_patch = false}, handle).ok)
 end
-assert(not c:control("register", {service_type = "player", modules = {}, service_patch = false}, 10).ok)
+assert(not c:control("register", {service_module = "player", modules = {}, service_patch = false}, 10).ok)
 assert(c:control("register_module", {name = "extra"}, 10).ok)
 assert(not c:control("register_module", {name = "extra"}, 30).ok)
 assert(not c:control("validate", {path = "module", selector = {percent = 0.5}}, 1).ok)
@@ -68,7 +68,7 @@ assert(c:control("validate", {path = "module"}, 1).target_count == 2)
 -- 三种入口必须在整包匹配失败时拒绝启动，连 prepare 都不能发给已匹配目标。
 for _, fixture in ipairs({
     {path = "unmatched_module", file = "lualib/missing_logic.lua", reason = "声明模块"},
-    {path = "unmatched_service", file = "service/unused.lua", reason = "service_type"},
+    {path = "unmatched_service", file = "service/unused.lua", reason = "service_module"},
 }) do
     for _, command in ipairs({"validate", "dry_run", "apply"}) do
         module_state.last_control_command_by_handle = {}
@@ -84,7 +84,7 @@ end
 -- 同一模块仍可匹配多个 Service，组合包中的 Service 脚本也必须被覆盖。
 local combined = new_controller()
 for _, handle in ipairs({30, 40}) do
-    assert(combined:control("register", {service_type = "player", modules = {"lualib.test_worker_logic"},
+    assert(combined:control("register", {service_module = "player", modules = {"lualib.test_worker_logic"},
         service_patch = true}, handle).ok)
 end
 for _, command in ipairs({"validate", "dry_run", "apply"}) do
@@ -100,7 +100,7 @@ assert(unsupported.message:find("combined/service/player.lua", 1, true))
 -- 路径映射保留宿主目录前缀，Service 目录可更换并支持多级类型名。
 local paths = new_controller()
 assert(paths:control("register",
-    {service_type = "battle.worker", modules = {"config.settings", "lualib.battle.state_sync.runtime", "lualib.packages.demo.init"},
+    {service_module = "battle.worker", modules = {"config.settings", "lualib.battle.state_sync.runtime", "lualib.packages.demo.init"},
         service_patch = true}, 50).ok)
 local loaded = paths:load({path = "host_paths"})
 assert(loaded.ok and #loaded.patch.modules == 3)
@@ -109,7 +109,7 @@ assert(loaded.patch.modules[2].name == "lualib.battle.state_sync.runtime")
 assert(paths:control("validate", {path = "nested_service"}, 1).ok)
 local changed = new_controller("actors")
 assert(changed:control("register",
-    {service_type = "zone.player", modules = {}, service_patch = true}, 60).ok)
+    {service_module = "zone.player", modules = {}, service_patch = true}, 60).ok)
 assert(changed:control("validate", {path = "custom_service"}, 1).ok)
 for _, path in ipairs({"duplicate_module", "duplicate_service"}) do
     assert(paths:control("validate", {path = path}, 1).code == "HU_INVALID_PATCH")
@@ -145,16 +145,16 @@ assert(not c:control("history", {}, 1).ok)
 assert(c:control("status", {txn_id = "99:1"}, 1).code == "HU_TRANSACTION_MISSING")
 local bounded = new_controller()
 for handle = 1, hotupgrade_common.MAX_TARGETS do
-    assert(bounded:control("register", {service_type = "empty", modules = {}, service_patch = false}, handle).ok)
+    assert(bounded:control("register", {service_module = "empty", modules = {}, service_patch = false}, handle).ok)
 end
-assert(bounded:control("register", {service_type = "empty", modules = {}, service_patch = false}, hotupgrade_common.MAX_TARGETS + 1).code
+assert(bounded:control("register", {service_module = "empty", modules = {}, service_patch = false}, hotupgrade_common.MAX_TARGETS + 1).code
     == "HU_TARGET_LIMIT")
 local names = {}
 for index = 1, hotupgrade_common.MAX_MODULES do
     names[index] = "logic_" .. index
 end
 local limited = new_controller()
-assert(limited:control("register", {service_type = "empty", modules = names, service_patch = false}, 1).ok)
+assert(limited:control("register", {service_module = "empty", modules = names, service_patch = false}, 1).ok)
 assert(limited:control("register_module", {name = names[1]}, 1).ok)
 assert(limited:control("register_module", {name = "overflow"}, 1).code == "HU_MODULE_LIMIT")
 print("HOTUPGRADE_CONTROLLER_OK")

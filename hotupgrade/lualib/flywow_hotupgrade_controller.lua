@@ -141,7 +141,7 @@ local function build_patch(root, patch_path, service_dir)
 end
 
 ---@class FlyWowHotUpgradeTargetMetadata
----@field service_type string 由现存 Service 声明，匹配配置 service_dir 下的相对路径
+---@field service_module string 由现存 Service 声明，匹配配置 service_dir 下的相对路径
 ---@field modules string[] 当前 State 已声明模块的唯一名称数组
 ---@field service_patch boolean 是否在本 State 提供私有状态及函数更新入口
 
@@ -216,8 +216,8 @@ end
 ---@param source integer Skynet 消息头中的真实 Service handle
 ---@return FlyWowHotUpgradeResult
 function Controller:register(request, source)
-    if math.type(source) ~= "integer" or type(request.service_type) ~= "string"
-        or not request.service_type:match("^[%w_.%-]+$") or type(request.modules) ~= "table"
+    if math.type(source) ~= "integer" or type(request.service_module) ~= "string"
+        or not request.service_module:match("^[%w_.%-]+$") or type(request.modules) ~= "table"
         or type(request.service_patch) ~= "boolean" then
         return hotupgrade_result.failure("HU_INVALID_OPTIONS", "登记元数据无效")
     end
@@ -252,11 +252,11 @@ function Controller:register(request, source)
     self.target_count = self.target_count + 1
     self.targets[source] =
     {
-        handle = source,                        -- Skynet 提供的真实来源，也是后续控制目标。
-        service_type = request.service_type,    -- 匹配配置 service_dir 下的相对路径。
-        module_count = #request.modules,         -- 已登记声明数，用于拒绝无界增长。
-        modules = modules,                      -- 该 State 明确声明的可更新模块集合。
-        service_patch = request.service_patch,  -- 是否提供本地 Service 状态/函数入口。
+        handle         = source,                     -- Skynet 提供的真实来源，也是后续控制目标。
+        service_module = request.service_module,     -- 匹配配置 service_dir 下的相对路径。
+        module_count   = #request.modules,            -- 已登记声明数，用于拒绝无界增长。
+        modules        = modules,                     -- 该 State 明确声明的可更新模块集合。
+        service_patch  = request.service_patch,       -- 是否提供本地 Service 状态/函数入口。
     }
     return hotupgrade_result.success()
 end
@@ -288,7 +288,7 @@ function Controller:load(request)
             end
         end
 
-        local service = loaded.patch.services[record.service_type]
+        local service = loaded.patch.services[record.service_module]
         if service and not record.service_patch then
             return hotupgrade_result.failure("HU_SERVICE_PATCH_UNSUPPORTED", request.path .. "/" .. service.entry_file
                 .. ": 目标 " .. record.handle .. " 未提供 Service 内部更新入口")
@@ -317,10 +317,10 @@ function Controller:load(request)
         end
     end
 
-    for service_type, entry in pairs(loaded.patch.services) do
+    for service_module, entry in pairs(loaded.patch.services) do
         if not matched[entry.entry_file] then
             return hotupgrade_result.failure("HU_TARGET_MISSING", request.path .. "/" .. entry.entry_file
-                .. ": 没有已登记目标匹配 service_type " .. service_type)
+                .. ": 没有已登记目标匹配 service_module " .. service_module)
         end
     end
 
