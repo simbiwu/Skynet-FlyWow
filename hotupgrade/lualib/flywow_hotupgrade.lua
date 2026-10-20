@@ -13,7 +13,7 @@ local module_state =
     module_patch_engine   = nil,                              -- 本 State 唯一完整模块更新器。
     active_transaction    = nil,                              -- 当前事务的撤销数据保留至 finish/abort 确认完成。
     completed_sequence    = 0,                                -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
-    last_transaction_id   = nil,                              -- 最近完成事务，用于 finish/abort 幂等响应。
+    last_batch_id         = nil,                              -- 最近完成的批次，用于 finish/abort 幂等响应。
     declared_module_count = 0,                                -- 本 State 已成功声明模块数，受 hotupgrade_common.MAX_MODULES 限制。
     declared_modules      = {},                               -- hotupgrade.require 已登记的模块集合。
     module_sources        = setmetatable({}, {__mode = "k"}), -- 仅保存本入口确认的模块表与文件路径；弱键不延长模块生命周期。
@@ -86,14 +86,14 @@ local function abort(txn)
         return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
     end
 
-    local resumed = module_state.business_guard:resume(txn.id)
+    local resumed = module_state.business_guard:resume(txn.batch_id)
     if not resumed.ok then
         txn.phase = "RECOVERY_REQUIRED"
         return resumed
     end
 
     module_state.completed_sequence = txn.sequence
-    module_state.last_transaction_id = txn.id
+    module_state.last_batch_id = txn.batch_id
     module_state.active_transaction = nil
     return hotupgrade_result.success()
 end
@@ -147,10 +147,10 @@ local function stage_service(source)
     return staged
 end
 
---- 当前 State 的控制入口；请求只携带源码与事务号，不传递业务状态、函数或私有表。
+--- 当前 State 的控制入口；请求只携带源码与批次号，不传递业务状态、函数或私有表。
 --- prepare 允许等待在途业务；stage/activate/abort/finish 的脚本和回调必须同步。
 ---@param command string prepare/stage/activate/abort/finish
----@param request table txn_id、sequence；stage 另含 modules 和可选 service_source
+---@param request table batch_id、sequence；stage 另含 modules 和可选 service_source
 ---@param source integer 由 Skynet 提供的真实调用来源
 ---@return FlyWowHotUpgradeResult 恢复不确定时保持 Guard 关闭
 local function control(command, request, source)
@@ -158,35 +158,35 @@ local function control(command, request, source)
         return hotupgrade_result.failure("HU_UNAUTHORIZED", "控制来源不匹配")
     end
 
-    if type(request) ~= "table" or type(request.txn_id) ~= "string"
+    if type(request) ~= "table" or type(request.batch_id) ~= "string"
         or math.type(request.sequence) ~= "integer" then
-        return hotupgrade_result.failure("HU_INVALID_REQUEST", "事务身份无效")
+        return hotupgrade_result.failure("HU_INVALID_REQUEST", "批次身份无效")
     end
 
-    if module_state.last_transaction_id == request.txn_id and (command == "abort" or command == "finish") then
+    if module_state.last_batch_id == request.batch_id and (command == "abort" or command == "finish") then
         return hotupgrade_result.success()
     end
 
-    if request.sequence <= module_state.completed_sequence or (module_state.active_transaction and module_state.active_transaction.id ~= request.txn_id) then
-        return hotupgrade_result.failure("HU_STALE_TRANSACTION", "过期或冲突事务")
+    if request.sequence <= module_state.completed_sequence or (module_state.active_transaction and module_state.active_transaction.batch_id ~= request.batch_id) then
+        return hotupgrade_result.failure("HU_STALE_TRANSACTION", "过期或冲突批次命令")
     end
 
     -- prepare 建立事务安全点并等待在途业务排空；等待过程可能 yield。
     if command == "prepare" then
         if module_state.active_transaction then
-            return hotupgrade_result.failure("HU_UPGRADE_BUSY", "当前事务已在处理中")
+            return hotupgrade_result.failure("HU_UPGRADE_BUSY", "当前批次已在处理中")
         end
-        module_state.active_transaction = {id = request.txn_id, sequence = request.sequence, phase = "QUIESCING"}
-        local paused = module_state.business_guard:prepare_upgrade(request.txn_id)
+        module_state.active_transaction = {batch_id = request.batch_id, sequence = request.sequence, phase = "QUIESCING"}
+        local paused = module_state.business_guard:prepare_upgrade(request.batch_id)
         if not paused.ok then
             module_state.active_transaction = nil
             return paused
         end
 
-        local waited = module_state.business_guard:wait_idle(request.txn_id, request.timeout_ms or hotupgrade_common.DEFAULT_TIMEOUT_MS, module_state.registration.before_upgrade)
+        local waited = module_state.business_guard:wait_idle(request.batch_id, request.timeout_ms or hotupgrade_common.DEFAULT_TIMEOUT_MS, module_state.registration.before_upgrade)
         -- wait_idle 可以 yield；恢复后须重新确认事务仍由当前请求持有。
-        if not module_state.active_transaction or module_state.active_transaction.id ~= request.txn_id then
-            return hotupgrade_result.failure("HU_STALE_TRANSACTION", "等待时事务已结束")
+        if not module_state.active_transaction or module_state.active_transaction.batch_id ~= request.batch_id then
+            return hotupgrade_result.failure("HU_STALE_TRANSACTION", "等待时批次已结束")
         end
 
         if waited.ok then
@@ -197,8 +197,8 @@ local function control(command, request, source)
     end
 
     local txn = module_state.active_transaction
-    if not txn or txn.sequence ~= request.sequence or module_state.business_guard.owner ~= txn.id then
-        return hotupgrade_result.failure("HU_STALE_TRANSACTION", "未取得本事务安全点")
+    if not txn or txn.sequence ~= request.sequence or module_state.business_guard.owner ~= txn.batch_id then
+        return hotupgrade_result.failure("HU_STALE_TRANSACTION", "未取得本批次安全点")
     end
 
     if command == "abort" then
@@ -276,14 +276,14 @@ local function control(command, request, source)
             return finished
         end
 
-        local resumed = module_state.business_guard:resume(txn.id)
+        local resumed = module_state.business_guard:resume(txn.batch_id)
         if not resumed.ok then
             txn.phase = "RECOVERY_REQUIRED"
             return resumed
         end
 
         module_state.completed_sequence = txn.sequence
-        module_state.last_transaction_id = txn.id
+        module_state.last_batch_id = txn.batch_id
         module_state.active_transaction = nil
         return hotupgrade_result.success()
     end

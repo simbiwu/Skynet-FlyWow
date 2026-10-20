@@ -30,12 +30,12 @@ end
 local function start(controller_handle, path, command)
     local answer = skynet.call(controller_handle, "hotupgrade", command or "apply", {path = path})
     assert(answer.ok, tostring(answer.code) .. ":" .. tostring(answer.message))
-    return answer.txn_id
+    return answer.batch_id
 end
 
 local function wait(controller_handle, id, expected)
     for _ = 1, 1000 do
-        local status = skynet.call(controller_handle, "hotupgrade", "status", {txn_id = id})
+        local status = skynet.call(controller_handle, "hotupgrade", "status", {batch_id = id})
         assert(status.ok, status.message)
         local record = status.record
         if record.phase == "COMPLETED" or record.phase == "DRY_RUN_COMPLETED"
@@ -85,7 +85,7 @@ local function run()
         for _, command in ipairs({"validate", "dry_run", "apply"}) do
             local rejected = skynet.call(controller_handle, "hotupgrade", command, {path = path})
             assert(not rejected.ok and rejected.code == "HU_TARGET_MISSING")
-            assert(rejected.txn_id == nil)
+            assert(rejected.batch_id == nil)
             assert(original(handle).marker_token == before.marker_token)
         end
     end
@@ -140,7 +140,7 @@ local function run()
     wait(controller_handle, start(controller_handle, "extra"), "COMPLETED")
     assert(read(handle).extra_value == 2)
     assert(skynet.call(handle, "hotupgrade", "activate",
-        {txn_id = "foreign", sequence = 999}).code == "HU_UNAUTHORIZED")
+        {batch_id = "foreign", sequence = 999}).code == "HU_UNAUTHORIZED")
     print("HOTUPGRADE_SKYNET_DECLARATION_OK")
 
     controller_handle = create_controller()
@@ -195,7 +195,7 @@ local function run()
         skynet.sleep(1)
     end
     id = start(controller_handle, "combined")
-    assert(skynet.call(controller_handle, "hotupgrade", "abort", {txn_id = id}).ok)
+    assert(skynet.call(controller_handle, "hotupgrade", "abort", {batch_id = id}).ok)
     wait(controller_handle, id, "ABORTED")
     original(handle)
     print("HOTUPGRADE_SKYNET_ABORT_OK")

@@ -10,7 +10,7 @@ local MAX_PATCH_BYTES = 16 * 1024 * 1024
 
 local M = {}
 
--- Controller 实例共享此方法表；各实例的登记、事务和资源状态保存在实例表中。
+-- Controller 实例共享此方法表；各实例的登记、活动批次和资源状态保存在实例表中。
 local Controller = {}
 Controller.__index = Controller
 
@@ -52,7 +52,7 @@ local function module_name(path)
     return path:sub(1, -5):gsub("/", ".")
 end
 
--- 递归扫描选定 Patch 目录，检查语法并冻结同一事务的全部源码。
+-- 递归扫描选定 Patch 目录，检查语法并冻结同一批次的全部源码。
 local function load_files(root, patch_path, identity, budget)
     local paths, code = hotupgrade_native.list_lua(root, patch_path)
     code = native_code(code)
@@ -146,15 +146,15 @@ end
 ---@field service_patch boolean 是否在本 State 提供私有状态及函数更新入口
 
 ---@class FlyWowHotUpgradeControlRequest
----@field txn_id string Controller handle 与本进程递增序号组成；仅在该 Controller 生命周期有效
----@field sequence integer 当前控制面严格递增的事务序号，目标用来拒绝迟到消息
+---@field batch_id string Controller handle 与本进程递增序号组成；仅在该 Controller 生命周期有效
+---@field sequence integer 当前批次严格递增的序号，目标用来拒绝迟到消息
 ---@field timeout_ms integer prepare 等待 Guard 排空的毫秒上限，不代表远端操作取消
 ---@field modules? table[] stage 使用的 name/source 完整模块数组；不含业务对象
 ---@field service_source? string stage 使用的可选一次性 Service 脚本源码
 
 ---@class FlyWowHotUpgradeManagementRequest
 ---@field path? string validate/apply/dry_run 的 Patch Root 相对目录
----@field txn_id? string status/abort 指定的事务身份
+---@field batch_id? string status/abort 指定的升级批次身份
 
 ---@class FlyWowHotUpgradeControllerConfig
 ---@field patch_root string 已存在且由宿主管理的受信 Patch 根目录
@@ -162,7 +162,7 @@ end
 ---@field service_dir string root_path 下的相对 Service 目录，其下 Lua 文件作为一次性 Service 更新脚本
 ---@field timeout_ms? integer Guard 排空上限；默认值见 hotupgrade_common.DEFAULT_TIMEOUT_MS，不是 RPC 取消期限
 
---- 创建控制面；不读取持久化历史，不尝试恢复上一进程的事务。
+--- 创建控制面；不读取持久化历史，不尝试恢复上一进程的批次。
 ---@param controller_config FlyWowHotUpgradeControllerConfig
 ---@return FlyWowHotUpgradeResult 成功含 controller
 function M.new(controller_config)
@@ -200,14 +200,14 @@ function M.new(controller_config)
 
     return hotupgrade_result.success({controller = setmetatable(
     {
-        root              = root,                                -- 固定使用已解析的受信 Patch 根目录，不随事务改变。
+        root              = root,                                -- 固定使用已解析的受信 Patch 根目录，不随批次改变。
         service_dir       = controller_config.service_dir,        -- Patch 中仅此目录及其子目录按 Service 脚本处理。
         timeout_ms        = controller_config.timeout_ms or hotupgrade_common.DEFAULT_TIMEOUT_MS, -- Guard 排空期限，单位毫秒；默认值见 hotupgrade_common.DEFAULT_TIMEOUT_MS。
         target_count      = 0,                                   -- 当前 Controller 生命周期内成功登记的目标数量，用于容量检查。
         targets           = {},                                  -- 以真实 Service handle 为键，保存其模块声明和 Service 更新能力。
-        sequence          = 0,                                   -- 当前 Controller 生命周期内递增的事务序号，用于拒绝迟到控制消息。
-        active            = nil,                                 -- 唯一活动事务；有值时拒绝启动另一个 apply 或 dry_run。
-        last              = nil,                                 -- 最近结束的事务结果；更早事务不保留，查询返回缺失。
+        sequence          = 0,                                   -- 当前 Controller 生命周期内递增的批次序号，用于拒绝迟到控制消息。
+        active            = nil,                                 -- 唯一活动批次；有值时拒绝启动另一个 apply 或 dry_run。
+        last              = nil,                                 -- 最近结束的批次结果；更早批次不保留，查询返回缺失。
         recovery_required = false,                               -- 恢复结果未确认时关闭后续发布，需先由宿主处理恢复。
     }, Controller)})
 end
@@ -276,9 +276,9 @@ function Controller:load(request)
         return loaded
     end
 
-    -- 按已登记模块和 Service 类型建立目标快照，之后再检查每个文件均已匹配。
+    -- 按已登记模块和 Service 模块建立目标快照，之后再检查每个文件均已匹配。
     local targets = {}
-    local matched = {} -- 仅当前登记快照覆盖的 Patch 文件；全量匹配后才允许启动事务。
+    local matched = {} -- 仅当前登记快照覆盖的 Patch 文件；全量匹配后才允许启动批次。
     for _, record in pairs(self.targets) do
         local modules = {}
         for _, entry in ipairs(loaded.patch.modules) do
@@ -335,12 +335,12 @@ function Controller:load(request)
 end
 
 --- 直接使用 Skynet 原生 call；失败不代表远端操作取消，协调方仍须明确恢复。
-function Controller:step(txn, target, command)
+function Controller:step(batch, target, command)
     ---@type FlyWowHotUpgradeControlRequest
     local request =
     {
-        txn_id = txn.id,
-        sequence = txn.sequence,
+        batch_id = batch.batch_id,
+        sequence = batch.sequence,
         timeout_ms = self.timeout_ms,
     }
     if command == "stage" then
@@ -359,17 +359,17 @@ function Controller:step(txn, target, command)
     return answer
 end
 
-function Controller:run_target(txn, target, dry_run)
+function Controller:run_target(batch, target, dry_run)
     for _, command in ipairs({"prepare", "stage", "activate"}) do
-        txn.phase = command:upper()
-        local answer = self:step(txn, target, command)
-        if not answer.ok or txn.cancelled then
-            local restored = self:step(txn, target, "abort")
+        batch.phase = command:upper()
+        local answer = self:step(batch, target, command)
+        if not answer.ok or batch.cancelled then
+            local restored = self:step(batch, target, "abort")
             if not restored.ok then
                 return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", restored.message, command)
             end
 
-            if txn.cancelled then
+            if batch.cancelled then
                 return hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
             end
 
@@ -383,15 +383,15 @@ function Controller:run_target(txn, target, dry_run)
     end
 
     if dry_run then
-        local restored = self:step(txn, target, "abort")
+        local restored = self:step(batch, target, "abort")
         return restored.ok and restored or hotupgrade_result.failure("HU_RECOVERY_REQUIRED", restored.message, "abort")
     end
 
     -- 当前目标已同步提交；发布决定后 finish 结果不明不能伪称已恢复。
-    txn.phase = "PUBLISH_DECIDED"
-    txn.decided = true
+    batch.phase = "PUBLISH_DECIDED"
+    batch.decided = true
     target.decided = true
-    local finished = self:step(txn, target, "finish")
+    local finished = self:step(batch, target, "finish")
     if not finished.ok then
         return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", finished.message, "finish")
     end
@@ -399,42 +399,42 @@ function Controller:run_target(txn, target, dry_run)
     return hotupgrade_result.success()
 end
 
-function Controller:run(txn, dry_run)
-    for _, target in ipairs(txn.targets) do
-        txn.current_handle = target.handle
-        local ok, answer = pcall(self.run_target, self, txn, target, dry_run)
+function Controller:run(batch, dry_run)
+    for _, target in ipairs(batch.targets) do
+        batch.current_handle = target.handle
+        local ok, answer = pcall(self.run_target, self, batch, target, dry_run)
         if not ok then
-            local restored = not target.decided and self:step(txn, target, "abort")
+            local restored = not target.decided and self:step(batch, target, "abort")
             answer = hotupgrade_result.failure(restored and restored.ok and "HU_CONTROL_FAILED" or "HU_RECOVERY_REQUIRED",
                 tostring(answer))
         end
 
-        txn.results[#txn.results + 1] = {handle = target.handle, hotupgrade_result = answer}
+        batch.results[#batch.results + 1] = {handle = target.handle, hotupgrade_result = answer}
         if not answer.ok then
-            txn.failed = txn.failed + 1
-            txn.error = answer
+            batch.failed = batch.failed + 1
+            batch.error = answer
             if answer.code == "HU_RECOVERY_REQUIRED" then
-                txn.phase = "RECOVERY_REQUIRED"
+                batch.phase = "RECOVERY_REQUIRED"
                 self.recovery_required = true
             else
-                txn.phase = txn.success > 0 and "PARTIAL" or "ABORTED"
+                batch.phase = batch.success > 0 and "PARTIAL" or "ABORTED"
             end
             break
         end
 
-        txn.success = txn.success + 1
+        batch.success = batch.success + 1
     end
 
-    if not txn.error then
-        txn.phase = dry_run and "DRY_RUN_COMPLETED" or "COMPLETED"
+    if not batch.error then
+        batch.phase = dry_run and "DRY_RUN_COMPLETED" or "COMPLETED"
     end
     -- 终态只保留有界结果，不继续持有冻结源码或目标运行时快照。
-    txn.targets = nil
-    self.last = txn
+    batch.targets = nil
+    self.last = batch
     self.active = nil
 end
 
---- 异步推进，立即返回 txn_id；一次仅执行一个发布，status 查询进程内状态。
+--- 异步推进，立即返回 batch_id；一次仅执行一个发布，status 查询进程内状态。
 function Controller:apply(request, dry_run)
     if self.active then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "已有活动发布")
@@ -446,9 +446,9 @@ function Controller:apply(request, dry_run)
     end
 
     self.sequence = self.sequence + 1
-    local txn =
+    local batch =
     {
-        id = tostring(skynet.self()) .. ":" .. self.sequence,
+        batch_id = tostring(skynet.self()) .. ":" .. self.sequence,
         sequence = self.sequence,
         phase = "PREPARING",
         targets = loaded.targets,
@@ -457,11 +457,11 @@ function Controller:apply(request, dry_run)
         success = 0,
         failed = 0,
     }
-    self.active = txn
+    self.active = batch
     skynet.fork(function()
-        self:run(txn, dry_run)
+        self:run(batch, dry_run)
     end)
-    return hotupgrade_result.success({txn_id = txn.id, target_count = txn.target_count})
+    return hotupgrade_result.success({batch_id = batch.batch_id, target_count = batch.target_count})
 end
 
 --- 管理命令不做远程认证；宿主掌握 Controller handle，登记来源由消息头确定。
@@ -509,26 +509,26 @@ function Controller:control(command, request, source)
     end
 
     if command == "status" then
-        local txn = self.active and self.active.id == request.txn_id and self.active or self.last
-        if not txn or txn.id ~= request.txn_id then
-            return hotupgrade_result.failure("HU_TRANSACTION_MISSING", "仅保留活动及最近终态事务")
+        local batch = self.active and self.active.batch_id == request.batch_id and self.active or self.last
+        if not batch or batch.batch_id ~= request.batch_id then
+            return hotupgrade_result.failure("HU_BATCH_MISSING", "仅保留活动及最近终态批次")
         end
 
         return hotupgrade_result.success({record =
         {
-            txn_id = txn.id, phase = txn.phase, success = txn.success, failed = txn.failed,
-            target_count = txn.target_count, current_handle = txn.current_handle,
-            results = txn.results, error = txn.error,
+            batch_id = batch.batch_id, phase = batch.phase, success = batch.success, failed = batch.failed,
+            target_count = batch.target_count, current_handle = batch.current_handle,
+            results = batch.results, error = batch.error,
         }, recovery_required = self.recovery_required})
     end
 
     if command == "abort" then
-        local txn = self.active
-        if not txn or txn.id ~= request.txn_id or txn.decided then
-            return hotupgrade_result.failure("HU_ABORT_NOT_SAFE", "事务不存在或已有目标越过发布决定")
+        local batch = self.active
+        if not batch or batch.batch_id ~= request.batch_id or batch.decided then
+            return hotupgrade_result.failure("HU_ABORT_NOT_SAFE", "批次不存在或已有目标越过发布决定")
         end
 
-        txn.cancelled = true
+        batch.cancelled = true
         return hotupgrade_result.success()
     end
 

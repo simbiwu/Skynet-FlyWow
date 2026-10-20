@@ -121,7 +121,7 @@ local function run(command)
     assert(answer.ok)
     assert(not c:control("apply", {path = "module"}, 1).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    return c:control("status", {txn_id = answer.txn_id}, 1)
+    return c:control("status", {batch_id = answer.batch_id}, 1)
 end
 local status = run()
 assert(status.record.phase == "COMPLETED" and status.record.success == 2 and module_state.last_control_command_by_handle[20] == "finish")
@@ -133,16 +133,16 @@ module_state.injected_control_failure = nil
 status = run("dry_run")
 assert(status.record.phase == "DRY_RUN_COMPLETED" and module_state.last_control_command_by_handle[10] == "abort")
 local started = c:control("apply", {path = "module"}, 1)
-assert(c:control("abort", {txn_id = started.txn_id}, 1).ok)
+assert(c:control("abort", {batch_id = started.batch_id}, 1).ok)
 module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-assert(c:control("status", {txn_id = started.txn_id}, 1).record.phase == "ABORTED")
+assert(c:control("status", {batch_id = started.batch_id}, 1).record.phase == "ABORTED")
 module_state.injected_control_failure = {handle = 10, command = "finish"}
 status = run()
 assert(status.recovery_required and status.record.phase == "RECOVERY_REQUIRED")
 assert(not c:control("apply", {path = "module"}, 1).ok)
 assert(not c:control("history", {}, 1).ok)
 -- 持有容量和只保留最近终态的合同，不能靠清空查询记录绕过恢复门禁。
-assert(c:control("status", {txn_id = "99:1"}, 1).code == "HU_TRANSACTION_MISSING")
+assert(c:control("status", {batch_id = "99:1"}, 1).code == "HU_BATCH_MISSING")
 local bounded = new_controller()
 for handle = 1, hotupgrade_common.MAX_TARGETS do
     assert(bounded:control("register", {service_module = "empty", modules = {}, service_patch = false}, handle).ok)

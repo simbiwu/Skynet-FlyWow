@@ -173,16 +173,16 @@ migrate 接收独立旧状态快照，返回完整候选状态。Activate 先原
 
 自定义回调负责业务对象的隔离、兼容验证和恢复；不能把浅拷贝当作隔离保证。所有构建、迁移、检查、提交和恢复回调均为受信同步代码，不得 yield、执行外部 I/O 或产生不可撤销副作用。框架捕获错误，但不提供安全沙箱，不承诺抢占死循环/阻塞 Native、撤销违反合同的副作用或从 OOM/进程退出恢复。
 
-## 管理命令与事务结果
+## 管理命令与批次结果
 
 ```lua
 local started = skynet.call(controller_handle, "hotupgrade", "apply", {path = "current"})
 assert(started.ok, started.message)
-local status = skynet.call(controller_handle, "hotupgrade", "status", {txn_id = started.txn_id})
+local status = skynet.call(controller_handle, "hotupgrade", "status", {batch_id = started.batch_id})
 assert(status.ok, status.message)
 ```
 
-validate 同步冻结源码、检查路径/语法和匹配的登记目标，不执行目标脚本。validate、dry_run 和 apply 使用同一匹配规则：每个 Patch 文件必须至少匹配一个已登记目标；未匹配时返回 HU_TARGET_MISSING，并在 message 中给出文件路径和原因，所有目标事务均不启动。Service 类型匹配但未提供内部更新入口时返回 HU_SERVICE_PATCH_UNSUPPORTED，同样在事务启动前拒绝整包。apply 和 dry_run 返回 txn_id 后异步推进，每次只运行一个发布，不排队。status 查询当前活动事务或最近一个终态；更早事务返回 HU_TRANSACTION_MISSING。状态不持久化，Controller 重启不恢复登记或事务。
+validate 同步冻结源码、检查路径/语法和匹配的登记目标，不执行目标脚本。validate、dry_run 和 apply 使用同一匹配规则：每个 Patch 文件必须至少匹配一个已登记目标；未匹配时返回 HU_TARGET_MISSING，并在 message 中给出文件路径和原因，本批次不会启动任何目标更新。Service 模块匹配但未提供内部更新入口时返回 HU_SERVICE_PATCH_UNSUPPORTED，同样在批次启动前拒绝整包。apply 和 dry_run 返回 batch_id 后异步推进，每次只运行一个发布，不排队。status 查询当前活动批次或最近一个终态；更早批次返回 HU_BATCH_MISSING。状态不持久化，Controller 重启不恢复登记或批次。
 
 各目标按 handle 顺序逐个执行：
 
@@ -191,7 +191,7 @@ validate 同步冻结源码、检查路径/语法和匹配的登记目标，不�
 3. activate 在目标一次同步处理内提交全部模块和 Service 更新，执行可选 after_upgrade；false/异常触发立即组合恢复。
 4. apply 达到 PUBLISH_DECIDED 后执行 finish，释放旧快照并开放入口；dry_run 则实际提交后 abort，验证恢复并回到旧代码/状态。
 
-发布决定前可请求 abort，Controller 在当前步骤返回后恢复目标；已完成目标不会自动撤销，跨 Service 不承诺全局原子性。结果 phase 为 COMPLETED、DRY_RUN_COMPLETED、ABORTED、PARTIAL 或 RECOVERY_REQUIRED；success/failed 表示处理成功和失败目标数，results 给出实际尝试目标的逐项结果。未尝试的目标不计入成功/失败。dry_run 的 success 表示更新及恢复验证成功。
+发布决定前可请求 abort，Controller 在当前步骤返回后恢复目标；已完成目标不会自动撤销，跨 Service 批次不承诺全局原子性。结果 phase 为 COMPLETED、DRY_RUN_COMPLETED、ABORTED、PARTIAL 或 RECOVERY_REQUIRED；success/failed 表示处理成功和失败目标数，results 给出实际尝试目标的逐项结果。未尝试的目标不计入成功/失败。dry_run 的 success 表示更新及恢复验证成功。
 
 任一恢复或发布后结果无法确认时，目标保持 Guard 暂停，Controller 设置 recovery_required 并拒绝新发布。RPC 失败/超时不等于远端取消；不要重新假定旧代码已恢复。宿主必须核对目标实际状态和业务外部数据，完成人工恢复或受控重启；框架不提供自动清除门禁命令。
 

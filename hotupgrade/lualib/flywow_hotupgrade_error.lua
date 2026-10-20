@@ -5,7 +5,7 @@ local M = {}
 ---@field ok boolean 是否成功
 ---@field code? string 稳定 HU_ 错误码；HU_RECOVERY_REQUIRED 表示不可确认恢复
 ---@field message? string 诊断信息
----@field txn_id? string 当前 Controller 生命周期内的事务身份
+---@field batch_id? string 当前 Controller 生命周期内的升级批次身份
 
 ---@param code string 稳定错误码
 ---@param message string 诊断信息
