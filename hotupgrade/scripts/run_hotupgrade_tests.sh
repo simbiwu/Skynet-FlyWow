@@ -23,6 +23,8 @@ for group in lifecycle preload host_paths custom_paths patch_match identity_guar
         2>&1 | tee -a "$LOG"
 done
 test "$(grep -c HOTUPGRADE_SKYNET_GROUP_OK "$LOG")" -eq 20
+# 每个真实 Skynet 进程都应执行 Native 文件扫描与路径测试。
+test "$(grep -c HOTUPGRADE_FILES_OK "$LOG")" -eq 20
 if grep -q HOTUPGRADE_SKYNET_FAILED "$LOG"; then
     exit 1
 fi

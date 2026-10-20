@@ -1,5 +1,7 @@
 # WordFilter 接入
 
+最小匹配与替换流程见 [WordFilter Sample](../../word_filter/sample/README.md)。
+
 本模块按宿主词库匹配 UTF-8 文本，可用于聊天、角色名或公会名。
 复用 FCLib 的 FCKeywordFilter.cpp/.h 中 AC 自动机、UTF-8 解码、归一化、
 compact 及原文 byte 映射算法；移除 FCLib 类型/导出宏及文件配置解析依赖。

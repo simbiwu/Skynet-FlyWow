@@ -3,6 +3,7 @@
 ## 文档入口
 
 - 第一次接入：接入指南.md
+- 运行主流程示例：[Gateway Sample](../../gateway/sample/README.md)
 - 配置复制起点：flywow_gateway_config.example.lua
 - 握手合同：握手合同.md
 

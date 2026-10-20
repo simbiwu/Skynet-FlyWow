@@ -84,9 +84,10 @@ local function lifecycle_status(controller_handle)
 end
 
 local function lifecycle_blocked(controller_handle)
-    for _, command in ipairs({"unknown_command", "dry_run", "apply"}) do
+    for _, command in ipairs({"unknown_command", "validate", "dry_run", "apply"}) do
         local rejected = skynet.call(controller_handle, "hotupgrade", command, {path = "module"})
-        local expected = command == "unknown_command" and "HU_UNKNOWN_COMMAND" or "HU_BATCH_MISSING"
+        local expected = (command == "unknown_command" or command == "validate")
+            and "HU_UNKNOWN_COMMAND" or "HU_BATCH_MISSING"
         assert(rejected.code == expected and rejected.batch_id == nil)
     end
     assert(lifecycle_status(controller_handle).active_batch_id == nil)

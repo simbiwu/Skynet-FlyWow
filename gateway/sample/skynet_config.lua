@@ -1,0 +1,18 @@
+-- 从 Server 根目录启动，路径与宿主实际配置一致。
+thread = 4
+harbor = 0
+bootstrap = "snlua bootstrap"
+start = "flywow_gateway_sample"
+lualoader = "./third_party/skynet/lualib/loader.lua"
+luaservice = "./third_party/skynet-flywow/gateway/service/?.lua;"
+    .. "./third_party/skynet-flywow/gateway/sample/?.lua;"
+    .. "./third_party/skynet/service/?.lua"
+lua_path = "./third_party/skynet/lualib/?.lua;"
+    .. "./third_party/skynet/lualib/?/init.lua;"
+    .. "./config/?.lua;"
+    .. "./lualib/?.lua;"
+    .. "./third_party/skynet-flywow/gateway/lualib/?.lua"
+lua_cpath = "./third_party/skynet/luaclib/?.so;"
+    .. "./third_party/lua-protobuf-runtime/?.so;"
+    .. "./third_party/skynet-flywow/build/native/?.so"
+cpath = "./third_party/skynet/cservice/?.so"

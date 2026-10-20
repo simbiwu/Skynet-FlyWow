@@ -1,5 +1,7 @@
 # Logger 接入与运维
 
+本模块的最小写日志与刷新流程见 [Logger Sample](../../logger/sample/README.md)。
+
 ## 职责和兼容
 
 Logger 是 C++17 Native Skynet Service，固定验证 Skynet v1.8.0、bundled Lua 5.4.7、Linux/WSL2。它独占文件、日期、缓冲与登记表，不依赖 Gateway、Navigation 或业务 DTO，不修改 Skynet 源码，不自动删除日志，不替换 print，不上传日志。Lua preload、SDK 和 .so 按同一 FlyWow 提交发布。

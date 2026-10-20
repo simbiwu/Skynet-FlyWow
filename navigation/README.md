@@ -1,5 +1,7 @@
 # FlyWow Navigation
 
+地面加载、寻路与移动主流程见 [Navigation Sample](sample/README.md)。
+
 本模块把地图生产工具和 Server 导航运行时放在同一个功能目录，支持 Unity Authoring → BMAP 候选包 → 验证发布 → Native 加载 → Lua 查询。Gateway 可单独安装；Navigation 不依赖 Gateway、Cluster、Protobuf 或具体战斗规则。
 
 ## 目录与边界

@@ -105,11 +105,12 @@ end
 local metadata = {service_module = "player", modules = {"lualib.test_worker_logic"}, service_patch = false}
 local lifecycle = new_controller()
 local function blocked(instance)
-    for _, command in ipairs({"unknown_command", "dry_run", "apply"}) do
+    for _, command in ipairs({"unknown_command", "validate", "dry_run", "apply"}) do
         local calls = #module_state.pending_control_coroutines
         module_state.last_control_command_by_handle = {}
         local answer = instance:control(command, {path = "module"}, 1)
-        local expected = command == "unknown_command" and "HU_UNKNOWN_COMMAND" or "HU_BATCH_MISSING"
+        local expected = (command == "unknown_command" or command == "validate")
+            and "HU_UNKNOWN_COMMAND" or "HU_BATCH_MISSING"
         assert(answer.code == expected and answer.batch_id == nil)
         assert(#module_state.pending_control_coroutines == calls)
         assert(next(module_state.last_control_command_by_handle) == nil and not instance.active)
