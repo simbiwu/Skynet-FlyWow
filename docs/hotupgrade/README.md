@@ -287,9 +287,9 @@ assert(resolved.ok, tostring(resolved.code) .. ": " .. tostring(resolved.message
 
 ## 文件边界与验证
 
-Native 提供 resolve(path[, relative_dir]) 和 list_lua(patch_root, path)；相对目录检查与递归扫描共用路径安全校验，拒绝越界路径、链接及特殊文件。扫描限制整个选定 Patch 最多 1024 个 Lua 文件、单文件 2 MiB，整包读取累计最多 16 MiB。宿主在扫描/冻结期间保持 Patch 目录不变；扫描和读取不是抵抗并发目录替换的原子安全边界。冻结后目标只使用本次源码，不重新读取磁盘。
+Native 提供 resolve(path[, relative_dir]) 和 list_lua(patch_root, path)；相对目录检查与递归扫描共用路径安全校验，拒绝越界路径、链接及特殊文件。Controller 不设目标 Service、模块声明、Patch Lua 文件数或源码字节数硬上限；扫描与冻结规模由实际 Patch 和运行时可用资源决定。宿主在扫描/冻结期间保持 Patch 目录不变；扫描和读取不是抵抗并发目录替换的原子安全边界。冻结后目标只使用本次源码，不重新读取磁盘。
 
-Controller 最多登记 1024 个目标，每目标最多声明 1024 个模块；达到上限返回 HU_TARGET_LIMIT/HU_MODULE_LIMIT。待创建记录也占用目标容量；每目标同时最多保留 1024 项模块加载许可，同一模块同时只保留一项。登记和许可记录由当前 Controller 持有，不建立后台发现、自动超时清理或持久化恢复；宿主负责保持实际 Service 生命周期与控制面一致。Service 或调用方在关键区间异常退出、许可取消 RPC 无法送达时，屏障会保留；须核对实际状态并受控重启，不得假定操作已完成。
+待创建记录也占用 Controller 内存。每个目标的同一模块仍同时只保留一项首次加载许可。登记和许可记录由当前 Controller 持有，不建立后台发现、自动超时清理或持久化恢复；宿主负责保持实际 Service 生命周期与控制面一致。Service 或调用方在关键区间异常退出、许可取消 RPC 无法送达时，屏障会保留；须核对实际状态并受控重启，不得假定操作已完成。
 
 从 FlyWow 根目录执行：
 

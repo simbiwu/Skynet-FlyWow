@@ -5,10 +5,6 @@ local hotupgrade_native = require "flywow_hotupgrade_native"
 local hotupgrade_result = require "flywow_hotupgrade_error"
 local hotupgrade_common = require "flywow_hotupgrade_common"
 
--- 与 Native 扫描器上限保持一致：单文件 2 MiB、一次 Patch 累计 16 MiB。
-local MAX_FILE_BYTES = 2 * 1024 * 1024
-local MAX_PATCH_BYTES = 16 * 1024 * 1024
-
 local M = {}
 
 -- Controller 实例共享此方法表；各实例的登记、活动批次和资源状态保存在实例表中。
@@ -24,21 +20,17 @@ local function native_code(value)
     return value or "HU_NATIVE_ERROR"
 end
 
--- 有界读取单个已规范化文件；关闭失败也视为读取失败，避免冻结不完整内容。
+-- 读取单个已规范化文件；关闭失败也视为读取失败，避免冻结不完整内容。
 local function read(path)
     local file, message = io.open(path, "rb")
     if not file then
         return hotupgrade_result.failure("HU_FILE_NOT_FOUND", message)
     end
 
-    local bytes = file:read(MAX_FILE_BYTES + 1)
+    local bytes = file:read("*a")
     local closed = file:close()
     if not bytes or not closed then
         return hotupgrade_result.failure("HU_FILE_READ_FAILED", path)
-    end
-
-    if #bytes > MAX_FILE_BYTES then
-        return hotupgrade_result.failure("HU_PATCH_LIMIT", path)
     end
 
     return hotupgrade_result.success({bytes = bytes})
@@ -54,7 +46,7 @@ local function module_name(path)
 end
 
 -- 递归扫描选定 Patch 目录，检查语法并冻结同一批次的全部源码。
-local function load_files(root, patch_path, identity, budget)
+local function load_files(root, patch_path, identity)
     local paths, code = hotupgrade_native.list_lua(root, patch_path)
     code = native_code(code)
     if not paths and code == "HU_PATCH_EMPTY" then
@@ -79,11 +71,6 @@ local function load_files(root, patch_path, identity, budget)
         if not loaded.ok then
             return loaded
         end
-        budget.bytes = budget.bytes + #loaded.bytes
-        if budget.bytes > MAX_PATCH_BYTES then
-            return hotupgrade_result.failure("HU_PATCH_LIMIT", "Patch 总字节数超限")
-        end
-
         local chunk, syntax_error = load(loaded.bytes, "@" .. relative, "t", {})
         if not chunk then
             return hotupgrade_result.failure("HU_MODULE_SYNTAX", syntax_error)
@@ -98,8 +85,7 @@ end
 -- 汇总模块与 Service 文件；Patch 身份仅由路径和文件名组成。
 local function build_patch(root, patch_path, service_dir)
     local identity = {}        -- 当前 Patch 的路径身份字段，不是内容 hash。
-    local budget = {bytes = 0} -- 整包冻结源码累计字节数。
-    local loaded = load_files(root, patch_path, identity, budget)
+    local loaded = load_files(root, patch_path, identity)
     if not loaded.ok then
         return loaded
     end
@@ -216,7 +202,7 @@ function M.new(controller_config)
         root                 = root,                             -- 固定使用已解析的受信 Patch 根目录，不随批次改变。
         service_dir          = controller_config.service_dir,    -- Patch 中仅此目录及其子目录按 Service 脚本处理。
         timeout_ms           = timeout_ms,                       -- Guard 排空期限，单位毫秒；默认值见 hotupgrade_common.DEFAULT_TIMEOUT_MS。
-        target_count         = 0,                                -- 当前 Controller 生命周期内成功登记的目标数量，用于容量检查。
+        target_count         = 0,                                -- 当前 Controller 生命周期内成功登记的目标数量，用于状态查询。
         targets              = {},                               -- 以真实 Service handle 为键，保存其模块声明和 Service 更新能力。
         pending_creations    = {},                               -- 创建协程拥有的记录；原生启动返回且登记完成后才移除。
         creation_handles     = {},                               -- 真实 handle 到待创建记录的索引，不用名称或延迟关联。
@@ -356,10 +342,6 @@ function Controller:newservice(request, source, unique_name)
     if not admitted.ok then
         return admitted
     end
-    if self.target_count + self.creation_count >= hotupgrade_common.MAX_TARGETS then
-        return hotupgrade_result.failure("HU_TARGET_LIMIT", "登记目标及待创建 Service 已达上限")
-    end
-
     local creation =
     {
         owner       = source,      -- 原创建者拥有返回后未登记 Service 的取消权。
@@ -444,18 +426,10 @@ function Controller:begin_module_load(request, source)
     if target.loading_modules[request.name] then
         return hotupgrade_result.failure("HU_MODULE_LOADING", "该模块已有未完成的加载许可")
     end
-    if target.module_load_count >= hotupgrade_common.MAX_MODULES then
-        return hotupgrade_result.failure("HU_MODULE_LIMIT", "目标待模块加载许可已达上限")
-    end
-    if not target.modules[request.name] and target.module_count >= hotupgrade_common.MAX_MODULES then
-        return hotupgrade_result.failure("HU_MODULE_LIMIT", "目标模块已达上限")
-    end
-
     self.module_sequence = self.module_sequence + 1
     local permit_id = tostring(skynet.self()) .. ":module:" .. self.module_sequence
     self.module_loads[permit_id] = {source = source, name = request.name}
     target.loading_modules[request.name] = permit_id
-    target.module_load_count = target.module_load_count + 1
     self.module_load_count = self.module_load_count + 1
     return hotupgrade_result.success({permit_id = permit_id})
 end
@@ -482,16 +456,11 @@ function Controller:complete_module_load(request, source, cancel)
         return hotupgrade_result.failure("HU_SERVICE_NOT_REGISTERED", "模块声明者未登记")
     end
     if not cancel and not target.modules[request.name] then
-        if target.module_count >= hotupgrade_common.MAX_MODULES then
-            return hotupgrade_result.failure("HU_MODULE_LIMIT", "目标模块已达上限")
-        end
         target.modules[request.name] = true
-        target.module_count = target.module_count + 1
     end
 
     self.module_loads[request.permit_id] = nil
     target.loading_modules[request.name] = nil
-    target.module_load_count = target.module_load_count - 1
     self.module_load_count = self.module_load_count - 1
     self:advance_deployment()
     return hotupgrade_result.success()
@@ -510,10 +479,6 @@ function Controller:register(request, source)
 
     if self.targets[source] then
         return hotupgrade_result.failure("HU_DUPLICATE_SERVICE", "Service 已登记")
-    end
-
-    if #request.modules > hotupgrade_common.MAX_MODULES then
-        return hotupgrade_result.failure("HU_MODULE_LIMIT", "目标模块已达 " .. hotupgrade_common.MAX_MODULES .. " 上限")
     end
 
     local modules = {}
@@ -558,19 +523,13 @@ function Controller:register(request, source)
     if self.phase == "DEPLOYING" or self.phase == "APPLYING" or self.phase == "FAILED_LOCKED" then
         return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "当前阶段不能登记新 Service")
     end
-    if self.target_count >= hotupgrade_common.MAX_TARGETS then
-        return hotupgrade_result.failure("HU_TARGET_LIMIT", "登记目标已达上限")
-    end
-
     self.target_count = self.target_count + 1
     self.targets[source] =
     {
         handle            = source,                 -- Skynet 提供的真实来源，也是后续控制目标。
         service_module    = request.service_module, -- 匹配配置 service_dir 下的相对路径。
-        module_count      = #request.modules,       -- 已登记声明数，用于拒绝无界增长。
         modules           = modules,                -- 该 State 明确声明的可更新模块集合。
         loading_modules   = {},                     -- 同一 Service/模块同时只允许一项首次加载操作。
-        module_load_count = 0,                      -- 此目标在途许可数，受 MAX_MODULES 限制。
         service_patch     = request.service_patch,  -- 是否提供本地 Service 状态/函数入口。
     }
     self:finish_creation(creation)

@@ -130,8 +130,7 @@ function Engine:stage(entries)
 
     local module_stage = {entries = {}, order = {}, old = {}, committed = false}
     local ok, message = pcall(function()
-        assert(type(entries) == "table" and #entries <= hotupgrade_common.MAX_MODULES,
-            "模块列表必须是最多 " .. hotupgrade_common.MAX_MODULES .. " 项的数组")
+        assert(type(entries) == "table", "模块列表必须是数组")
         local entry_count = 0
         for index in pairs(entries) do
             entry_count = entry_count + 1

@@ -492,18 +492,17 @@ assert(dry.phase == "FAILED_LOCKED" and dry.last.error.recovery_error.code == "H
 module_state.injected_control_failure = nil
 print("HOTUPGRADE_CONTROLLER_LOCAL_UNIQUE_OK")
 
-local bounded = new_controller()
-for handle = 1, hotupgrade_common.MAX_TARGETS do
-    assert(managed_register(bounded, {service_module = "empty", modules = {}, service_patch = false}, handle).ok)
+local unbounded_targets = new_controller()
+for handle = 1, 1025 do
+    assert(managed_register(unbounded_targets,
+        {service_module = "empty", modules = {}, service_patch = false}, handle).ok)
 end
-assert(managed_register(bounded, {service_module = "empty", modules = {}, service_patch = false}, hotupgrade_common.MAX_TARGETS + 1).code
-    == "HU_TARGET_LIMIT")
 local names = {}
-for index = 1, hotupgrade_common.MAX_MODULES do
+for index = 1, 1025 do
     names[index] = "logic_" .. index
 end
-local limited = new_controller()
-assert(managed_register(limited, {service_module = "empty", modules = names, service_patch = false}, 1).ok)
-assert(register_module(limited, names[1], 1).ok)
-assert(register_module(limited, "overflow", 1).code == "HU_MODULE_LIMIT")
+local unlimited_modules = new_controller()
+assert(managed_register(unlimited_modules,
+    {service_module = "empty", modules = names, service_patch = false}, 1).ok)
+assert(register_module(unlimited_modules, "beyond_previous_limit", 1).ok)
 print("HOTUPGRADE_CONTROLLER_OK")

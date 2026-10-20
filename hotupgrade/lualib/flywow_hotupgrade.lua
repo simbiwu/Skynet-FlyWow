@@ -18,7 +18,6 @@ local module_state =
     active_transaction    = nil,                              -- 当前事务的撤销数据保留至 finish/abort 确认完成。
     completed_sequence    = 0,                                -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
     last_batch_id         = nil,                              -- 最近完成的批次，用于 finish/abort 幂等响应。
-    declared_module_count = 0,                                -- 本 State 已成功声明模块数，受 hotupgrade_common.MAX_MODULES 限制。
     declared_modules      = {},                               -- hotupgrade.require 已登记的模块集合。
     module_loads          = {},                               -- 同一规范模块的首次声明串行完成，等待者不能观察半完成的本地状态。
     module_sources        = setmetatable({}, {__mode = "k"}), -- 仅保存本入口确认的模块表与文件路径；弱键不延长模块生命周期。
@@ -485,7 +484,7 @@ function M.require(name)
     local value                     -- 本次加载或复用的模块根表。
     local snapshot_taken = false    -- 许可失败时尚未触碰本地缓存，无需回退。
     local added_source = false      -- 只撤销本次新建的来源映射。
-    local added_declaration = false -- 只回退本次新增的声明及计数。
+    local added_declaration = false -- 只回退本次新增的本地模块声明。
     local ok, message = pcall(function()
         if module_state.registration and not module_state.declared_modules[canonical_name] then
             local answer = skynet.call(controller_handle, "hotupgrade",
@@ -510,11 +509,6 @@ function M.require(name)
         assert(previous_alias == nil or (rawequal(previous_alias, cached_value)
             and module_state.module_sources[previous_alias] == resolved_path),
             "HU_DUPLICATE_MODULE: 模块路径登记名已被其他模块占用: " .. canonical_name)
-        if not module_state.declared_modules[canonical_name] then
-            assert(module_state.declared_module_count < hotupgrade_common.MAX_MODULES,
-                "HU_MODULE_LIMIT: 模块声明已达 " .. hotupgrade_common.MAX_MODULES .. " 上限")
-        end
-
         if value == nil then
             local loaded_value, loader_path = require(name)
             value = loaded_value
@@ -544,7 +538,6 @@ function M.require(name)
         package.loaded[canonical_name] = value
         if not module_state.declared_modules[canonical_name] then
             module_state.declared_modules[canonical_name] = true
-            module_state.declared_module_count = module_state.declared_module_count + 1
             added_declaration = true
         end
         if permit_id then
@@ -564,7 +557,6 @@ function M.require(name)
         end
         if added_declaration then
             module_state.declared_modules[canonical_name] = nil
-            module_state.declared_module_count = module_state.declared_module_count - 1
         end
         if permit_id then
             -- 登记响应丢失时许可可能已消费；重复取消不会改变其他操作的许可。

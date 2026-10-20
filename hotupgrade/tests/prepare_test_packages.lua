@@ -100,19 +100,17 @@ for name, directories in pairs(cases) do
         end
     end
 end
--- 验证扫描器对整棵 Patch 树共用数量/字节预算，数值与 Native 的现有限制对应。
-local MAX_LUA_FILES = 1024
-local MAX_FILE_BYTES = 2 * 1024 * 1024
-assert(os.execute("mkdir -p " .. root .. "count_limit/config " .. root .. "count_limit/lualib "
-    .. root .. "total_limit/config " .. root .. "total_limit/lualib " .. root .. "file_limit"))
-for index = 1, MAX_LUA_FILES + 1 do
+-- 生成超过旧限制的 Patch 夹具，验证扫描与源码冻结不再因数量或字节数拒绝。
+assert(os.execute("mkdir -p " .. root .. "count_unlimited/config " .. root .. "count_unlimited/lualib "
+    .. root .. "total_unlimited/config " .. root .. "total_unlimited/lualib " .. root .. "file_unlimited"))
+for index = 1, 1025 do
     local directory = index % 2 == 0 and "config" or "lualib"
-    write(root .. "count_limit/" .. directory .. "/" .. index .. ".lua", "")
+    write(root .. "count_unlimited/" .. directory .. "/" .. index .. ".lua", "")
 end
-local full_file = string.rep(" ", MAX_FILE_BYTES)
+local previous_file_limit = string.rep(" ", 2 * 1024 * 1024)
 for index = 1, 9 do
     local directory = index % 2 == 0 and "config" or "lualib"
-    write(root .. "total_limit/" .. directory .. "/" .. index .. ".lua", full_file)
+    write(root .. "total_unlimited/" .. directory .. "/" .. index .. ".lua", previous_file_limit)
 end
-write(root .. "file_limit/large.lua", full_file .. " ")
+write(root .. "file_unlimited/large.lua", previous_file_limit .. " ")
 print("HOTUPGRADE_PACKAGES_OK")

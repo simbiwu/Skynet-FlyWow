@@ -1,4 +1,4 @@
---- 在真实 Skynet 内验证递归扫描、路径安全及整包资源边界。
+--- 在真实 Skynet 内验证递归扫描、路径安全及无数量/字节硬上限。
 local hotupgrade_native = require "flywow_hotupgrade_native"
 local controller = require "flywow_hotupgrade_controller"
 local config = require "hotupgrade_test_options"
@@ -32,9 +32,13 @@ end
 for _, path in ipairs({"duplicate_module", "duplicate_service"}) do
     assert(c:load({path = path}).code == "HU_INVALID_PATCH")
 end
-for _, path in ipairs({"count_limit", "file_limit", "total_limit"}) do
-    local listed, failure = hotupgrade_native.list_lua(root, path)
-    assert(not listed and failure.code == "HU_PATCH_LIMIT")
+local many_files = assert(hotupgrade_native.list_lua(root, "count_unlimited"))
+assert(#many_files == 1025)
+assert(#assert(hotupgrade_native.list_lua(root, "file_unlimited")) == 1)
+assert(#assert(hotupgrade_native.list_lua(root, "total_unlimited")) == 9)
+-- Lua Controller 也必须读取完整源码；不匹配目标时应到目标匹配阶段才拒绝。
+for _, path in ipairs({"count_unlimited", "file_unlimited", "total_unlimited"}) do
+    assert(c:load({path = path}).code == "HU_TARGET_MISSING")
 end
 local other_root = config.root_path .. "/another"
 assert(os.execute("mkdir -p " .. other_root .. "/service"))

@@ -23,11 +23,6 @@ namespace
 {
 using flywow_lua_binding::LuaBinding;
 using flywow_lua_binding::LuaTable;
-// 单次补丁扫描的硬上限：文件数、总 Lua 字节数和单文件字节数分别独立校验。
-constexpr std::size_t kMaxLuaFiles   = 1024;
-constexpr std::size_t kMaxTotalBytes = 16U * 1024U * 1024U;
-constexpr std::size_t kMaxFileBytes  = 2U * 1024U * 1024U;
-
 // C++ 分配或容器操作异常不得越过 Lua C 回调边界；错误结果沿 Native 的 nil/error 合同返回。
 int pushNativeException(lua_State *state)
 {
@@ -45,7 +40,6 @@ int pushNativeException(lua_State *state)
 struct FileList
 {
     std::vector<std::string> paths; ///< Patch 目录下的相对 Lua 路径，供 Lua 推导模块名并读取源码。
-    std::size_t total_bytes = 0;    ///< 已接受文件累计大小；与单文件上限共同限制扫描占用。
 };
 
 // realpath 要求目标已存在；输出规范化绝对路径，供后续根目录包含关系校验。
@@ -65,8 +59,8 @@ bool resolvePath(const std::string &path, std::string &output)
     return true;
 }
 
-// 递归枚举受信任根目录内的普通 Lua 文件；拒绝符号链接/特殊文件，并累计资源上限。
-// 返回 0 成功，-1 路径/文件结构无效，-2 超出文件数或字节预算。
+// 递归枚举受信任根目录内的普通 Lua 文件；拒绝符号链接和特殊文件。
+// 返回 0 成功，-1 路径或文件结构无效。
 int scanDirectory(const std::string &root, const std::string &directory,
                   const std::string &relative, FileList &files)
 {
@@ -112,7 +106,6 @@ int scanDirectory(const std::string &root, const std::string &directory,
         }
         if (S_ISDIR(attributes.st_mode))
         {
-            // 同一个 FileList 贯穿递归，因此数量和累计字节上限覆盖整个 Patch 目录。
             status = scanDirectory(root, absolute, child_relative, files);
             if (status != 0)
             {
@@ -130,14 +123,7 @@ int scanDirectory(const std::string &root, const std::string &directory,
         {
             continue;
         }
-        // 非 Lua 普通文件不计入源码数量和字节预算；Lua 文件在保存路径前先检查上限。
-        const std::size_t file_bytes = static_cast<std::size_t>(attributes.st_size);
-        if (files.paths.size() >= kMaxLuaFiles || files.total_bytes > kMaxTotalBytes ||
-            file_bytes > kMaxFileBytes || files.total_bytes + file_bytes > kMaxTotalBytes)
-        {
-            status = -2;
-            break;
-        }
+        // 非 Lua 普通文件不登记；Lua 文件保留相对路径交由 Lua 层读取。
         char canonical[PATH_MAX];
         if (realpath(absolute.c_str(), canonical) == nullptr)
         {
@@ -154,7 +140,6 @@ int scanDirectory(const std::string &root, const std::string &directory,
             break;
         }
         files.paths.push_back(child_relative);
-        files.total_bytes += file_bytes;
     }
     return status;
 }
@@ -210,7 +195,7 @@ bool resolveDirectory(const std::string &root_argument, const std::string &relat
     return true;
 }
 
-// 一次扫描整个选定 Patch 目录，数量和字节预算覆盖全部 Lua 文件。
+// 一次扫描整个选定 Patch 目录，返回其中全部 Lua 文件。
 int listLuaFiles(const std::string &root_argument, const std::string &relative,
                  std::vector<std::string> &output)
 {
@@ -225,7 +210,7 @@ int listLuaFiles(const std::string &root_argument, const std::string &relative,
     const int status = scanDirectory(root, directory, "", files);
     if (status != 0)
     {
-        return status == -2 ? -2 : -1;
+        return -1;
     }
     if (files.paths.empty())
     {
@@ -303,9 +288,7 @@ int list_lua(lua_State *state)
         const int                status = listLuaFiles(root, relative, paths);
         if (status != 0)
         {
-            return binding.pushError(status == 1    ? "HU_PATCH_EMPTY"
-                                     : status == -2 ? "HU_PATCH_LIMIT"
-                                                    : "HU_INVALID_PATH",
+            return binding.pushError(status == 1 ? "HU_PATCH_EMPTY" : "HU_INVALID_PATH",
                                      "patch Lua file list is invalid or empty");
         }
         LuaTable output = binding.newTable();
