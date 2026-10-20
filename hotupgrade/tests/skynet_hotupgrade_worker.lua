@@ -23,6 +23,7 @@ local marker = {} -- 仅此 Lua State 中创建的身份标记，用于更新前
 local original_marker = marker
 local business = {}
 local worker_test_config -- 本 State 的故障注入配置。
+local startup_registration -- 独立启动登记协程的结果；业务观察等待它完成。
 local extra_logic  -- 登记后才声明的模块，用于验证 register_module 真实链路。
 
 function business.load(item)
@@ -89,11 +90,11 @@ skynet.start(function()
         if startup_mode == "fail" then
             error("injected startup failure")
         end
-        local initialized = initialize({controller_handle = assert(tonumber(startup_controller))})
-        assert(initialized.ok, initialized.message)
-        if startup_mode == "fail_after_register" then
-            error("injected failure after early registration")
-        end
+        -- 原生 newservice 等待 start 回调结束；登记必须在独立协程执行，避免相互等待。
+        skynet.fork(function()
+            startup_registration = initialize({controller_handle = assert(tonumber(startup_controller))})
+            assert(startup_registration.ok, startup_registration.message)
+        end)
     end
     skynet.dispatch("lua", function(session, _source, command, request)
         request = request or {}
@@ -107,6 +108,8 @@ skynet.start(function()
                 answer = initialize(request)
             end
         elseif command == "read" then
+            while startup_controller and not startup_registration do skynet.sleep(1) end
+            assert(not startup_registration or startup_registration.ok)
             -- 仅测试诊断用的只读观察，不是可绕过 Guard 的生产业务入口。
             answer =
             {

@@ -16,11 +16,10 @@ package.loaded.skynet =
     getenv = function(key) return module_state.shared_environment[key] end,
     setenv = function(key, value) module_state.shared_environment[key] = value end,
     self = function() return 99 end,
-    newservice = function(name, controller_handle, creation_id, service_name, ...)
-        assert(name == "flywow_hotupgrade_bootstrap" and controller_handle == 99)
-        module_state.launches[#module_state.launches + 1] = {name = service_name, arguments = table.pack(...)}
+    newservice = function(name, ...)
+        module_state.launches[#module_state.launches + 1] = {name = name, arguments = table.pack(...)}
         if module_state.launch_hook then
-            module_state.launch_hook(creation_id, ...)
+            module_state.launch_hook(...)
         end
         return module_state.launch_handle
     end,
@@ -117,22 +116,71 @@ local function blocked(instance)
     end
 end
 
--- 原生调用挂起期间用内部创建身份关联早到登记；目标 handle 只取消息头，拒绝未知来源。
+-- 登记先到时协程挂起；只有原生返回的 handle 能解除等待，未知来源不能借用创建。
+module_state.launch_hook = function() coroutine.yield() end
+local early_created
+local early_registered
+local duplicate_registered
+local unknown_registered
+local early_create = coroutine.create(function()
+    early_created = lifecycle:control("newservice", {service_name = "fixture", arguments = {n = 0}}, 1)
+end)
+local early_register = coroutine.create(function()
+    early_registered = lifecycle:control("register", metadata, 70)
+end)
+local duplicate_register = coroutine.create(function()
+    duplicate_registered = lifecycle:control("register", metadata, 70)
+end)
+local unknown_register = coroutine.create(function()
+    unknown_registered = lifecycle:control("register", metadata, 71)
+end)
+assert(coroutine.resume(early_create))
+assert(coroutine.resume(early_register) and early_registered == nil)
+assert(coroutine.resume(duplicate_register) and duplicate_registered == nil)
+assert(coroutine.resume(unknown_register) and unknown_registered == nil)
+assert(lifecycle:control("register", {}, 70).code == "HU_INVALID_OPTIONS")
+blocked(lifecycle)
 module_state.launch_handle = 70
-module_state.launch_hook = function(creation_id)
-    blocked(lifecycle)
-    local early_metadata = {service_module = metadata.service_module, modules = metadata.modules,
-        service_patch = metadata.service_patch, creation_id = creation_id}
-    assert(lifecycle:control("register", metadata, 71).code == "HU_CREATION_MISSING")
-    assert(lifecycle:control("register", early_metadata, 70).ok)
-    assert(lifecycle:control("register", early_metadata, 70).code == "HU_DUPLICATE_SERVICE")
-    blocked(lifecycle) -- 登记已完成，原生启动尚未返回仍持有屏障。
-end
-assert(lifecycle:control("newservice", {service_name = "fixture", arguments = {n = 0}}, 1).handle == 70)
+assert(coroutine.resume(early_create))
 module_state.launch_hook = nil
-assert(lifecycle.creation_count == 0 and lifecycle.targets[70])
+assert(early_created.handle == 70)
+assert((early_registered.ok and duplicate_registered.code == "HU_DUPLICATE_SERVICE")
+    or (duplicate_registered.ok and early_registered.code == "HU_DUPLICATE_SERVICE"))
+assert(unknown_registered.code == "HU_CREATION_MISSING")
+assert(lifecycle.creation_count == 0 and lifecycle.targets[70] and next(lifecycle.registration_waiters) == nil)
 assert(lifecycle:control("validate", {path = "module"}, 1).ok)
 assert(lifecycle:control("cancel_service_creation", {handle = 70}, 1).code == "HU_SERVICE_ALREADY_REGISTERED")
+
+-- 多项原生创建交错返回；早到登记只按 source 匹配，另一项在途时未知来源继续等待。
+local interleaved = new_controller()
+local created_by_owner = {}
+local registered_by_source = {}
+local creators = {}
+module_state.launch_hook = function() coroutine.yield() end
+for owner = 1, 2 do
+    creators[owner] = coroutine.create(function()
+        created_by_owner[owner] = interleaved:control("newservice", {service_name = "fixture", arguments = {n = 0}}, owner)
+    end)
+    assert(coroutine.resume(creators[owner]))
+end
+for _, source in ipairs({72, 73, 74}) do
+    local waiter = coroutine.create(function()
+        registered_by_source[source] = interleaved:control("register", metadata, source)
+    end)
+    assert(coroutine.resume(waiter))
+end
+local waiting_batch = interleaved:control("begin", {}, 1)
+assert(waiting_batch.ok and interleaved.phase == "WAITING_CREATIONS")
+module_state.launch_handle = 73
+assert(coroutine.resume(creators[2]))
+assert(registered_by_source[73].ok and not registered_by_source[72] and not registered_by_source[74])
+assert(interleaved.creation_count == 1 and interleaved.phase == "WAITING_CREATIONS")
+module_state.launch_handle = 72
+assert(coroutine.resume(creators[1]))
+assert(registered_by_source[72].ok and registered_by_source[74].code == "HU_CREATION_MISSING")
+assert(interleaved.phase == "DEPLOYING" and interleaved.creation_count == 0)
+assert(next(interleaved.creation_handles) == nil and next(interleaved.registration_waiters) == nil)
+module_state.launch_hook = nil
 
 -- 原生返回早于登记；显式取消、初始化失败和创建失败均不留记录。
 module_state.launch_handle = 80
@@ -140,23 +188,20 @@ assert(lifecycle:control("newservice", {service_name = "fixture", arguments = {n
 blocked(lifecycle)
 assert(lifecycle:control("cancel_service_creation", {handle = 80}, 1).code == "HU_UNAUTHORIZED")
 assert(not module_state.killed[80] and lifecycle.creation_count == 1)
-assert(lifecycle:control("register", {service_module = "player", modules = {}, service_patch = false,
-    creation_id = "foreign"}, 80).code == "HU_CREATION_MISSING")
 assert(lifecycle:control("register", metadata, 80).ok and lifecycle.creation_count == 0)
 assert(lifecycle:control("register", metadata, 81).code == "HU_CREATION_MISSING")
-for _, early_register in ipairs({false, true}) do
-    module_state.launch_handle = 81
-    module_state.launch_hook = function(creation_id)
-        if early_register then
-            local early_metadata = {service_module = metadata.service_module, modules = metadata.modules,
-                service_patch = metadata.service_patch, creation_id = creation_id}
-            assert(lifecycle:control("register", early_metadata, 81).ok)
-        end
-        error("startup failed")
-    end
-    assert(lifecycle:control("newservice", {service_name = "fixture", arguments = {n = 0}}, 1).code == "HU_SERVICE_CREATE_FAILED")
-    assert(lifecycle.creation_count == 0 and not lifecycle.targets[81])
+-- 原生失败唤醒早到登记并释放记录，失败的来源不会进入 targets。
+local failed_registration
+module_state.launch_hook = function()
+    local waiter = coroutine.create(function()
+        failed_registration = lifecycle:control("register", metadata, 81)
+    end)
+    assert(coroutine.resume(waiter) and failed_registration == nil)
+    error("startup failed")
 end
+assert(lifecycle:control("newservice", {service_name = "fixture", arguments = {n = 0}}, 1).code == "HU_SERVICE_CREATE_FAILED")
+assert(failed_registration.code == "HU_CREATION_MISSING")
+assert(lifecycle.creation_count == 0 and not lifecycle.targets[81] and next(lifecycle.registration_waiters) == nil)
 module_state.launch_hook = nil
 module_state.launch_handle = 82
 assert(lifecycle:control("newservice", {service_name = "fixture", arguments = {n = 0}}, 2).ok)
@@ -351,14 +396,16 @@ assert(waiting.phase == "FAILED_LOCKED" and denied_creation.code == "HU_DEPLOYME
 assert(waiting:control("resolve_deployment", {batch_id = failed_batch, confirmed = true,
     confirmation = "CONVERGED_CACHE_CLEARED"}, 1).ok)
 
--- preload 拒绝早于实际启动及创建计数；测试环境可直接撤销共享环境替身。
+-- preload 由原生启动处理；Controller 不拒绝、不改写目标名或启动参数。
 module_state.shared_environment.preload = "fixture_preload.lua"
-module_state.launch_hook = function() error("preload must reject before native launch") end
+module_state.launch_handle = 89
 for _, command in ipairs({"newservice", "uniqueservice"}) do
-    assert(waiting:control(command, {service_name = "fixture", arguments = {n = 0}}, 1).code == "HU_PRELOAD_UNSUPPORTED")
-    assert(waiting.creation_count == 0)
+    local created = waiting:control(command, {service_name = "fixture", arguments = table.pack("head", nil, "tail")}, 1)
+    assert(created.handle == 89)
+    local launch = module_state.launches[#module_state.launches]
+    assert(launch.name == "fixture" and launch.arguments.n == 3 and launch.arguments[3] == "tail")
+    assert(waiting:control("cancel_service_creation", {handle = 89}, 1).ok)
 end
-module_state.launch_hook = nil
 module_state.shared_environment.preload = nil
 print("HOTUPGRADE_CONTROLLER_DEPLOYMENT_OK")
 

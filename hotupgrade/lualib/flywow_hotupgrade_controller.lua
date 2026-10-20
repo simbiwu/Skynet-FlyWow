@@ -143,7 +143,6 @@ end
 
 ---@class FlyWowHotUpgradeTargetMetadata
 ---@field service_module string 由现存 Service 声明，匹配配置 service_dir 下的相对路径
----@field creation_id? string 内部引导交付的创建标识；原生返回前登记时用它关联真实来源
 ---@field modules string[] 当前 State 已声明模块的唯一名称数组
 ---@field service_patch boolean 是否在本 State 提供私有状态及函数更新入口
 
@@ -214,25 +213,26 @@ function M.new(controller_config)
     local timeout_ms = controller_config.timeout_ms or hotupgrade_common.DEFAULT_TIMEOUT_MS
     return hotupgrade_result.success({controller = setmetatable(
     {
-        root              = root,                          -- 固定使用已解析的受信 Patch 根目录，不随批次改变。
-        service_dir       = controller_config.service_dir, -- Patch 中仅此目录及其子目录按 Service 脚本处理。
-        timeout_ms        = timeout_ms,                    -- Guard 排空期限，单位毫秒；默认值见 hotupgrade_common.DEFAULT_TIMEOUT_MS。
-        target_count      = 0,                             -- 当前 Controller 生命周期内成功登记的目标数量，用于容量检查。
-        targets           = {},                            -- 以真实 Service handle 为键，保存其模块声明和 Service 更新能力。
-        creation_sequence = 0,                             -- 本 Controller 内递增且不复用的创建身份序号。
-        pending_creations = {},                            -- 创建协程拥有的记录；原生启动返回且登记完成后才移除。
-        creation_handles  = {},                            -- 真实 handle 到待创建记录的索引，不用名称或延迟关联。
-        creation_count    = 0,                             -- 尚未完成原生创建或首次登记的操作数。
-        module_loads      = {},                            -- 许可 ID 到来源 Service/模块名的记录，登记或取消时释放。
-        module_load_count = 0,                             -- 首次加载关键区间的在途许可数。
-        module_sequence   = 0,                             -- 本 Controller 内不复用的许可序号，拒绝重复消费。
-        sequence          = 0,                             -- 当前 Controller 生命周期内递增的批次序号，用于拒绝迟到控制消息。
-        phase             = "IDLE",                        -- 发布门禁独立于事务协程，失败后保持关闭。
-        lifecycle_waiters = {},                            -- 发布期间等待的创建和首次模块加载请求，终态统一唤醒。
-        unique_services   = {},                            -- 仅本 Controller 内的逻辑唯一名、在途结果和 handle，不提供全局发现。
-        active            = nil,                           -- begin 持有的唯一发布批次，事务结束后失败门禁仍由 phase 保持。
-        last              = nil,                           -- 最近结束的批次结果；更早批次不保留，查询返回缺失。
-        recovery_required = false,                         -- 恢复结果未确认时关闭后续发布，需先由宿主处理恢复。
+        root                 = root,                             -- 固定使用已解析的受信 Patch 根目录，不随批次改变。
+        service_dir          = controller_config.service_dir,    -- Patch 中仅此目录及其子目录按 Service 脚本处理。
+        timeout_ms           = timeout_ms,                       -- Guard 排空期限，单位毫秒；默认值见 hotupgrade_common.DEFAULT_TIMEOUT_MS。
+        target_count         = 0,                                -- 当前 Controller 生命周期内成功登记的目标数量，用于容量检查。
+        targets              = {},                               -- 以真实 Service handle 为键，保存其模块声明和 Service 更新能力。
+        creation_sequence    = 0,                                -- 本 Controller 内递增且不复用的创建记录索引序号。
+        pending_creations    = {},                               -- 创建协程拥有的记录；原生启动返回且登记完成后才移除。
+        creation_handles     = {},                               -- 真实 handle 到待创建记录的索引，不用名称或延迟关联。
+        registration_waiters = {},                               -- 等待原生返回 handle 后按真实来源重新关联的登记协程。
+        creation_count       = 0,                                -- 尚未完成原生创建或首次登记的操作数。
+        module_loads         = {},                               -- 许可 ID 到来源 Service/模块名的记录，登记或取消时释放。
+        module_load_count    = 0,                                -- 首次加载关键区间的在途许可数。
+        module_sequence      = 0,                                -- 本 Controller 内不复用的许可序号，拒绝重复消费。
+        sequence             = 0,                                -- 当前 Controller 生命周期内递增的批次序号，用于拒绝迟到控制消息。
+        phase                = "IDLE",                           -- 发布门禁独立于事务协程，失败后保持关闭。
+        lifecycle_waiters    = {},                               -- 发布期间等待的创建和首次模块加载请求，终态统一唤醒。
+        unique_services      = {},                               -- 仅本 Controller 内的逻辑唯一名、在途结果和 handle，不提供全局发现。
+        active               = nil,                              -- begin 持有的唯一发布批次，事务结束后失败门禁仍由 phase 保持。
+        last                 = nil,                              -- 最近结束的批次结果；更早批次不保留，查询返回缺失。
+        recovery_required    = false,                            -- 恢复结果未确认时关闭后续发布，需先由宿主处理恢复。
     }, Controller)})
 end
 
@@ -245,22 +245,15 @@ function Controller:finish_creation(creation)
         end
         self.creation_count = self.creation_count - 1
         self:advance_deployment()
+        self:wake_registration()
     end
 end
 
--- 原生启动失败时，早到登记及其后续许可都属于已终止的启动，必须一起撤销。
-function Controller:remove_failed_creation(creation)
-    if creation.handle and self.targets[creation.handle] then
-        for permit_id, permit in pairs(self.module_loads) do
-            if permit.source == creation.handle then
-                self.module_loads[permit_id] = nil
-                self.module_load_count = self.module_load_count - 1
-            end
-        end
-        self.targets[creation.handle] = nil
-        self.target_count = self.target_count - 1
+-- 映射和计数先更新，再唤醒登记协程；唤醒不代表已匹配成功。
+function Controller:wake_registration()
+    for waiter in pairs(self.registration_waiters) do
+        skynet.wakeup(waiter)
     end
-    self:finish_creation(creation)
 end
 
 ---@class FlyWowHotUpgradeServiceCreationRequest
@@ -303,7 +296,7 @@ function Controller:uniqueservice(request, source)
         return hotupgrade_result.failure("HU_INVALID_REQUEST", "需要创建者、逻辑 Service 名和完整启动参数")
     end
     if request.service_name == "snaxd" then
-        return hotupgrade_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "Bootstrap 不支持 Snax 专用启动合同")
+        return hotupgrade_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "snaxd 不满足受管理 Service 自行调用 register_service 的登记合同")
     end
 
     local unique = self.unique_services[request.service_name]
@@ -349,7 +342,7 @@ end
 ---@return FlyWowHotUpgradeResult 成功含 handle
 function Controller:newservice(request, source, unique_name)
     if math.type(source) ~= "integer" or source <= 0 or type(request.service_name) ~= "string"
-        or not request.service_name:match("^%S+$") or request.service_name == "flywow_hotupgrade_bootstrap"
+        or not request.service_name:match("^%S+$")
         or type(request.arguments) ~= "table"
         or math.type(request.arguments.n) ~= "integer" or request.arguments.n < 0
         or (request.global ~= nil and type(request.global) ~= "boolean") then
@@ -357,14 +350,9 @@ function Controller:newservice(request, source, unique_name)
     end
 
     if request.service_name == "snaxd" then
-        return hotupgrade_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "Bootstrap 不支持 Snax 专用启动合同")
+        return hotupgrade_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "snaxd 不满足受管理 Service 自行调用 register_service 的登记合同")
     end
 
-    -- preload 先于引导执行，必须在建立记录及原生启动之前拒绝。
-    local preload = skynet.getenv("preload")
-    if preload and preload ~= "" then
-        return hotupgrade_result.failure("HU_PRELOAD_UNSUPPORTED", "受管理启动不支持非空 preload")
-    end
     local admitted = self:wait_lifecycle()
     if not admitted.ok then
         return admitted
@@ -377,36 +365,28 @@ function Controller:newservice(request, source, unique_name)
     local creation_id = tostring(skynet.self()) .. ":creation:" .. self.creation_sequence
     local creation =
     {
-        creation_id = creation_id, -- 仅引导携带的进程内创建标识。
+        creation_id = creation_id, -- 仅 Controller 内部索引，不传入目标 Service。
         owner       = source,      -- 原创建者拥有返回后未登记 Service 的取消权。
-        handle      = nil,         -- 登记消息头绑定，原生返回时再次核对。
+        handle      = nil,         -- 仅由原生返回值建立真实来源索引。
         unique_name = unique_name, -- 本地唯一预留的逻辑名，非唯一创建为 nil。
-        returned    = false,       -- 早登记时继续覆盖原生启动剩余代码。
+        returned    = false,       -- 原生返回前，早到登记只能让出执行权等待。
     }
     self.pending_creations[creation.creation_id] = creation
     self.creation_count = self.creation_count + 1
     -- 打包参数的 n 保留包括中间 nil 在内的完整签名；启动行约束仍由原生 Skynet 决定。
     local ok, handle = pcall(function()
-        return skynet.newservice("flywow_hotupgrade_bootstrap", skynet.self(), creation.creation_id,
-            request.service_name, table.unpack(request.arguments, 1, request.arguments.n))
+        return skynet.newservice(request.service_name,
+            table.unpack(request.arguments, 1, request.arguments.n))
     end)
     if not ok or math.type(handle) ~= "integer" or handle <= 0 then
-        self:remove_failed_creation(creation)
+        self:finish_creation(creation)
         return hotupgrade_result.failure("HU_SERVICE_CREATE_FAILED", tostring(handle))
     end
 
-    if creation.handle and creation.handle ~= handle then
-        -- 身份串用属于启动错误：仅终止本次原生创建出的 Service，不能误杀登记消息来源。
-        skynet.kill(handle)
-        self:remove_failed_creation(creation)
-        return hotupgrade_result.failure("HU_CREATION_HANDLE_MISMATCH", "登记来源与原生创建 handle 不一致")
-    end
     creation.handle = handle
-    creation.returned = true
     self.creation_handles[handle] = creation
-    if self.targets[handle] then
-        self:finish_creation(creation)
-    end
+    creation.returned = true
+    self:wake_registration()
     return hotupgrade_result.success({handle = handle})
 end
 
@@ -521,6 +501,7 @@ function Controller:complete_module_load(request, source, cancel)
     return hotupgrade_result.success()
 end
 
+--- 早到登记会 yield，直至原生返回的 handle 与消息 source 精确匹配或全部原生创建结束。
 ---@param request FlyWowHotUpgradeTargetMetadata
 ---@param source integer Skynet 消息头中的真实 Service handle
 ---@return FlyWowHotUpgradeResult
@@ -533,21 +514,6 @@ function Controller:register(request, source)
 
     if self.targets[source] then
         return hotupgrade_result.failure("HU_DUPLICATE_SERVICE", "Service 已登记")
-    end
-
-    local creation = self.creation_handles[source] or self.pending_creations[request.creation_id]
-    if not creation or self.pending_creations[creation.creation_id] ~= creation
-        or (creation.handle and creation.handle ~= source)
-        or (request.creation_id and request.creation_id ~= creation.creation_id) then
-        return hotupgrade_result.failure("HU_CREATION_MISSING", "来源不是受管理入口创建的待登记 Service")
-    end
-
-    if self.phase == "DEPLOYING" or self.phase == "APPLYING" or self.phase == "FAILED_LOCKED" then
-        return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "当前阶段不能登记新 Service")
-    end
-
-    if self.target_count >= hotupgrade_common.MAX_TARGETS then
-        return hotupgrade_result.failure("HU_TARGET_LIMIT", "登记目标已达 " .. hotupgrade_common.MAX_TARGETS .. " 上限")
     end
 
     if #request.modules > hotupgrade_common.MAX_MODULES then
@@ -569,9 +535,37 @@ function Controller:register(request, source)
         return hotupgrade_result.failure("HU_INVALID_OPTIONS", "模块声明数组有空洞")
     end
 
-    -- 原生返回前通过创建身份找到记录，但目标始终使用消息头中的真实 source。
-    creation.handle = source
-    self.creation_handles[source] = creation
+    -- 不猜测名称或创建顺序；原生调用返回前，登记必须让出执行权等待真实 handle。
+    local creation = self.creation_handles[source]
+    while not creation do
+        local native_pending = false
+        for _, pending in pairs(self.pending_creations) do
+            if not pending.returned then
+                native_pending = true
+                break
+            end
+        end
+        if not native_pending then
+            return hotupgrade_result.failure("HU_CREATION_MISSING", "来源不是受管理入口创建的待登记 Service")
+        end
+
+        local waiter = coroutine.running()
+        self.registration_waiters[waiter] = true
+        skynet.wait(waiter)
+        self.registration_waiters[waiter] = nil
+        if self.targets[source] then
+            return hotupgrade_result.failure("HU_DUPLICATE_SERVICE", "Service 已登记")
+        end
+        creation = self.creation_handles[source]
+    end
+
+    if self.phase == "DEPLOYING" or self.phase == "APPLYING" or self.phase == "FAILED_LOCKED" then
+        return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "当前阶段不能登记新 Service")
+    end
+    if self.target_count >= hotupgrade_common.MAX_TARGETS then
+        return hotupgrade_result.failure("HU_TARGET_LIMIT", "登记目标已达上限")
+    end
+
     self.target_count = self.target_count + 1
     self.targets[source] =
     {
@@ -583,9 +577,7 @@ function Controller:register(request, source)
         module_load_count = 0,                      -- 此目标在途许可数，受 MAX_MODULES 限制。
         service_patch     = request.service_patch,  -- 是否提供本地 Service 状态/函数入口。
     }
-    if creation.returned then
-        self:finish_creation(creation)
-    end
+    self:finish_creation(creation)
     return hotupgrade_result.success()
 end
 

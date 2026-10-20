@@ -5,7 +5,6 @@ local hotupgrade_result = require "flywow_hotupgrade_error"
 local hotupgrade_common = require "flywow_hotupgrade_common"
 local hotupgrade_native = require "flywow_hotupgrade_native"
 local hotupgrade_module_patch = require "flywow_hotupgrade_module_patch"
-local hotupgrade_creation = require "flywow_hotupgrade_creation"
 local M = {}
 local module_state =
 {
@@ -402,11 +401,6 @@ function M.register_service(registration)
         return hotupgrade_result.failure("HU_LIFECYCLE_PENDING", "本 State 仍有模块首次加载，完成后再登记 Service")
     end
 
-    local creation = hotupgrade_creation.get()
-    if creation and creation.controller_handle ~= registration.controller_handle then
-        return hotupgrade_result.failure("HU_UNAUTHORIZED", "登记 Controller 与受管理创建身份不一致")
-    end
-
     module_state.registration = registration
     module_state.module_patch_engine = hotupgrade_module_patch.new()
     M.guard()
@@ -433,7 +427,6 @@ function M.register_service(registration)
     local metadata =
     {
         service_module = module_state.registration.service_module,
-        creation_id = creation and creation.creation_id,
         modules = names,
         service_patch = service_update ~= nil,
     }

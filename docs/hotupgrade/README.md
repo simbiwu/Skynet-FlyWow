@@ -49,11 +49,11 @@ end
 
 hotupgrade.newservice 会 yield，成功返回原生 handle，失败抛出含 HU_SERVICE_CREATE_FAILED（或入口拒绝码）的异常。原生创建失败自动释放记录；创建成功后的业务 init 由调用方负责。业务 init 应在所有可能失败的初始化工作完成后，最后调用 register_service，并把登记结果作为 init 的结果；成功后再宣布 READY。业务初始化在登记前失败时，原创建者必须显式调用 cancel_service_creation，不能仅丢弃 handle。取消返回统一结果，非创建者返回 HU_UNAUTHORIZED，未知/已取消的 handle 返回 HU_CREATION_MISSING，已登记 Service 返回 HU_SERVICE_ALREADY_REGISTERED 且不会被终止。若登记 RPC 结果不明或登记后又失败，取消可能被拒绝，须由宿主核对真实登记状态并处理受控终止/重启，不能把它当成仍未登记。
 
-Controller 在调用原生 newservice 前建立待创建记录和不复用的进程内创建标识，实际启动内部 flywow_hotupgrade_bootstrap。引导在同一个 Lua State 内绑定创建身份，随后复用宿主配置的 Skynet loader 加载真实 Service，交付原业务参数以及正确的 SERVICE_NAME/SERVICE_PATH，不启动代理 Service、不接管业务 init。register_service 自动携带该内部身份；Controller 用它找到本次创建记录，以消息头真实 source 绑定 handle，并在原生调用返回时核对同一 handle。登记和原生启动都完成后才释放记录。若原生调用先返回，记录按返回 handle 保留至该来源登记或创建者取消。未知来源的 register 返回 HU_CREATION_MISSING，重复登记返回 HU_DUPLICATE_SERVICE。记录不会自动超时清除，漏掉登记或取消会持续关闭发布入口。
+Controller 在调用原生 skynet.newservice(service_name, ...) 前建立创建记录，原样转发目标名称和全部启动参数。原生返回后立即保存真实 handle 索引并返回调用方，不等待业务登记。目标由原生 loader 在自己的 Lua State 中启动；SERVICE_NAME、SERVICE_PATH、preload 和参数语义均由 Skynet 原生处理，Controller 不改写启动环境或重新执行 loader。
 
-内部文件为 hotupgrade/service/flywow_hotupgrade_bootstrap.lua 和 hotupgrade/lualib/flywow_hotupgrade_creation.lua，沿用现有 Service/Lua 搜索路径。创建身份仅用于受信进程内关联，不是远程认证。标准 Skynet loader 下保留同一个 Lua State、真实业务 SERVICE_NAME/SERVICE_PATH 及原生空白分隔的启动参数语义。
+register_service 只发送原有元数据，Controller 仅按消息头真实 source 与原生返回 handle 精确关联。登记先到时，登记协程让出执行权，等待在途原生创建返回后重新查询索引；其他消息和创建返回仍能继续处理。所有原生调用均返回后仍无匹配时返回 HU_CREATION_MISSING，重复登记返回 HU_DUPLICATE_SERVICE。内部创建序号仅作 Controller 表索引，不传入业务 Service。登记成功、原生失败或创建者合法取消后释放对应记录；记录不会自动超时清除。
 
-**非空 preload 不受支持。** 原生 loader 会在 Bootstrap 入口执行前运行 LUA_PRELOAD，此时它只能看到内部引导名称与参数。Controller 因此在建立创建记录和实际启动 Service 之前检查 skynet.getenv("preload")，非空时返回 HU_PRELOAD_UNSUPPORTED；不会先执行错误的 preload 再跳过真实业务初始化。普通原生 Service 不受影响。自定义 lualoader 仍须由宿主核对兼容性，本模块只保证标准 Skynet loader 合同。
+**登记不能阻止原生启动完成。** Skynet 的 newservice 等待 skynet.start 回调返回后才交付 handle，因此不能在该回调中同步等待 register_service；这会与早到登记的 handle 等待形成循环。推荐按上述例子在创建返回后调用业务 init，或在独立协程执行登记并让 start 回调先结束。独立协程仍可能先发出登记，Controller 会按真实 handle 关联；业务 READY 必须等待登记成功。
 
 ### 受管理本地唯一服务
 
@@ -65,7 +65,7 @@ local global_handle = hotupgrade.uniqueservice(controller_handle, true, "player"
 
 唯一键是本 Controller 内的原始逻辑 Service 名称。首次创建先建立该名称的在途预留，再复用受管理 newservice 流程；同名并发请求等待同一创建结果，原生创建返回后一起取得相同 handle。只有首次请求的启动参数生效，后续重复请求的参数不改变实例。不同名称可启动不同 Service；已有 handle 即使在发布期间也直接返回，尚未创建的新逻辑键须等待发布成功。
 
-该映射仅属于一个 Controller，不与原生 uniqueservice 的名称空间互通，不承诺跨 Controller、跨进程或跨节点唯一。全局 true 重载始终在实际启动前拒绝。snaxd 等需要专用启动合同的入口返回 HU_SPECIAL_SERVICE_UNSUPPORTED，不增加 Snax 专用初始化流程；newservice 同样拒绝 snaxd。
+该映射仅属于一个 Controller，不与原生 uniqueservice 的名称空间互通，不承诺跨 Controller、跨进程或跨节点唯一。全局 true 重载始终在实际启动前拒绝。snaxd 不满足受管理 Service 自行调用 register_service 的登记合同，入口返回 HU_SPECIAL_SERVICE_UNSUPPORTED，不增加 Snax 专用初始化流程；newservice 同样拒绝 snaxd。
 
 首次创建失败时释放创建记录和唯一名预留，唤醒同一次创建的等待者返回错误，后续请求可重试。原创建者合法取消尚未登记的 Service 时，在原生终止成功后释放该唯一名。成功登记后不能取消创建。本地唯一入口不进行死亡监控或自动重建；已登记 Service 的受控终止和替换须由宿主管理。FlyWow 仅使用现有 Skynet 公开接口，不要求修改、复制、覆盖或生成任何 Skynet 框架源码。
 
