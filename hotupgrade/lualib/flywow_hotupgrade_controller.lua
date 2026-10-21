@@ -5,7 +5,28 @@ local hotupgrade_native = require "flywow_hotupgrade_native"
 local hotupgrade_result = require "flywow_hotupgrade_error"
 local hotupgrade_common = require "flywow_hotupgrade_common"
 
-local M = {}
+local M =
+{
+    initialized          = nil, -- initialize 完整成功后设为 true；此前管理命令不可用。
+    root_path            = nil, -- 已解析的宿主根目录；正式文件读取、替换和恢复共用此边界。
+    patch_path           = nil, -- 已解析的受信 Patch 根目录；每个批次从此目录读取冻结源码。
+    service_path         = nil, -- Patch 内按 Service 脚本分类的相对目录。
+    targets              = nil, -- 以真实 Service handle 索引登记信息，供 Patch 匹配和批次快照使用。
+    pending_creations    = nil, -- 尚未完成创建或首次登记的记录；完成后由 finish_creation 移除。
+    creation_handles     = nil, -- 原生返回的真实 handle 到创建记录的索引，用于关联早到登记。
+    registration_waiters = nil, -- 等待原生 handle 建立映射的登记协程；映射完成后唤醒。
+    creation_count       = nil, -- 尚未完成原生创建或首次登记的数量；决定何时解除部署等待。
+    module_loads         = nil, -- 许可 ID 到来源 Service/模块名的映射；登记或取消时移除。
+    module_load_count    = nil, -- 正在执行首次加载与登记的许可数；决定何时解除部署等待。
+    module_sequence      = nil, -- 本 Controller 内递增的许可序号，用来拒绝重复消费。
+    sequence             = nil, -- 本 Controller 生命周期内递增的批次序号，用来拒绝迟到控制消息。
+    phase                = nil, -- 当前发布门禁阶段；恢复未确认时保持 FAILED_LOCKED。
+    lifecycle_waiters    = nil, -- 发布屏障期间等待创建或首次模块加载的协程，终态时统一唤醒。
+    unique_services      = nil, -- 逻辑唯一 Service 名到在途结果/handle 的映射，仅限本 Controller。
+    active_batch         = nil, -- 当前唯一活动批次；批次结束后移入 last_batch。
+    last_batch           = nil, -- 最近结束批次的结果；更早批次不保留。
+    recovery_required    = nil, -- 宿主文件或目标恢复未确认时阻止后续发布。
+}
 
 -- Native 失败时以第二返回值返回带 code 字段的错误对象。
 local function native_code(value)
@@ -181,26 +202,27 @@ function M.initialize(controller_config)
         return hotupgrade_result.failure("HU_ALREADY_INITIALIZED", "控制面已初始化")
     end
 
+    -- 校验成功后构造初始化候选；提交前模块表的长期状态字段保持 nil。
     local initialized_state =
     {
-        root_path            = root_path,                        -- 正式文件部署根目录；所有文件操作仍受 Native 路径检查约束。
-        patch_path           = patch_path,                       -- 固定使用已解析的受信 Patch 根目录，不随批次改变。
-        service_path         = controller_config.service_path,   -- Patch 中仅此目录及其子目录按 Service 脚本处理。
-        targets              = {},                               -- 以真实 Service handle 为键，保存其模块声明和 Service 更新能力。
-        pending_creations    = {},                               -- 创建协程拥有的记录；原生启动返回且登记完成后才移除。
-        creation_handles     = {},                               -- 真实 handle 到待创建记录的索引，不用名称或延迟关联。
-        registration_waiters = {},                               -- 等待原生返回 handle 后按真实来源重新关联的登记协程。
-        creation_count       = 0,                                -- 尚未完成原生创建或首次登记的操作数。
-        module_loads         = {},                               -- 许可 ID 到来源 Service/模块名的记录，登记或取消时释放。
-        module_load_count    = 0,                                -- 首次加载关键区间的在途许可数。
-        module_sequence      = 0,                                -- 本 Controller 内不复用的许可序号，拒绝重复消费。
-        sequence             = 0,                                -- 当前 Controller 生命周期内递增的批次序号，用于拒绝迟到控制消息。
-        phase                = "IDLE",                           -- 发布门禁独立于事务协程，失败后保持关闭。
-        lifecycle_waiters    = {},                               -- 发布期间等待的创建和首次模块加载请求，终态统一唤醒。
-        unique_services      = {},                               -- 仅本 Controller 内的逻辑唯一名、在途结果和 handle，不提供全局发现。
-        active_batch         = nil,                              -- begin 持有的唯一发布批次，事务结束后失败门禁仍由 phase 保持。
-        last_batch           = nil,                              -- 最近结束的批次结果；更早批次不保留，查询返回缺失。
-        recovery_required    = false,                            -- 恢复结果未确认时关闭后续发布，需先由宿主处理恢复。
+        root_path            = root_path,
+        patch_path           = patch_path,
+        service_path         = controller_config.service_path,
+        targets              = {},
+        pending_creations    = {},
+        creation_handles     = {},
+        registration_waiters = {},
+        creation_count       = 0,
+        module_loads         = {},
+        module_load_count    = 0,
+        module_sequence      = 0,
+        sequence             = 0,
+        phase                = "IDLE",
+        lifecycle_waiters    = {},
+        unique_services      = {},
+        active_batch         = nil,
+        last_batch           = nil,
+        recovery_required    = false,
     }
 
     if not published_root then
