@@ -1,4 +1,4 @@
-// 职责：提供 HotUpgrade 的路径校验和补丁枚举能力。
+// 职责：提供 HotUpgrade 的路径校验、发布包枚举及同步文件部署恢复能力。
 // 边界：只处理本模块的同步文件操作；Lua 参数、结果和错误统一由 lua_binding
 // 管理。
 #define _XOPEN_SOURCE 700
@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <exception>
 #include <memory>
 #include <string>
@@ -39,7 +41,7 @@ int pushNativeException(lua_State *state)
 
 struct FileList
 {
-    std::vector<std::string> paths; ///< Patch 目录下的相对 Lua 路径，供 Lua 推导模块名并读取源码。
+    std::vector<std::string> paths; ///< 发布包中的相对 .lua/.patch 路径，供 Controller 分类并冻结源码。
 };
 
 // realpath 要求目标已存在；输出规范化绝对路径，供后续根目录包含关系校验。
@@ -119,11 +121,13 @@ int scanDirectory(const std::string &root, const std::string &directory,
             break;
         }
         const std::string name = entry->d_name;
-        if (name.size() < 4 || name.compare(name.size() - 4, 4, ".lua") != 0)
+        const bool lua_file = name.size() >= 4 && name.compare(name.size() - 4, 4, ".lua") == 0;
+        const bool patch_file = name.size() >= 6 && name.compare(name.size() - 6, 6, ".patch") == 0;
+        if (!lua_file && !patch_file)
         {
             continue;
         }
-        // 非 Lua 普通文件不登记；Lua 文件保留相对路径交由 Lua 层读取。
+        // 只登记 .lua/.patch；相对路径交由 Controller 检查和分类。
         char canonical[PATH_MAX];
         if (realpath(absolute.c_str(), canonical) == nullptr)
         {
@@ -218,6 +222,228 @@ int listLuaFiles(const std::string &root_argument, const std::string &relative,
     }
     output = std::move(files.paths);
     return 0;
+}
+
+// 文件描述符仅由当前同步调用持有；字符串分配异常时同样关闭。
+struct FileHandle
+{
+    int descriptor; ///< 当前打开的普通文件；负值表示未取得资源。
+    ~FileHandle()
+    {
+        if (descriptor >= 0)
+        {
+            close(descriptor);
+        }
+    }
+};
+
+// 与目录扫描共用根目录解析规则；不存在的中间目录只在正式写入时创建。
+// 所有分量先做词法校验，再逐级 lstat；不允许通过链接或特殊文件改变部署目标。
+bool resolveFile(const std::string &root_argument, const std::string &relative,
+                 bool create_parents, std::string &path)
+{
+    if (relative.empty() || relative[0] == '/' || relative.size() >= PATH_MAX ||
+        relative.find('\\') != std::string::npos || relative.find('\0') != std::string::npos ||
+        !resolvePath(root_argument, path))
+    {
+        return false;
+    }
+    std::vector<std::string> components;
+    std::size_t offset = 0;
+    while (offset <= relative.size())
+    {
+        const auto separator = relative.find('/', offset);
+        const auto component = relative.substr(offset, separator - offset);
+        if (component.empty() || component == "." || component == "..")
+        {
+            return false;
+        }
+        components.push_back(component);
+        if (separator == std::string::npos)
+        {
+            break;
+        }
+        offset = separator + 1;
+    }
+
+    for (std::size_t index = 0; index < components.size(); ++index)
+    {
+        path += "/" + components[index];
+        if (path.size() >= PATH_MAX)
+        {
+            return false;
+        }
+        struct stat attributes;
+        if (lstat(path.c_str(), &attributes) != 0)
+        {
+            if (errno != ENOENT)
+            {
+                return false;
+            }
+            if (index + 1 < components.size() && create_parents)
+            {
+                if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST)
+                {
+                    return false;
+                }
+                if (lstat(path.c_str(), &attributes) != 0 || !S_ISDIR(attributes.st_mode) ||
+                    S_ISLNK(attributes.st_mode))
+                {
+                    return false;
+                }
+            }
+            continue;
+        }
+        if (S_ISLNK(attributes.st_mode) ||
+            (index + 1 < components.size() ? !S_ISDIR(attributes.st_mode) : !S_ISREG(attributes.st_mode)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 内部部署准备入口：返回完整旧内容；不存在返回 false；失败沿用 nil/error。
+// 不创建目录或文件，Controller 在任何目标 Prepare 前调用。
+int read_file(lua_State *state)
+{
+    try
+    {
+        LuaBinding  binding(state);
+        std::string root;     // Controller 配置的正式文件根目录。
+        std::string relative; // 本次完整 .lua 的根目录相对路径。
+        std::string path;     // 逐级校验后用于同步文件操作的绝对路径。
+        if (!binding.readValue(1, root) || !binding.readValue(2, relative))
+        {
+            return binding.pushError();
+        }
+        if (!resolveFile(root, relative, false, path))
+        {
+            return binding.pushError("HU_INVALID_PATH", relative);
+        }
+
+        FileHandle file{open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK)};
+        if (file.descriptor < 0)
+        {
+            if (errno == ENOENT)
+            {
+                return binding.returnValues(false);
+            }
+            return binding.pushError("HU_FILE_READ_FAILED", relative);
+        }
+        struct stat attributes;
+        if (fstat(file.descriptor, &attributes) != 0 || !S_ISREG(attributes.st_mode))
+        {
+            return binding.pushError("HU_INVALID_PATH", relative);
+        }
+        std::string contents;
+        char buffer[8192]; // 每次读取 8 KiB；只限制读取块，不限制文件总大小。
+        for (;;)
+        {
+            const ssize_t count = read(file.descriptor, buffer, sizeof(buffer));
+            if (count == 0)
+            {
+                break;
+            }
+            if (count < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                return binding.pushError("HU_FILE_READ_FAILED", relative);
+            }
+            contents.append(buffer, static_cast<std::size_t>(count));
+        }
+        // returnValues 把完整字节复制到 Lua 字符串；C++ contents 随后正常释放。
+        return binding.returnValues(contents);
+    }
+    catch (...)
+    {
+        return pushNativeException(state);
+    }
+}
+
+// 同目录临时文件完整写入后 rename；nil 内容表示恢复时删除本批新增文件。
+// 临时文件由此同步调用负责清理；不提供跨进程、断电或外部并发改写恢复。
+int replace_file(lua_State *state)
+{
+    std::string temporary;
+    try
+    {
+        LuaBinding  binding(state);
+        std::string root;     // Controller 配置的正式文件根目录。
+        std::string relative; // 本次完整 .lua 的根目录相对路径。
+        std::string path;     // 逐级校验后用于同步文件操作的绝对路径。
+        std::string contents; // Controller 已冻结的新版源码，或恢复时传回的完整旧内容。
+        // lua_isnoneornil/readValue 均只读参数槽；returnValues 在原栈顶追加唯一结果。
+        const bool removing = lua_isnoneornil(state, 3);
+        if (!binding.readValue(1, root) || !binding.readValue(2, relative) ||
+            (!removing && !binding.readValue(3, contents)))
+        {
+            return binding.pushError();
+        }
+        if (!resolveFile(root, relative, !removing, path))
+        {
+            return binding.pushError("HU_INVALID_PATH", relative);
+        }
+        if (removing)
+        {
+            if (unlink(path.c_str()) != 0 && errno != ENOENT)
+            {
+                return binding.pushError("HU_FILE_DEPLOY_FAILED", relative);
+            }
+            return binding.returnValues(true);
+        }
+
+        struct stat attributes;
+        mode_t mode = 0644; // 新代码文件默认可读、owner 可写；覆盖时沿用原文件权限。
+        if (lstat(path.c_str(), &attributes) == 0)
+        {
+            mode = attributes.st_mode & 0777;
+        }
+        temporary = path.substr(0, path.find_last_of('/')) + "/.flywow-hotupgrade-XXXXXX";
+        std::vector<char> pattern(temporary.begin(), temporary.end());
+        pattern.push_back('\0');
+        FileHandle file{mkstemp(pattern.data())};
+        if (file.descriptor < 0)
+        {
+            return binding.pushError("HU_FILE_DEPLOY_FAILED", relative);
+        }
+        temporary.assign(pattern.data());
+        bool written = fchmod(file.descriptor, mode) == 0;
+        std::size_t offset = 0;
+        while (written && offset < contents.size())
+        {
+            const ssize_t count = write(file.descriptor, contents.data() + offset, contents.size() - offset);
+            if (count < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            if (count <= 0)
+            {
+                written = false;
+                break;
+            }
+            offset += static_cast<std::size_t>(count);
+        }
+        const bool closed = close(file.descriptor) == 0;
+        file.descriptor = -1;
+        if (!written || !closed || rename(temporary.c_str(), path.c_str()) != 0)
+        {
+            unlink(temporary.c_str());
+            return binding.pushError("HU_FILE_DEPLOY_FAILED", relative);
+        }
+        return binding.returnValues(true);
+    }
+    catch (...)
+    {
+        if (!temporary.empty())
+        {
+            unlink(temporary.c_str());
+        }
+        return pushNativeException(state);
+    }
 }
 
 // 参数 1 是已存在的路径；可选参数 2 是其下的相对目录，复用扫描器的包含关系和链接检查。
@@ -328,7 +554,8 @@ extern "C" int luaopen_flywow_hotupgrade_native(lua_State *state)
         LuaBinding binding(state);
         LuaTable   module = binding.newTable();
         if (!module.valid() || !module.setFunction("resolve", resolve) ||
-            !module.setFunction("list_lua", list_lua))
+            !module.setFunction("list_lua", list_lua) ||
+            !module.setFunction("read_file", read_file) || !module.setFunction("replace_file", replace_file))
         {
             return binding.pushError();
         }

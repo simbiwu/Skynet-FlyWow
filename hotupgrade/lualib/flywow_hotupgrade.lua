@@ -348,7 +348,7 @@ end
 ---@field restore? fun(state:table, old_state:table) 提交失败时同步恢复快照；返回 false 或抛错会保持 Guard 关闭。
 
 ---@class FlyWowHotUpgradeRegistration
----@field service_module string 对应 service_dir 下的相对 Lua 路径；去掉 .lua 并将 / 转为 .
+---@field service_module string 匹配 service_dir 下的一次性 .patch 相对路径；去掉 .patch 并将 / 转为 .
 ---@field service_update? FlyWowHotUpgradeServiceUpdate 可选 Service 内部状态/函数更新入口
 ---@field before_upgrade? fun():boolean|table Guard 暂停新业务且在途调用归零后反复调用；true 或 {ok=true} 才放行，否则继续等待至超时，异常立即失败。同步只读，不得 yield
 ---@field after_upgrade? fun():boolean Activate 提交模块与 Service 状态后、finish 前调用；false 或异常触发组合恢复。只检查已提交状态，不得产生外部副作用或 yield

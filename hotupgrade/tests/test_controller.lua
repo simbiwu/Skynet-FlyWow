@@ -9,10 +9,23 @@ local module_state =
     launch_hook = nil, -- 在原生创建尚未返回时注入登记或启动失败。
     launches = {}, -- 记录实际进入原生创建的逻辑名和完整参数。
     killed = {}, -- 验证只有创建者取消时才终止对应待登记 Service。
+    injected_read_failure = nil, -- 文件准备失败时不得开始运行时更新。
+    injected_restore_failure = false, -- 旧文件回写失败时必须锁定并保留错误。
+    cache_failures = 0, -- 缓存清理替身连续失败次数。
+    file_contents = {}, -- Native 替身的正式文件，验证部署和恢复是否发生。
+    operations = {}, -- 按时间记录目标协议、文件写入和缓存清理。
+    injected_file_failure = nil, -- 指定写入失败的相对文件名。
     injected_control_failure = nil, -- 当前测试注入的目标和命令失败条件。
 }
 package.loaded.skynet =
 {
+    cache = {clear = function()
+        module_state.operations[#module_state.operations + 1] = "cache"
+        if module_state.cache_failures > 0 then
+            module_state.cache_failures = module_state.cache_failures - 1
+            error("injected cache clear failure")
+        end
+    end},
     getenv = function(key) return module_state.shared_environment[key] end,
     setenv = function(key, value) module_state.shared_environment[key] = value end,
     self = function() return 99 end,
@@ -29,6 +42,7 @@ package.loaded.skynet =
     fork = function(fn) module_state.pending_control_coroutines[#module_state.pending_control_coroutines + 1] = fn end,
     call = function(handle, protocol, command, request)
         assert(protocol == "hotupgrade" and request.sequence > 0)
+        module_state.operations[#module_state.operations + 1] = handle .. ":" .. command
         module_state.last_control_command_by_handle[handle] = command
         if module_state.injected_control_failure and module_state.injected_control_failure.handle == handle and module_state.injected_control_failure.command == command then
             return {ok = false, code = "HU_FIXTURE_FAILED", message = command}
@@ -43,19 +57,36 @@ package.loaded.flywow_hotupgrade_native =
     resolve = function(path, relative)
         return relative and path .. "/" .. relative or (path:gsub("/%.$", ""))
     end,
+    read_file = function(_root, path)
+        if path == module_state.injected_read_failure then
+            return nil, {code = "HU_FILE_READ_FAILED"}
+        end
+        return module_state.file_contents[path] or false
+    end,
+    replace_file = function(_root, path, source)
+        module_state.operations[#module_state.operations + 1] = "file:" .. path
+        if path == module_state.injected_file_failure
+            or (module_state.injected_restore_failure and source == "old") then
+            return nil, {code = "HU_FILE_DEPLOY_FAILED"}
+        end
+        module_state.file_contents[path] = source
+        return true
+    end,
     list_lua = function(_root, path)
         local files =
         {
             module = {"lualib/test_worker_logic.lua"},
-            combined = {"lualib/test_worker_logic.lua", "service/player.lua"},
+            service_file = {"service/new_service.lua"},
+            deploy_failure = {"lualib/a_added.lua", "lualib/test_worker_logic.lua", "service/z_blocked.lua"},
+            combined = {"lualib/test_worker_logic.lua", "service/player.patch"},
             unmatched_module = {"lualib/test_worker_logic.lua", "lualib/missing_logic.lua"},
-            unmatched_service = {"lualib/test_worker_logic.lua", "service/unused.lua"},
+            unmatched_service = {"lualib/test_worker_logic.lua", "service/unused.patch"},
             host_paths = {"config/settings.lua", "lualib/battle/state_sync/runtime.lua",
                 "lualib/packages/demo/init.lua"},
-            nested_service = {"service/battle/worker.lua"},
-            custom_service = {"actors/zone/player.lua"},
+            nested_service = {"service/battle/worker.patch"},
+            custom_service = {"actors/zone/player.patch"},
             duplicate_module = {"lualib/battle.worker.lua", "lualib/battle/worker.lua"},
-            duplicate_service = {"service/battle.worker.lua", "service/battle/worker.lua"},
+            duplicate_service = {"service/battle.worker.patch", "service/battle/worker.patch"},
         }
         return files[path], {code = "HU_PATCH_EMPTY"}
     end,
@@ -264,27 +295,15 @@ assert(not register_module(c, "extra", 30).ok)
 local module_patch = c:load({path = "module"})
 assert(module_patch.ok and #module_patch.targets == 2)
 assert(not c:load({path = "module", selector = {percent = 0.5}}).ok)
--- dry_run 与正式 apply 均在任何目标 RPC 前拒绝不匹配的整包 Patch。
-for _, fixture in ipairs({
-    {path = "unmatched_module", file = "lualib/missing_logic.lua", reason = "声明模块"},
-    {path = "unmatched_service", file = "service/unused.lua", reason = "service_module"},
-}) do
-    for _, command in ipairs({"dry_run", "apply"}) do
-        module_state.last_control_command_by_handle = {}
-        local rejected = publish(c, command, {path = fixture.path})
-        assert(not rejected.ok and rejected.code == "HU_TARGET_MISSING")
-        assert(rejected.message:find(fixture.path .. "/" .. fixture.file, 1, true))
-        assert(rejected.message:find(fixture.reason, 1, true))
-        assert(next(module_state.last_control_command_by_handle) == nil and not c.active)
-        if command == "dry_run" then
-            assert(c.phase == "IDLE" and c.last.phase == "ABORTED")
-        else
-            assert(c.phase == "FAILED_LOCKED" and c.last.phase == "ABORTED")
-            assert(c.last.error.code == "HU_TARGET_MISSING" and not c.last.control_started)
-            assert(c:control("resolve_deployment", {batch_id = c.last.batch_id,
-                confirmed = true, confirmation = "UNCHANGED"}, 1).ok)
-        end
-    end
+-- 未登记模块只部署；一次性 Service .patch 仍须匹配。
+local unmatched = c:load({path = "unmatched_module"})
+assert(unmatched.ok and #unmatched.targets == 2 and #unmatched.patch.files == 2)
+for _, command in ipairs({"dry_run", "apply"}) do
+    module_state.last_control_command_by_handle = {}
+    local rejected = publish(c, command, {path = "unmatched_service"})
+    assert(rejected.code == "HU_TARGET_MISSING" and rejected.message:find("service/unused.patch", 1, true))
+    assert(next(module_state.last_control_command_by_handle) == nil and c.phase == "IDLE")
+    assert(c.last.phase == "ABORTED" and not c.last.control_started)
 end
 -- 同一模块仍可匹配多个 Service，组合包中的 Service 脚本也必须覆盖所有目标。
 local combined = new_controller()
@@ -300,7 +319,7 @@ for _, command in ipairs({"dry_run", "apply"}) do
 end
 local unsupported = c:load({path = "combined"})
 assert(unsupported.code == "HU_SERVICE_PATCH_UNSUPPORTED")
-assert(unsupported.message:find("combined/service/player.lua", 1, true))
+assert(unsupported.message:find("combined/service/player.patch", 1, true))
 -- 路径映射保留宿主目录前缀，Service 目录可更换并支持多级类型名。
 local paths = new_controller()
 assert(managed_register(paths,
@@ -331,7 +350,8 @@ local status = run()
 assert(status.record.phase == "COMPLETED" and status.record.success == 2 and module_state.last_control_command_by_handle[20] == "finish")
 module_state.injected_control_failure = {handle = 20, command = "activate"}
 status = run()
-assert(status.record.phase == "PARTIAL" and status.record.success == 1 and status.record.failed == 1)
+assert(status.record.phase == "ABORTED" and status.record.success == 0 and status.record.failed == 2)
+assert(c.phase == "IDLE" and module_state.last_control_command_by_handle[10] == "abort")
 assert(module_state.last_control_command_by_handle[20] == "abort")
 module_state.injected_control_failure = nil
 status = run("dry_run")
@@ -386,17 +406,18 @@ assert(waiting:control("dry_run", {batch_id = module_batch.batch_id, path = "mod
 module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
 assert(waiting.phase == "DRY_RUN_COMPLETED")
 
--- 部署后校验失败也锁定；排队者必须收到失败，不能静默重试启动。
+-- 检查失败尚未改变文件/运行时，解除屏障并允许排队创建正常继续。
 local failed_batch = begin_deployment(waiting)
-local denied_creation
-local denied_waiter = coroutine.create(function()
-    denied_creation = waiting:control("newservice", {service_name = "fixture", arguments = {n = 0}}, 1)
+local queued_creation
+module_state.launch_handle = 85
+local queued_waiter = coroutine.create(function()
+    queued_creation = waiting:control("newservice", {service_name = "fixture", arguments = {n = 0}}, 1)
 end)
-assert(coroutine.resume(denied_waiter) and denied_creation == nil)
-assert(waiting:control("apply", {batch_id = failed_batch, path = "unmatched_module"}, 1).code == "HU_TARGET_MISSING")
-assert(waiting.phase == "FAILED_LOCKED" and denied_creation.code == "HU_DEPLOYMENT_BLOCKED")
-assert(waiting:control("resolve_deployment", {batch_id = failed_batch, confirmed = true,
-    confirmation = "CONVERGED_CACHE_CLEARED"}, 1).ok)
+assert(coroutine.resume(queued_waiter) and queued_creation == nil)
+assert(waiting:control("apply", {batch_id = failed_batch, path = "unmatched_service"}, 1).code == "HU_TARGET_MISSING")
+assert(waiting.phase == "IDLE" and queued_creation.handle == 85)
+assert(waiting.last.error.code == "HU_TARGET_MISSING" and not waiting.last.control_started)
+assert(waiting:control("cancel_service_creation", {handle = 85}, 1).ok)
 
 -- preload 由原生启动处理；Controller 不拒绝、不改写目标名或启动参数。
 module_state.shared_environment.preload = "fixture_preload.lua"
@@ -480,7 +501,7 @@ assert(#module_state.launches == launch_count and unique.creation_count == 0)
 local dry = new_controller()
 assert(managed_register(dry, metadata, 93).ok)
 local dry_id = begin_deployment(dry)
-assert(dry:control("dry_run", {batch_id = dry_id, path = "unmatched_module"}, 1).code == "HU_TARGET_MISSING")
+assert(dry:control("dry_run", {batch_id = dry_id, path = "unmatched_service"}, 1).code == "HU_TARGET_MISSING")
 assert(dry.phase == "IDLE" and dry.last.error.code == "HU_TARGET_MISSING" and not dry.last.control_started)
 module_state.injected_control_failure = {handle = 93, command = "stage"}
 assert(publish(dry, "dry_run", {path = "module"}).ok)
@@ -506,4 +527,67 @@ local unlimited_modules = new_controller()
 assert(managed_register(unlimited_modules,
     {service_module = "empty", modules = names, service_patch = false}, 1).ok)
 assert(register_module(unlimited_modules, "beyond_previous_limit", 1).ok)
+local ordered = new_controller()
+for _, handle in ipairs({101, 102, 103}) do
+    assert(managed_register(ordered, metadata, handle).ok)
+end
+module_state.operations = {}
+assert(publish(ordered, "apply", {path = "module"}).ok)
+module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+assert(table.concat(module_state.operations, ",") ==
+    "101:prepare,102:prepare,103:prepare,101:stage,102:stage,103:stage,101:activate,102:activate,103:activate,file:lualib/test_worker_logic.lua,cache,101:finish,102:finish,103:finish")
+module_state.operations = {}
+local before_dry = module_state.file_contents["lualib/test_worker_logic.lua"]
+assert(publish(ordered, "dry_run", {path = "module"}).ok)
+module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+assert(table.concat(module_state.operations, ",") ==
+    "101:prepare,102:prepare,103:prepare,101:stage,102:stage,103:stage,101:activate,102:activate,103:activate,103:abort,102:abort,101:abort")
+assert(module_state.file_contents["lualib/test_worker_logic.lua"] == before_dry)
+module_state.injected_control_failure = {handle = 102, command = "finish"}
+assert(publish(ordered, "apply", {path = "module"}).ok)
+module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+assert(ordered.phase == "FAILED_LOCKED" and ordered.last.success == 2 and ordered.last.failed == 1)
+assert(module_state.last_control_command_by_handle[101] == "finish"
+    and module_state.last_control_command_by_handle[103] == "finish")
+module_state.injected_control_failure = nil
+
+local deployment = new_controller()
+assert(managed_register(deployment, metadata, 104).ok)
+module_state.file_contents = {["lualib/test_worker_logic.lua"] = "old"}
+module_state.injected_file_failure = "service/z_blocked.lua"
+assert(publish(deployment, "apply", {path = "deploy_failure"}).ok)
+module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+assert(deployment.phase == "IDLE" and deployment.last.phase == "ABORTED")
+assert(module_state.file_contents["lualib/test_worker_logic.lua"] == "old")
+assert(module_state.file_contents["lualib/a_added.lua"] == nil)
+assert(module_state.last_control_command_by_handle[104] == "abort")
+module_state.injected_file_failure = nil
+-- 文件准备和缓存清理失败均保留具体诊断；恢复失败才锁定。
+module_state.injected_read_failure = "lualib/test_worker_logic.lua"
+module_state.operations = {}
+local rejected_file = publish(deployment, "apply", {path = "module"})
+assert(rejected_file.code == "HU_FILE_READ_FAILED" and deployment.phase == "IDLE")
+assert(#module_state.operations == 0 and not deployment.last.control_started)
+module_state.injected_read_failure = nil
+module_state.file_contents = {["lualib/test_worker_logic.lua"] = "old"}
+module_state.cache_failures = 1
+assert(publish(deployment, "apply", {path = "module"}).ok)
+module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+assert(deployment.phase == "IDLE" and deployment.last.error.code == "HU_CACHE_CLEAR_FAILED")
+assert(module_state.file_contents["lualib/test_worker_logic.lua"] == "old")
+
+module_state.injected_file_failure = "service/z_blocked.lua"
+module_state.injected_restore_failure = true
+assert(publish(deployment, "apply", {path = "deploy_failure"}).ok)
+module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+assert(deployment.phase == "FAILED_LOCKED" and deployment.recovery_required)
+assert(deployment.last.error.original_error.code == "HU_FILE_DEPLOY_FAILED")
+assert(deployment.last.error.recovery_error.code == "HU_FILE_DEPLOY_FAILED")
+module_state.injected_restore_failure = false
+module_state.injected_file_failure = nil
+local files_only = new_controller()
+local started_files = publish(files_only, "apply", {path = "service_file"})
+assert(started_files.ok and started_files.target_count == 0)
+module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+assert(files_only.last.phase == "COMPLETED" and module_state.file_contents["service/new_service.lua"])
 print("HOTUPGRADE_CONTROLLER_OK")

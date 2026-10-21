@@ -291,7 +291,56 @@ local function run()
     local group = assert(os.getenv("HOTUPGRADE_TEST_GROUP"), "HOTUPGRADE_TEST_GROUP is required")
     local controller = nil
     local handle = nil
-    if group == "lifecycle" then
+    if group == "service_file" then
+        controller = create_controller()
+        local native = require "flywow_hotupgrade_native"
+        local root = require("hotupgrade_test_options").root_path
+        assert(native.read_file(root, "service/new_service.lua") == false)
+        local dry = wait(controller, start(controller, "service_file", "dry_run"), "DRY_RUN_COMPLETED")
+        assert(dry.target_count == 0 and not dry.control_started)
+        assert(native.read_file(root, "service/new_service.lua") == false)
+        local record = wait(controller, start(controller, "service_file"), "COMPLETED")
+        assert(record.target_count == 0 and not record.control_started)
+        assert(assert(load(assert(native.read_file(root, "service/new_service.lua"))))().version == 2)
+        assert(native.read_file(root, "service/player.patch") == false)
+        local only_files = wait(controller, start(controller, "unmatched_module"), "COMPLETED")
+        assert(only_files.target_count == 0)
+        assert(read(worker()).module_value == 2)
+        print("HOTUPGRADE_SKYNET_SERVICE_FILE_OK")
+    elseif group == "deployment" then
+        controller = create_controller()
+        handle = worker()
+        local native = require "flywow_hotupgrade_native"
+        local root = require("hotupgrade_test_options").root_path
+        local old = assert(native.read_file(root, "lualib/test_worker_logic.lua"))
+        wait(controller, start(controller, "deployment", "dry_run"), "DRY_RUN_COMPLETED")
+        assert(native.read_file(root, "lualib/test_worker_logic.lua") == old)
+        assert(native.read_file(root, "lualib/new/dependency.lua") == false)
+        wait(controller, start(controller, "deployment"), "COMPLETED")
+        assert(read(handle).module_value == 2 and read(handle).equip == "剑")
+        assert(read(worker()).module_value == 2)
+        assert(require("new.dependency").version == 2)
+        assert(native.read_file(root, "service/player.patch") == false)
+        print("HOTUPGRADE_SKYNET_DEPLOYMENT_OK")
+    elseif group == "deploy_failure" then
+        controller = create_controller()
+        handle = worker()
+        local native = require "flywow_hotupgrade_native"
+        local root = require("hotupgrade_test_options").root_path
+        local old = assert(native.read_file(root, "lualib/test_worker_logic.lua"))
+        skynet.fork(function() assert(skynet.call(handle, "lua", "hold", {ticks = 20}).ok) end)
+        while skynet.call(handle, "lua", "active", {}) == 0 do skynet.sleep(1) end
+        local id = start(controller, "deploy_failure")
+        -- apply 已冻结源码并准备旧文件；在 Guard 排空窗口注入目标路径失效。
+        assert(os.execute("mkdir " .. root .. "/service/z_blocked.lua"))
+        local record = wait(controller, id, "ABORTED")
+        assert(record.error.code == "HU_INVALID_PATH" and lifecycle_status(controller).phase == "IDLE")
+        original(handle)
+        assert(native.read_file(root, "lualib/test_worker_logic.lua") == old)
+        assert(native.read_file(root, "lualib/a_added.lua") == false)
+        assert(os.execute("rmdir " .. root .. "/service/z_blocked.lua"))
+        print("HOTUPGRADE_SKYNET_DEPLOY_FAILURE_OK")
+    elseif group == "lifecycle" then
         creation_lifecycle_tests()
         module_lifecycle_tests()
         unique_lifecycle_tests()
@@ -322,10 +371,14 @@ local function run()
         controller = create_controller()
         handle = worker()
         local before = original(handle)
+        local native = require "flywow_hotupgrade_native"
+        local root = require("hotupgrade_test_options").root_path
+        local old_source = assert(native.read_file(root, "lualib/test_worker_logic.lua"))
         local fixtures = {
             {path = "../module", code = "HU_INVALID_PATH"},
             {path = "invalid", code = "HU_MODULE_SYNTAX"},
-            {path = "unmatched_module", code = "HU_TARGET_MISSING"},
+            {path = "invalid_patch", code = "HU_INVALID_PATCH"},
+            {path = "invalid_service", code = "HU_MODULE_SYNTAX"},
             {path = "unmatched_service", code = "HU_TARGET_MISSING"},
         }
         for _, fixture in ipairs(fixtures) do
@@ -341,15 +394,8 @@ local function run()
                 assert(status.ok and status.record.phase == "ABORTED")
                 assert(status.record.error.code == fixture.code and not status.record.control_started)
                 assert(original(handle).marker_token == before.marker_token)
-                if command == "dry_run" then
-                    assert(status.lifecycle.phase == "IDLE")
-                else
-                    assert(status.lifecycle.phase == "FAILED_LOCKED")
-                    local unresolved = skynet.call(controller, "hotupgrade", "begin", {})
-                    assert(unresolved.code == "HU_DEPLOYMENT_BLOCKED")
-                    assert(skynet.call(controller, "hotupgrade", "resolve_deployment",
-                        {batch_id = begun.batch_id, confirmed = true, confirmation = "UNCHANGED"}).ok)
-                end
+                assert(native.read_file(root, "lualib/test_worker_logic.lua") == old_source)
+                assert(status.lifecycle.phase == "IDLE")
             end
         end
         assert(skynet.call(controller, "hotupgrade", "unknown_command", {path = "module"}).code == "HU_UNKNOWN_COMMAND")
@@ -410,8 +456,12 @@ local function run()
         controller = create_controller()
         handle = worker()
         local patch_path = group == "bad_functions" and "bad_functions" or "stage_failure"
+        local native = require "flywow_hotupgrade_native"
+        local root = require("hotupgrade_test_options").root_path
+        local old_source = assert(native.read_file(root, "lualib/test_worker_logic.lua"))
         wait(controller, start(controller, patch_path), "ABORTED")
         original(handle)
+        assert(native.read_file(root, "lualib/test_worker_logic.lua") == old_source)
         print(group == "bad_functions" and "HOTUPGRADE_SKYNET_BAD_FUNCTIONS_OK" or "HOTUPGRADE_SKYNET_STAGE_FAILURE_OK")
     elseif group == "activation_after_failure" or group == "activation_custom_failure"
         or group == "activation_custom_success" or group == "activation_custom_success_failure" then
@@ -448,15 +498,13 @@ local function run()
         controller = create_controller()
         local first = worker()
         local second = worker({after_upgrade_failure = true})
-        local record = wait(controller, start(controller, "combined"), "PARTIAL")
-        assert(record.success == 1 and record.failed == 1)
-        assert(read(first).equip == "剑" and not read(first).paused)
+        local record = wait(controller, start(controller, "combined"), "ABORTED")
+        assert(record.success == 0 and record.failed == 2)
+        original(first)
         original(second)
-        assert(lifecycle_status(controller).failed_locked)
-        local denied, denial = pcall(hotupgrade.newservice, "skynet_hotupgrade_worker")
-        assert(not denied and tostring(denial):find("HU_DEPLOYMENT_BLOCKED", 1, true))
-        assert(skynet.call(controller, "hotupgrade", "resolve_deployment",
-            {batch_id = record.batch_id, confirmed = true, confirmation = "UNCHANGED"}).code == "HU_RECOVERY_CONFIRMATION_REQUIRED")
+        assert(lifecycle_status(controller).phase == "IDLE")
+        local new_handle = hotupgrade.newservice("skynet_hotupgrade_worker")
+        assert(hotupgrade.cancel_service_creation(new_handle).ok)
         print("HOTUPGRADE_SKYNET_PARTIAL_OK")
     elseif group == "abort" then
         controller = create_controller()

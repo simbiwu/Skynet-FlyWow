@@ -68,43 +68,6 @@ local function wait_for_completion(batch_id)
     error("HU_SAMPLE_TIMEOUT: 等待事务完成超时")
 end
 
-local function copy_file(source_path, target_path)
-    local input, open_error = io.open(source_path, "rb")
-    if not input then
-        error("HU_SAMPLE_DEPLOY_FAILED: 无法读取 " .. source_path .. ": " .. tostring(open_error))
-    end
-
-    local contents, read_error = input:read("*a")
-    local source_closed, source_close_error = input:close()
-    if contents == nil or not source_closed then
-        error("HU_SAMPLE_DEPLOY_FAILED: 读取失败 " .. source_path .. ": "
-            .. tostring(read_error or source_close_error))
-    end
-
-    local output, target_open_error = io.open(target_path, "wb")
-    if not output then
-        error("HU_SAMPLE_DEPLOY_FAILED: 无法写入 " .. target_path .. ": " .. tostring(target_open_error))
-    end
-
-    local written, write_error = output:write(contents)
-    local target_closed, target_close_error = output:close()
-    if not written or not target_closed then
-        error("HU_SAMPLE_DEPLOY_FAILED: 写入失败 " .. target_path .. ": "
-            .. tostring(write_error or target_close_error))
-    end
-
-    local verify, verify_open_error = io.open(target_path, "rb")
-    if not verify then
-        error("HU_SAMPLE_DEPLOY_FAILED: 无法回读 " .. target_path .. ": " .. tostring(verify_open_error))
-    end
-    local copied, verify_read_error = verify:read("*a")
-    local verify_closed, verify_close_error = verify:close()
-    if copied ~= contents or not verify_closed then
-        error("HU_SAMPLE_DEPLOY_FAILED: 文件复制不完整 " .. target_path .. ": "
-            .. tostring(verify_read_error or verify_close_error))
-    end
-end
-
 local function create_player()
     local created, handle = pcall(hotupgrade.newservice, "player_service")
     if not created then
@@ -146,7 +109,7 @@ local function run_sample()
     local sample_root = assert(os.getenv("HOTUPGRADE_SAMPLE_ROOT"))
     checked(skynet.call(controller_handle, "lua", "init",
         {patch_root = sample_root .. "/patches", root_path = sample_root .. "/host",
-            service_dir = "hotupgrade/service_patches"}), "初始化 Controller")
+            service_dir = "service"}), "初始化 Controller")
 
     current_step = "创建并登记 V1 PlayerService"
     local first_handle = create_player()
@@ -161,15 +124,7 @@ local function run_sample()
     print("发布批次 " .. begun.batch_id .. " 等待进入 DEPLOYING")
     wait_for_deploying(begun.batch_id)
 
-    current_step = "部署 V2 文件"
-    copy_file(sample_root .. "/patches/v2/lualib/player_logic.lua",
-        sample_root .. "/host/lualib/player_logic.lua")
-    copy_file(sample_root .. "/patches/v2/hotupgrade/service_patches/player.lua",
-        sample_root .. "/host/hotupgrade/service_patches/player.lua")
-    skynet.cache.clear()
-    print("V2 文件已复制，skynet.cache.clear() 已完成")
-
-    current_step = "apply V2 Patch"
+    current_step = "apply V2：由 HotUpgrade 更新运行时并部署文件"
     checked(skynet.call(controller_handle, "hotupgrade", "apply",
         {batch_id = begun.batch_id, path = "v2"}), "apply")
     local completed = wait_for_completion(begun.batch_id)

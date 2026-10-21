@@ -90,23 +90,37 @@ local function build_patch(root, patch_path, service_dir)
         return loaded
     end
 
-    local modules = {}
-    local services = {}
-    local service_prefix = service_dir .. "/"
+    local modules        = {}                 -- 按规范模块名归集普通 .lua，供已登记目标更新。
+    local services       = {}                 -- 按 Service 模块名归集仅供现存实例执行的 .patch。
+    local files          = {}                 -- 冻结的完整 .lua，正式发布时部署；不含 .patch。
+    local service_prefix = service_dir .. "/" -- 此目录下的 .lua 仅部署，.patch 才匹配 Service。
     for _, entry in ipairs(loaded.entries) do
         local is_service = entry.file:sub(1, #service_prefix) == service_prefix
-        local relative = is_service and entry.file:sub(#service_prefix + 1) or entry.file
-        local name = module_name(relative)
-        local entries = is_service and services or modules
-        if not name or name == "" or entries[name]
-            or (is_service and not name:match("^[%w_.%-]+$")) then
-            return hotupgrade_result.failure("HU_INVALID_PATCH", "Lua 路径映射重复或无效: " .. entry.file)
+        local is_patch = entry.file:sub(-6) == ".patch"
+        if is_patch and not is_service then
+            return hotupgrade_result.failure("HU_INVALID_PATCH", ".patch 只能位于 service_dir: " .. entry.file)
         end
-        entries[name] = {name = name, entry_file = entry.file, source = entry.source}
+
+        if is_patch then
+            local name = entry.file:sub(#service_prefix + 1, -7):gsub("/", ".")
+            if name == "" or not name:match("^[%w_.%-]+$") or services[name] then
+                return hotupgrade_result.failure("HU_INVALID_PATCH", "Service 路径映射重复或无效: " .. entry.file)
+            end
+            services[name] = {name = name, entry_file = entry.file, source = entry.source}
+        else
+            files[#files + 1] = {entry_file = entry.file, source = entry.source}
+            if not is_service then
+                local name = module_name(entry.file)
+                if not name or name == "" or modules[name] then
+                    return hotupgrade_result.failure("HU_INVALID_PATCH", "Lua 路径映射重复或无效: " .. entry.file)
+                end
+                modules[name] = {name = name, entry_file = entry.file, source = entry.source}
+            end
+        end
     end
 
-    if next(modules) == nil and next(services) == nil then
-        return hotupgrade_result.failure("HU_PATCH_EMPTY", "Patch 至少要有一个模块或 Service 文件")
+    if #files == 0 and next(services) == nil then
+        return hotupgrade_result.failure("HU_PATCH_EMPTY", "发布包至少要有一个 .lua 或 Service .patch")
     end
 
     table.sort(identity)
@@ -116,7 +130,7 @@ local function build_patch(root, patch_path, service_dir)
     end
 
     local patch = {patch_id = table.concat(identity_parts),
-        modules = {}, services = services}
+        modules = {}, services = services, files = files}
     for _, module in pairs(modules) do
         patch.modules[#patch.modules + 1] = module
     end
@@ -199,6 +213,7 @@ function M.new(controller_config)
     local timeout_ms = controller_config.timeout_ms or hotupgrade_common.DEFAULT_TIMEOUT_MS
     return hotupgrade_result.success({controller = setmetatable(
     {
+        root_path            = root_path,                        -- 正式文件部署根目录；所有文件操作仍受 Native 路径检查约束。
         root                 = root,                             -- 固定使用已解析的受信 Patch 根目录，不随批次改变。
         service_dir          = controller_config.service_dir,    -- Patch 中仅此目录及其子目录按 Service 脚本处理。
         timeout_ms           = timeout_ms,                       -- Guard 排空期限，单位毫秒；默认值见 hotupgrade_common.DEFAULT_TIMEOUT_MS。
@@ -556,15 +571,14 @@ function Controller:load(request)
         return loaded
     end
 
-    -- 按已登记模块和 Service 模块建立目标快照，之后再检查每个文件均已匹配。
-    local targets = {}
-    local matched = {} -- 仅当前登记快照覆盖的 Patch 文件；全量匹配后才允许启动批次。
+    -- 固定运行时接收者；只有一次性 Service .patch 强制要求目标存在。
+    local targets = {} -- 本批需要执行原有更新协议的真实 Service。
+    local matched = {} -- 当前登记快照已覆盖的 Service .patch 文件。
     for _, record in pairs(self.targets) do
         local modules = {}
         for _, entry in ipairs(loaded.patch.modules) do
             if record.modules[entry.name] then
                 modules[#modules + 1] = entry
-                matched[entry.entry_file] = true
             end
         end
 
@@ -588,15 +602,7 @@ function Controller:load(request)
             }
         end
     end
-    -- 每份文件都必须有接收者，不能因其他文件匹配成功而静默遗漏。
-    -- 整包匹配校验先于任何目标 RPC，避免部分 Patch 被静默遗漏。
-    for _, entry in ipairs(loaded.patch.modules) do
-        if not matched[entry.entry_file] then
-            return hotupgrade_result.failure("HU_TARGET_MISSING", request.path .. "/" .. entry.entry_file
-                .. ": 没有已登记目标声明模块 " .. entry.name)
-        end
-    end
-
+    -- 完整 .lua 无运行时接收者时只部署；一次性 .patch 必须匹配现存目标。
     for service_module, entry in pairs(loaded.patch.services) do
         if not matched[entry.entry_file] then
             return hotupgrade_result.failure("HU_TARGET_MISSING", request.path .. "/" .. entry.entry_file
@@ -607,10 +613,6 @@ function Controller:load(request)
     table.sort(targets, function(left, right)
         return left.handle < right.handle
     end)
-    if #targets == 0 then
-        return hotupgrade_result.failure("HU_TARGET_MISSING", "没有匹配的已登记目标")
-    end
-
     return hotupgrade_result.success({patch = loaded.patch, targets = targets})
 end
 
@@ -640,98 +642,144 @@ function Controller:step(batch, target, command)
     return answer
 end
 
-function Controller:run_target(batch, target, dry_run)
-    for _, command in ipairs({"prepare", "stage", "activate"}) do
-        batch.phase = command:upper()
-        local answer = self:step(batch, target, command)
-        if not answer.ok or batch.cancelled then
-            local restored = self:step(batch, target, "abort")
-            if not restored.ok then
-                local failed = hotupgrade_result.failure("HU_RECOVERY_REQUIRED", restored.message, command)
-                failed.original_error = not answer.ok and answer or
-                    hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
-                failed.recovery_error = restored
-                return failed
-            end
-
-            if batch.cancelled then
-                return hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
-            end
-
-            if answer.code == "HU_RECOVERY_REQUIRED" then
-                -- 目标先前恢复失败，但本次显式 Abort 已确认恢复；保留失败诊断而不伪报仍未恢复。
-                return hotupgrade_result.failure("HU_UPDATE_FAILED", answer.message, command)
-            end
-
-            return answer
-        end
-    end
-
-    if dry_run then
-        local restored = self:step(batch, target, "abort")
-        if restored.ok then
-            return restored
-        end
-        local failed = hotupgrade_result.failure("HU_RECOVERY_REQUIRED", restored.message, "abort")
-        failed.original_error = restored
-        failed.recovery_error = restored
-        return failed
-    end
-
-    -- 当前目标已同步提交；发布决定后 finish 结果不明不能伪称已恢复。
-    batch.phase = "PUBLISH_DECIDED"
-    batch.decided = true
-    target.decided = true
-    local finished = self:step(batch, target, "finish")
-    if not finished.ok then
-        return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", finished.message, "finish")
-    end
-
-    return hotupgrade_result.success()
-end
-
+-- 按阶段协调整批目标；Finish 开始后只报告收尾故障，不回滚已开放业务的目标。
 function Controller:run(batch, dry_run)
-    for _, target in ipairs(batch.targets) do
-        batch.current_handle = target.handle
-        local ok, answer = pcall(self.run_target, self, batch, target, dry_run)
-        if not ok then
-            local restored = not target.decided and self:step(batch, target, "abort")
-            local original = hotupgrade_result.failure("HU_CONTROL_FAILED", tostring(answer))
-            answer = hotupgrade_result.failure(restored and restored.ok and "HU_CONTROL_FAILED" or "HU_RECOVERY_REQUIRED",
-                original.message)
-            answer.original_error = original
-            answer.recovery_error = restored and not restored.ok and restored or nil
-        end
-
-        batch.results[#batch.results + 1] = {handle = target.handle, hotupgrade_result = answer}
-        if not answer.ok then
-            batch.failed = batch.failed + 1
-            batch.error = answer
-            if answer.code == "HU_RECOVERY_REQUIRED" then
-                batch.phase = "RECOVERY_REQUIRED"
-                self.recovery_required = true
-            else
-                batch.phase = batch.success > 0 and "PARTIAL" or "ABORTED"
+    local ok, message = pcall(function()
+        for _, command in ipairs({"prepare", "stage", "activate"}) do
+            batch.phase = command:upper()
+            for _, target in ipairs(batch.targets) do
+                if batch.cancelled then
+                    batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
+                    return
+                end
+                batch.current_handle = target.handle
+                target.participated = true
+                local answer = self:step(batch, target, command)
+                if not answer.ok then
+                    target.result = answer
+                    batch.error = answer
+                    return
+                end
             end
-            break
         end
 
-        batch.success = batch.success + 1
+        if batch.cancelled then
+            batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
+            return
+        end
+        if dry_run then
+            return
+        end
+
+        -- 仅使用 load 冻结的完整文件，不能在 Activate 后重新读取发布包。
+        for _, file in ipairs(batch.files) do
+            local written, failure = hotupgrade_native.replace_file(self.root_path, file.entry_file, file.source)
+            if not written then
+                batch.error = hotupgrade_result.failure(native_code(failure), "部署失败: " .. file.entry_file)
+                return
+            end
+            file.touched = true
+        end
+        if #batch.files > 0 then
+            local cleared, failure = pcall(skynet.cache.clear)
+            if not cleared then
+                batch.error = hotupgrade_result.failure("HU_CACHE_CLEAR_FAILED", tostring(failure))
+            end
+        end
+    end)
+    if not ok then
+        batch.error = hotupgrade_result.failure("HU_CONTROL_FAILED", tostring(message))
     end
 
-    if not batch.error then
-        batch.phase = dry_run and "DRY_RUN_COMPLETED" or "COMPLETED"
+    if batch.error or dry_run then
+        local recovery_errors  = {}    -- 汇总全部恢复失败的信息，不因一项失败停止其余恢复。
+        local recovery_failure         -- 第一份原始恢复错误，供 status 保留具体错误码。
+        local files_touched    = false -- 只有已替换文件时，恢复流程才需要清理正式代码缓存。
+        -- 文件先恢复、清缓存，再 Abort 目标；业务重新开放时必须读取到旧文件。
+        for index = #(batch.files or {}), 1, -1 do
+            local file = batch.files[index]
+            if file.touched then
+                files_touched = true
+                local called, restored, failure = pcall(hotupgrade_native.replace_file,
+                    self.root_path, file.entry_file, file.old_source or nil)
+                if not called or not restored then
+                    recovery_failure = recovery_failure or hotupgrade_result.failure(
+                        called and native_code(failure) or "HU_CONTROL_FAILED", file.entry_file)
+                    recovery_errors[#recovery_errors + 1] = file.entry_file .. ": "
+                        .. tostring(called and native_code(failure) or restored)
+                end
+            end
+        end
+        if files_touched then
+            local cleared, failure = pcall(skynet.cache.clear)
+            if not cleared then
+                recovery_failure = recovery_failure or hotupgrade_result.failure("HU_CACHE_CLEAR_FAILED", tostring(failure))
+                recovery_errors[#recovery_errors + 1] = tostring(failure)
+            end
+        end
+
+        for index = #batch.targets, 1, -1 do
+            local target = batch.targets[index]
+            if target.participated then
+                local restored = self:step(batch, target, "abort")
+                if not restored.ok then
+                    recovery_failure = recovery_failure or restored
+                    recovery_errors[#recovery_errors + 1] = target.handle .. ": " .. tostring(restored.message or restored.code)
+                    target.result = restored
+                elseif target.result and target.result.code == "HU_RECOVERY_REQUIRED" then
+                    target.result = hotupgrade_result.failure("HU_UPDATE_FAILED", target.result.message)
+                end
+            end
+        end
+
+        if #recovery_errors > 0 then
+            local original = batch.error
+            batch.error = hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(recovery_errors, "; "))
+            batch.error.original_error = original or recovery_failure
+            batch.error.recovery_error = recovery_failure
+            self.recovery_required = true
+        elseif batch.error and batch.error.code == "HU_RECOVERY_REQUIRED" then
+            batch.error = hotupgrade_result.failure("HU_UPDATE_FAILED", batch.error.message)
+        end
+        batch.phase = #recovery_errors > 0 and "RECOVERY_REQUIRED"
+            or (batch.error and "ABORTED" or "DRY_RUN_COMPLETED")
+    else
+        -- 文件和全部 Activate 已确认成功；各目标 Finish 独立报告，不再执行回滚。
+        batch.phase = "PUBLISH_DECIDED"
+        batch.decided = true
+        for _, target in ipairs(batch.targets) do
+            batch.current_handle = target.handle
+            target.result = self:step(batch, target, "finish")
+            if not target.result.ok then
+                batch.error = hotupgrade_result.failure("HU_RECOVERY_REQUIRED",
+                    target.result.message or target.result.code, "finish")
+                self.recovery_required = true
+            end
+        end
+        batch.phase = batch.error and "RECOVERY_REQUIRED" or "COMPLETED"
     end
-    -- 终态只保留有界结果，不继续持有冻结源码或目标运行时快照。
+
+    for _, target in ipairs(batch.targets) do
+        if target.participated then
+            local answer = target.result or (batch.error
+                and hotupgrade_result.failure("HU_BATCH_ABORTED", "本批失败，已尝试恢复")
+                or hotupgrade_result.success())
+            batch.results[#batch.results + 1] = {handle = target.handle, hotupgrade_result = answer}
+            if answer.ok then
+                batch.success = batch.success + 1
+            else
+                batch.failed = batch.failed + 1
+            end
+        end
+    end
     batch.targets = nil
+    if batch.decided or not self.recovery_required then
+        batch.files = nil
+    end
     self.last = batch
     self.active = nil
-    if dry_run and batch.error and batch.error.code ~= "HU_RECOVERY_REQUIRED" then
-        -- dry-run 失败但所有尝试目标均已恢复，不需要宿主进行版本收敛。
-        self.phase = "IDLE"
-    else
-        self.phase = batch.error and "FAILED_LOCKED" or batch.phase
-    end
+    self.phase = self.recovery_required and "FAILED_LOCKED"
+        or (batch.error and "IDLE" or batch.phase)
     self:wake_lifecycle()
 end
 
@@ -750,7 +798,7 @@ function Controller:wake_lifecycle()
     end
 end
 
---- 建立屏障并立即返回；已有创建和许可完成后才允许部署宿主文件。
+--- 建立屏障并立即返回；已有创建和许可完成后才允许 apply 读取发布包。
 function Controller:begin()
     if self.phase == "FAILED_LOCKED" then
         return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "上次发布尚未恢复")
@@ -801,9 +849,26 @@ function Controller:apply(request, dry_run)
         batch.phase = "ABORTED"
         self.last = batch
         self.active = nil
-        self.phase = dry_run and "IDLE" or "FAILED_LOCKED"
+        self.phase = "IDLE"
         self:wake_lifecycle()
         return loaded
+    end
+    -- 在运行时更新前准备完整文件的旧内容；不存在以 false 记录，恢复时删除新增文件。
+    if not dry_run then
+        for _, file in ipairs(loaded.patch.files) do
+            local old_source, failure = hotupgrade_native.read_file(self.root_path, file.entry_file)
+            if old_source == nil then
+                batch.error = hotupgrade_result.failure(native_code(failure), "文件准备失败: " .. file.entry_file)
+                batch.phase = "ABORTED"
+                self.last = batch
+                self.active = nil
+                self.phase = "IDLE"
+                self:wake_lifecycle()
+                return batch.error
+            end
+            file.old_source = old_source
+        end
+        batch.files = loaded.patch.files
     end
     batch.targets = loaded.targets
     batch.target_count = #loaded.targets
@@ -835,6 +900,7 @@ function Controller:resolve_deployment(request)
     self.active = nil
     self.last = batch
     batch.resolved = true
+    batch.files = nil
     self.recovery_required = false
     self.phase = "IDLE"
     self:wake_lifecycle()

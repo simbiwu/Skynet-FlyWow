@@ -21,7 +21,7 @@ if [[ ! -s "$FRAMEWORK_DIR/build/native/flywow_hotupgrade_native.so" ]]; then
 fi
 
 rm -rf -- "$RUNTIME_ROOT"
-mkdir -p "$HOST_ROOT" "$PATCH_ROOT" "$HOST_ROOT/hotupgrade/service_patches"
+mkdir -p "$HOST_ROOT" "$PATCH_ROOT"
 cp -a "$SCRIPT_DIR/host_v1/." "$HOST_ROOT/"
 cp -a "$SCRIPT_DIR/patches/." "$PATCH_ROOT/"
 

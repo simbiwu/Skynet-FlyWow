@@ -36,9 +36,9 @@ local many_files = assert(hotupgrade_native.list_lua(root, "count_unlimited"))
 assert(#many_files == 1025)
 assert(#assert(hotupgrade_native.list_lua(root, "file_unlimited")) == 1)
 assert(#assert(hotupgrade_native.list_lua(root, "total_unlimited")) == 9)
--- Lua Controller 也必须读取完整源码；不匹配目标时应到目标匹配阶段才拒绝。
+-- Lua Controller 也必须读取完整源码；未登记普通 .lua 现在可直接进入部署集合。
 for _, path in ipairs({"count_unlimited", "file_unlimited", "total_unlimited"}) do
-    assert(c:load({path = path}).code == "HU_TARGET_MISSING")
+    assert(c:load({path = path}).ok)
 end
 local other_root = config.root_path .. "/another"
 assert(os.execute("mkdir -p " .. other_root .. "/service"))
@@ -83,4 +83,23 @@ local nested = assert(controller.new(
 assert(register_fixture(nested, 20,
     {service_module = "player", modules = {}, service_patch = true}).ok)
 assert(nested:load({path = "custom_service"}).ok)
+local file_path = "native_files/nested/value.lua"
+assert(hotupgrade_native.read_file(config.root_path, file_path) == false)
+assert(hotupgrade_native.replace_file(config.root_path, file_path, "old"))
+assert(hotupgrade_native.read_file(config.root_path, file_path) == "old")
+assert(hotupgrade_native.replace_file(config.root_path, file_path, "new"))
+assert(hotupgrade_native.read_file(config.root_path, file_path) == "new")
+assert(hotupgrade_native.replace_file(config.root_path, file_path))
+assert(hotupgrade_native.read_file(config.root_path, file_path) == false)
+for _, path in ipairs({"../outside.lua", "/outside.lua", "native_files//x.lua", "native_files/../x.lua"}) do
+    assert(hotupgrade_native.read_file(config.root_path, path) == nil)
+    assert(hotupgrade_native.replace_file(config.root_path, path, "bad") == nil)
+end
+local link = config.root_path .. "/native_files/link.lua"
+assert(os.execute("ln -s nested/value.lua " .. link))
+assert(hotupgrade_native.read_file(config.root_path, "native_files/link.lua") == nil)
+assert(hotupgrade_native.replace_file(config.root_path, "native_files/link.lua", "bad") == nil)
+assert(os.remove(link))
+assert(os.execute("mkdir -p " .. config.root_path .. "/native_files/directory.lua"))
+assert(hotupgrade_native.replace_file(config.root_path, "native_files/directory.lua", "bad") == nil)
 print("HOTUPGRADE_FILES_OK")

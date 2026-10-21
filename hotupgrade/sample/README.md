@@ -17,9 +17,9 @@ bash hotupgrade/sample/run_hotupgrade_sample.sh ../skynet
 
 - `run_hotupgrade_sample.sh`：准备独立运行目录并启动 Skynet。
 - `skynet_config.lua`：按真实集成测试配置 loader、Service、Lua 和 Native 搜索路径。
-- `flywow_hotupgrade_sample.lua`：初始化 Controller，创建实例，依次执行 begin、部署、cache clear、apply 和验收。
+- `flywow_hotupgrade_sample.lua`：初始化 Controller，创建实例，依次执行 begin、apply 和验收，正式文件部署和缓存清理由 HotUpgrade 执行。
 - `host_v1/`：初始宿主文件；Service 入口在 `service/player_service.lua`，普通模块在 `lualib/player_logic.lua`。
-- `patches/v2/`：完整普通模块 V2 和一次性 Service Patch。
+- `patches/v2/`：完整普通模块 V2、完整 Service V2，以及仅供现存实例使用的 service/player.patch。
 
 ## 调用顺序和代码差异
 
@@ -27,7 +27,7 @@ bash hotupgrade/sample/run_hotupgrade_sample.sh ../skynet
 
 V1 的 `make_load(state)` 返回捕获状态表的函数：装备为“刀”时基础攻击力加 5。初始化状态是“刀”、等级 50、schema 1。主 Service 从 PlayerService 的 Guard 保护查询读取真实 RPC 返回值，断言模块版本 v1 且 `load(100) = 105`。
 
-主 Service 调用 `begin`，轮询状态直到 `DEPLOYING`，再把 V2 普通模块及 Service Patch 完整复制到运行时 `root_path` 对应位置。复制失败不会继续；成功后调用 `skynet.cache.clear()`，以同一个 `batch_id` 调用 `apply(path = "v2")`，并轮询到 `COMPLETED`。所有等待都有 tick 上限。
+主 Service 调用 begin，轮询状态直到 DEPLOYING，再以同一个 batch_id 调用 apply(path = "v2")，并轮询到 COMPLETED。Controller 先完成全部目标的 Prepare、Stage、Activate，再部署完整 .lua 文件和清理 Skynet 代码缓存，最后 Finish。service/player.patch 不复制到宿主目录。所有等待都有 tick 上限。
 
 V2 普通模块完整替换导出内容：`version()` 返回 v2，装备为“剑”时 `make_load(state)` 计算基础攻击力加 20 再加 1。模块导出表和两种 `package.loaded` 名称仍保持同一张表，但这不会改写 PlayerService 缓存的旧 `business.load` 函数变量。示例保留旧函数引用，并检查 Service Patch 是否显式替换了 `business.load`。
 
