@@ -34,22 +34,6 @@ local function lifecycle_text()
         lifecycle.pending_creations, lifecycle.pending_module_loads, tostring(lifecycle.failed_locked))
 end
 
-local function wait_for_deploying(batch_id)
-    for _ = 1, WAIT_LIMIT_TICKS do
-        local status = checked(skynet.call(controller_handle, "hotupgrade", "status", {batch_id = batch_id}),
-            "查询发布状态")
-        local phase = status.lifecycle.phase
-        if phase == "DEPLOYING" then
-            return
-        end
-        if phase == "FAILED_LOCKED" then
-            error("HU_DEPLOYMENT_BLOCKED: begin 后进入失败锁定")
-        end
-        skynet.sleep(1)
-    end
-    error("HU_SAMPLE_TIMEOUT: 等待 DEPLOYING 超时")
-end
-
 local function wait_for_completion(batch_id)
     for _ = 1, WAIT_LIMIT_TICKS do
         local status = checked(skynet.call(controller_handle, "hotupgrade", "status", {batch_id = batch_id}),
@@ -91,15 +75,15 @@ end
 
 local function read_player(handle)
     local response = checked(skynet.call(handle, "lua", "inspect", {}), "读取 PlayerService")
-    local player = response.values and response.values[1]
+    local player = response.player
     assert(type(player) == "table", "HU_SAMPLE_INVALID_RESPONSE: PlayerService 未返回状态")
     return player
 end
 
 local function print_player(label, player)
-    print(string.format("%s handle=%d module=%s equip=%s schema_version=%d load(100)=%d guard_open=%s",
+    print(string.format("%s handle=%d module=%s equip=%s schema_version=%d load(100)=%d patching=%s",
         label, player.handle, player.module_version, player.equip, player.schema_version,
-        player.load_attack, tostring(player.guard_open)))
+        player.load_attack, tostring(player.patching)))
 end
 
 local function run_sample()
@@ -119,14 +103,9 @@ local function run_sample()
     assert(before.module_version == "v1" and before.load_attack == 105)
     assert(before.state_root_identity and before.module_root_identity and before.module_alias_identity)
 
-    current_step = "建立发布屏障"
-    local begun = checked(skynet.call(controller_handle, "hotupgrade", "begin", {}), "begin")
-    print("发布批次 " .. begun.batch_id .. " 等待进入 DEPLOYING")
-    wait_for_deploying(begun.batch_id)
-
-    current_step = "apply V2：由 HotUpgrade 更新运行时并部署文件"
-    checked(skynet.call(controller_handle, "hotupgrade", "apply",
-        {batch_id = begun.batch_id, path = "v2"}), "apply")
+    current_step = "发布 V2：由 begin 异步完成运行时更新与文件部署"
+    local begun = checked(skynet.call(controller_handle, "hotupgrade", "begin", {path = "v2"}), "begin")
+    print("已接受发布批次 " .. begun.batch_id)
     local completed = wait_for_completion(begun.batch_id)
     assert(completed.record.phase == "COMPLETED")
     print("原 PlayerService 批次 COMPLETED")
@@ -139,7 +118,7 @@ local function run_sample()
     assert(after.module_root_identity and after.module_alias_identity)
     assert(after.module_version == "v2" and after.equip == "剑" and after.schema_version == 2)
     assert(after.load_replaced and after.load_attack == 121 and after.cached_v1_load_attack == 100)
-    assert(after.guard_open)
+    assert(not after.patching)
 
     current_step = "创建并验收 V2 PlayerService"
     local second_handle = create_player()
@@ -147,7 +126,7 @@ local function run_sample()
     print_player("V2 new", created)
     assert(created.handle == second_handle and second_handle ~= first_handle)
     assert(created.module_version == "v2" and created.equip == "剑" and created.schema_version == 2)
-    assert(created.load_attack == 121 and created.guard_open)
+    assert(created.load_attack == 121 and not created.patching)
     print("原实例与新实例业务版本一致：v2")
 end
 

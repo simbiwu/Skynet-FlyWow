@@ -1,5 +1,6 @@
---- PlayerService 入口；登记后所有业务查询和攻击函数都通过同一个 Guard。
+--- PlayerService 入口；登记后所有业务查询和攻击函数都通过Service 自己的 queue。
 local skynet = require "skynet"
+local business_queue = require "skynet.queue"()
 
 local hotupgrade
 local logic
@@ -25,7 +26,7 @@ local function inspect()
         module_root_identity = package.loaded.player_logic == logic,
         module_alias_identity = package.loaded.player_logic == logic
             and package.loaded["lualib.player_logic"] == logic,
-        guard_open = hotupgrade.guard().owner == nil,
+        patching = hotupgrade.patching,
     }
 end
 
@@ -51,6 +52,9 @@ local function initialize()
     {
         service_module = "player",
         service_update = {state = state, functions = business},
+        before_upgrade = function()
+            return business_queue(function() return true end)
+        end,
         after_upgrade = function()
             return logic.version() == "v2" and state.equip == "剑"
                 and state.schema_version == 2 and business.load(100) == 121
@@ -75,11 +79,19 @@ skynet.start(function()
         elseif not registered then
             answer = {ok = false, code = "HU_NOT_INITIALIZED", message = "PlayerService 尚未登记"}
         elseif command == "inspect" then
-            answer = hotupgrade.guard():run(inspect)
+            if hotupgrade.patching then
+                answer = {ok = false, code = "HU_UPGRADING"}
+            else
+                answer = {ok = true, player = business_queue(inspect)}
+            end
         elseif command == "attack" then
-            answer = hotupgrade.guard():run(function()
-                return business.load(100)
-            end)
+            if hotupgrade.patching then
+                answer = {ok = false, code = "HU_UPGRADING"}
+            else
+                answer = business_queue(function()
+                    return {ok = true, attack = business.load(100)}
+                end)
+            end
         else
             answer = {ok = false, code = "HU_UNKNOWN_COMMAND", message = tostring(command)}
         end

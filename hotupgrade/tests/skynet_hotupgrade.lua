@@ -1,4 +1,4 @@
---- 真实多 State：handle/状态身份、组合恢复、Guard 排空、部分成功与恢复门禁。
+--- 真实多 State：handle/状态身份、组合恢复、queue 排空、部分成功与恢复门禁。
 local skynet = require "skynet"
 require "skynet.manager"
 local hotupgrade
@@ -37,18 +37,8 @@ local function read(handle)
     return skynet.call(handle, "lua", "read", {})
 end
 
-local function start(controller_handle, path, command)
-    local begun = skynet.call(controller_handle, "hotupgrade", "begin", {})
-    assert(begun.ok, begun.message)
-    for _ = 1, 1000 do
-        local status = skynet.call(controller_handle, "hotupgrade", "status", {batch_id = begun.batch_id})
-        if status.lifecycle.phase == "DEPLOYING" then
-            break
-        end
-        skynet.sleep(1)
-    end
-    local answer = skynet.call(controller_handle, "hotupgrade", command or "apply",
-        {batch_id = begun.batch_id, path = path})
+local function start(controller_handle, path, dry_run)
+    local answer = skynet.call(controller_handle, "hotupgrade", "begin", {path = path, dry_run = dry_run})
     assert(answer.ok, tostring(answer.code) .. ":" .. tostring(answer.message))
     return answer.batch_id
 end
@@ -87,8 +77,7 @@ end
 local function lifecycle_blocked(controller_handle)
     for _, command in ipairs({"unknown_command", "validate", "dry_run", "apply"}) do
         local rejected = skynet.call(controller_handle, "hotupgrade", command, {path = "module"})
-        local expected = (command == "unknown_command" or command == "validate")
-            and "HU_UNKNOWN_COMMAND" or "HU_BATCH_MISSING"
+        local expected = "HU_UNKNOWN_COMMAND"
         assert(rejected.code == expected and rejected.batch_id == nil)
     end
     assert(lifecycle_status(controller_handle).active_batch_id == nil)
@@ -136,7 +125,7 @@ local function creation_lifecycle_tests()
     assert(skynet.call(concurrent_late, "lua", "init", {}).ok)
     assert(lifecycle_status(controller_handle).pending_creations == 0)
     original(concurrent_early)
-    local target_count = wait(controller_handle, start(controller_handle, "module", "dry_run"),
+    local target_count = wait(controller_handle, start(controller_handle, "module", true),
         "DRY_RUN_COMPLETED").target_count
     for _, fixture in ipairs({
         {name = "hotupgrade_missing_service"},
@@ -146,7 +135,7 @@ local function creation_lifecycle_tests()
             fixture.mode)
         assert(not created and tostring(message):find("HU_SERVICE_CREATE_FAILED", 1, true))
         assert(lifecycle_status(controller_handle).pending_creations == 0)
-        local measured = wait(controller_handle, start(controller_handle, "module", "dry_run"),
+        local measured = wait(controller_handle, start(controller_handle, "module", true),
             "DRY_RUN_COMPLETED")
         assert(measured.target_count == target_count)
     end
@@ -183,16 +172,16 @@ local function module_lifecycle_tests()
         skynet.sleep(1)
     end
     assert(loaded and concurrent_loaded and lifecycle_status(controller_handle).pending_module_loads == 0)
-    local extra_batch = start(controller_handle, "extra", "dry_run")
+    local extra_batch = start(controller_handle, "extra", true)
     assert(wait(controller_handle, extra_batch, "DRY_RUN_COMPLETED").target_count == 1)
 
-    -- 活动批次的 Guard 排空窗口中，创建和首次模块执行等待成功终态。
+    -- 活动批次的 queue 排空窗口中，创建和首次模块执行等待成功终态。
     controller_handle = create_controller()
     handle = worker()
     skynet.fork(function()
         assert(skynet.call(handle, "lua", "hold", {ticks = 15}).ok)
     end)
-    while skynet.call(handle, "lua", "active", {}) == 0 do
+    while skynet.call(handle, "lua", "holding", {}) == false do
         skynet.sleep(1)
     end
     local id = start(controller_handle, "module")
@@ -245,7 +234,7 @@ local function unique_lifecycle_tests()
         assert(not ok and lifecycle_status(controller_handle).pending_creations == 0)
     end
     second = hotupgrade.uniqueservice("skynet_hotupgrade_unique_b")
-    local begun = skynet.call(controller_handle, "hotupgrade", "begin", {})
+    local begun = skynet.call(controller_handle, "hotupgrade", "begin", {path = "module", dry_run = true})
     assert(begun.ok and lifecycle_status(controller_handle).phase == "WAITING_CREATIONS")
     -- 已存在 handle 直接复用，新的逻辑键必须等待发布完成。
     assert(hotupgrade.uniqueservice("skynet_hotupgrade_unique_a") == first)
@@ -256,9 +245,7 @@ local function unique_lifecycle_tests()
     skynet.sleep(1)
     assert(queued == nil)
     assert(skynet.call(second, "lua", "init", {}).ok)
-    while lifecycle_status(controller_handle).phase ~= "DEPLOYING" do skynet.sleep(1) end
     assert(skynet.call(controller_handle, "hotupgrade", "unknown_command", {path = "module"}).code == "HU_UNKNOWN_COMMAND")
-    assert(skynet.call(controller_handle, "hotupgrade", "dry_run", {batch_id = begun.batch_id, path = "module"}).ok)
     wait(controller_handle, begun.batch_id, "DRY_RUN_COMPLETED")
     while not queued do skynet.sleep(1) end
     assert(queued ~= first and queued ~= second)
@@ -297,7 +284,7 @@ local function run()
         local native = require "flywow_hotupgrade_native"
         local root = require("hotupgrade_test_options").root_path
         assert(native.read_file(root, "service/new_service.lua") == false)
-        local dry = wait(controller, start(controller, "service_file", "dry_run"), "DRY_RUN_COMPLETED")
+        local dry = wait(controller, start(controller, "service_file", true), "DRY_RUN_COMPLETED")
         assert(dry.target_count == 0 and not dry.control_started)
         assert(native.read_file(root, "service/new_service.lua") == false)
         local record = wait(controller, start(controller, "service_file"), "COMPLETED")
@@ -314,7 +301,7 @@ local function run()
         local native = require "flywow_hotupgrade_native"
         local root = require("hotupgrade_test_options").root_path
         local old = assert(native.read_file(root, "lualib/test_worker_logic.lua"))
-        wait(controller, start(controller, "deployment", "dry_run"), "DRY_RUN_COMPLETED")
+        wait(controller, start(controller, "deployment", true), "DRY_RUN_COMPLETED")
         assert(native.read_file(root, "lualib/test_worker_logic.lua") == old)
         assert(native.read_file(root, "lualib/new/dependency.lua") == false)
         wait(controller, start(controller, "deployment"), "COMPLETED")
@@ -330,12 +317,14 @@ local function run()
         local root = require("hotupgrade_test_options").root_path
         local old = assert(native.read_file(root, "lualib/test_worker_logic.lua"))
         skynet.fork(function() assert(skynet.call(handle, "lua", "hold", {ticks = 20}).ok) end)
-        while skynet.call(handle, "lua", "active", {}) == 0 do skynet.sleep(1) end
+        while skynet.call(handle, "lua", "holding", {}) == false do skynet.sleep(1) end
         local id = start(controller, "deploy_failure")
-        -- apply 已冻结源码并准备旧文件；在 Guard 排空窗口注入目标路径失效。
+        while not read(handle).paused do skynet.sleep(1) end
+        -- begin 的异步发布已冻结源码并准备旧文件；在 queue 排空窗口注入目标路径失效。
         assert(os.execute("mkdir " .. root .. "/service/z_blocked.lua"))
         local record = wait(controller, id, "ABORTED")
-        assert(record.error.code == "HU_INVALID_PATH" and lifecycle_status(controller).phase == "IDLE")
+        assert(record.error.code == "HU_INVALID_PATH" and record.control_started
+            and record.target_count == 1 and record.failed == 1 and lifecycle_status(controller).phase == "IDLE")
         original(handle)
         assert(native.read_file(root, "lualib/test_worker_logic.lua") == old)
         assert(native.read_file(root, "lualib/a_added.lua") == false)
@@ -352,7 +341,7 @@ local function run()
         handle = worker()
         local before = original(handle)
         assert(before.runtime_alias_identity and before.runtime_value == 1 and before.max_level == 100)
-        wait(controller, start(controller, "host_paths", "dry_run"), "DRY_RUN_COMPLETED")
+        wait(controller, start(controller, "host_paths", true), "DRY_RUN_COMPLETED")
         assert(read(handle).runtime_value == 1 and read(handle).max_level == 100)
         assert(read(handle).package_value == 1 and read(handle).package_alias_identity)
         wait(controller, start(controller, "host_paths"), "COMPLETED")
@@ -383,15 +372,12 @@ local function run()
             {path = "unmatched_service", code = "HU_TARGET_MISSING"},
         }
         for _, fixture in ipairs(fixtures) do
-            for _, command in ipairs({"dry_run", "apply"}) do
-                local begun = skynet.call(controller, "hotupgrade", "begin", {})
-                assert(begun.ok)
-                while lifecycle_status(controller).phase ~= "DEPLOYING" do skynet.sleep(1) end
-                local rejected = skynet.call(controller, "hotupgrade", command,
-                    {batch_id = begun.batch_id, path = fixture.path})
-                assert(not rejected.ok and rejected.code == fixture.code)
-                assert(rejected.message and #rejected.message > 0)
-                local status = skynet.call(controller, "hotupgrade", "status", {batch_id = begun.batch_id})
+            for _, dry_run in ipairs({true, false}) do
+                local id = start(controller, fixture.path, dry_run)
+                local record = wait(controller, id, "ABORTED")
+                local rejected = record.error
+                assert(rejected.code == fixture.code and rejected.message and #rejected.message > 0)
+                local status = skynet.call(controller, "hotupgrade", "status", {batch_id = id})
                 assert(status.ok and status.record.phase == "ABORTED")
                 assert(status.record.error.code == fixture.code and not status.record.control_started)
                 assert(original(handle).marker_token == before.marker_token)
@@ -401,17 +387,17 @@ local function run()
         end
         assert(skynet.call(controller, "hotupgrade", "unknown_command", {path = "module"}).code == "HU_UNKNOWN_COMMAND")
         print("HOTUPGRADE_SKYNET_PATCH_MATCH_OK")
-    elseif group == "identity_guard" then
+    elseif group == "identity_queue" then
         controller = create_controller()
         handle = worker()
         local before = original(handle)
-        assert(skynet.call(handle, "lua", "bump", {}).values[1] == 8)
+        assert(skynet.call(handle, "lua", "bump", {}).value == 8)
         local held = false
         skynet.fork(function()
             assert(skynet.call(handle, "lua", "hold", {ticks = 15}).ok)
             held = true
         end)
-        while skynet.call(handle, "lua", "active", {}) == 0 do skynet.sleep(1) end
+        while skynet.call(handle, "lua", "holding", {}) == false do skynet.sleep(1) end
         local id = start(controller, "combined")
         while not read(handle).paused do skynet.sleep(1) end
         local rejected = skynet.call(handle, "lua", "hold", {ticks = 1})
@@ -424,12 +410,21 @@ local function run()
         assert(after.equip == "剑" and after.level == 50 and after.schema_version == 2)
         assert(after.attack == 120 and after.save_identity)
         assert(after.module_value == 2 and after.cached_value == 1 and after.added and after.removed == nil)
-        assert(skynet.call(handle, "lua", "bump", {}).values[1] == 9)
-        print("HOTUPGRADE_SKYNET_IDENTITY_STATE_GUARD_OK")
+        assert(skynet.call(handle, "lua", "bump", {}).value == 9)
+        print("HOTUPGRADE_SKYNET_IDENTITY_STATE_QUEUE_OK")
+    elseif group == "prepare_missing" or group == "prepare_false" or group == "prepare_error" then
+        controller = create_controller()
+        local config = {}
+        config[group == "prepare_missing" and "before_missing"
+            or (group == "prepare_false" and "before_false" or "before_error")] = true
+        handle = worker(config)
+        local record = wait(controller, start(controller, "combined"), "ABORTED")
+        assert(record.error.code == (group == "prepare_error" and "HU_PREPARE_FAILED" or "HU_SAFEPOINT_REQUIRED"))
+        original(handle)
     elseif group == "dry_run" then
         controller = create_controller()
         handle = worker()
-        wait(controller, start(controller, "combined", "dry_run"), "DRY_RUN_COMPLETED")
+        wait(controller, start(controller, "combined", true), "DRY_RUN_COMPLETED")
         original(handle)
         print("HOTUPGRADE_SKYNET_DRY_RUN_OK")
     elseif group == "optional_service" then
@@ -450,7 +445,7 @@ local function run()
         assert(skynet.call(handle, "lua", "declare", {}) == 1)
         wait(controller, start(controller, "extra"), "COMPLETED")
         assert(read(handle).extra_value == 2)
-        assert(skynet.call(handle, "hotupgrade", "activate",
+        assert(skynet.call(handle, "hotupgrade", "update",
             {batch_id = "foreign", sequence = 999}).code == "HU_UNAUTHORIZED")
         print("HOTUPGRADE_SKYNET_DECLARATION_OK")
     elseif group == "bad_functions" or group == "stage_failure" then
@@ -511,8 +506,9 @@ local function run()
         controller = create_controller()
         handle = worker()
         skynet.fork(function() assert(skynet.call(handle, "lua", "hold", {ticks = 15}).ok) end)
-        while skynet.call(handle, "lua", "active", {}) == 0 do skynet.sleep(1) end
+        while skynet.call(handle, "lua", "holding", {}) == false do skynet.sleep(1) end
         local id = start(controller, "combined")
+        while not read(handle).paused do skynet.sleep(1) end
         assert(skynet.call(controller, "hotupgrade", "abort", {batch_id = id}).ok)
         wait(controller, id, "ABORTED")
         original(handle)
@@ -526,7 +522,7 @@ local function run()
         local locked = lifecycle_status(controller)
         assert(skynet.call(controller, "hotupgrade", "resolve_deployment",
             {batch_id = locked.batch_id, confirmed = true, confirmation = "UNCHANGED"}).code == "HU_RECOVERY_CONFIRMATION_REQUIRED")
-        local answer = skynet.call(controller, "hotupgrade", "apply", {path = "module"})
+        local answer = skynet.call(controller, "hotupgrade", "begin", {path = "module"})
         assert(not answer.ok and answer.code == "HU_DEPLOYMENT_BLOCKED")
         print("HOTUPGRADE_SKYNET_RECOVERY_REQUIRED_OK")
     else

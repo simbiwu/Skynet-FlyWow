@@ -9,6 +9,8 @@ elseif not startup_mode then
     assert(startup_arguments.n == 0)
 end
 local skynet = require "skynet"
+local business_queue = require "skynet.queue"()
+local holding = false -- 仅测试观察 queue 中可 yield 业务是否仍未退出。
 local hotupgrade
 local logic
 local runtime
@@ -71,6 +73,16 @@ local function initialize(request)
     {
         service_module = worker_test_config.service_module or "player",
         service_update = service_update,
+        before_upgrade = not worker_test_config.before_missing and function()
+            assert(hotupgrade.patching)
+            if worker_test_config.before_error then
+                error("injected before_upgrade failure")
+            end
+            if worker_test_config.before_false then
+                return false
+            end
+            return business_queue(function() return true end)
+        end or nil,
         after_upgrade = function()
             if worker_test_config.after_upgrade_failure then
                 error("after_upgrade failed")
@@ -116,7 +128,7 @@ skynet.start(function()
         elseif command == "read" then
             while startup_mode and not startup_registration do skynet.sleep(1) end
             assert(not startup_registration or startup_registration.ok)
-            -- 仅测试诊断用的只读观察，不是可绕过 Guard 的生产业务入口。
+            -- 仅测试诊断用的只读观察，不是生产业务入口。
             answer =
             {
                 handle = skynet.self(), marker_token = tostring(marker),
@@ -135,7 +147,7 @@ skynet.start(function()
                 save_identity = business.save == original_save,
                 module_value = logic.value(), cached_value = cached(),
                 removed = logic.removed, added = logic.added,
-                paused = hotupgrade.guard().owner ~= nil,
+                paused = hotupgrade.patching,
                 nested_count = service_state.nested and service_state.nested.count,
                 nested_identity = service_state.nested == nested_identity,
                 extra_value = extra_logic and extra_logic.value(),
@@ -254,14 +266,24 @@ skynet.start(function()
             extra_logic = hotupgrade.require("hotupgrade_extra")
             answer = extra_logic.value()
         elseif command == "bump" then
-            answer = hotupgrade.guard():run(logic.bump)
+            if hotupgrade.patching then
+                answer = {ok = false, code = "HU_UPGRADING"}
+            else
+                answer = business_queue(function() return {ok = true, value = logic.bump()} end)
+            end
         elseif command == "hold" then
-            answer = hotupgrade.guard():run(function()
-                skynet.sleep(request.ticks or 10)
-                return service_state.level
-            end)
-        elseif command == "active" then
-            answer = hotupgrade.guard().active
+            if hotupgrade.patching then
+                answer = {ok = false, code = "HU_UPGRADING"}
+            else
+                answer = business_queue(function()
+                    holding = true
+                    skynet.sleep(request.ticks or 10)
+                    holding = false
+                    return {ok = true, level = service_state.level}
+                end)
+            end
+        elseif command == "holding" then
+            answer = holding
         elseif command == "repair" then
             package.loaded["lualib.test_worker_logic"] = logic
             answer = true

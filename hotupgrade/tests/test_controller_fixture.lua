@@ -2,20 +2,22 @@
 local hotupgrade_common = require "flywow_hotupgrade_common"
 local module_state =
 {
-    pending_control_coroutines = {}, -- 测试替身排队的 Controller 控制面协程。
-    last_control_command_by_handle = {}, -- 各目标最近收到的控制步骤。
-    shared_environment = {}, -- 模拟 Skynet 跨 State 的只写一次环境。
-    launch_handle = nil, -- 原生创建替身将返回的真实 handle。
-    launch_hook = nil, -- 在原生创建尚未返回时注入登记或启动失败。
-    launches = {}, -- 记录实际进入原生创建的逻辑名和完整参数。
-    killed = {}, -- 验证只有创建者取消时才终止对应待登记 Service。
-    injected_read_failure = nil, -- 文件准备失败时不得开始运行时更新。
-    injected_restore_failure = false, -- 旧文件回写失败时必须锁定并保留错误。
-    cache_failures = 0, -- 缓存清理替身连续失败次数。
-    file_contents = {}, -- Native 替身的正式文件，验证部署和恢复是否发生。
-    operations = {}, -- 按时间记录目标协议、文件写入和缓存清理。
-    injected_file_failure = nil, -- 指定写入失败的相对文件名。
-    injected_control_failure = nil, -- 当前测试注入的目标和命令失败条件。
+    pending_control_coroutines     = {},    -- 测试替身排队的 Controller 控制面协程。
+    last_control_command_by_handle = {},    -- 各目标最近收到的控制步骤。
+    shared_environment             = {},    -- 模拟 Skynet 跨 State 的只写一次环境。
+    launch_handle                  = nil,   -- 原生创建替身将返回的真实 handle。
+    launch_hook                    = nil,   -- 在原生创建尚未返回时注入登记或启动失败。
+    launches                       = {},    -- 记录实际进入原生创建的逻辑名和完整参数。
+    killed                         = {},    -- 验证只有创建者取消时才终止对应待登记 Service。
+    injected_patch_read_failure    = nil,   -- 包扫描后文件消失或读取失败的诊断。
+    injected_read_failure          = nil,   -- 文件准备失败时不得开始运行时更新。
+    injected_restore_failure       = false, -- 旧文件回写失败时必须锁定并保留错误。
+    cache_failures                 = 0,     -- 缓存清理替身连续失败次数。
+    file_contents                  = {},    -- Native 替身的正式文件，验证部署和恢复是否发生。
+    operations                     = {},    -- 按时间记录目标协议、文件写入和缓存清理。
+    injected_file_failure          = nil,   -- 指定写入失败的相对文件名。
+    control_hook                   = nil,   -- 在目标 RPC 中暂停协调协程，验证运行中取消。
+    injected_control_failure       = nil,   -- 当前测试注入的目标和命令失败条件。
 }
 package.loaded.skynet =
 {
@@ -39,12 +41,24 @@ package.loaded.skynet =
     wait = function() coroutine.yield() end,
     wakeup = function(co) assert(coroutine.resume(co)) end,
     kill = function(handle) module_state.killed[handle] = true end,
-    fork = function(fn) module_state.pending_control_coroutines[#module_state.pending_control_coroutines + 1] = fn end,
+    fork = function(fn)
+        local co = coroutine.create(fn)
+        module_state.pending_control_coroutines[#module_state.pending_control_coroutines + 1] = function()
+            local ok, message = coroutine.resume(co)
+            assert(ok, message)
+        end
+    end,
     call = function(handle, protocol, command, request)
         assert(protocol == "hotupgrade" and request.sequence > 0)
         module_state.operations[#module_state.operations + 1] = handle .. ":" .. command
         module_state.last_control_command_by_handle[handle] = command
+        if module_state.control_hook then
+            module_state.control_hook(handle, command)
+        end
         if module_state.injected_control_failure and module_state.injected_control_failure.handle == handle and module_state.injected_control_failure.command == command then
+            if module_state.injected_control_failure.unknown then
+                error("injected RPC result unknown")
+            end
             return {ok = false, code = "HU_FIXTURE_FAILED", message = command}
         end
         return {ok = true}
@@ -58,6 +72,18 @@ package.loaded.flywow_hotupgrade_native =
         return relative and path .. "/" .. relative or (path:gsub("/%.$", ""))
     end,
     read_file = function(_root, path)
+        if _root:find("/patches", 1, true) then
+            if module_state.injected_patch_read_failure == "missing" then
+                return false
+            elseif module_state.injected_patch_read_failure == "error" then
+                return nil, {code = "HU_FILE_READ_FAILED"}
+            end
+            local file = io.open(_root .. "/" .. path, "rb")
+            if not file then return false end
+            local source = file:read("*a")
+            file:close()
+            return source
+        end
         if path == module_state.injected_read_failure then
             return nil, {code = "HU_FILE_READ_FAILED"}
         end
@@ -102,20 +128,18 @@ local function initialize_controller(service_dir)
     assert(initialized.ok, initialized.message)
     return controller
 end
-local function begin_deployment(instance)
-    local begun = instance:control("begin", {}, 1)
+local function begin_deployment(instance, path, dry_run)
+    local begun = instance:control("begin", {path = path, dry_run = dry_run}, 1)
     assert(begun.ok)
-    module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     return begun.batch_id
 end
 
-local function publish(instance, command, request)
+local function publish(instance, dry_run, request)
     if instance.phase == "FAILED_LOCKED" then
         assert(instance:control("resolve_deployment", {batch_id = instance.last.batch_id,
             confirmed = true, confirmation = "CONVERGED_CACHE_CLEARED"}, 1).ok)
     end
-    request.batch_id = begin_deployment(instance)
-    return instance:control(command, request, 1)
+    return instance:control("begin", {path = request.path, dry_run = dry_run}, 1)
 end
 
 local function managed_register(instance, metadata, handle)

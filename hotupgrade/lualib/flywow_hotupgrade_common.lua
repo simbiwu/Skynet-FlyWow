@@ -3,7 +3,6 @@ local M =
 {
     ROOT_PATH_ENV      = "flywow_hotupgrade_root_path", -- Controller 发布的进程内宿主根路径；所有目标 State 共用。
     PROTOCOL_ID        = 20,                            -- 所有 HotUpgrade Lua State 注册的 Skynet 协议 ID。
-    DEFAULT_TIMEOUT_MS = 10000,                         -- Guard 等待业务排空的默认毫秒数。
 }
 
 return M

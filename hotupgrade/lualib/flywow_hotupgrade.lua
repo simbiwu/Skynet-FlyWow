@@ -6,15 +6,16 @@ local hotupgrade_common = require "flywow_hotupgrade_common"
 local hotupgrade_native = require "flywow_hotupgrade_native"
 local hotupgrade_module_patch = require "flywow_hotupgrade_module_patch"
 local controller_handle = skynet.uniqueservice("flywow_hotupgrade_service")
-local M = {}
+local M =
+{
+    patching = false, -- prepare 起禁止新业务进入，finish 或确认恢复后解除。
+}
 local module_state =
 {
     registered            = false,                            -- Controller 已确认首次登记；配置建立早于此确认。
     registration_complete = false,                            -- 首次登记 RPC 已返回；失败后不得继续本 State 的业务启动。
     registration_waiters  = {},                               -- 首次登记 RPC 期间的声明等待者，避免遗漏初始元数据快照。
     registration          = nil,                              -- 本 Lua State 登记配置；私有表和函数不发送给 Controller。
-    business_guard        = nil,                              -- 注册前创建的业务 Guard 在注册后继续复用。
-    module_patch_engine   = nil,                              -- 本 State 唯一完整模块更新器。
     active_transaction    = nil,                              -- 当前事务的撤销数据保留至 finish/abort 确认完成。
     completed_sequence    = 0,                                -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
     last_batch_id         = nil,                              -- 最近完成的批次，用于 finish/abort 幂等响应。
@@ -72,24 +73,6 @@ function M.cancel_service_creation(handle)
     return skynet.call(controller_handle, "hotupgrade", "cancel_service_creation", {handle = handle})
 end
 
---- 当前 Service 的唯一 Guard；业务请求和会写状态的后台任务都须经过它。
----@return table Guard:run 可执行正常 yield 的业务回调。
-function M.guard()
-    if not module_state.business_guard then
-        module_state.business_guard = require("flywow_hotupgrade_guard").new(
-        {
-            now = function()
-                return skynet.now() * 10
-            end,
-            sleep = function(ms)
-                skynet.sleep(math.max(1, math.ceil(ms / 10)))
-            end,
-        })
-    end
-
-    return module_state.business_guard
-end
-
 local function restore_service(txn)
     local staged = txn.service
     if not staged or not staged.touched then
@@ -122,7 +105,7 @@ local function abort(txn)
     end
 
     if txn.modules then
-        local restored = module_state.module_patch_engine:abort(txn.modules)
+        local restored = hotupgrade_module_patch.abort(txn.modules)
         if not restored.ok then
             errors[#errors + 1] = restored.message
         else
@@ -135,19 +118,14 @@ local function abort(txn)
         return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
     end
 
-    local resumed = module_state.business_guard:resume(txn.batch_id)
-    if not resumed.ok then
-        txn.phase = "RECOVERY_REQUIRED"
-        return resumed
-    end
-
     module_state.completed_sequence = txn.sequence
     module_state.last_batch_id = txn.batch_id
     module_state.active_transaction = nil
+    M.patching = false
     return hotupgrade_result.success()
 end
 
--- 只在 Guard 已排空时执行受信同步脚本；此函数不提供安全沙箱或副作用撤销。
+-- 只在业务安全点已确认时执行受信同步脚本；此函数不提供安全沙箱或副作用撤销。
 local function stage_service(source)
     if not source then
         return nil
@@ -197,11 +175,11 @@ local function stage_service(source)
 end
 
 --- 当前 State 的控制入口；请求只携带源码与批次号，不传递业务状态、函数或私有表。
---- prepare 允许等待在途业务；stage/activate/abort/finish 的脚本和回调必须同步。
----@param command string prepare/stage/activate/abort/finish
----@param request table batch_id、sequence；stage 另含 modules 和可选 service_source
+--- prepare 通过业务 queue 等待排空，允许 yield；update/abort/finish 必须同步。
+---@param command string prepare/update/abort/finish
+---@param request table batch_id、sequence；update 另含 modules 和可选 service_source
 ---@param source integer 由 Skynet 提供的真实调用来源
----@return FlyWowHotUpgradeResult 恢复不确定时保持 Guard 关闭
+---@return FlyWowHotUpgradeResult 恢复不确定时保持 patching=true
 local function control(command, request, source)
     if not module_state.registration or source ~= controller_handle then
         return hotupgrade_result.failure("HU_UNAUTHORIZED", "控制来源不匹配")
@@ -212,6 +190,10 @@ local function control(command, request, source)
         return hotupgrade_result.failure("HU_INVALID_REQUEST", "批次身份无效")
     end
 
+    if command ~= "prepare" and command ~= "update" and command ~= "abort" and command ~= "finish" then
+        return hotupgrade_result.failure("HU_UNKNOWN_COMMAND", tostring(command))
+    end
+
     if module_state.last_batch_id == request.batch_id and (command == "abort" or command == "finish") then
         return hotupgrade_result.success()
     end
@@ -220,33 +202,34 @@ local function control(command, request, source)
         return hotupgrade_result.failure("HU_STALE_TRANSACTION", "过期或冲突批次命令")
     end
 
-    -- prepare 建立事务安全点并等待在途业务排空；等待过程可能 yield。
+    -- 先禁止新业务，再通过业务自己的 queue 等待；callback 内允许正常 yield。
     if command == "prepare" then
         if module_state.active_transaction then
             return hotupgrade_result.failure("HU_UPGRADE_BUSY", "当前批次已在处理中")
         end
-        module_state.active_transaction = {batch_id = request.batch_id, sequence = request.sequence, phase = "QUIESCING"}
-        local paused = module_state.business_guard:prepare_upgrade(request.batch_id)
-        if not paused.ok then
-            module_state.active_transaction = nil
-            return paused
+        local txn = {batch_id = request.batch_id, sequence = request.sequence, phase = "QUIESCING"}
+        module_state.active_transaction = txn
+        M.patching = true
+        if not module_state.registration.before_upgrade then
+            return hotupgrade_result.failure("HU_SAFEPOINT_REQUIRED", "未提供 before_upgrade，不能确认业务已排空")
         end
-
-        local waited = module_state.business_guard:wait_idle(request.batch_id, request.timeout_ms or hotupgrade_common.DEFAULT_TIMEOUT_MS, module_state.registration.before_upgrade)
-        -- wait_idle 可以 yield；恢复后须重新确认事务仍由当前请求持有。
-        if not module_state.active_transaction or module_state.active_transaction.batch_id ~= request.batch_id then
+        local ok, answer = pcall(module_state.registration.before_upgrade)
+        if module_state.active_transaction ~= txn or not M.patching then
             return hotupgrade_result.failure("HU_STALE_TRANSACTION", "等待时批次已结束")
         end
-
-        if waited.ok then
-            module_state.active_transaction.phase = "QUIESCED"
+        if not ok then
+            return hotupgrade_result.failure("HU_PREPARE_FAILED", tostring(answer))
         end
-
-        return waited
+        if answer ~= true and not (type(answer) == "table" and answer.ok == true) then
+            return hotupgrade_result.failure("HU_SAFEPOINT_REQUIRED",
+                type(answer) == "table" and (answer.message or answer.code) or "before_upgrade 未确认业务安全点")
+        end
+        txn.phase = "QUIESCED"
+        return hotupgrade_result.success()
     end
 
     local txn = module_state.active_transaction
-    if not txn or txn.sequence ~= request.sequence or module_state.business_guard.owner ~= txn.batch_id then
+    if not txn or txn.sequence ~= request.sequence or not M.patching then
         return hotupgrade_result.failure("HU_STALE_TRANSACTION", "未取得本批次安全点")
     end
 
@@ -254,19 +237,18 @@ local function control(command, request, source)
         return abort(txn)
     end
 
-    if module_state.business_guard.active ~= 0 then
-        return hotupgrade_result.failure("HU_SAFEPOINT_REQUIRED", "在途业务尚未排空")
-    end
-
-    -- Stage 只准备候选模块和 Service 更新，不写线上导出或状态。
-    if command == "stage" and txn.phase == "QUIESCED" then
+    if command == "update" then
+        if txn.phase ~= "QUIESCED" then
+            return hotupgrade_result.failure("HU_SAFEPOINT_REQUIRED", "Prepare 尚未确认业务安全点")
+        end
+        -- Stage 只准备候选和快照，不写线上导出或状态。
         for _, entry in ipairs(request.modules or {}) do
             if not module_state.declared_modules[entry.name] then
                 return hotupgrade_result.failure("HU_MODULE_NOT_REGISTERED", tostring(entry.name))
             end
         end
 
-        local staged = module_state.module_patch_engine:stage(request.modules or {})
+        local staged = hotupgrade_module_patch.stage(request.modules or {})
         if not staged.ok then
             return staged
         end
@@ -279,12 +261,9 @@ local function control(command, request, source)
 
         txn.service = service
         txn.phase = "STAGED"
-        return hotupgrade_result.success()
-    end
 
-    -- Activate 在 Guard 内同步提交；任一步失败都会调用组合恢复。
-    if command == "activate" and txn.phase == "STAGED" then
-        local installed = module_state.module_patch_engine:commit(txn.modules)
+        -- Activate 同步提交；任一步失败先组合恢复，再由 Controller 整批 Abort。
+        local installed = hotupgrade_module_patch.commit(txn.modules)
         local ok, message = pcall(function()
             assert(installed.ok, installed.message)
             local staged = txn.service
@@ -319,21 +298,16 @@ local function control(command, request, source)
 
     -- finish 确认提交后才清理旧快照并重新开放业务入口。
     if command == "finish" and txn.phase == "ACTIVATED" then
-        local finished = module_state.module_patch_engine:finish(txn.modules)
+        local finished = hotupgrade_module_patch.finish(txn.modules)
         if not finished.ok then
             txn.phase = "RECOVERY_REQUIRED"
             return finished
         end
 
-        local resumed = module_state.business_guard:resume(txn.batch_id)
-        if not resumed.ok then
-            txn.phase = "RECOVERY_REQUIRED"
-            return resumed
-        end
-
         module_state.completed_sequence = txn.sequence
         module_state.last_batch_id = txn.batch_id
         module_state.active_transaction = nil
+        M.patching = false
         return hotupgrade_result.success()
     end
 
@@ -345,13 +319,13 @@ end
 ---@field functions table Service 原有业务函数表；Patch 只替换本次列出的现有函数字段。
 ---@field snapshot? fun(state:table):table Stage 开始迁移前生成与线上对象隔离的快照；与 commit、restore 成组提供。
 ---@field commit? fun(state:table, next_state:table) Activate 内同步原地应用候选状态；不得 yield 或写外部权威数据。
----@field restore? fun(state:table, old_state:table) 提交失败时同步恢复快照；返回 false 或抛错会保持 Guard 关闭。
+---@field restore? fun(state:table, old_state:table) 提交失败时同步恢复快照；返回 false 或抛错会保持 patching=true。
 
 ---@class FlyWowHotUpgradeRegistration
 ---@field service_module string 匹配 service_dir 下的一次性 .patch 相对路径；去掉 .patch 并将 / 转为 .
 ---@field service_update? FlyWowHotUpgradeServiceUpdate 可选 Service 内部状态/函数更新入口
----@field before_upgrade? fun():boolean|table Guard 暂停新业务且在途调用归零后反复调用；true 或 {ok=true} 才放行，否则继续等待至超时，异常立即失败。同步只读，不得 yield
----@field after_upgrade? fun():boolean Activate 提交模块与 Service 状态后、finish 前调用；false 或异常触发组合恢复。只检查已提交状态，不得产生外部副作用或 yield
+---@field before_upgrade? fun():boolean|table prepare 设置 patching 后调用，允许 yield；须通过业务自己的 queue 确认此前业务结束。true 或 {ok=true} 才允许 Update，缺失或失败则 Abort
+---@field after_upgrade? fun():boolean Update 内 Activate 提交模块与 Service 状态后、finish 前调用；false 或异常触发组合恢复。只检查已提交状态，不得产生外部副作用或 yield
 
 --- 登记现存 Service；仅元数据跨 Service 传递。可能 yield，成功前宿主不能宣布 READY。
 ---@param registration FlyWowHotUpgradeRegistration 本 State 配置及可选 Service 更新入口
@@ -397,12 +371,10 @@ function M.register_service(registration)
     end
 
     module_state.registration = registration
-    module_state.module_patch_engine = hotupgrade_module_patch.new()
-    M.guard()
     skynet.dispatch("hotupgrade", function(session, source, command, request)
         local ok, answer = pcall(control, command, request, source)
         if not ok then
-            -- 未预期异常可能发生在写入后；保留本地事务与 Guard，不能伪称恢复成功。
+            -- 未预期异常可能发生在写入后；保留本地事务与 patching，不能伪称恢复成功。
             if module_state.active_transaction then
                 module_state.active_transaction.phase = "RECOVERY_REQUIRED"
             end

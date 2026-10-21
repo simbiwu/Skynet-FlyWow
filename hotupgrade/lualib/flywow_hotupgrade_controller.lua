@@ -16,22 +16,6 @@ local function native_code(value)
     return value or "HU_NATIVE_ERROR"
 end
 
--- 读取单个已规范化文件；关闭失败也视为读取失败，避免冻结不完整内容。
-local function read(path)
-    local file, message = io.open(path, "rb")
-    if not file then
-        return hotupgrade_result.failure("HU_FILE_NOT_FOUND", message)
-    end
-
-    local bytes = file:read("*a")
-    local closed = file:close()
-    if not bytes or not closed then
-        return hotupgrade_result.failure("HU_FILE_READ_FAILED", path)
-    end
-
-    return hotupgrade_result.success({bytes = bytes})
-end
-
 -- 宿主根目录相对 Lua 路径对应 Controller 使用的唯一模块登记名。
 local function module_name(path)
     if path:sub(-4) ~= ".lua" or path:find("\\", 1, true) then
@@ -57,21 +41,16 @@ local function load_files(root, patch_path, identity)
 
     local entries = {}
     for _, relative in ipairs(paths) do
-        local absolute = root .. "/" .. patch_path .. "/" .. relative
-        local located, locate_error = hotupgrade_native.resolve(absolute)
-        if not located then
-            return hotupgrade_result.failure(native_code(locate_error), relative)
+        local source, failure = hotupgrade_native.read_file(root, patch_path .. "/" .. relative)
+        if source == nil or source == false then
+            return hotupgrade_result.failure(source == false and "HU_FILE_NOT_FOUND" or native_code(failure),
+                "发布包读取失败: " .. patch_path .. "/" .. relative)
         end
-
-        local loaded = read(located)
-        if not loaded.ok then
-            return loaded
-        end
-        local chunk, syntax_error = load(loaded.bytes, "@" .. relative, "t", {})
+        local chunk, syntax_error = load(source, "@" .. relative, "t", {})
         if not chunk then
             return hotupgrade_result.failure("HU_MODULE_SYNTAX", syntax_error)
         end
-        entries[#entries + 1] = {file = relative, source = loaded.bytes}
+        entries[#entries + 1] = {file = relative, source = source}
         identity[#identity + 1] = relative
     end
 
@@ -145,13 +124,13 @@ end
 ---@class FlyWowHotUpgradeControlRequest
 ---@field batch_id string Controller handle 与本进程递增序号组成；仅在该 Controller 生命周期有效
 ---@field sequence integer 当前批次严格递增的序号，目标用来拒绝迟到消息
----@field timeout_ms integer prepare 等待 Guard 排空的毫秒上限，不代表远端操作取消
----@field modules? table[] stage 使用的 name/source 完整模块数组；不含业务对象
----@field service_source? string stage 使用的可选一次性 Service 脚本源码
+---@field modules? table[] update 使用的 name/source 完整模块数组；不含业务对象
+---@field service_source? string update 使用的可选一次性 Service 脚本源码
 
 ---@class FlyWowHotUpgradeManagementRequest
----@field path? string apply/dry_run 的 Patch Root 相对目录
----@field batch_id? string apply/dry_run/status/abort/resolve_deployment 使用 begin 返回的身份
+---@field path? string begin 的 Patch Root 相对目录
+---@field dry_run? boolean begin 仅验证更新与恢复，不部署正式文件
+---@field batch_id? string status/abort/resolve_deployment 使用 begin 返回的身份
 ---@field confirmed? boolean 宿主明确确认恢复完成
 ---@field confirmation? string UNCHANGED 或 CONVERGED_CACHE_CLEARED
 
@@ -167,8 +146,7 @@ end
 ---@class FlyWowHotUpgradeControllerConfig
 ---@field patch_root string 已存在且由宿主管理的受信 Patch 根目录
 ---@field root_path string 宿主项目根目录；模块登记名由其相对文件路径生成
----@field service_dir string root_path 下的相对 Service 目录，其下 Lua 文件作为一次性 Service 更新脚本
----@field timeout_ms? integer Guard 排空上限；默认值见 hotupgrade_common.DEFAULT_TIMEOUT_MS，不是 RPC 取消期限
+---@field service_dir string root_path 下的相对 Service 目录；.lua 完整部署，.patch 匹配现存实例
 
 --- 初始化唯一控制面；不读取持久化历史，不尝试恢复上一进程的批次。
 ---@param controller_config FlyWowHotUpgradeControllerConfig
@@ -176,10 +154,8 @@ end
 function M.initialize(controller_config)
     if type(controller_config) ~= "table" or type(controller_config.patch_root) ~= "string" or controller_config.patch_root == ""
         or type(controller_config.root_path) ~= "string" or controller_config.root_path == ""
-        or type(controller_config.service_dir) ~= "string"
-        or (controller_config.timeout_ms ~= nil and (math.type(controller_config.timeout_ms) ~= "integer"
-            or controller_config.timeout_ms <= 0)) then
-        return hotupgrade_result.failure("HU_INVALID_OPTIONS", "需要 patch_root、root_path、service_dir 和可选正整数 timeout_ms")
+        or type(controller_config.service_dir) ~= "string" then
+        return hotupgrade_result.failure("HU_INVALID_OPTIONS", "需要 patch_root、root_path、service_dir")
     end
 
     local root, code = hotupgrade_native.resolve(controller_config.patch_root .. "/.")
@@ -206,14 +182,11 @@ function M.initialize(controller_config)
         return hotupgrade_result.failure("HU_ALREADY_INITIALIZED", "控制面已初始化")
     end
 
-    local timeout_ms = controller_config.timeout_ms or hotupgrade_common.DEFAULT_TIMEOUT_MS
     local initialized_state =
     {
         root_path            = root_path,                        -- 正式文件部署根目录；所有文件操作仍受 Native 路径检查约束。
         root                 = root,                             -- 固定使用已解析的受信 Patch 根目录，不随批次改变。
         service_dir          = controller_config.service_dir,    -- Patch 中仅此目录及其子目录按 Service 脚本处理。
-        timeout_ms           = timeout_ms,                       -- Guard 排空期限，单位毫秒；默认值见 hotupgrade_common.DEFAULT_TIMEOUT_MS。
-        target_count         = 0,                                -- 当前 Controller 生命周期内成功登记的目标数量，用于状态查询。
         targets              = {},                               -- 以真实 Service handle 为键，保存其模块声明和 Service 更新能力。
         pending_creations    = {},                               -- 创建协程拥有的记录；原生启动返回且登记完成后才移除。
         creation_handles     = {},                               -- 真实 handle 到待创建记录的索引，不用名称或延迟关联。
@@ -545,7 +518,6 @@ function M:register(request, source)
     if self.phase == "DEPLOYING" or self.phase == "APPLYING" or self.phase == "FAILED_LOCKED" then
         return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "当前阶段不能登记新 Service")
     end
-    self.target_count = self.target_count + 1
     self.targets[source] =
     {
         handle            = source,                 -- Skynet 提供的真实来源，也是后续控制目标。
@@ -630,9 +602,8 @@ function M:step(batch, target, command)
     {
         batch_id = batch.batch_id,
         sequence = batch.sequence,
-        timeout_ms = self.timeout_ms,
     }
-    if command == "stage" then
+    if command == "update" then
         request.modules = target.modules
         request.service_source = target.service_source
     end
@@ -650,9 +621,39 @@ function M:step(batch, target, command)
 end
 
 -- 按阶段协调整批目标；Finish 开始后只报告收尾故障，不回滚已开放业务的目标。
-function M:run(batch, dry_run)
+function M:run(batch, request)
+    -- 登记 waiter 到 wait 之间不 yield；完成回调会唤醒同一批次，恢复后重验身份和计数。
+    while self.active == batch and (self.creation_count > 0 or self.module_load_count > 0) do
+        batch.waiter = coroutine.running()
+        skynet.wait(batch.waiter)
+        batch.waiter = nil
+    end
+    if self.active ~= batch then
+        return
+    end
+    self:advance_deployment()
+    local dry_run = request.dry_run == true
     local ok, message = pcall(function()
-        for _, command in ipairs({"prepare", "stage", "activate"}) do
+        local loaded = self:load(request)
+        if not loaded.ok then
+            batch.error = loaded
+            return
+        end
+        if not dry_run then
+            for _, file in ipairs(loaded.patch.files) do
+                local old_source, failure = hotupgrade_native.read_file(self.root_path, file.entry_file)
+                if old_source == nil then
+                    batch.error = hotupgrade_result.failure(native_code(failure), "文件准备失败: " .. file.entry_file)
+                    return
+                end
+                file.old_source = old_source
+            end
+            batch.files = loaded.patch.files
+        end
+        batch.targets = loaded.targets
+        batch.target_count = #loaded.targets
+        self.phase = "APPLYING"
+        for _, command in ipairs({"prepare", "update"}) do
             batch.phase = command:upper()
             for _, target in ipairs(batch.targets) do
                 if batch.cancelled then
@@ -678,7 +679,7 @@ function M:run(batch, dry_run)
             return
         end
 
-        -- 仅使用 load 冻结的完整文件，不能在 Activate 后重新读取发布包。
+        -- 仅使用已冻结的完整文件，不能在 Update 后重新读取发布包。
         for _, file in ipairs(batch.files) do
             local written, failure = hotupgrade_native.replace_file(self.root_path, file.entry_file, file.source)
             if not written then
@@ -751,7 +752,7 @@ function M:run(batch, dry_run)
         batch.phase = #recovery_errors > 0 and "RECOVERY_REQUIRED"
             or (batch.error and "ABORTED" or "DRY_RUN_COMPLETED")
     else
-        -- 文件和全部 Activate 已确认成功；各目标 Finish 独立报告，不再执行回滚。
+        -- 文件和全部 Update 已确认成功；各目标 Finish 独立报告，不再执行回滚。
         batch.phase = "PUBLISH_DECIDED"
         batch.decided = true
         for _, target in ipairs(batch.targets) do
@@ -795,6 +796,9 @@ function M:advance_deployment()
     if self.phase == "WAITING_CREATIONS" and self.creation_count == 0 and self.module_load_count == 0 then
         self.phase = "DEPLOYING"
         self.active.phase = "DEPLOYING"
+        if self.active.waiter then
+            skynet.wakeup(self.active.waiter)
+        end
     end
 end
 
@@ -805,14 +809,21 @@ function M:wake_lifecycle()
     end
 end
 
---- 建立屏障并立即返回；已有创建和许可完成后才允许 apply 读取发布包。
-function M:begin()
+--- 接受发布并立即返回批次；协程等待已有创建/许可后读取发布包并完成更新。
+---@param request FlyWowHotUpgradeManagementRequest path 指向发布包；dry_run=true 只更新和恢复运行时
+---@return FlyWowHotUpgradeResult 成功仅表示接受请求，最终结果通过 status(batch_id) 查询
+function M:begin(request)
     if self.phase == "FAILED_LOCKED" then
         return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "上次发布尚未恢复")
     end
     if self.active then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "已有发布屏障")
     end
+    if request.dry_run ~= nil and type(request.dry_run) ~= "boolean" then
+        return hotupgrade_result.failure("HU_INVALID_REQUEST", "dry_run 必须为布尔值")
+    end
+    local path = request.path
+    local dry_run = request.dry_run
     self.sequence = self.sequence + 1
     self.active =
     {
@@ -820,6 +831,7 @@ function M:begin()
         sequence = self.sequence,
         phase = "WAITING_CREATIONS",
         results = {},
+        targets = {},
         success = 0,
         failed = 0,
         target_count = 0,
@@ -827,67 +839,12 @@ function M:begin()
     self.phase = "WAITING_CREATIONS"
     local batch = self.active
     skynet.fork(function()
-        if self.active == batch then
-            self:advance_deployment()
-        end
+        self:run(batch, {path = path, dry_run = dry_run})
     end)
     return hotupgrade_result.success({batch_id = batch.batch_id})
 end
 
---- 使用 begin 的同一批次号，固定目标后沿用原事务引擎。
-function M:apply(request, dry_run)
-    if self.phase == "FAILED_LOCKED" then
-        return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "失败发布尚未恢复")
-    end
-    local batch = self.active
-    if not batch or request.batch_id ~= batch.batch_id then
-        return hotupgrade_result.failure("HU_BATCH_MISSING", "须携带当前 begin 批次号")
-    end
-    if self.phase == "WAITING_CREATIONS" then
-        return hotupgrade_result.failure("HU_LIFECYCLE_PENDING", "已有创建或许可尚未完成")
-    end
-    if self.phase ~= "DEPLOYING" then
-        return hotupgrade_result.failure("HU_DEPLOYMENT_PHASE", "仅 DEPLOYING 可以执行 apply/dry_run")
-    end
-
-    local loaded = self:load(request)
-    if not loaded.ok then
-        batch.error = loaded
-        batch.phase = "ABORTED"
-        self.last = batch
-        self.active = nil
-        self.phase = "IDLE"
-        self:wake_lifecycle()
-        return loaded
-    end
-    -- 在运行时更新前准备完整文件的旧内容；不存在以 false 记录，恢复时删除新增文件。
-    if not dry_run then
-        for _, file in ipairs(loaded.patch.files) do
-            local old_source, failure = hotupgrade_native.read_file(self.root_path, file.entry_file)
-            if old_source == nil then
-                batch.error = hotupgrade_result.failure(native_code(failure), "文件准备失败: " .. file.entry_file)
-                batch.phase = "ABORTED"
-                self.last = batch
-                self.active = nil
-                self.phase = "IDLE"
-                self:wake_lifecycle()
-                return batch.error
-            end
-            file.old_source = old_source
-        end
-        batch.files = loaded.patch.files
-    end
-    batch.targets = loaded.targets
-    batch.target_count = #loaded.targets
-    batch.phase = "PREPARING"
-    self.phase = "APPLYING"
-    skynet.fork(function()
-        self:run(batch, dry_run)
-    end)
-    return hotupgrade_result.success({batch_id = batch.batch_id, target_count = batch.target_count})
-end
-
---- 仅校验宿主的显式恢复确认；不发送目标 RPC，也不恢复或强制开启目标 Guard。
+--- 仅校验宿主的显式恢复确认；不发送目标 RPC，也不恢复或强制开放目标业务。
 function M:resolve_deployment(request)
     local batch = self.active or self.last
     if not batch or request.batch_id ~= batch.batch_id then
@@ -905,6 +862,9 @@ function M:resolve_deployment(request)
     end
 
     self.active = nil
+    if batch.waiter then
+        skynet.wakeup(batch.waiter)
+    end
     self.last = batch
     batch.resolved = true
     batch.files = nil
@@ -915,7 +875,7 @@ function M:resolve_deployment(request)
 end
 
 --- 管理命令不做远程认证；宿主掌握 Controller handle，登记来源由消息头确定。
----@param command string begin/resolve_deployment/newservice/uniqueservice/cancel_service_creation/register/begin_module_load/register_module/cancel_module_load/apply/dry_run/status/abort
+---@param command string begin/resolve_deployment/newservice/uniqueservice/cancel_service_creation/register/begin_module_load/register_module/cancel_module_load/status/abort
 ---@param request FlyWowHotUpgradeManagementRequest|FlyWowHotUpgradeTargetMetadata|table 命令请求
 ---@param source integer Skynet 真实调用方
 ---@return FlyWowHotUpgradeResult 可判别的管理结果；目标控制调用可能 yield
@@ -929,7 +889,7 @@ function M:control(command, request, source)
     end
 
     if command == "begin" then
-        return self:begin()
+        return self:begin(request)
     end
     if command == "resolve_deployment" then
         return self:resolve_deployment(request)
@@ -951,10 +911,6 @@ function M:control(command, request, source)
 
     if command == "register_module" or command == "cancel_module_load" then
         return self:complete_module_load(request, source, command == "cancel_module_load")
-    end
-
-    if command == "apply" or command == "dry_run" then
-        return self:apply(request, command == "dry_run")
     end
 
     if command == "status" then

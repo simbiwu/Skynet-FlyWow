@@ -17,7 +17,7 @@ bash hotupgrade/sample/run_hotupgrade_sample.sh ../skynet
 
 - `run_hotupgrade_sample.sh`：准备独立运行目录并启动 Skynet。
 - `skynet_config.lua`：按真实集成测试配置 loader、Service、Lua 和 Native 搜索路径。
-- `flywow_hotupgrade_sample.lua`：初始化 Controller，创建实例，依次执行 begin、apply 和验收，正式文件部署和缓存清理由 HotUpgrade 执行。
+- `flywow_hotupgrade_sample.lua`：初始化 Controller，创建实例，调用 begin 并通过 status 验收，正式文件部署和缓存清理由 HotUpgrade 执行。
 - `host_v1/`：初始宿主文件；Service 入口在 `service/player_service.lua`，普通模块在 `lualib/player_logic.lua`。
 - `patches/v2/`：完整普通模块 V2、完整 Service V2，以及仅供现存实例使用的 service/player.patch。
 
@@ -25,12 +25,14 @@ bash hotupgrade/sample/run_hotupgrade_sample.sh ../skynet
 
 主 Service 在 Skynet 协程内加载 `flywow_hotupgrade`，用 `skynet.uniqueservice("flywow_hotupgrade_service")` 取得 Controller 并初始化配置。它通过 `hotupgrade.newservice("player_service")` 创建 Service，再发送 `init`。PlayerService 以 `hotupgrade.require("player_logic")` 加载模块，最后通过 `register_service()` 声明 `service_module = "player"`、状态根表和业务函数表。
 
-V1 的 `make_load(state)` 返回捕获状态表的函数：装备为“刀”时基础攻击力加 5。初始化状态是“刀”、等级 50、schema 1。主 Service 从 PlayerService 的 Guard 保护查询读取真实 RPC 返回值，断言模块版本 v1 且 `load(100) = 105`。
+V1 的 `make_load(state)` 返回捕获状态表的函数：装备为“刀”时基础攻击力加 5。初始化状态是“刀”、等级 50、schema 1。主 Service 从 PlayerService 的 业务 queue 保护查询读取真实 RPC 返回值，断言模块版本 v1 且 `load(100) = 105`。
 
-主 Service 调用 begin，轮询状态直到 DEPLOYING，再以同一个 batch_id 调用 apply(path = "v2")，并轮询到 COMPLETED。Controller 先完成全部目标的 Prepare、Stage、Activate，再部署完整 .lua 文件和清理 Skynet 代码缓存，最后 Finish。service/player.patch 不复制到宿主目录。所有等待都有 tick 上限。
+主 Service 调用 begin({path = "v2"})，取得已接受批次的 batch_id 后通过 status 等待 COMPLETED。Controller 先让全部目标 Prepare，再逐个目标 Update（内部 Stage → Activate），随后部署完整 .lua、清理 Skynet 代码缓存并 Finish。service/player.patch 不复制到宿主目录。所有等待都有 tick 上限。
 
 V2 普通模块完整替换导出内容：`version()` 返回 v2，装备为“剑”时 `make_load(state)` 计算基础攻击力加 20 再加 1。模块导出表和两种 `package.loaded` 名称仍保持同一张表，但这不会改写 PlayerService 缓存的旧 `business.load` 函数变量。示例保留旧函数引用，并检查 Service Patch 是否显式替换了 `business.load`。
 
-Service Patch 的 `migrate(old_state)` 检查 schema 1 并返回完整的新状态：装备“剑”、等级 50、schema 2。其 `functions.load` 捕获该 Service 的状态根表并安装 V2 计算。原实例完成后须保持 handle、状态根表和模块导出表身份（通过 Service 实际返回的稳定身份标识比较），版本、状态和函数均已更新，攻击值为 121，Guard 已开放。
+Service Patch 的 `migrate(old_state)` 检查 schema 1 并返回完整的新状态：装备“剑”、等级 50、schema 2。其 `functions.load` 捕获该 Service 的状态根表并安装 V2 计算。原实例完成后须保持 handle、状态根表和模块导出表身份（通过 Service 实际返回的稳定身份标识比较），版本、状态和函数均已更新，攻击值为 121，hot.patching 为 false，业务已开放。
 
 随后创建第二个 PlayerService。它从已部署的宿主文件加载 V2，以“剑”和 schema 2 初始化；通过自己的 `make_load(state)` 得到 `load(100) = 121`，与原实例业务版本一致。
+
+两个版本的 PlayerService 都使用自己的 skynet.queue()；业务入口先检查 hot.patching，再立即进入同一个 queue。before_upgrade 在 Prepare 关闭新业务后进入该 queue，以空操作等待此前业务（包括正在 yield 的业务）退出。业务响应使用自己的具名 record，不包含框架返回值包装。
