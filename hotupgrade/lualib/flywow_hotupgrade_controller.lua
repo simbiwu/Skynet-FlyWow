@@ -7,13 +7,13 @@ local hotupgrade_common = require "flywow_hotupgrade_common"
 
 local M = {}
 
--- Native 以第二返回值携带稳定 HU_ 错误；兼容历史上的裸字符串错误值。
+-- Native 失败时以第二返回值返回带 code 字段的错误对象。
 local function native_code(value)
     if type(value) == "table" then
         return value.code or "HU_NATIVE_ERROR"
     end
 
-    return value or "HU_NATIVE_ERROR"
+    return "HU_NATIVE_ERROR"
 end
 
 -- 宿主根目录相对 Lua 路径对应 Controller 使用的唯一模块登记名。
@@ -34,7 +34,7 @@ local function load_files(root, patch_path, identity)
     end
 
     if not paths then
-        return hotupgrade_result.failure(native_code(code), "Patch 目录扫描失败: " .. patch_path)
+        return hotupgrade_result.failure(code, "Patch 目录扫描失败: " .. patch_path)
     end
 
     table.sort(paths)
