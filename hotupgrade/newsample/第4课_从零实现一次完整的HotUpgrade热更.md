@@ -344,13 +344,13 @@ end)
 local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
 ```
 
-这里使用的是 **Skynet 原生 `uniqueservice()`**，创建或取得进程中的唯一 Controller Service。
+这里使用的是 **Skynet 原生 `uniqueservice()`**，创建或取得进程中的唯一 HotUpgrade Service。
 
-Controller 的入口文件是仓库现有的：
+HotUpgrade Service 的入口文件是仓库现有的：
 
 `hotupgrade/service/flywow_hotupgrade_service.lua`
 
-Controller 启动后，在自己的 Lua State 中加载 `flywow_hotupgrade_controller.lua`，并注册 `lua` 和 `hotupgrade` 两套协议处理。
+HotUpgrade Service 启动后，在自己的 Lua State 中加载 `flywow_hotupgrade_controller.lua`，并注册 `lua` 和 `hotupgrade` 两套协议处理。
 
 随后我们的主 Service 发送：
 
@@ -406,7 +406,7 @@ function M.newservice(service_name, ...)
 end
 ```
 
-这里的 `hotupgrade_service_handle` 是 HotUpgrade 模块在所在 Lua State 内取得的 Controller handle。
+这里的 `hotupgrade_service_handle` 是 HotUpgrade 模块在所在 Lua State 内取得的 HotUpgrade Service handle。
 
 函数把创建请求发送给 Controller。主 Service 当前协程等待回复。
 
@@ -486,14 +486,14 @@ table.sort(names)
 local metadata =
 {
     modules = names,
-    service_patch = service_update ~= nil,
+    has_service_update = service_update ~= nil,
 }
 local ok, answer = pcall(skynet.call, hotupgrade_service_handle, "hotupgrade", "register", metadata)
 ```
 
 注意，这个请求里没有 `state`，没有 `business`，也没有 `initial_load`。
 
-Controller 只需要知道：哪个 Service、登记了哪些普通模块、是否支持 Service Patch。
+Controller 只需要知道：哪个 Service、登记了哪些普通模块、是否提供 Service 更新配置。
 
 Controller 最终持有的目标记录可以理解为（其中 `service_name` 来自受管理创建记录，不是 `register_service()` 请求字段）：
 
@@ -501,7 +501,7 @@ Controller 最终持有的目标记录可以理解为（其中 `service_name` �
 {
     service_name = "player_service",
     modules = {"lualib.player_logic"},
-    service_patch = true,
+    has_service_update = true,
 }
 ```
 
@@ -549,7 +549,7 @@ Controller 收到 `"register"` 后，由：
 主 Service：lesson4_main.lua
     hot.newservice("player_service")
             ↓ RPC
-Controller Service：M:newservice()
+HotUpgrade Service：M:newservice()
     skynet.newservice() → 返回 first_handle
             ↓
 主 Service
@@ -558,7 +558,7 @@ Controller Service：M:newservice()
 PlayerService：Lua dispatch → initialize()
     hot.require() → hot.register_service()
             ↓ RPC
-Controller Service：M:register() → finish_creation()
+HotUpgrade Service：M:register() → finish_creation()
             ↓ 返回
 PlayerService：init 回复 → 主 Service：inspect
 ```
@@ -568,7 +568,7 @@ PlayerService：init 回复 → 主 Service：inspect
 第一次创建和登记完成后，我们应该建立这样一份运行时状态：
 
 ```text
-Controller Service
+HotUpgrade Service
     phase = IDLE
     active_batch = nil
     sequence = 0
@@ -1097,11 +1097,10 @@ function M:begin(request)
     if self.active_batch then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "已有发布屏障")
     end
-    if request.dry_run ~= nil and type(request.dry_run) ~= "boolean" then
-        return hotupgrade_result.failure("HU_INVALID_REQUEST", "dry_run 必须为布尔值")
+    if request.dry_run ~= nil then
+        return hotupgrade_result.failure("HU_INVALID_REQUEST", "不支持 dry_run")
     end
     local path = request.path
-    local dry_run = request.dry_run
     self.sequence = self.sequence + 1
     self.active_batch =
     {
@@ -1117,7 +1116,7 @@ function M:begin(request)
     self.phase = "WAITING_CREATIONS"
     local batch = self.active_batch
     skynet.fork(function()
-        self:run_batch(batch, {path = path, dry_run = dry_run})
+        self:run_batch(batch, {path = path})
     end)
     return hotupgrade_result.success({batch_id = batch.batch_id})
 end
@@ -1133,13 +1132,13 @@ end
 
 `self.active_batch = batch` 代表 Controller 当前正在管理这个批次。
 
-`self.sequence` 则是 Controller 生命周期内不断递增的批次序号。它与 Controller 自己的 handle 一起组成 `batch_id`，用于区分不同事务。
+`self.sequence` 则是 Controller 生命周期内不断递增的批次序号。它与 HotUpgrade Service 的真实 handle 一起组成 `batch_id`，用于区分不同发布批次。
 
 创建完批次后：
 
 ```lua
 skynet.fork(function()
-    self:run_batch(batch, {path = path, dry_run = dry_run})
+    self:run_batch(batch, {path = path})
 end)
 ```
 
@@ -1168,7 +1167,7 @@ Controller
     phase = WAITING_CREATIONS
     active_batch = batch
     sequence = 1
-    batch.batch_id = "<Controller handle>:1"
+    batch.batch_id = "<HotUpgrade Service handle>:1"
     batch.sequence = 1
     batch.phase = WAITING_CREATIONS
     batch.targets = {}
@@ -1213,7 +1212,6 @@ function M:run_batch(batch, request)
         return
     end
     self:advance_deployment()
-    local dry_run = request.dry_run == true
     local ok, message = pcall(function()
         local loaded = self:load_patch(request)
         if not loaded.ok then
@@ -1266,7 +1264,7 @@ function M:run_batch(batch, request)
 local loaded = self:load_patch(request)
 ```
 
-这是对同一个 Controller 模块表的方法调用，仍然运行在 Controller Service 的 Lua State 内，没有跨 Service。
+这是对同一个 Controller 模块表的方法调用，仍然运行在 HotUpgrade Service 的 Lua State 内，没有跨 Service。
 
 现在进入：
 
@@ -1325,7 +1323,7 @@ for _, record in pairs(self.targets) do
     end
 
     local service = loaded.patch.services[record.service_name]
-    if service and not record.service_patch then
+    if service and not record.has_service_update then
         return hotupgrade_result.failure("HU_SERVICE_PATCH_UNSUPPORTED", request.path .. "/" .. service.entry_file
             .. ": 目标 " .. record.handle .. " 未提供 Service 内部更新入口")
     end
@@ -1545,7 +1543,7 @@ Prepare 不传送模块源码，只传批次身份。
 这里发生了真正的跨 Service 跳转：
 
 ```text
-Controller Service                             PlayerService
+HotUpgrade Service                             PlayerService
  M:run_batch()
    └── M:step(batch,target,"prepare")
          │
@@ -1592,7 +1590,7 @@ end)
 
 前者执行在 PlayerService 的 Lua State，能够访问玩家状态和本地模块表。
 
-后者执行在 Controller Service 的 Lua State，只负责管理命令及协调。
+后者执行在 HotUpgrade Service 的 Lua State，只负责管理命令及协调。
 
 现在我们进入前者。
 

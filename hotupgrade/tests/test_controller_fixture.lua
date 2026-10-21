@@ -128,18 +128,18 @@ local function initialize_controller(service_path)
     assert(initialized.ok, initialized.message)
     return controller
 end
-local function begin_deployment(instance, path, dry_run)
-    local begun = instance:handle_command("begin", {path = path, dry_run = dry_run}, 1)
+local function begin_deployment(instance, path)
+    local begun = instance:handle_command("begin", {path = path}, 1)
     assert(begun.ok)
     return begun.batch_id
 end
 
-local function publish(instance, dry_run, request)
+local function publish(instance, request)
     if instance.phase == "FAILED_LOCKED" then
         assert(instance:handle_command("resolve_deployment", {batch_id = instance.last_batch.batch_id,
             confirmed = true, confirmation = "CONVERGED_CACHE_CLEARED"}, 1).ok)
     end
-    return instance:handle_command("begin", {path = request.path, dry_run = dry_run}, 1)
+    return instance:handle_command("begin", {path = request.path}, 1)
 end
 
 local function managed_register(instance, metadata, handle, service_name)
@@ -165,7 +165,7 @@ local function register_module(instance, name, handle)
     return instance:handle_command("register_module", {name = name, permit_id = allowed.permit_id}, handle)
 end
 
-local metadata = {modules = {"lualib.test_worker_logic"}, service_patch = false}
+local metadata = {modules = {"lualib.test_worker_logic"}, has_service_update = false}
 
 return
 {

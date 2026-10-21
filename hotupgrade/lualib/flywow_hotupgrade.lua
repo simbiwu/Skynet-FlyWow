@@ -395,7 +395,7 @@ function M.register_service(registration)
     local metadata =
     {
         modules = names,
-        service_patch = service_update ~= nil,
+        has_service_update = service_update ~= nil,
     }
     local ok, answer = pcall(skynet.call, hotupgrade_service_handle, "hotupgrade", "register", metadata)
     module_state.registration_complete = true

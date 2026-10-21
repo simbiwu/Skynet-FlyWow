@@ -67,6 +67,8 @@ local function load_files(patch_base_path, selected_path, identity)
             return hotupgrade_result.failure(source == false and "HU_FILE_NOT_FOUND" or native_code(failure),
                 "发布包读取失败: " .. selected_path .. "/" .. relative)
         end
+        -- load 只编译并检查语法，不执行返回的 chunk；失败时 syntax_error 用于诊断。
+        -- @路径标记错误中的文件名，t 只接受文本源码，最后的空表是 chunk 的运行环境。
         local chunk, syntax_error = load(source, "@" .. relative, "t", {})
         if not chunk then
             return hotupgrade_result.failure("HU_MODULE_SYNTAX", syntax_error)
@@ -139,7 +141,7 @@ end
 
 ---@class FlyWowHotUpgradeTargetMetadata
 ---@field modules string[] 当前 State 已声明模块的唯一名称数组
----@field service_patch boolean 是否在本 State 提供私有状态及函数更新入口
+---@field has_service_update boolean 是否在本 State 提供私有状态及函数更新入口
 
 ---@class FlyWowHotUpgradeControlRequest
 ---@field batch_id string Controller handle 与本进程递增序号组成；仅在该 Controller 生命周期有效
@@ -149,13 +151,12 @@ end
 
 ---@class FlyWowHotUpgradeManagementRequest
 ---@field path? string begin 的 Patch Root 相对目录
----@field dry_run? boolean begin 仅验证更新与恢复，不部署正式文件
 ---@field batch_id? string status/abort/resolve_deployment 使用 begin 返回的身份
 ---@field confirmed? boolean 宿主明确确认恢复完成
 ---@field confirmation? string UNCHANGED 或 CONVERGED_CACHE_CLEARED
 
 ---@class FlyWowHotUpgradeLifecycleStatus
----@field phase string IDLE/WAITING_CREATIONS/DEPLOYING/APPLYING/COMPLETED/DRY_RUN_COMPLETED/FAILED_LOCKED
+---@field phase string IDLE/WAITING_CREATIONS/DEPLOYING/APPLYING/COMPLETED/FAILED_LOCKED
 ---@field batch_id? string 当前或最近批次
 ---@field failed_locked boolean 是否因失败锁定版本门禁
 ---@field pending_creations integer 原生创建或首次登记尚未完成的记录数
@@ -489,7 +490,7 @@ end
 ---@return FlyWowHotUpgradeResult
 function M:register(request, source)
     if math.type(source) ~= "integer" or type(request) ~= "table"
-        or type(request.modules) ~= "table" or type(request.service_patch) ~= "boolean" then
+        or type(request.modules) ~= "table" or type(request.has_service_update) ~= "boolean" then
         return hotupgrade_result.failure("HU_INVALID_OPTIONS", "登记元数据无效")
     end
     if request.service_module ~= nil then
@@ -544,11 +545,11 @@ function M:register(request, source)
     end
     self.targets[source] =
     {
-        handle          = source,                 -- Skynet 提供的真实来源，也是后续控制目标。
-        service_name    = creation.service_name,   -- 来自该 handle 对应的受管理创建记录。
-        modules         = modules,                -- 该 State 明确声明的可更新模块集合。
-        loading_modules = {},                     -- 同一 Service/模块同时只允许一项首次加载操作。
-        service_patch   = request.service_patch,  -- 是否提供本地 Service 状态/函数入口。
+        handle              = source,                 -- Skynet 提供的真实来源，也是后续控制目标。
+        service_name        = creation.service_name,   -- 来自该 handle 对应的受管理创建记录。
+        modules             = modules,                -- 该 State 明确声明的可更新模块集合。
+        loading_modules     = {},                     -- 同一 Service/模块同时只允许一项首次加载操作。
+        has_service_update  = request.has_service_update,  -- 是否提供本地 Service 状态/函数入口。
     }
     self:finish_creation(creation)
     return hotupgrade_result.success()
@@ -586,7 +587,7 @@ function M:load_patch(request)
         end
 
         local service = loaded.patch.services[record.service_name]
-        if service and not record.service_patch then
+        if service and not record.has_service_update then
             return hotupgrade_result.failure("HU_SERVICE_PATCH_UNSUPPORTED", request.path .. "/" .. service.entry_file
                 .. ": 目标 " .. record.handle .. " 未提供 Service 内部更新入口")
         end
@@ -656,24 +657,21 @@ function M:run_batch(batch, request)
         return
     end
     self:advance_deployment()
-    local dry_run = request.dry_run == true
     local ok, message = pcall(function()
         local loaded = self:load_patch(request)
         if not loaded.ok then
             batch.error = loaded
             return
         end
-        if not dry_run then
-            for _, file in ipairs(loaded.patch.files) do
-                local old_source, failure = hotupgrade_native.read_file(self.root_path, file.entry_file)
-                if old_source == nil then
-                    batch.error = hotupgrade_result.failure(native_code(failure), "文件准备失败: " .. file.entry_file)
-                    return
-                end
-                file.old_source = old_source
+        for _, file in ipairs(loaded.patch.files) do
+            local old_source, failure = hotupgrade_native.read_file(self.root_path, file.entry_file)
+            if old_source == nil then
+                batch.error = hotupgrade_result.failure(native_code(failure), "文件准备失败: " .. file.entry_file)
+                return
             end
-            batch.files = loaded.patch.files
+            file.old_source = old_source
         end
+        batch.files = loaded.patch.files
         batch.targets = loaded.targets
         batch.target_count = #loaded.targets
         self.phase = "APPLYING"
@@ -699,9 +697,6 @@ function M:run_batch(batch, request)
             batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
             return
         end
-        if dry_run then
-            return
-        end
 
         -- 仅使用已冻结的完整文件，不能在 Update 后重新读取发布包。
         for _, file in ipairs(batch.files) do
@@ -723,7 +718,7 @@ function M:run_batch(batch, request)
         batch.error = hotupgrade_result.failure("HU_CONTROL_FAILED", tostring(message))
     end
 
-    if batch.error or dry_run then
+    if batch.error then
         local recovery_errors  = {}    -- 汇总全部恢复失败的信息，不因一项失败停止其余恢复。
         local recovery_failure         -- 第一份原始恢复错误，供 status 保留具体错误码。
         local files_touched    = false -- 只有已替换文件时，恢复流程才需要清理正式代码缓存。
@@ -773,8 +768,7 @@ function M:run_batch(batch, request)
         elseif batch.error and batch.error.code == "HU_RECOVERY_REQUIRED" then
             batch.error = hotupgrade_result.failure("HU_UPDATE_FAILED", batch.error.message)
         end
-        batch.phase = #recovery_errors > 0 and "RECOVERY_REQUIRED"
-            or (batch.error and "ABORTED" or "DRY_RUN_COMPLETED")
+        batch.phase = #recovery_errors > 0 and "RECOVERY_REQUIRED" or "ABORTED"
     else
         -- 文件和全部 Update 已确认成功；各目标 Finish 独立报告，不再执行回滚。
         batch.phase = "PUBLISH_DECIDED"
@@ -834,7 +828,7 @@ function M:wake_lifecycle()
 end
 
 --- 接受发布并立即返回批次；协程等待已有创建/许可后读取发布包并完成更新。
----@param request FlyWowHotUpgradeManagementRequest path 指向发布包；dry_run=true 只更新和恢复运行时
+---@param request FlyWowHotUpgradeManagementRequest path 指向发布包
 ---@return FlyWowHotUpgradeResult 成功仅表示接受请求，最终结果通过 status(batch_id) 查询
 function M:begin(request)
     if self.phase == "FAILED_LOCKED" then
@@ -843,11 +837,10 @@ function M:begin(request)
     if self.active_batch then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "已有发布屏障")
     end
-    if request.dry_run ~= nil and type(request.dry_run) ~= "boolean" then
-        return hotupgrade_result.failure("HU_INVALID_REQUEST", "dry_run 必须为布尔值")
+    if request.dry_run ~= nil then
+        return hotupgrade_result.failure("HU_INVALID_REQUEST", "不支持 dry_run")
     end
     local path = request.path
-    local dry_run = request.dry_run
     self.sequence = self.sequence + 1
     self.active_batch =
     {
@@ -863,7 +856,7 @@ function M:begin(request)
     self.phase = "WAITING_CREATIONS"
     local batch = self.active_batch
     skynet.fork(function()
-        self:run_batch(batch, {path = path, dry_run = dry_run})
+        self:run_batch(batch, {path = path})
     end)
     return hotupgrade_result.success({batch_id = batch.batch_id})
 end

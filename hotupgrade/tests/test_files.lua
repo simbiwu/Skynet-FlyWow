@@ -32,7 +32,7 @@ local function register_fixture(instance, handle, metadata, service_name)
     return registered
 end
 assert(register_fixture(c, 10, {modules = {"lualib.test_worker_logic"},
-    service_patch = true}, "battle.worker").ok)
+    has_service_update = true}, "battle.worker").ok)
 assert(c:load_patch({path = "module"}).ok)
 assert(not c:load_patch({path = "invalid"}).ok)
 for _, path in ipairs({"../module", "/module", "module/../module", "module//lualib",
@@ -90,7 +90,7 @@ local rejected = controller.initialize({patch_path = root, root_path = config.ro
 assert(os.remove(service_link))
 assert(not rejected.ok and rejected.code == "HU_INVALID_PATH")
 assert(register_fixture(c, 20,
-    {modules = {}, service_patch = true}, "skynet_hotupgrade_worker").ok)
+    {modules = {}, has_service_update = true}, "skynet_hotupgrade_worker").ok)
 assert(c:load_patch({path = "custom_service_files"}).ok)
 local file_path = "native_files/nested/value.lua"
 assert(hotupgrade_native.read_file(config.root_path, file_path) == false)
