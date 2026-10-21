@@ -7,10 +7,6 @@ local hotupgrade_common = require "flywow_hotupgrade_common"
 
 local M = {}
 
--- Controller 实例共享此方法表；各实例的登记、活动批次和资源状态保存在实例表中。
-local Controller = {}
-Controller.__index = Controller
-
 -- Native 以第二返回值携带稳定 HU_ 错误；兼容历史上的裸字符串错误值。
 local function native_code(value)
     if type(value) == "table" then
@@ -174,10 +170,10 @@ end
 ---@field service_dir string root_path 下的相对 Service 目录，其下 Lua 文件作为一次性 Service 更新脚本
 ---@field timeout_ms? integer Guard 排空上限；默认值见 hotupgrade_common.DEFAULT_TIMEOUT_MS，不是 RPC 取消期限
 
---- 创建控制面；不读取持久化历史，不尝试恢复上一进程的批次。
+--- 初始化唯一控制面；不读取持久化历史，不尝试恢复上一进程的批次。
 ---@param controller_config FlyWowHotUpgradeControllerConfig
----@return FlyWowHotUpgradeResult 成功含 controller
-function M.new(controller_config)
+---@return FlyWowHotUpgradeResult 初始化结果
+function M.initialize(controller_config)
     if type(controller_config) ~= "table" or type(controller_config.patch_root) ~= "string" or controller_config.patch_root == ""
         or type(controller_config.root_path) ~= "string" or controller_config.root_path == ""
         or type(controller_config.service_dir) ~= "string"
@@ -206,12 +202,12 @@ function M.new(controller_config)
     if published_root and published_root ~= root_path then
         return hotupgrade_result.failure("HU_INVALID_OPTIONS", "同一 Skynet 进程的 Controller 必须使用相同 root_path")
     end
-    if not published_root then
-        skynet.setenv(hotupgrade_common.ROOT_PATH_ENV, root_path)
+    if M.initialized then
+        return hotupgrade_result.failure("HU_ALREADY_INITIALIZED", "控制面已初始化")
     end
 
     local timeout_ms = controller_config.timeout_ms or hotupgrade_common.DEFAULT_TIMEOUT_MS
-    return hotupgrade_result.success({controller = setmetatable(
+    local initialized_state =
     {
         root_path            = root_path,                        -- 正式文件部署根目录；所有文件操作仍受 Native 路径检查约束。
         root                 = root,                             -- 固定使用已解析的受信 Patch 根目录，不随批次改变。
@@ -233,11 +229,22 @@ function M.new(controller_config)
         active               = nil,                              -- begin 持有的唯一发布批次，事务结束后失败门禁仍由 phase 保持。
         last                 = nil,                              -- 最近结束的批次结果；更早批次不保留，查询返回缺失。
         recovery_required    = false,                            -- 恢复结果未确认时关闭后续发布，需先由宿主处理恢复。
-    }, Controller)})
+    }
+
+    if not published_root then
+        skynet.setenv(hotupgrade_common.ROOT_PATH_ENV, root_path)
+    end
+
+    -- 校验和路径解析全部成功后才发布运行状态，失败不会留下半初始化控制面。
+    for name, value in pairs(initialized_state) do
+        M[name] = value
+    end
+    M.initialized = true
+    return hotupgrade_result.success()
 end
 
 -- 移除同一条创建记录；创建失败、登记完成和创建者取消共用此释放路径。
-function Controller:finish_creation(creation)
+function M:finish_creation(creation)
     if self.pending_creations[creation] == creation then
         self.pending_creations[creation] = nil
         if creation.handle then
@@ -250,7 +257,7 @@ function Controller:finish_creation(creation)
 end
 
 -- 映射和计数先更新，再唤醒登记协程；唤醒不代表已匹配成功。
-function Controller:wake_registration()
+function M:wake_registration()
     for waiter in pairs(self.registration_waiters) do
         skynet.wakeup(waiter)
     end
@@ -263,7 +270,7 @@ end
 
 --- 等待发布门禁；只有成功终态或显式恢复确认后重新检查接纳条件。
 --- 等待中的请求不计入在途创建/许可，避免阻塞当前批次排空。
-function Controller:wait_lifecycle()
+function M:wait_lifecycle()
     while self.phase == "WAITING_CREATIONS" or self.phase == "DEPLOYING" or self.phase == "APPLYING" do
         local waiter = coroutine.running()
         local waiting = {}
@@ -285,7 +292,7 @@ end
 ---@param request FlyWowHotUpgradeServiceCreationRequest
 ---@param source integer 原请求者的真实消息来源；仅首次创建者拥有取消权
 ---@return FlyWowHotUpgradeResult 成功含 handle，全局和特殊启动合同明确拒绝
-function Controller:uniqueservice(request, source)
+function M:uniqueservice(request, source)
     if request.global == true then
         return hotupgrade_result.failure("HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED", "受管理唯一服务只支持本 Controller 内的本地唯一")
     end
@@ -340,7 +347,7 @@ end
 ---@param source integer 创建者的真实消息来源
 ---@param unique_name? string 仅本地唯一入口在内部传入的逻辑预留名
 ---@return FlyWowHotUpgradeResult 成功含 handle
-function Controller:newservice(request, source, unique_name)
+function M:newservice(request, source, unique_name)
     if math.type(source) ~= "integer" or source <= 0 or type(request.service_name) ~= "string"
         or not request.service_name:match("^%S+$")
         or type(request.arguments) ~= "table"
@@ -387,7 +394,7 @@ end
 ---@param request {handle:integer} 原生创建返回的待登记 Service
 ---@param source integer 创建者的真实来源
 ---@return FlyWowHotUpgradeResult
-function Controller:cancel_service_creation(request, source)
+function M:cancel_service_creation(request, source)
     if math.type(request.handle) ~= "integer" then
         return hotupgrade_result.failure("HU_INVALID_REQUEST", "需要待登记 Service handle")
     end
@@ -425,7 +432,7 @@ end
 ---@param request FlyWowHotUpgradeModuleLoadRequest
 ---@param source integer 已登记 Service 的真实消息来源
 ---@return FlyWowHotUpgradeResult 成功含 permit_id
-function Controller:begin_module_load(request, source)
+function M:begin_module_load(request, source)
     local admitted = self:wait_lifecycle()
     if not admitted.ok then
         return admitted
@@ -454,7 +461,7 @@ end
 ---@param source integer 许可原申请者的真实来源
 ---@param cancel boolean true 仅释放许可，不声明模块
 ---@return FlyWowHotUpgradeResult
-function Controller:complete_module_load(request, source, cancel)
+function M:complete_module_load(request, source, cancel)
     local permit = self.module_loads[request.permit_id]
     if not permit then
         return hotupgrade_result.failure("HU_MODULE_PERMIT_MISSING", "模块加载许可不存在或已消费")
@@ -485,7 +492,7 @@ end
 ---@param request FlyWowHotUpgradeTargetMetadata
 ---@param source integer Skynet 消息头中的真实 Service handle
 ---@return FlyWowHotUpgradeResult
-function Controller:register(request, source)
+function M:register(request, source)
     if math.type(source) ~= "integer" or type(request.service_module) ~= "string"
         or not request.service_module:match("^[%w_.%-]+$") or type(request.modules) ~= "table"
         or type(request.service_patch) ~= "boolean" then
@@ -552,7 +559,7 @@ function Controller:register(request, source)
 end
 
 --- 冻结文件并生成目标快照；不执行 Patch 代码、不读其他 Service Lua State。
-function Controller:load(request)
+function M:load(request)
     if self.creation_count > 0 or self.module_load_count > 0 then
         return hotupgrade_result.failure("HU_LIFECYCLE_PENDING",
             "生命周期未完成：待创建/登记 " .. self.creation_count .. "，待模块加载/登记 " .. self.module_load_count)
@@ -617,7 +624,7 @@ function Controller:load(request)
 end
 
 --- 直接使用 Skynet 原生 call；失败不代表远端操作取消，协调方仍须明确恢复。
-function Controller:step(batch, target, command)
+function M:step(batch, target, command)
     ---@type FlyWowHotUpgradeControlRequest
     local request =
     {
@@ -643,7 +650,7 @@ function Controller:step(batch, target, command)
 end
 
 -- 按阶段协调整批目标；Finish 开始后只报告收尾故障，不回滚已开放业务的目标。
-function Controller:run(batch, dry_run)
+function M:run(batch, dry_run)
     local ok, message = pcall(function()
         for _, command in ipairs({"prepare", "stage", "activate"}) do
             batch.phase = command:upper()
@@ -784,14 +791,14 @@ function Controller:run(batch, dry_run)
 end
 
 -- 完成回调推进等待阶段，不轮询或超时删除创建记录。
-function Controller:advance_deployment()
+function M:advance_deployment()
     if self.phase == "WAITING_CREATIONS" and self.creation_count == 0 and self.module_load_count == 0 then
         self.phase = "DEPLOYING"
         self.active.phase = "DEPLOYING"
     end
 end
 
-function Controller:wake_lifecycle()
+function M:wake_lifecycle()
     for waiter, waiting in pairs(self.lifecycle_waiters) do
         waiting.blocked = waiting.blocked or self.phase == "FAILED_LOCKED"
         skynet.wakeup(waiter)
@@ -799,7 +806,7 @@ function Controller:wake_lifecycle()
 end
 
 --- 建立屏障并立即返回；已有创建和许可完成后才允许 apply 读取发布包。
-function Controller:begin()
+function M:begin()
     if self.phase == "FAILED_LOCKED" then
         return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "上次发布尚未恢复")
     end
@@ -828,7 +835,7 @@ function Controller:begin()
 end
 
 --- 使用 begin 的同一批次号，固定目标后沿用原事务引擎。
-function Controller:apply(request, dry_run)
+function M:apply(request, dry_run)
     if self.phase == "FAILED_LOCKED" then
         return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "失败发布尚未恢复")
     end
@@ -881,7 +888,7 @@ function Controller:apply(request, dry_run)
 end
 
 --- 仅校验宿主的显式恢复确认；不发送目标 RPC，也不恢复或强制开启目标 Guard。
-function Controller:resolve_deployment(request)
+function M:resolve_deployment(request)
     local batch = self.active or self.last
     if not batch or request.batch_id ~= batch.batch_id then
         return hotupgrade_result.failure("HU_BATCH_MISSING", "恢复批次号不匹配")
@@ -912,7 +919,7 @@ end
 ---@param request FlyWowHotUpgradeManagementRequest|FlyWowHotUpgradeTargetMetadata|table 命令请求
 ---@param source integer Skynet 真实调用方
 ---@return FlyWowHotUpgradeResult 可判别的管理结果；目标控制调用可能 yield
-function Controller:control(command, request, source)
+function M:control(command, request, source)
     if type(request) ~= "table" then
         return hotupgrade_result.failure("HU_INVALID_REQUEST", "请求必须是 table")
     end

@@ -93,10 +93,13 @@ local cases =
         lualib = {["battle/state_sync/runtime.lua"] = "return {value = function() return 2 end}",
             ["packages/demo/init.lua"] = "return {value = function() return 2 end}"}},
     nested_service = {service = {["battle/worker.patch"] = service}},
-    custom_service = {actors = {["zone/player.patch"] = service}},
+    nested_custom_service = {["actors/zone"] = {["battle/worker.patch"] = service}},
+    custom_service = {["actors/zone"] = {["player.patch"] = service}},
     duplicate_module = {lualib = {["battle.worker.lua"] = "return {}",
         ["battle/worker.lua"] = "return {}"}},
     duplicate_service = {service = {["battle.worker.patch"] = service, ["battle/worker.patch"] = service}},
+    duplicate_custom_service = {["actors/zone"] = {["battle.worker.patch"] = service,
+        ["battle/worker.patch"] = service}},
 }
 for name, directories in pairs(cases) do
     for directory, entries in pairs(directories) do

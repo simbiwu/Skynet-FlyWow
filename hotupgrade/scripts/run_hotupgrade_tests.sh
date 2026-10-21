@@ -13,7 +13,13 @@ rm -rf build/hotupgrade-tests/patches build/hotupgrade-tests/host build/hotupgra
 mkdir -p build/hotupgrade-tests/patches
 "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/prepare_test_packages.lua
 "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_foundation.lua
-"$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_controller.lua
+CONTROLLER_LOG="$FRAMEWORK_DIR/build/hotupgrade-tests/controller.log"
+: > "$CONTROLLER_LOG"
+for scenario in lifecycle interleaved matching combined paths custom_paths unique resources; do
+    "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_controller.lua "$scenario" \
+        2>&1 | tee -a "$CONTROLLER_LOG"
+done
+test "$(grep -c HOTUPGRADE_CONTROLLER_SCENARIO_OK "$CONTROLLER_LOG")" -eq 8
 cp -a build/hotupgrade-tests/host build/hotupgrade-tests/host-original
 cd "$FRAMEWORK_DIR/../.."
 LOG="$FRAMEWORK_DIR/build/hotupgrade-tests/skynet.log"

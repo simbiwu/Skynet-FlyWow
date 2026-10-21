@@ -13,6 +13,7 @@ local function create_controller(service_dir)
         return handle
     end
     assert(skynet.call(handle, "hotupgrade", "status", {}).code == "HU_NOT_INITIALIZED")
+    assert(skynet.call(handle, "lua", "init", {}).code == "HU_INVALID_OPTIONS")
     local config = require "hotupgrade_test_options"
     assert(skynet.call(handle, "lua", "init",
         {patch_root = config.patch_root, root_path = config.root_path, service_dir = service_dir or config.service_dir}).ok)

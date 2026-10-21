@@ -3,13 +3,21 @@ local hotupgrade_native = require "flywow_hotupgrade_native"
 local controller = require "flywow_hotupgrade_controller"
 local config = require "hotupgrade_test_options"
 local root = config.patch_root
+local controller_config =
+{
+    patch_root = config.patch_root,
+    root_path = config.root_path,
+    service_dir = "actors/zone",
+}
 assert(hotupgrade_native.append_sync == nil)
 local paths = assert(hotupgrade_native.list_lua(root, "module"))
 assert(#paths == 1 and paths[1] == "lualib/test_worker_logic.lua")
 local hotupgrade = require "flywow_hotupgrade"
 local early_ok, early_error = pcall(hotupgrade.require, "test_worker_logic")
 assert(not early_ok and tostring(early_error):find("HU_NOT_INITIALIZED", 1, true))
-local c = assert(controller.new(config).controller)
+assert(not controller.initialize({}).ok)
+assert(controller.initialize(controller_config).ok)
+local c = controller
 -- 此文件只测扫描/路径；以原生创建替身为虚拟目标建立合法的待登记记录。
 local function register_fixture(instance, handle, metadata)
     local skynet = require "skynet"
@@ -20,8 +28,8 @@ local function register_fixture(instance, handle, metadata)
     assert(created.ok)
     return instance:control("register", metadata, handle)
 end
-assert(register_fixture(c, 10, {service_module = "unused", modules = {"lualib.test_worker_logic"},
-    service_patch = false}).ok)
+assert(register_fixture(c, 10, {service_module = "battle.worker", modules = {"lualib.test_worker_logic"},
+    service_patch = true}).ok)
 assert(c:load({path = "module"}).ok)
 assert(not c:load({path = "invalid"}).ok)
 for _, path in ipairs({"../module", "/module", "module/../module", "module//lualib",
@@ -29,7 +37,7 @@ for _, path in ipairs({"../module", "/module", "module/../module", "module//lual
     assert(not hotupgrade_native.list_lua(root, path), path)
 end
 
-for _, path in ipairs({"duplicate_module", "duplicate_service"}) do
+for _, path in ipairs({"duplicate_module", "duplicate_custom_service"}) do
     assert(c:load({path = path}).code == "HU_INVALID_PATCH")
 end
 local many_files = assert(hotupgrade_native.list_lua(root, "count_unlimited"))
@@ -42,7 +50,7 @@ for _, path in ipairs({"count_unlimited", "file_unlimited", "total_unlimited"}) 
 end
 local other_root = config.root_path .. "/another"
 assert(os.execute("mkdir -p " .. other_root .. "/service"))
-local conflicting = controller.new({patch_root = root, root_path = other_root, service_dir = "service"})
+local conflicting = controller.initialize({patch_root = root, root_path = other_root, service_dir = "service"})
 assert(not conflicting.ok and conflicting.code == "HU_INVALID_OPTIONS")
 assert(require("skynet").getenv(require("flywow_hotupgrade_common").ROOT_PATH_ENV)
     == hotupgrade_native.resolve(config.root_path))
@@ -67,7 +75,7 @@ assert(os.execute("mkfifo " .. fifo))
 assert(not hotupgrade_native.list_lua(root, "module"))
 assert(os.remove(fifo))
 for _, service_dir in ipairs({"../service", "/service", "service/../service", "service/"}) do
-    local rejected = controller.new(
+    local rejected = controller.initialize(
     {
         patch_root = root, root_path = config.root_path, service_dir = service_dir,
     })
@@ -75,14 +83,12 @@ for _, service_dir in ipairs({"../service", "/service", "service/../service", "s
 end
 local service_link = config.root_path .. "/service_link"
 assert(os.execute("ln -s service " .. service_link))
-local rejected = controller.new({patch_root = root, root_path = config.root_path, service_dir = "service_link"})
+local rejected = controller.initialize({patch_root = root, root_path = config.root_path, service_dir = "service_link"})
 assert(os.remove(service_link))
 assert(not rejected.ok and rejected.code == "HU_INVALID_PATH")
-local nested = assert(controller.new(
-    {patch_root = root, root_path = config.root_path, service_dir = "actors/zone"}).controller)
-assert(register_fixture(nested, 20,
+assert(register_fixture(c, 20,
     {service_module = "player", modules = {}, service_patch = true}).ok)
-assert(nested:load({path = "custom_service"}).ok)
+assert(c:load({path = "custom_service"}).ok)
 local file_path = "native_files/nested/value.lua"
 assert(hotupgrade_native.read_file(config.root_path, file_path) == false)
 assert(hotupgrade_native.replace_file(config.root_path, file_path, "old"))
