@@ -2,7 +2,7 @@
 
 本课使用的源码版本：
 
-`SKYNET-FLYWOW main`：`f928ba214012d98776094b81f0db4eb047af2bb7`
+`SKYNET-FLYWOW main`：`8e1424afedc5835bdbf4cc67244a6f272a0b2cbc`
 
 前三课我们已经分别学习了 Service 登记、普通 Lua 模块热更，以及 Service 状态与函数更新。现在要把这些知识真正连接起来。
 
