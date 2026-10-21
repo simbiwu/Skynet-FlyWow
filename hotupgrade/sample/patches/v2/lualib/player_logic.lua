@@ -1,4 +1,4 @@
---- PlayerService V2 普通模块；以完整版本更新导出表。
+--- PlayerService V2 普通模块。
 local M = {}
 
 function M.version()
@@ -7,7 +7,7 @@ end
 
 function M.make_load(state)
     return function(base_attack)
-        return base_attack + (state.equip == "剑" and 20 or 0) + 1
+        return base_attack + (state.equip == "剑" and 20 or 0)
     end
 end
 

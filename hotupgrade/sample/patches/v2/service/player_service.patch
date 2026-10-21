@@ -1,9 +1,12 @@
---- 一次性 PlayerService Patch；返回完整迁移状态和要替换的业务函数。
+--- 把现存 PlayerService 的状态和 load 函数更新为 V2。
 return function(state)
     return
     {
         migrate = function(old_state)
-            assert(old_state.schema_version == 1, "只支持从 schema 1 迁移")
+            if old_state.schema_version ~= 1 then
+                error("PlayerService 只支持从 schema 1 迁移")
+            end
+
             return
             {
                 equip = "剑",
@@ -14,7 +17,7 @@ return function(state)
         functions =
         {
             load = function(base_attack)
-                return base_attack + (state.equip == "剑" and 20 or 0) + 1
+                return base_attack + (state.equip == "剑" and 20 or 0)
             end,
         },
     }

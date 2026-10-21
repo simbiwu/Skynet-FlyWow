@@ -1,99 +1,62 @@
---- PlayerService 入口；登记后所有业务查询和攻击函数都通过Service 自己的 queue。
+--- PlayerService V1：保留本实例状态，并在更新前排空业务调用。
 local skynet = require "skynet"
 local business_queue = require "skynet.queue"()
 
-local hotupgrade
-local logic
-local state
-local state_root
-local business
-local cached_v1_load
-local registered = false
-
-local function inspect()
-    return
-    {
-        handle = skynet.self(),
-        module_version = logic.version(),
-        equip = state.equip,
-        level = state.level,
-        schema_version = state.schema_version,
-        load_attack = business.load(100),
-        cached_v1_load_attack = cached_v1_load(100),
-        load_replaced = business.load ~= cached_v1_load,
-        state_root_identity = state == state_root,
-        module_identity = tostring(logic),
-        module_root_identity = package.loaded.player_logic == logic,
-        module_alias_identity = package.loaded.player_logic == logic
-            and package.loaded["lualib.player_logic"] == logic,
-        patching = hotupgrade.patching,
-    }
-end
-
-local function initialize()
-    logic = hotupgrade.require("player_logic")
-    local version = logic.version()
-    if version ~= "v1" and version ~= "v2" then
-        return {ok = false, code = "HU_PLAYER_VERSION_UNSUPPORTED", message = tostring(version)}
-    end
-
-    local is_v2 = version == "v2"
-    state =
-    {
-        equip = is_v2 and "剑" or "刀",
-        level = 50,
-        schema_version = is_v2 and 2 or 1,
-    }
-    state_root = state
-    business = {load = logic.make_load(state)}
-    cached_v1_load = business.load
-
-    local registered_result = hotupgrade.register_service(
-    {
-        service_module = "player",
-        service_update = {state = state, functions = business},
-        before_upgrade = function()
-            return business_queue(function() return true end)
-        end,
-        after_upgrade = function()
-            return logic.version() == "v2" and state.equip == "剑"
-                and state.schema_version == 2 and business.load(100) == 121
-        end,
-    })
-    if registered_result.ok then
-        registered = true
-    end
-    return registered_result
-end
-
 skynet.start(function()
-    hotupgrade = require "flywow_hotupgrade"
+    local hotupgrade = require "flywow_hotupgrade"
+    local player_logic
+    local player_state
+    local business_functions
+    local registered = false
+
     skynet.dispatch("lua", function(session, _source, command)
         local answer
+
         if command == "init" then
             if registered then
-                answer = {ok = false, code = "HU_ALREADY_INITIALIZED", message = "PlayerService 已初始化"}
+                answer = {ok = false, code = "HU_ALREADY_INITIALIZED"}
             else
-                answer = initialize()
+                player_logic = hotupgrade.require("player_logic")
+                player_state =
+                {
+                    equip = "刀",
+                    level = 50,
+                    schema_version = 1,
+                }
+                business_functions = {load = player_logic.make_load(player_state)}
+                answer = hotupgrade.register_service(
+                {
+                    service_update =
+                    {
+                        state = player_state,
+                        functions = business_functions,
+                    },
+                    before_upgrade = function()
+                        return business_queue(function() return true end)
+                    end,
+                })
+                registered = answer.ok
             end
         elseif not registered then
-            answer = {ok = false, code = "HU_NOT_INITIALIZED", message = "PlayerService 尚未登记"}
+            answer = {ok = false, code = "HU_NOT_INITIALIZED"}
         elseif command == "inspect" then
             if hotupgrade.patching then
                 answer = {ok = false, code = "HU_UPGRADING"}
             else
-                answer = {ok = true, player = business_queue(inspect)}
-            end
-        elseif command == "attack" then
-            if hotupgrade.patching then
-                answer = {ok = false, code = "HU_UPGRADING"}
-            else
                 answer = business_queue(function()
-                    return {ok = true, attack = business.load(100)}
+                    return
+                    {
+                        ok = true,
+                        version = player_logic.version(),
+                        equip = player_state.equip,
+                        level = player_state.level,
+                        schema_version = player_state.schema_version,
+                        attack = business_functions.load(100),
+                    }
                 end)
             end
         else
-            answer = {ok = false, code = "HU_UNKNOWN_COMMAND", message = tostring(command)}
+            answer = {ok = false, code = "HU_UNKNOWN_COMMAND"}
         end
 
         if session ~= 0 then

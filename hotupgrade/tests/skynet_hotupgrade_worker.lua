@@ -71,7 +71,6 @@ local function initialize(request)
     end
     return hotupgrade.register_service(
     {
-        service_module = worker_test_config.service_module or "player",
         service_update = service_update,
         before_upgrade = not worker_test_config.before_missing and function()
             assert(hotupgrade.patching)

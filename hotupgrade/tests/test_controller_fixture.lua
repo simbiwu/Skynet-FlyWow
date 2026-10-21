@@ -104,13 +104,13 @@ package.loaded.flywow_hotupgrade_native =
             module = {"lualib/test_worker_logic.lua"},
             service_file = {"service/new_service.lua"},
             deploy_failure = {"lualib/a_added.lua", "lualib/test_worker_logic.lua", "service/z_blocked.lua"},
-            combined = {"lualib/test_worker_logic.lua", "service/player.patch"},
+            combined = {"lualib/test_worker_logic.lua", "service/skynet_hotupgrade_worker.patch"},
             unmatched_module = {"lualib/test_worker_logic.lua", "lualib/missing_logic.lua"},
             unmatched_service = {"lualib/test_worker_logic.lua", "service/unused.patch"},
             host_paths = {"config/settings.lua", "lualib/battle/state_sync/runtime.lua",
                 "lualib/packages/demo/init.lua"},
-            nested_service = {"service/battle/worker.patch"},
-            custom_service = {"actors/zone/player.patch"},
+            nested_named_service = {"service/battle/worker.patch"},
+            custom_named_service = {"actors/zone/player.patch"},
             duplicate_module = {"lualib/battle.worker.lua", "lualib/battle/worker.lua"},
             duplicate_service = {"service/battle.worker.patch", "service/battle/worker.patch"},
         }
@@ -142,13 +142,19 @@ local function publish(instance, dry_run, request)
     return instance:control("begin", {path = request.path, dry_run = dry_run}, 1)
 end
 
-local function managed_register(instance, metadata, handle)
+local function managed_register(instance, metadata, handle, service_name)
+    service_name = service_name or "skynet_hotupgrade_worker"
     module_state.launch_handle = handle
-    local created = instance:control("newservice", {service_name = "fixture", arguments = {n = 0}}, 1)
+    local created = instance:control("newservice", {service_name = service_name, arguments = {n = 0}}, 1)
     if not created.ok then
         return created
     end
-    return instance:control("register", metadata, handle)
+    assert(instance.creation_handles[handle].service_name == service_name)
+    local registered = instance:control("register", metadata, handle)
+    if registered.ok then
+        assert(instance.targets[handle].service_name == service_name)
+    end
+    return registered
 end
 
 local function register_module(instance, name, handle)
@@ -159,7 +165,7 @@ local function register_module(instance, name, handle)
     return instance:control("register_module", {name = name, permit_id = allowed.permit_id}, handle)
 end
 
-local metadata = {service_module = "player", modules = {"lualib.test_worker_logic"}, service_patch = false}
+local metadata = {modules = {"lualib.test_worker_logic"}, service_patch = false}
 
 return
 {

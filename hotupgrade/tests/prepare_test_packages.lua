@@ -51,26 +51,26 @@ end
 local cases =
 {
     module = {lualib = {["test_worker_logic.lua"] = module_v2}},
-    combined = {lualib = {["test_worker_logic.lua"] = module_v2}, service = {["player.patch"] = service}},
-    service = {service = {["player.patch"] = service}},
-    stage_failure = {lualib = {["test_worker_logic.lua"] = module_v2}, service = {["player.patch"] = [[return function(state)
+    combined = {lualib = {["test_worker_logic.lua"] = module_v2}, service = {["skynet_hotupgrade_worker.patch"] = service}},
+    service = {service = {["skynet_hotupgrade_worker.patch"] = service}},
+    stage_failure = {lualib = {["test_worker_logic.lua"] = module_v2}, service = {["skynet_hotupgrade_worker.patch"] = [[return function(state)
         return {migrate = function(old)
             old.equip = "坏"
             old.nested.count = 99
             error("migration rejected")
         end}
     end]]}},
-    functions = {service = {["player.patch"] = [[return function(state)
+    functions = {service = {["skynet_hotupgrade_worker.patch"] = [[return function(state)
         return {functions = {load = function(item)
             return item.base_attack + (state.equip == "剑" and 20 or 0)
         end}}
     end]]}},
-    state_only = {service = {["player.patch"] = [[return function()
+    state_only = {service = {["skynet_hotupgrade_worker.patch"] = [[return function()
         return {migrate = function(old)
             return {equip = "剑", level = old.level, schema_version = 2}
         end}
     end]]}},
-    bad_functions = {service = {["player.patch"] = [[return function()
+    bad_functions = {service = {["skynet_hotupgrade_worker.patch"] = [[return function()
         return {functions = {load = 12}}
     end]]}},
     extra = {lualib = {["hotupgrade_extra.lua"] = "return {value = function() return 2 end}"}},
@@ -83,18 +83,21 @@ local cases =
     service_file = {service = {["new_service.lua"] = "return {version = 2}"}},
     deployment = {lualib = {["test_worker_logic.lua"] = module_v2,
         ["new/dependency.lua"] = "return {version = 2}"},
-        service = {["new_service.lua"] = "return {version = 2}", ["player.patch"] = service}},
+        service = {["new_service.lua"] = "return {version = 2}", ["skynet_hotupgrade_worker.patch"] = service}},
     deploy_failure = {lualib = {["a_added.lua"] = "return {version = 2}",
         ["test_worker_logic.lua"] = module_v2}, service = {["z_blocked.lua"] = "return {}"}},
     invalid_patch = {lualib = {["wrong.patch"] = "return function() end"}},
-    invalid_service = {service = {["player.patch"] = "return {"}},
+    invalid_service = {service = {["skynet_hotupgrade_worker.patch"] = "return {"}},
     invalid = {lualib = {["test_worker_logic.lua"] = "return {"}},
     host_paths = {config = {["settings.lua"] = "return {max_level = 200}"},
         lualib = {["battle/state_sync/runtime.lua"] = "return {value = function() return 2 end}",
             ["packages/demo/init.lua"] = "return {value = function() return 2 end}"}},
-    nested_service = {service = {["battle/worker.patch"] = service}},
+    nested_service = {service = {["skynet_hotupgrade_worker.patch"] = service}},
+    nested_named_service = {service = {["battle/worker.patch"] = service}},
     nested_custom_service = {["actors/zone"] = {["battle/worker.patch"] = service}},
-    custom_service = {["actors/zone"] = {["player.patch"] = service}},
+    custom_service = {actors = {["skynet_hotupgrade_worker.patch"] = service}},
+    custom_service_files = {["actors/zone"] = {["skynet_hotupgrade_worker.patch"] = service}},
+    custom_named_service = {["actors/zone"] = {["player.patch"] = service}},
     duplicate_module = {lualib = {["battle.worker.lua"] = "return {}",
         ["battle/worker.lua"] = "return {}"}},
     duplicate_service = {service = {["battle.worker.patch"] = service, ["battle/worker.patch"] = service}},

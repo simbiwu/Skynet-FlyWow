@@ -40,7 +40,7 @@ init 失败可修正后重试，成功后重复 init 返回 HU_ALREADY_INITIALIZ
 纳入 HotUpgrade 管理的 Service 必须由创建者使用受管理入口启动；Controller 自身和非受管理 Service 继续使用原生入口。宿主可通过原生 uniqueservice 获取相同 handle，用于 begin/status 等管理命令；业务 Service 的 HotUpgrade API 不再接收 handle：
 
 ```lua
-local handle = hotupgrade.newservice("player", "原有启动参数")
+local handle = hotupgrade.newservice("player_service", "原有启动参数")
 -- newservice 仅转交原生启动参数，返回后不额外等待业务 init 或 register_service。
 local called, initialized = pcall(skynet.call, handle, "lua", "init", player_config)
 if not called or type(initialized) ~= "table" or not initialized.ok then
@@ -93,7 +93,6 @@ end
 
 local registered = hotupgrade.register_service(
 {
-    service_module = "player",
     service_update = {state = state, functions = M},
     before_upgrade = function()
         return business_queue(function() return true end)
@@ -106,7 +105,7 @@ assert(registered.ok, registered.message)
 end)
 ```
 
-service_module 匹配 service_dir 下的一次性 .patch 相对路径：去掉 .patch 并将 / 转为 .。例如 service_dir 为 service 时，service/player.patch 对应 player，service/battle/worker.patch 对应 battle.worker。service_update 可省略，此时该 Service 只参与普通模块更新。Controller 使用注册消息真实 source 作为目标 handle；私有状态、函数和回调留在业务 State，不经消息传给 Controller。登记成功前宿主不得宣布 Service READY；登记 RPC 失败可能有不确定结果，应终止该次启动，由宿主管理，而不是继续接收业务。
+Controller 使用 newservice()/uniqueservice() 创建记录中的 service_name 匹配 service_dir 下的一次性 .patch。service_dir 为 service 时，service/player_service.patch 对应 player_service，service/battle/worker.patch 对应 battle.worker；登记请求不重复携带 Service 名称。service_update 可省略，此时该 Service 只参与普通模块更新。Controller 使用注册消息真实 source 作为目标 handle；私有状态、函数和回调留在业务 State，不经消息传给 Controller。登记成功前宿主不得宣布 Service READY；登记 RPC 失败可能有不确定结果，应终止该次启动，由宿主管理，而不是继续接收业务。
 
 hotupgrade.require(name) 仍用宿主原有 name 加载模块，通过 package.searchpath(name, package.path) 定位 Lua 文件，再复用 Native resolve 得到规范化路径。Controller 登记名由该文件相对 root_path 的路径去掉 .lua、将 / 转为 . 得到。例如原调用 hotupgrade.require("battle.state_sync.runtime") 加载 lualib/battle/state_sync/runtime.lua，登记名为 lualib.battle.state_sync.runtime；不是给原 name 固定增加目录前缀。?/init.lua 解析出的文件也按真实路径登记，例如 lualib/battle/init.lua 对应 lualib.battle.init。
 
@@ -153,7 +152,7 @@ Finish 释放旧快照并结束本地事务后将 hot.patching 设为 false。Ab
     battle/state_sync/runtime.lua
   service/
     player.lua
-    player.patch
+    player_service.patch
     battle/worker.patch
 ```
 
@@ -198,7 +197,7 @@ return M
 
 ## 一次性 Service 更新脚本
 
-service_dir 为 service 时，service/player.patch 返回构建函数，接收现存 Service 私有 state 根表：
+service_dir 为 service 时，service/player_service.patch 返回构建函数，接收现存 Service 私有 state 根表：
 
 ```lua
 return function(state)

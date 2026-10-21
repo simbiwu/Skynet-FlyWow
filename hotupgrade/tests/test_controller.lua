@@ -47,6 +47,13 @@ end
 
 scenarios['lifecycle'] = function()
     local lifecycle = initialize_controller()
+    local launches_before_invalid_names = #module_state.launches
+    for _, command in ipairs({"newservice", "uniqueservice"}) do
+        local rejected = lifecycle:control(command,
+            {service_name = "fixture/name", arguments = {n = 0}}, 1)
+        assert(rejected.code == "HU_INVALID_REQUEST")
+    end
+    assert(#module_state.launches == launches_before_invalid_names)
     local function blocked(instance)
         for _, command in ipairs({"unknown_command", "validate", "dry_run", "apply"}) do
             local calls = #module_state.pending_control_coroutines
@@ -167,11 +174,17 @@ end
 scenarios['matching'] = function()
     assert(not controller.initialize({}).ok)
     local c = initialize_controller()
+    module_state.launch_handle = 9
+    local named_creation = c:control("newservice",
+        {service_name = "player_service", arguments = {n = 0}}, 1)
+    assert(named_creation.ok and c.creation_handles[9].service_name == "player_service")
+    assert(c:control("cancel_service_creation", {handle = 9}, 1).ok)
     for _, handle in ipairs({10, 20}) do
-        assert(managed_register(c, {service_module = "player", modules = {"lualib.test_worker_logic"},
+        assert(managed_register(c, {modules = {"lualib.test_worker_logic"},
             service_patch = false}, handle).ok)
     end
-    assert(c:control("register", {service_module = "player", modules = {}, service_patch = false}, 10).code == "HU_DUPLICATE_SERVICE")
+    assert(c:control("register", {modules = {}, service_patch = false}, 10).code == "HU_DUPLICATE_SERVICE")
+    assert(c:control("register", {service_module = "player", modules = {}, service_patch = false}, 10).code == "HU_INVALID_OPTIONS")
     assert(register_module(c, "extra", 10).ok)
     assert(not register_module(c, "extra", 30).ok)
     local module_patch = c:load({path = "module"})
@@ -194,7 +207,7 @@ scenarios['matching'] = function()
 
     local unsupported = c:load({path = "combined"})
     assert(unsupported.code == "HU_SERVICE_PATCH_UNSUPPORTED")
-    assert(unsupported.message:find("combined/service/player.patch", 1, true))
+    assert(unsupported.message:find("combined/service/skynet_hotupgrade_worker.patch", 1, true))
 
     local function run(dry_run)
         local answer = publish(c, dry_run == true, {path = "module"})
@@ -296,7 +309,7 @@ end
 scenarios['combined'] = function()
     local combined = initialize_controller()
     for _, handle in ipairs({30, 40}) do
-        assert(managed_register(combined, {service_module = "player", modules = {"lualib.test_worker_logic"},
+        assert(managed_register(combined, {modules = {"lualib.test_worker_logic"},
             service_patch = true}, handle).ok)
     end
     for _, dry_run in ipairs({true, false}) do
@@ -310,13 +323,13 @@ end
 scenarios['paths'] = function()
     local paths = initialize_controller()
     assert(managed_register(paths,
-        {service_module = "battle.worker", modules = {"config.settings", "lualib.battle.state_sync.runtime", "lualib.packages.demo.init"},
-            service_patch = true}, 50).ok)
+        {modules = {"config.settings", "lualib.battle.state_sync.runtime", "lualib.packages.demo.init"},
+            service_patch = true}, 50, "battle.worker").ok)
     local loaded = paths:load({path = "host_paths"})
     assert(loaded.ok and #loaded.patch.modules == 3)
     assert(loaded.patch.modules[1].entry_file == "config/settings.lua")
     assert(loaded.patch.modules[2].name == "lualib.battle.state_sync.runtime")
-    assert(paths:load({path = "nested_service"}).ok)
+    assert(paths:load({path = "nested_named_service"}).ok)
 
     for _, path in ipairs({"duplicate_module", "duplicate_service"}) do
         assert(paths:load({path = path}).code == "HU_INVALID_PATCH")
@@ -326,8 +339,8 @@ end
 scenarios['custom_paths'] = function()
     local changed = initialize_controller("actors")
     assert(managed_register(changed,
-        {service_module = "zone.player", modules = {}, service_patch = true}, 60).ok)
-    assert(changed:load({path = "custom_service"}).ok)
+        {modules = {}, service_patch = true}, 60, "zone.player").ok)
+    assert(changed:load({path = "custom_named_service"}).ok)
 end
 
 scenarios['unique'] = function()
@@ -508,11 +521,11 @@ scenarios['resources'] = function()
         module_names[index] = "logic_" .. index
     end
     assert(managed_register(deployment,
-        {service_module = "empty", modules = module_names, service_patch = false}, 20000).ok)
+        {modules = module_names, service_patch = false}, 20000).ok)
     assert(register_module(deployment, "beyond_previous_limit", 20000).ok)
     for handle = 10000, 11024 do
         assert(managed_register(deployment,
-            {service_module = "empty", modules = {}, service_patch = false}, handle).ok)
+            {modules = {}, service_patch = false}, handle).ok)
     end
     print("HOTUPGRADE_CONTROLLER_RESOURCE_OK")
 end

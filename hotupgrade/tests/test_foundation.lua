@@ -222,7 +222,9 @@ assert(forwarded.uniqueservice.global and forwarded.uniqueservice.service_name =
 assert(forwarded.uniqueservice.arguments.n == 1 and forwarded.uniqueservice.arguments[1] == "arg")
 assert(hotupgrade.cancel_service_creation(101).ok and forwarded.cancel.handle == 101)
 assert(unique_calls == 1, "controller lookup happens exactly once per Lua State")
-local registration = {service_module = "fixture"}
+local rejected_registration = hotupgrade.register_service({service_module = "fixture"})
+assert(not rejected_registration.ok and rejected_registration.code == "HU_INVALID_OPTIONS")
+local registration = {}
 assert(hotupgrade.register_service(registration).ok)
 local function target_control(command, sequence)
     control_dispatch(1, 99, command, {batch_id = "fixture:" .. sequence, sequence = sequence})

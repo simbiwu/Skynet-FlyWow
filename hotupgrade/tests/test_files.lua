@@ -19,17 +19,20 @@ assert(not controller.initialize({}).ok)
 assert(controller.initialize(controller_config).ok)
 local c = controller
 -- 此文件只测扫描/路径；以原生创建替身为虚拟目标建立合法的待登记记录。
-local function register_fixture(instance, handle, metadata)
+local function register_fixture(instance, handle, metadata, service_name)
     local skynet = require "skynet"
     local original_newservice = skynet.newservice
     skynet.newservice = function() return handle end
-    local created = instance:control("newservice", {service_name = "path_fixture", arguments = {n = 0}}, 1)
+    local created = instance:control("newservice",
+        {service_name = service_name, arguments = {n = 0}}, 1)
     skynet.newservice = original_newservice
-    assert(created.ok)
-    return instance:control("register", metadata, handle)
+    assert(created.ok and instance.creation_handles[handle].service_name == service_name)
+    local registered = instance:control("register", metadata, handle)
+    assert(registered.ok and instance.targets[handle].service_name == service_name)
+    return registered
 end
-assert(register_fixture(c, 10, {service_module = "battle.worker", modules = {"lualib.test_worker_logic"},
-    service_patch = true}).ok)
+assert(register_fixture(c, 10, {modules = {"lualib.test_worker_logic"},
+    service_patch = true}, "battle.worker").ok)
 assert(c:load({path = "module"}).ok)
 assert(not c:load({path = "invalid"}).ok)
 for _, path in ipairs({"../module", "/module", "module/../module", "module//lualib",
@@ -87,8 +90,8 @@ local rejected = controller.initialize({patch_root = root, root_path = config.ro
 assert(os.remove(service_link))
 assert(not rejected.ok and rejected.code == "HU_INVALID_PATH")
 assert(register_fixture(c, 20,
-    {service_module = "player", modules = {}, service_patch = true}).ok)
-assert(c:load({path = "custom_service"}).ok)
+    {modules = {}, service_patch = true}, "skynet_hotupgrade_worker").ok)
+assert(c:load({path = "custom_service_files"}).ok)
 local file_path = "native_files/nested/value.lua"
 assert(hotupgrade_native.read_file(config.root_path, file_path) == false)
 assert(hotupgrade_native.replace_file(config.root_path, file_path, "old"))

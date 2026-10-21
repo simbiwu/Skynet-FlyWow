@@ -117,7 +117,6 @@ local function build_patch(root, patch_path, service_dir)
 end
 
 ---@class FlyWowHotUpgradeTargetMetadata
----@field service_module string 由现存 Service 声明，匹配配置 service_dir 下的相对路径
 ---@field modules string[] 当前 State 已声明模块的唯一名称数组
 ---@field service_patch boolean 是否在本 State 提供私有状态及函数更新入口
 
@@ -270,7 +269,7 @@ function M:uniqueservice(request, source)
         return hotupgrade_result.failure("HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED", "受管理唯一服务只支持本 Controller 内的本地唯一")
     end
     if math.type(source) ~= "integer" or source <= 0 or type(request.service_name) ~= "string"
-        or not request.service_name:match("^%S+$") or type(request.arguments) ~= "table"
+        or not request.service_name:match("^[%w_.%-]+$") or type(request.arguments) ~= "table"
         or math.type(request.arguments.n) ~= "integer" or request.arguments.n < 0
         or (request.global ~= nil and type(request.global) ~= "boolean") then
         return hotupgrade_result.failure("HU_INVALID_REQUEST", "需要创建者、逻辑 Service 名和完整启动参数")
@@ -322,7 +321,7 @@ end
 ---@return FlyWowHotUpgradeResult 成功含 handle
 function M:newservice(request, source, unique_name)
     if math.type(source) ~= "integer" or source <= 0 or type(request.service_name) ~= "string"
-        or not request.service_name:match("^%S+$")
+        or not request.service_name:match("^[%w_.%-]+$")
         or type(request.arguments) ~= "table"
         or math.type(request.arguments.n) ~= "integer" or request.arguments.n < 0
         or (request.global ~= nil and type(request.global) ~= "boolean") then
@@ -339,10 +338,11 @@ function M:newservice(request, source, unique_name)
     end
     local creation =
     {
-        owner       = source,      -- 原创建者拥有返回后未登记 Service 的取消权。
-        handle      = nil,         -- 仅由原生返回值建立真实来源索引。
-        unique_name = unique_name, -- 本地唯一预留的逻辑名，非唯一创建为 nil。
-        returned    = false,       -- 原生返回前，早到登记只能让出执行权等待。
+        owner        = source,                -- 原创建者拥有返回后未登记 Service 的取消权。
+        service_name = request.service_name,  -- Patch 匹配使用的原生 Service 入口名。
+        handle       = nil,                   -- 仅由原生返回值建立真实来源索引。
+        unique_name  = unique_name,           -- 本地唯一预留名，不改变其既有语义。
+        returned     = false,                 -- 原生返回前，早到登记只能让出执行权等待。
     }
     self.pending_creations[creation] = creation
     self.creation_count = self.creation_count + 1
@@ -466,10 +466,12 @@ end
 ---@param source integer Skynet 消息头中的真实 Service handle
 ---@return FlyWowHotUpgradeResult
 function M:register(request, source)
-    if math.type(source) ~= "integer" or type(request.service_module) ~= "string"
-        or not request.service_module:match("^[%w_.%-]+$") or type(request.modules) ~= "table"
-        or type(request.service_patch) ~= "boolean" then
+    if math.type(source) ~= "integer" or type(request) ~= "table"
+        or type(request.modules) ~= "table" or type(request.service_patch) ~= "boolean" then
         return hotupgrade_result.failure("HU_INVALID_OPTIONS", "登记元数据无效")
+    end
+    if request.service_module ~= nil then
+        return hotupgrade_result.failure("HU_INVALID_OPTIONS", "不再接受 service_module")
     end
 
     if self.targets[source] then
@@ -520,11 +522,11 @@ function M:register(request, source)
     end
     self.targets[source] =
     {
-        handle            = source,                 -- Skynet 提供的真实来源，也是后续控制目标。
-        service_module    = request.service_module, -- 匹配配置 service_dir 下的相对路径。
-        modules           = modules,                -- 该 State 明确声明的可更新模块集合。
-        loading_modules   = {},                     -- 同一 Service/模块同时只允许一项首次加载操作。
-        service_patch     = request.service_patch,  -- 是否提供本地 Service 状态/函数入口。
+        handle          = source,                 -- Skynet 提供的真实来源，也是后续控制目标。
+        service_name    = creation.service_name,   -- 来自该 handle 对应的受管理创建记录。
+        modules         = modules,                -- 该 State 明确声明的可更新模块集合。
+        loading_modules = {},                     -- 同一 Service/模块同时只允许一项首次加载操作。
+        service_patch   = request.service_patch,  -- 是否提供本地 Service 状态/函数入口。
     }
     self:finish_creation(creation)
     return hotupgrade_result.success()
@@ -561,7 +563,7 @@ function M:load(request)
             end
         end
 
-        local service = loaded.patch.services[record.service_module]
+        local service = loaded.patch.services[record.service_name]
         if service and not record.service_patch then
             return hotupgrade_result.failure("HU_SERVICE_PATCH_UNSUPPORTED", request.path .. "/" .. service.entry_file
                 .. ": 目标 " .. record.handle .. " 未提供 Service 内部更新入口")
@@ -582,10 +584,10 @@ function M:load(request)
         end
     end
     -- 完整 .lua 无运行时接收者时只部署；一次性 .patch 必须匹配现存目标。
-    for service_module, entry in pairs(loaded.patch.services) do
+    for service_name, entry in pairs(loaded.patch.services) do
         if not matched[entry.entry_file] then
             return hotupgrade_result.failure("HU_TARGET_MISSING", request.path .. "/" .. entry.entry_file
-                .. ": 没有已登记目标匹配 service_module " .. service_module)
+                .. ": 没有已登记目标匹配 Service 名称 " .. service_name)
         end
     end
 
