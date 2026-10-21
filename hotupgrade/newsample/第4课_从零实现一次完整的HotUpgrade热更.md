@@ -570,7 +570,7 @@ PlayerService：init 回复 → 主 Service：inspect
 ```text
 Controller Service
     phase = IDLE
-    active = nil
+    active_batch = nil
     sequence = 0
     creation_count = 0
     module_load_count = 0
@@ -1094,7 +1094,7 @@ function M:begin(request)
     if self.phase == "FAILED_LOCKED" then
         return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "上次发布尚未恢复")
     end
-    if self.active then
+    if self.active_batch then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "已有发布屏障")
     end
     if request.dry_run ~= nil and type(request.dry_run) ~= "boolean" then
@@ -1103,7 +1103,7 @@ function M:begin(request)
     local path = request.path
     local dry_run = request.dry_run
     self.sequence = self.sequence + 1
-    self.active =
+    self.active_batch =
     {
         batch_id = tostring(skynet.self()) .. ":" .. self.sequence,
         sequence = self.sequence,
@@ -1115,9 +1115,9 @@ function M:begin(request)
         target_count = 0,
     }
     self.phase = "WAITING_CREATIONS"
-    local batch = self.active
+    local batch = self.active_batch
     skynet.fork(function()
-        self:run(batch, {path = path, dry_run = dry_run})
+        self:run_batch(batch, {path = path, dry_run = dry_run})
     end)
     return hotupgrade_result.success({batch_id = batch.batch_id})
 end
@@ -1131,7 +1131,7 @@ end
 
 `batch` 是刚刚创建的一次发布批次对象。
 
-`self.active = batch` 代表 Controller 当前正在管理这个批次。
+`self.active_batch = batch` 代表 Controller 当前正在管理这个批次。
 
 `self.sequence` 则是 Controller 生命周期内不断递增的批次序号。它与 Controller 自己的 handle 一起组成 `batch_id`，用于区分不同事务。
 
@@ -1139,7 +1139,7 @@ end
 
 ```lua
 skynet.fork(function()
-    self:run(batch, {path = path, dry_run = dry_run})
+    self:run_batch(batch, {path = path, dry_run = dry_run})
 end)
 ```
 
@@ -1157,7 +1157,7 @@ return hotupgrade_result.success({batch_id = batch.batch_id})
 
 这只表示 Controller **接受了发布请求**，并不表示业务已经更新。
 
-后续真正的文件加载、Prepare、Update、Finish，都由新协程中的 `M:run()` 负责执行。
+后续真正的文件加载、Prepare、Update、Finish，都由新协程中的 `M:run_batch()` 负责执行。
 
 这也是为什么我们的 Sample 必须通过 `status({batch_id=...})` 等待最终结果。
 
@@ -1166,7 +1166,7 @@ return hotupgrade_result.success({batch_id = batch.batch_id})
 ```text
 Controller
     phase = WAITING_CREATIONS
-    active = batch
+    active_batch = batch
     sequence = 1
     batch.batch_id = "<Controller handle>:1"
     batch.sequence = 1
@@ -1195,27 +1195,27 @@ Controller
 
 当前函数：
 
-`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:run(batch, request)`。
+`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:run_batch(batch, request)`。
 
 调用者是刚才 `M:begin()` 创建的 `skynet.fork()` 协程。
 
 先看 `run()` 的开头，这是一段连续真实源码：
 
 ```lua
-function M:run(batch, request)
+function M:run_batch(batch, request)
     -- 登记 waiter 到 wait 之间不 yield；完成回调会唤醒同一批次，恢复后重验身份和计数。
-    while self.active == batch and (self.creation_count > 0 or self.module_load_count > 0) do
+    while self.active_batch == batch and (self.creation_count > 0 or self.module_load_count > 0) do
         batch.waiter = coroutine.running()
         skynet.wait(batch.waiter)
         batch.waiter = nil
     end
-    if self.active ~= batch then
+    if self.active_batch ~= batch then
         return
     end
     self:advance_deployment()
     local dry_run = request.dry_run == true
     local ok, message = pcall(function()
-        local loaded = self:load(request)
+        local loaded = self:load_patch(request)
         if not loaded.ok then
             batch.error = loaded
             return
@@ -1263,18 +1263,18 @@ function M:run(batch, request)
 生命周期屏障通过后，`run()` 进入：
 
 ```lua
-local loaded = self:load(request)
+local loaded = self:load_patch(request)
 ```
 
 这是对同一个 Controller 模块表的方法调用，仍然运行在 Controller Service 的 Lua State 内，没有跨 Service。
 
 现在进入：
 
-`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:load()`。
+`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:load_patch()`。
 
 这里的 `request.path` 就是我们从 Sample 传入的 `"v2"`。
 
-`M:load()` 先检查生命周期和请求，再调用同文件的 `build_patch()`。
+`M:load_patch()` 先检查生命周期和请求，再调用同文件的 `build_patch()`。
 
 `build_patch()` 经由 `load_files()` 和 Native `list_lua()` 扫描发布目录，使用 Native `read_file()` 读取文件内容。
 
@@ -1309,9 +1309,9 @@ end
 
 因为它是用于升级现存 PlayerService 的一次性脚本，而不是以后 Skynet 创建 Service 时要加载的入口文件。
 
-分类之后，`M:load()` 再根据 Controller 已保存的 `targets` 登记表确定真正需要发送控制 RPC 的目标。
+分类之后，`M:load_patch()` 再根据 Controller 已保存的 `targets` 登记表确定真正需要发送控制 RPC 的目标。
 
-真实源码的目标匹配部分位于 `M:load()`：
+真实源码的目标匹配部分位于 `M:load_patch()`：
 
 ```lua
 local targets = {} -- 本批需要执行原有更新协议的真实 Service。
@@ -1346,7 +1346,7 @@ for _, record in pairs(self.targets) do
 end
 ```
 
-这是 `M:load()` 中的连续代码，没有重新编写算法。
+这是 `M:load_patch()` 中的连续代码，没有重新编写算法。
 
 Controller 从 `self.targets` 取出此前登记的 `first_handle`。
 
@@ -1385,13 +1385,13 @@ Controller 只知道应该把哪些源码发送给哪个 Service。
 
 真正的模块表、状态表和业务函数表，都需要等 RPC 到达 PlayerService 后，在那个 Lua State 中完成更新。
 
-`M:load()` 也会检查发布包中的 Service Patch 是否至少匹配一个目标。如果找不到对应的已登记 Service，就不会继续本次发布。
+`M:load_patch()` 也会检查发布包中的 Service Patch 是否至少匹配一个目标。如果找不到对应的已登记 Service，就不会继续本次发布。
 
 ### 4. Prepare 之前，Controller 还做了什么？
 
-现在返回 `M:run()`。
+现在返回 `M:run_batch()`。
 
-`M:load()` 已经成功返回，里面包含两样东西：
+`M:load_patch()` 已经成功返回，里面包含两样东西：
 
 `loaded.patch`：本次完整发布包的冻结内容。
 
@@ -1407,7 +1407,7 @@ batch.targets = loaded.targets
 batch.target_count = #loaded.targets
 ```
 
-这些语句位于 `flywow_hotupgrade_controller.lua` 的 `M:run()`，在 `self:load(request)` 返回之后执行。
+这些语句位于 `flywow_hotupgrade_controller.lua` 的 `M:run_batch()`，在 `self:load_patch(request)` 返回之后执行。
 
 本次 `batch.files` 包含两份完整 `.lua` 文件：
 
@@ -1425,7 +1425,7 @@ service/player_service.lua
 ```text
 Controller
     phase = DEPLOYING → 即将进入 APPLYING
-    active = batch
+    active_batch = batch
     batch.targets = {first_handle}
     batch.target_count = 1
     batch.files = {player_logic.lua, player_service.lua}
@@ -1453,7 +1453,7 @@ Controller
 
 ### 5. Prepare：Controller 怎样让 PlayerService 到达安全点？
 
-现在回到 Controller 的 `M:run()`。
+现在回到 Controller 的 `M:run_batch()`。
 
 接下来执行的是这个函数中的一段连续源码：
 
@@ -1482,7 +1482,7 @@ end
 
 这段代码来自：
 
-`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:run()`。
+`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:run_batch()`。
 
 这里最重要的一点，是外层循环：
 
@@ -1546,7 +1546,7 @@ Prepare 不传送模块源码，只传批次身份。
 
 ```text
 Controller Service                             PlayerService
- M:run()
+ M:run_batch()
    └── M:step(batch,target,"prepare")
          │
          └── skynet.call(first_handle, "hotupgrade", "prepare", request)
@@ -1557,7 +1557,7 @@ Controller Service                             PlayerService
                                                 │
                  <────────── RPC 回复 ────────────┘
          │
-         └── 继续 M:run()
+         └── 继续 M:run_batch()
 ```
 
 为什么 PlayerService 能接收 `"hotupgrade"` 协议？
@@ -1687,7 +1687,7 @@ end
 
 随后返回 `{ok=true}`，通过 PlayerService 的 `skynet.retpack()` 回复 Controller。
 
-Controller 中先前 yield 的 `M:step()` 恢复，接着返回 `M:run()`。
+Controller 中先前 yield 的 `M:step()` 恢复，接着返回 `M:run_batch()`。
 
 **到这里，Prepare 才真正完成。**
 
@@ -1727,7 +1727,7 @@ Controller
 
 ### 6. Update：真正修改运行中的 Lua 对象
 
-现在 `M:run()` 已经完成所有目标的 Prepare。
+现在 `M:run_batch()` 已经完成所有目标的 Prepare。
 
 外层循环进入第二轮：
 
@@ -2307,7 +2307,7 @@ Controller
 
 现在执行权回到了：
 
-`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:run()`。
+`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:run_batch()`。
 
 前面的 Prepare 和 Update 都已经成功返回，Controller 可以继续执行后面的文件部署代码。
 
@@ -2331,9 +2331,9 @@ if #batch.files > 0 then
 end
 ```
 
-这段代码位于 `M:run()` 的 Update 成功之后。
+这段代码位于 `M:run_batch()` 的 Update 成功之后。
 
-`batch.files` 是之前由 `M:load()` 冻结的正式 `.lua` 文件集合。
+`batch.files` 是之前由 `M:load_patch()` 冻结的正式 `.lua` 文件集合。
 
 我们的发布包中，它包含：
 
@@ -2425,7 +2425,7 @@ Skynet
 
 ### 9. Finish：为什么这时才开放玩家业务？
 
-正式文件部署、代码缓存清理和所有目标 Update 均确认成功之后，执行权仍然在 Controller 的 `M:run()`。
+正式文件部署、代码缓存清理和所有目标 Update 均确认成功之后，执行权仍然在 Controller 的 `M:run_batch()`。
 
 接下来执行：
 
@@ -2445,7 +2445,7 @@ end
 batch.phase = batch.error and "RECOVERY_REQUIRED" or "COMPLETED"
 ```
 
-这是 `flywow_hotupgrade_controller.lua` 的 `M:run()` 中完整的发布决定和 Finish 循环。
+这是 `flywow_hotupgrade_controller.lua` 的 `M:run_batch()` 中完整的发布决定和 Finish 循环。
 
 首先把批次阶段设置为：
 
@@ -2527,17 +2527,17 @@ M.patching = false
 
 Finish 成功后，它通过 RPC 返回 Controller。
 
-Controller 收齐结果后，在 `M:run()` 的结尾保存最终批次记录：
+Controller 收齐结果后，在 `M:run_batch()` 的结尾保存最终批次记录：
 
 ```lua
-self.last = batch
-self.active = nil
+self.last_batch = batch
+self.active_batch = nil
 self.phase = self.recovery_required and "FAILED_LOCKED"
     or (batch.error and "IDLE" or batch.phase)
 self:wake_lifecycle()
 ```
 
-这里的代码来自 `M:run()` 的事务收尾部分。
+这里的代码来自 `M:run_batch()` 的事务收尾部分。
 
 本次成功，因此：
 
@@ -2545,9 +2545,9 @@ self:wake_lifecycle()
 
 `self.phase = "COMPLETED"`
 
-`self.active = nil`
+`self.active_batch = nil`
 
-`self.last` 保存刚才完成的批次记录。
+`self.last_batch` 保存刚才完成的批次记录。
 
 `self:wake_lifecycle()` 则唤醒发布期间等待创建新 Service 或首次加载模块的协程。
 
@@ -2556,8 +2556,8 @@ self:wake_lifecycle()
 ```text
 Controller
     phase = COMPLETED
-    active = nil
-    last = 本次 batch
+    active_batch = nil
+    last_batch = 本次 batch
     batch.phase = COMPLETED
     recovery_required = false
 
@@ -2760,7 +2760,7 @@ second_handle
 
 这时本地 `handle_upgrade("prepare")` 返回失败。
 
-Controller 的 `M:step()` 将失败结果交给 `M:run()`，后者进入恢复分支，对已经参与当前批次的目标发送：
+Controller 的 `M:step()` 将失败结果交给 `M:run_batch()`，后者进入恢复分支，对已经参与当前批次的目标发送：
 
 `handle_upgrade("abort")`
 
@@ -2793,7 +2793,7 @@ Controller.phase = IDLE
 
 此时 Controller 不能直接放开 PlayerService，否则运行时和正式文件可能处于不同版本。
 
-所以 `M:run()` 的恢复分支会先尝试恢复已经改动的正式文件，并在需要时重新清理 Skynet 代码缓存。
+所以 `M:run_batch()` 的恢复分支会先尝试恢复已经改动的正式文件，并在需要时重新清理 Skynet 代码缓存。
 
 然后再对参与过事务的 PlayerService 执行 Abort。
 

@@ -136,7 +136,7 @@ end
 
 local function publish(instance, dry_run, request)
     if instance.phase == "FAILED_LOCKED" then
-        assert(instance:handle_command("resolve_deployment", {batch_id = instance.last.batch_id,
+        assert(instance:handle_command("resolve_deployment", {batch_id = instance.last_batch.batch_id,
             confirmed = true, confirmation = "CONVERGED_CACHE_CLEARED"}, 1).ok)
     end
     return instance:handle_command("begin", {path = request.path, dry_run = dry_run}, 1)

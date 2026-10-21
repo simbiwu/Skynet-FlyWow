@@ -198,8 +198,8 @@ function M.initialize(controller_config)
         phase                = "IDLE",                           -- 发布门禁独立于事务协程，失败后保持关闭。
         lifecycle_waiters    = {},                               -- 发布期间等待的创建和首次模块加载请求，终态统一唤醒。
         unique_services      = {},                               -- 仅本 Controller 内的逻辑唯一名、在途结果和 handle，不提供全局发现。
-        active               = nil,                              -- begin 持有的唯一发布批次，事务结束后失败门禁仍由 phase 保持。
-        last                 = nil,                              -- 最近结束的批次结果；更早批次不保留，查询返回缺失。
+        active_batch         = nil,                              -- begin 持有的唯一发布批次，事务结束后失败门禁仍由 phase 保持。
+        last_batch           = nil,                              -- 最近结束的批次结果；更早批次不保留，查询返回缺失。
         recovery_required    = false,                            -- 恢复结果未确认时关闭后续发布，需先由宿主处理恢复。
     }
 
@@ -533,7 +533,7 @@ function M:register(request, source)
 end
 
 --- 冻结文件并生成目标快照；不执行 Patch 代码、不读其他 Service Lua State。
-function M:load(request)
+function M:load_patch(request)
     if self.creation_count > 0 or self.module_load_count > 0 then
         return hotupgrade_result.failure("HU_LIFECYCLE_PENDING",
             "生命周期未完成：待创建/登记 " .. self.creation_count .. "，待模块加载/登记 " .. self.module_load_count)
@@ -623,20 +623,20 @@ function M:step(batch, target, command)
 end
 
 -- 按阶段协调整批目标；Finish 开始后只报告收尾故障，不回滚已开放业务的目标。
-function M:run(batch, request)
+function M:run_batch(batch, request)
     -- 登记 waiter 到 wait 之间不 yield；完成回调会唤醒同一批次，恢复后重验身份和计数。
-    while self.active == batch and (self.creation_count > 0 or self.module_load_count > 0) do
+    while self.active_batch == batch and (self.creation_count > 0 or self.module_load_count > 0) do
         batch.waiter = coroutine.running()
         skynet.wait(batch.waiter)
         batch.waiter = nil
     end
-    if self.active ~= batch then
+    if self.active_batch ~= batch then
         return
     end
     self:advance_deployment()
     local dry_run = request.dry_run == true
     local ok, message = pcall(function()
-        local loaded = self:load(request)
+        local loaded = self:load_patch(request)
         if not loaded.ok then
             batch.error = loaded
             return
@@ -786,8 +786,8 @@ function M:run(batch, request)
     if batch.decided or not self.recovery_required then
         batch.files = nil
     end
-    self.last = batch
-    self.active = nil
+    self.last_batch = batch
+    self.active_batch = nil
     self.phase = self.recovery_required and "FAILED_LOCKED"
         or (batch.error and "IDLE" or batch.phase)
     self:wake_lifecycle()
@@ -797,9 +797,9 @@ end
 function M:advance_deployment()
     if self.phase == "WAITING_CREATIONS" and self.creation_count == 0 and self.module_load_count == 0 then
         self.phase = "DEPLOYING"
-        self.active.phase = "DEPLOYING"
-        if self.active.waiter then
-            skynet.wakeup(self.active.waiter)
+        self.active_batch.phase = "DEPLOYING"
+        if self.active_batch.waiter then
+            skynet.wakeup(self.active_batch.waiter)
         end
     end
 end
@@ -818,7 +818,7 @@ function M:begin(request)
     if self.phase == "FAILED_LOCKED" then
         return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "上次发布尚未恢复")
     end
-    if self.active then
+    if self.active_batch then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "已有发布屏障")
     end
     if request.dry_run ~= nil and type(request.dry_run) ~= "boolean" then
@@ -827,7 +827,7 @@ function M:begin(request)
     local path = request.path
     local dry_run = request.dry_run
     self.sequence = self.sequence + 1
-    self.active =
+    self.active_batch =
     {
         batch_id = tostring(skynet.self()) .. ":" .. self.sequence,
         sequence = self.sequence,
@@ -839,16 +839,16 @@ function M:begin(request)
         target_count = 0,
     }
     self.phase = "WAITING_CREATIONS"
-    local batch = self.active
+    local batch = self.active_batch
     skynet.fork(function()
-        self:run(batch, {path = path, dry_run = dry_run})
+        self:run_batch(batch, {path = path, dry_run = dry_run})
     end)
     return hotupgrade_result.success({batch_id = batch.batch_id})
 end
 
 --- 仅校验宿主的显式恢复确认；不发送目标 RPC，也不恢复或强制开放目标业务。
 function M:resolve_deployment(request)
-    local batch = self.active or self.last
+    local batch = self.active_batch or self.last_batch
     if not batch or request.batch_id ~= batch.batch_id then
         return hotupgrade_result.failure("HU_BATCH_MISSING", "恢复批次号不匹配")
     end
@@ -863,11 +863,11 @@ function M:resolve_deployment(request)
         return hotupgrade_result.failure("HU_RECOVERY_CONFIRMATION_REQUIRED", "已向目标发送控制命令，不能声明运行时未发生变更")
     end
 
-    self.active = nil
+    self.active_batch = nil
     if batch.waiter then
         skynet.wakeup(batch.waiter)
     end
-    self.last = batch
+    self.last_batch = batch
     batch.resolved = true
     batch.files = nil
     self.recovery_required = false
@@ -919,18 +919,18 @@ function M:handle_command(command, request, source)
         local lifecycle =
         {
             phase = self.phase,
-            batch_id = (self.active or self.last) and (self.active or self.last).batch_id,
+            batch_id = (self.active_batch or self.last_batch) and (self.active_batch or self.last_batch).batch_id,
             failed_locked = self.phase == "FAILED_LOCKED",
             pending_creations = self.creation_count,
             pending_module_loads = self.module_load_count,
-            active_batch_id = self.active and self.active.batch_id,
+            active_batch_id = self.active_batch and self.active_batch.batch_id,
             recovery_required = self.recovery_required,
         }
         if request.batch_id == nil then
             return hotupgrade_result.success({lifecycle = lifecycle, recovery_required = self.recovery_required})
         end
 
-        local batch = self.active and self.active.batch_id == request.batch_id and self.active or self.last
+        local batch = self.active_batch and self.active_batch.batch_id == request.batch_id and self.active_batch or self.last_batch
         if not batch or batch.batch_id ~= request.batch_id then
             return hotupgrade_result.failure("HU_BATCH_MISSING", "仅保留活动及最近终态批次")
         end
@@ -944,7 +944,7 @@ function M:handle_command(command, request, source)
     end
 
     if command == "abort" then
-        local batch = self.active
+        local batch = self.active_batch
         if batch and batch.batch_id == request.batch_id and self.phase ~= "APPLYING" then
             return self:resolve_deployment(request)
         end
