@@ -2,7 +2,7 @@
 
 本课使用的源码版本：
 
-`SKYNET-FLYWOW main`：`485f0465f09e432fb9f2f9c1afda528d57b4b601`
+`SKYNET-FLYWOW main`：`f928ba214012d98776094b81f0db4eb047af2bb7`
 
 前三课我们已经分别学习了 Service 登记、普通 Lua 模块热更，以及 Service 状态与函数更新。现在要把这些知识真正连接起来。
 
@@ -277,7 +277,7 @@ logic = hot.require("player_logic")
 
 最后，`hot.register_service()` 向 HotUpgrade 声明：
 
-- 本 Service 的逻辑登记名是 `player`。
+- Service 入口名是 `player_service`，由 `hot.newservice("player_service")` 创建时记录，不在登记元数据中重复传递。
 - 要更新的私有状态是 `state`。
 - 要更新的业务函数表是 `business`。
 - 热更前要通过 `before_upgrade()` 等待业务 queue 排空。
@@ -301,16 +301,16 @@ logic = hot.require("player_logic")
 local skynet = require "skynet"
 
 skynet.start(function()
-    local controller_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+    local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
     local hot = require "flywow_hotupgrade"
 
     local root = os.getenv("HOTUPGRADE_LESSON_ROOT")
 
-    local result = skynet.call(controller_handle, "lua", "init",
+    local result = skynet.call(hotupgrade_service_handle, "lua", "init",
     {
-        patch_root = root .. "/patches",
+        patch_path = root .. "/patches",
         root_path = root .. "/host",
-        service_dir = "service",
+        service_path = "service",
     })
     if not result.ok then
         error(result.message)
@@ -341,7 +341,7 @@ end)
 我们从 `skynet.start()` 的回调进入，先执行：
 
 ```lua
-local controller_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
 ```
 
 这里使用的是 **Skynet 原生 `uniqueservice()`**，创建或取得进程中的唯一 Controller Service。
@@ -355,7 +355,7 @@ Controller 启动后，在自己的 Lua State 中加载 `flywow_hotupgrade_contr
 随后我们的主 Service 发送：
 
 ```lua
-skynet.call(controller_handle, "lua", "init", ...)
+skynet.call(hotupgrade_service_handle, "lua", "init", ...)
 ```
 
 注意，现在仍然是主 Service 在执行。`skynet.call()` 会使当前调用协程等待 Controller 的回复。
@@ -366,9 +366,9 @@ skynet.call(controller_handle, "lua", "init", ...)
 
 这个函数会验证并保存三个配置：
 
-- `patch_root`：以后从哪里读取 V2 发布包。
+- `patch_path`：以后从哪里读取 V2 发布包。
 - `root_path`：正式宿主文件在哪里。
-- `service_dir`：Service 入口文件所在的相对目录。
+- `service_path`：Service 入口文件所在的相对目录。
 
 还会建立目标登记表、创建中的 Service 记录、模块加载许可记录，以及后面发布事务使用的状态。
 
@@ -397,7 +397,7 @@ local first_handle = hot.newservice("player_service")
 ```lua
 function M.newservice(service_name, ...)
     -- 基础设施转发未知启动签名，固定 n 以保留参数个数和 nil。
-    local answer = skynet.call(controller_handle, "hotupgrade", "newservice",
+    local answer = skynet.call(hotupgrade_service_handle, "hotupgrade", "newservice",
         {service_name = service_name, arguments = table.pack(...)})
     assert(type(answer) == "table" and answer.ok,
         tostring(type(answer) == "table" and answer.code) .. ": " ..
@@ -406,7 +406,7 @@ function M.newservice(service_name, ...)
 end
 ```
 
-这里的 `controller_handle` 是 HotUpgrade 模块在所在 Lua State 内取得的 Controller handle。
+这里的 `hotupgrade_service_handle` 是 HotUpgrade 模块在所在 Lua State 内取得的 Controller handle。
 
 函数把创建请求发送给 Controller。主 Service 当前协程等待回复。
 
@@ -416,9 +416,9 @@ Controller 收到 `"hotupgrade"` 协议的 `"newservice"` 命令后，由：
 
 调用：
 
-`flywow_hotupgrade_controller.lua` 的 `M:control()`。
+`flywow_hotupgrade_controller.lua` 的 `M:handle_command()`。
 
-`control()` 将这条请求分发给同文件的 `M:newservice()`。
+`handle_command()` 将这条请求分发给同文件的 `M:newservice()`。
 
 Controller 的 `M:newservice()` 会检查发布门禁，然后建立一个 `creation` 记录，增加 `creation_count`，再真正调用：
 
@@ -429,7 +429,7 @@ skynet.newservice(request.service_name,
 
 这一段属于：
 
-`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:newservice()`，由 `M:control()` 分发调用。
+`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:newservice()`，由 `M:handle_command()` 分发调用。
 
 真正创建新 Service 的仍是 Skynet。Controller 只是管理这次创建操作的生命周期。
 
@@ -488,18 +488,18 @@ local metadata =
     modules = names,
     service_patch = service_update ~= nil,
 }
-local ok, answer = pcall(skynet.call, controller_handle, "hotupgrade", "register", metadata)
+local ok, answer = pcall(skynet.call, hotupgrade_service_handle, "hotupgrade", "register", metadata)
 ```
 
 注意，这个请求里没有 `state`，没有 `business`，也没有 `initial_load`。
 
 Controller 只需要知道：哪个 Service、登记了哪些普通模块、是否支持 Service Patch。
 
-本例中发送的元数据可以理解为：
+Controller 最终持有的目标记录可以理解为（其中 `service_name` 来自受管理创建记录，不是 `register_service()` 请求字段）：
 
 ```lua
 {
-    service_name = "player",
+    service_name = "player_service",
     modules = {"lualib.player_logic"},
     service_patch = true,
 }
@@ -962,16 +962,16 @@ V2 初始化为 `"剑"`、schema 2。
 local skynet = require "skynet"
 
 skynet.start(function()
-    local controller_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+    local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
     local hot = require "flywow_hotupgrade"
     local root = os.getenv("HOTUPGRADE_LESSON_ROOT")
 
     -- 初始化 Controller。
-    local result = skynet.call(controller_handle, "lua", "init",
+    local result = skynet.call(hotupgrade_service_handle, "lua", "init",
     {
-        patch_root = root .. "/patches",
+        patch_path = root .. "/patches",
         root_path = root .. "/host",
-        service_dir = "service",
+        service_path = "service",
     })
     if not result.ok then
         error(result.message)
@@ -989,7 +989,7 @@ skynet.start(function()
         before.player.schema_version, before.player.attack)
 
     -- 开始发布 V2。
-    local begun = skynet.call(controller_handle, "hotupgrade", "begin",
+    local begun = skynet.call(hotupgrade_service_handle, "hotupgrade", "begin",
     {
         path = "v2",
     })
@@ -1001,7 +1001,7 @@ skynet.start(function()
 
     -- 等待该批次执行完毕。
     while true do
-        local status = skynet.call(controller_handle, "hotupgrade", "status",
+        local status = skynet.call(hotupgrade_service_handle, "hotupgrade", "status",
         {
             batch_id = begun.batch_id,
         })
@@ -1065,7 +1065,7 @@ end)
 前面的 V1 创建和登记过程已经讲过，现在从主 Service 的这条 RPC 开始：
 
 ```lua
-local begun = skynet.call(controller_handle, "hotupgrade", "begin",
+local begun = skynet.call(hotupgrade_service_handle, "hotupgrade", "begin",
 {
     path = "v2",
 })
@@ -1073,7 +1073,7 @@ local begun = skynet.call(controller_handle, "hotupgrade", "begin",
 
 代码来源是 `hotupgrade/lesson4/lesson4_main.lua` 的 `skynet.start()` 回调。
 
-`controller_handle` 来自之前的 `skynet.uniqueservice()`，`path="v2"` 则表示选择 Controller 配置的 `patch_root` 下的 `v2` 目录。
+`hotupgrade_service_handle` 来自之前的 `skynet.uniqueservice()`，`path="v2"` 则表示选择 Controller 配置的 `patch_path` 下的 `v2` 目录。
 
 这是一条跨 Service 的 RPC。主 Service 发送请求后 yield，等待 Controller 回复。
 
@@ -1083,9 +1083,9 @@ local begun = skynet.call(controller_handle, "hotupgrade", "begin",
 
 其 `skynet.dispatch("hotupgrade", ...)` 调用：
 
-`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 中的 `M:control()`。
+`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 中的 `M:handle_command()`。
 
-`control()` 根据 `"begin"` 命令进入同文件的 `M:begin()`。
+`handle_command()` 根据 `"begin"` 命令进入同文件的 `M:begin()`。
 
 我们来看这个完整函数：
 
@@ -1356,7 +1356,7 @@ Controller 从 `self.targets` 取出此前登记的 `first_handle`。
 
 而本次发布包恰好包含同名的完整模块 Patch。
 
-同时，该 Service 的 `service_name` 是 `player`，与发布包中的 `service/player_service.patch` 匹配，而且登记时声明支持 Service 内部更新。
+同时，该 Service 的 `service_name` 是 `player_service`，与发布包中的 `service/player_service.patch` 匹配，而且登记时声明支持 Service 内部更新。
 
 所以本次将 `first_handle` 加入更新目标。
 
@@ -1552,7 +1552,7 @@ Controller Service                             PlayerService
          └── skynet.call(first_handle, "hotupgrade", "prepare", request)
                                                 │
                                                 └── skynet.dispatch("hotupgrade")
-                                                      └── control("prepare")
+                                                      └── handle_upgrade("prepare")
                                                             └── before_upgrade()
                                                 │
                  <────────── RPC 回复 ────────────┘
@@ -1573,7 +1573,7 @@ Controller Service                             PlayerService
 ```lua
 module_state.registration = registration
 skynet.dispatch("hotupgrade", function(session, source, command, request)
-    local ok, answer = pcall(control, command, request, source)
+    local ok, answer = pcall(handle_upgrade, command, request, source)
     if not ok then
         -- 未预期异常可能发生在写入后；保留本地事务与 patching，不能伪称恢复成功。
         if module_state.active_transaction then
@@ -1588,7 +1588,7 @@ skynet.dispatch("hotupgrade", function(session, source, command, request)
 end)
 ```
 
-这个 `control()` 是 PlayerService 所加载的 HotUpgrade 模块中的**本地函数**，与 Controller 的 `M:control()` 不是同一个函数。
+这个 `handle_upgrade()` 是 PlayerService 所加载的 HotUpgrade 模块中的**本地函数**，与 Controller 的 `M:handle_command()` 不是同一个函数。
 
 前者执行在 PlayerService 的 Lua State，能够访问玩家状态和本地模块表。
 
@@ -1602,7 +1602,7 @@ end)
 
 函数：
 
-`local function control(command, request, source)`
+`local function handle_upgrade(command, request, source)`
 
 收到 `"prepare"` 后，它先检查请求是否来自合法的 Controller，以及批次身份是否正确，再执行下面这一段：
 
@@ -1645,7 +1645,7 @@ module_state.active_transaction = txn
 M.patching = true
 ```
 
-这两句属于 `flywow_hotupgrade.lua` 的本地 `control("prepare")` 分支。
+这两句属于 `flywow_hotupgrade.lua` 的本地 `handle_upgrade("prepare")` 分支。
 
 `module_state.active_transaction` 保存当前 Service 的本地热更事务。
 
@@ -1681,7 +1681,7 @@ end
 
 此时，因为 `hot.patching=true` 已经阻止新的受控业务加入，框架便取得了业务安全点。
 
-`control()` 将：
+`handle_upgrade()` 将：
 
 `txn.phase = "QUIESCED"`
 
@@ -1762,7 +1762,7 @@ Controller 通过 `skynet.call()` 把更新请求发送给 `first_handle`，当�
 
 PlayerService 收到消息后，经本地 `skynet.dispatch("hotupgrade", ...)` 进入：
 
-`flywow_hotupgrade.lua` 的 `control("update")`。
+`flywow_hotupgrade.lua` 的 `handle_upgrade("update")`。
 
 现在先看真实代码的 Stage 部分：
 
@@ -1793,7 +1793,7 @@ if command == "update" then
     txn.phase = "STAGED"
 ```
 
-这是 `control()` 的连续代码，暂时只读到 `STAGED`。下一步 Activate 还在同一个 `control("update")` 中，等我们理解 Stage 后再继续。
+这是 `handle_upgrade()` 的连续代码，暂时只读到 `STAGED`。下一步 Activate 还在同一个 `handle_upgrade("update")` 中，等我们理解 Stage 后再继续。
 
 这里先调用：
 
@@ -1860,13 +1860,13 @@ end
 
 同样，`business.load` 和 `initial_load` 都仍然指向 V1 闭包。
 
-框架把候选模块、原模块表、旧导出字段等保存在 Stage 记录中，返回给 `control("update")`，后者将其保存到 `txn.modules`。
+框架把候选模块、原模块表、旧导出字段等保存在 Stage 记录中，返回给 `handle_upgrade("update")`，后者将其保存到 `txn.modules`。
 
 这部分是普通模块更新引擎的入口。第 5 课再研究它如何进行完整导出检查和私有状态迁移；现在只需要理解：**Stage 产生候选版本，并保留旧版本的恢复依据，暂不修改线上对象。**
 
 #### 接着 Stage Service 状态和函数
 
-普通模块 Stage 成功后，`control("update")` 执行：
+普通模块 Stage 成功后，`handle_upgrade("update")` 执行：
 
 ```lua
 local ok, service = pcall(stage_service, request.service_source)
@@ -2014,7 +2014,7 @@ PlayerService 线上 state
 
 这样，即使 Stage 失败，正常线上对象也不需要先经历一次修改再恢复。
 
-`stage_service()` 返回 `staged` 后，执行权回到本地 `control("update")`，把它保存到 `txn.service`，并设置：
+`stage_service()` 返回 `staged` 后，执行权回到本地 `handle_upgrade("update")`，把它保存到 `txn.service`，并设置：
 
 `txn.phase = "STAGED"`
 
@@ -2060,7 +2060,7 @@ Controller
 
 现在继续执行：
 
-`hotupgrade/lualib/flywow_hotupgrade.lua` 的 `control("update")`。
+`hotupgrade/lualib/flywow_hotupgrade.lua` 的 `handle_upgrade("update")`。
 
 前面已经运行到：
 
@@ -2156,7 +2156,7 @@ state.equip = "刀"
 
 这是一次尚未结束的 Activate 内部状态，不是已经开放给业务使用的最终状态。Prepare 阶段建立的安全点仍然有效。
 
-接下来 `control("update")` 开始应用 Service Patch。
+接下来 `handle_upgrade("update")` 开始应用 Service Patch。
 
 它取得：
 
@@ -2185,7 +2185,7 @@ function M.restore_state(live, fields)
 end
 ```
 
-来源是 `hotupgrade/lualib/flywow_hotupgrade_module_patch.lua`。这次由 `control("update")` 的 Activate 分支调用。
+来源是 `hotupgrade/lualib/flywow_hotupgrade_module_patch.lua`。这次由 `handle_upgrade("update")` 的 Activate 分支调用。
 
 调用时：
 
@@ -2214,7 +2214,7 @@ for name, fn in pairs(staged.patch.functions or {}) do
 end
 ```
 
-这段是框架 `control("update")` 的 Activate 代码。
+这段是框架 `handle_upgrade("update")` 的 Activate 代码。
 
 我们的 `staged.patch.functions` 只有一个 `load` 字段。
 
@@ -2459,13 +2459,13 @@ batch.phase = batch.error and "RECOVERY_REQUIRED" or "COMPLETED"
 
 随后，Controller 通过此前学习过的 `M:step()`，向 `first_handle` 发送：
 
-`control("finish")`
+`handle_upgrade("finish")`
 
 这又是一条跨 Service RPC。
 
 PlayerService 收到后，仍然进入：
 
-`hotupgrade/lualib/flywow_hotupgrade.lua` 的本地 `control()`。
+`hotupgrade/lualib/flywow_hotupgrade.lua` 的本地 `handle_upgrade()`。
 
 我们之前已经读过这个函数的 Prepare 和 Update，现在继续读 Finish 分支：
 
@@ -2597,7 +2597,7 @@ Controller 完成批次之后，我们最初编写的 `lesson4_main.lua` 正在�
 
 这一部分调用的仍然是 Controller 的 `"hotupgrade"` 协议。
 
-消息进入 `flywow_hotupgrade_controller.lua` 的 `M:control("status")`。
+消息进入 `flywow_hotupgrade_controller.lua` 的 `M:handle_command("status")`。
 
 这个分支读取当前生命周期状态和指定 `batch_id` 的批次记录，并将它们返回给主 Service。
 
@@ -2668,7 +2668,7 @@ local second_handle = hot.newservice("player_service")
 
 调用过程和第一次创建相同：
 
-主 Service → HotUpgrade `M.newservice()` → Controller `M:control()` → `M:newservice()` → Skynet 原生 `newservice()`。
+主 Service → HotUpgrade `M.newservice()` → Controller `M:handle_command()` → `M:newservice()` → Skynet 原生 `newservice()`。
 
 区别在于，这次正式宿主目录已经部署了完整的 V2 `player_service.lua`，并且 Skynet 代码缓存已经清理。
 
@@ -2758,11 +2758,11 @@ second_handle
 
 假设我们的 PlayerService 在 Prepare 阶段无法取得业务安全点。
 
-这时本地 `control("prepare")` 返回失败。
+这时本地 `handle_upgrade("prepare")` 返回失败。
 
 Controller 的 `M:step()` 将失败结果交给 `M:run()`，后者进入恢复分支，对已经参与当前批次的目标发送：
 
-`control("abort")`
+`handle_upgrade("abort")`
 
 PlayerService 收到 Abort 后进入 `flywow_hotupgrade.lua` 的本地 `abort(txn)`。
 

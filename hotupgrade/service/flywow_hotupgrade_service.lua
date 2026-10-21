@@ -32,7 +32,7 @@ skynet.start(function()
             answer = hotupgrade_result.failure("HU_NOT_INITIALIZED", "宿主尚未完成 init")
         else
             local ok
-            ok, answer = pcall(hotupgrade_controller.control, hotupgrade_controller, command, request, source)
+            ok, answer = pcall(hotupgrade_controller.handle_command, hotupgrade_controller, command, request, source)
             if not ok then
                 answer = hotupgrade_result.failure("HU_CONTROL_FAILED", tostring(answer))
             end

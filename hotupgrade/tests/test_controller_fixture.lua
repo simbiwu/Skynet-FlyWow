@@ -118,39 +118,39 @@ package.loaded.flywow_hotupgrade_native =
     end,
 }
 local controller = require "flywow_hotupgrade_controller"
-local function initialize_controller(service_dir)
+local function initialize_controller(service_path)
     local initialized = controller.initialize(
     {
-        patch_root = "build/hotupgrade-tests/patches",
+        patch_path = "build/hotupgrade-tests/patches",
         root_path = "build/hotupgrade-tests/host",
-        service_dir = service_dir or "service",
+        service_path = service_path or "service",
     })
     assert(initialized.ok, initialized.message)
     return controller
 end
 local function begin_deployment(instance, path, dry_run)
-    local begun = instance:control("begin", {path = path, dry_run = dry_run}, 1)
+    local begun = instance:handle_command("begin", {path = path, dry_run = dry_run}, 1)
     assert(begun.ok)
     return begun.batch_id
 end
 
 local function publish(instance, dry_run, request)
     if instance.phase == "FAILED_LOCKED" then
-        assert(instance:control("resolve_deployment", {batch_id = instance.last.batch_id,
+        assert(instance:handle_command("resolve_deployment", {batch_id = instance.last.batch_id,
             confirmed = true, confirmation = "CONVERGED_CACHE_CLEARED"}, 1).ok)
     end
-    return instance:control("begin", {path = request.path, dry_run = dry_run}, 1)
+    return instance:handle_command("begin", {path = request.path, dry_run = dry_run}, 1)
 end
 
 local function managed_register(instance, metadata, handle, service_name)
     service_name = service_name or "skynet_hotupgrade_worker"
     module_state.launch_handle = handle
-    local created = instance:control("newservice", {service_name = service_name, arguments = {n = 0}}, 1)
+    local created = instance:handle_command("newservice", {service_name = service_name, arguments = {n = 0}}, 1)
     if not created.ok then
         return created
     end
     assert(instance.creation_handles[handle].service_name == service_name)
-    local registered = instance:control("register", metadata, handle)
+    local registered = instance:handle_command("register", metadata, handle)
     if registered.ok then
         assert(instance.targets[handle].service_name == service_name)
     end
@@ -158,11 +158,11 @@ local function managed_register(instance, metadata, handle, service_name)
 end
 
 local function register_module(instance, name, handle)
-    local allowed = instance:control("begin_module_load", {name = name}, handle)
+    local allowed = instance:handle_command("begin_module_load", {name = name}, handle)
     if not allowed.ok then
         return allowed
     end
-    return instance:control("register_module", {name = name, permit_id = allowed.permit_id}, handle)
+    return instance:handle_command("register_module", {name = name, permit_id = allowed.permit_id}, handle)
 end
 
 local metadata = {modules = {"lualib.test_worker_logic"}, service_patch = false}

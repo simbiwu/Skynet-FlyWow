@@ -4,15 +4,15 @@ local skynet = require "skynet"
 skynet.start(function()
     local ok, failure = xpcall(function()
         local hotupgrade = require "flywow_hotupgrade"
-        local controller_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+        local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
 
         -- Skynet 从 Server 根目录启动；运行脚本会把夹具复制到这个目录。
         local sample_root = "./third_party/skynet-flywow/build/hotupgrade-sample"
-        local initialized = skynet.call(controller_handle, "lua", "init",
+        local initialized = skynet.call(hotupgrade_service_handle, "lua", "init",
         {
-            patch_root = sample_root .. "/patches",
+            patch_path = sample_root .. "/patches",
             root_path = sample_root .. "/host",
-            service_dir = "service",
+            service_path = "service",
         })
         if not initialized.ok then
             error(initialized.code .. ": " .. initialized.message)
@@ -28,7 +28,7 @@ skynet.start(function()
         print(string.format("V1 handle=%d module=%s equip=%s level=%d schema=%d attack=%d",
             first_handle, before.version, before.equip, before.level, before.schema_version, before.attack))
 
-        local batch = skynet.call(controller_handle, "hotupgrade", "begin", {path = "v2"})
+        local batch = skynet.call(hotupgrade_service_handle, "hotupgrade", "begin", {path = "v2"})
         if not batch.ok then
             error(batch.code .. ": " .. batch.message)
         end
@@ -36,7 +36,7 @@ skynet.start(function()
 
         local completed
         for _ = 1, 3000 do
-            local status = skynet.call(controller_handle, "hotupgrade", "status",
+            local status = skynet.call(hotupgrade_service_handle, "hotupgrade", "status",
                 {batch_id = batch.batch_id})
             if not status.ok then
                 error(status.code .. ": " .. status.message)

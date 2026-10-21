@@ -1,15 +1,15 @@
 local skynet = require "skynet"
 
 skynet.satart(function()
-    local controller_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+    local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
     local hot = require "flywow_hotupgrade"
 
     local root = os.getenv("HOTUPGRADE_LESSON_ROOT")
-    local result = skynet.call(controller_handle, "lua", init,
+    local result = skynet.call(hotupgrade_service_handle, "lua", init,
     {
-        patch_root = root .. "/patches",
+        patch_path = root .. "/patches",
             root_path = root .. "/host",
-            service_dir = "service",
+            service_path = "service",
     })
 
     if not result.ok then

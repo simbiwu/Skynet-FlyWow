@@ -2,12 +2,12 @@
 local hotupgrade_native = require "flywow_hotupgrade_native"
 local controller = require "flywow_hotupgrade_controller"
 local config = require "hotupgrade_test_options"
-local root = config.patch_root
+local root = config.patch_path
 local controller_config =
 {
-    patch_root = config.patch_root,
+    patch_path = config.patch_path,
     root_path = config.root_path,
-    service_dir = "actors/zone",
+    service_path = "actors/zone",
 }
 assert(hotupgrade_native.append_sync == nil)
 local paths = assert(hotupgrade_native.list_lua(root, "module"))
@@ -23,11 +23,11 @@ local function register_fixture(instance, handle, metadata, service_name)
     local skynet = require "skynet"
     local original_newservice = skynet.newservice
     skynet.newservice = function() return handle end
-    local created = instance:control("newservice",
+    local created = instance:handle_command("newservice",
         {service_name = service_name, arguments = {n = 0}}, 1)
     skynet.newservice = original_newservice
     assert(created.ok and instance.creation_handles[handle].service_name == service_name)
-    local registered = instance:control("register", metadata, handle)
+    local registered = instance:handle_command("register", metadata, handle)
     assert(registered.ok and instance.targets[handle].service_name == service_name)
     return registered
 end
@@ -53,7 +53,7 @@ for _, path in ipairs({"count_unlimited", "file_unlimited", "total_unlimited"}) 
 end
 local other_root = config.root_path .. "/another"
 assert(os.execute("mkdir -p " .. other_root .. "/service"))
-local conflicting = controller.initialize({patch_root = root, root_path = other_root, service_dir = "service"})
+local conflicting = controller.initialize({patch_path = root, root_path = other_root, service_path = "service"})
 assert(not conflicting.ok and conflicting.code == "HU_INVALID_OPTIONS")
 assert(require("skynet").getenv(require("flywow_hotupgrade_common").ROOT_PATH_ENV)
     == hotupgrade_native.resolve(config.root_path))
@@ -77,16 +77,16 @@ local fifo = root .. "/module/special"
 assert(os.execute("mkfifo " .. fifo))
 assert(not hotupgrade_native.list_lua(root, "module"))
 assert(os.remove(fifo))
-for _, service_dir in ipairs({"../service", "/service", "service/../service", "service/"}) do
+for _, service_path in ipairs({"../service", "/service", "service/../service", "service/"}) do
     local rejected = controller.initialize(
     {
-        patch_root = root, root_path = config.root_path, service_dir = service_dir,
+        patch_path = root, root_path = config.root_path, service_path = service_path,
     })
     assert(not rejected.ok and rejected.code == "HU_INVALID_PATH")
 end
 local service_link = config.root_path .. "/service_link"
 assert(os.execute("ln -s service " .. service_link))
-local rejected = controller.initialize({patch_root = root, root_path = config.root_path, service_dir = "service_link"})
+local rejected = controller.initialize({patch_path = root, root_path = config.root_path, service_path = "service_link"})
 assert(os.remove(service_link))
 assert(not rejected.ok and rejected.code == "HU_INVALID_PATH")
 assert(register_fixture(c, 20,

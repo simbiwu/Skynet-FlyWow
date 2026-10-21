@@ -10,13 +10,13 @@ HotUpgrade 在现存 Skynet Service、现存 Lua State 内更新受信 Lua 代�
 
 ```lua
 skynet.start(function()
-    local controller_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+    local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
     local hotupgrade = require "flywow_hotupgrade" -- 必须在协程内加载；模块顶部的唯一服务查询会 yield。
-    local initialized = skynet.call(controller_handle, "lua", "init",
+    local initialized = skynet.call(hotupgrade_service_handle, "lua", "init",
     {
-        patch_root = "./config/hotupgrade",
+        patch_path = "./config/hotupgrade",
         root_path = ".",
-        service_dir = "service",
+        service_path = "service",
     })
     assert(initialized.ok, initialized.message)
     -- 在此之后再启动受管理业务 Service。
@@ -31,7 +31,7 @@ end)
 
 公开入口是 hotupgrade/lualib/flywow_hotupgrade.lua；控制 Service 入口是 hotupgrade/service/flywow_hotupgrade_service.lua。Controller 加载 flywow_hotupgrade_native 时，Lua 从 Native 搜索路径定位统一构建入口产出的 build/native/flywow_hotupgrade_native.so。每个加载公开入口的 State 会在模块加载时调用一次原生 skynet.uniqueservice("flywow_hotupgrade_service")，并缓存 handle。该调用会 yield，因此须从 Skynet 协程内（例如 skynet.start 回调）首次 require 公开入口。宿主仍负责在启动受管理业务 Service 前初始化 Controller。管理 State 无需登记为业务目标。
 
-patch_root 必须存在且可读取。root_path 是已存在的宿主项目根目录，service_dir 是它下面已存在的相对 Service 目录；拒绝绝对路径、空路径段、.、..、反斜杠和符号链接目录。目录允许多级，例如 service/battle。
+patch_path 必须存在且可读取。root_path 是已存在的宿主项目根目录，service_path 是它下面已存在的相对 Service 目录；拒绝绝对路径、空路径段、.、..、反斜杠和符号链接目录。目录允许多级，例如 service/battle。
 
 Controller 初始化成功时通过现有 Skynet 共享环境发布内部键 flywow_hotupgrade_root_path。须先完成 Controller init，再启动会调用 hotupgrade.require 的业务 Service。同一 Skynet 进程的 Controller 必须使用同一规范化 root_path；不一致时初始化失败。宿主不需要另行配置此内部环境键。
 
@@ -105,7 +105,7 @@ assert(registered.ok, registered.message)
 end)
 ```
 
-Controller 使用 newservice()/uniqueservice() 创建记录中的 service_name 匹配 service_dir 下的一次性 .patch。service_dir 为 service 时，service/player_service.patch 对应 player_service，service/battle/worker.patch 对应 battle.worker；登记请求不重复携带 Service 名称。service_update 可省略，此时该 Service 只参与普通模块更新。Controller 使用注册消息真实 source 作为目标 handle；私有状态、函数和回调留在业务 State，不经消息传给 Controller。登记成功前宿主不得宣布 Service READY；登记 RPC 失败可能有不确定结果，应终止该次启动，由宿主管理，而不是继续接收业务。
+Controller 使用 newservice()/uniqueservice() 创建记录中的 service_name 匹配 service_path 下的一次性 .patch。service_path 为 service 时，service/player_service.patch 对应 player_service，service/battle/worker.patch 对应 battle.worker；登记请求不重复携带 Service 名称。service_update 可省略，此时该 Service 只参与普通模块更新。Controller 使用注册消息真实 source 作为目标 handle；私有状态、函数和回调留在业务 State，不经消息传给 Controller。登记成功前宿主不得宣布 Service READY；登记 RPC 失败可能有不确定结果，应终止该次启动，由宿主管理，而不是继续接收业务。
 
 hotupgrade.require(name) 仍用宿主原有 name 加载模块，通过 package.searchpath(name, package.path) 定位 Lua 文件，再复用 Native resolve 得到规范化路径。Controller 登记名由该文件相对 root_path 的路径去掉 .lua、将 / 转为 . 得到。例如原调用 hotupgrade.require("battle.state_sync.runtime") 加载 lualib/battle/state_sync/runtime.lua，登记名为 lualib.battle.state_sync.runtime；不是给原 name 固定增加目录前缀。?/init.lua 解析出的文件也按真实路径登记，例如 lualib/battle/init.lua 对应 lualib.battle.init。
 
@@ -144,7 +144,7 @@ Finish 释放旧快照并结束本地事务后将 hot.patching 设为 false。Ab
 ## Patch 布局与普通模块
 
 ```text
-<patch_root>/<path>/
+<patch_path>/<path>/
   config/
     settings.lua
   lualib/
@@ -156,7 +156,7 @@ Finish 释放旧快照并结束本地事务后将 hot.patching 设为 false。Ab
     battle/worker.patch
 ```
 
-发布包内部路径对应宿主 root_path 下的实际路径。递归扫描全部 .lua 和 .patch，并先冻结内容、检查语法。配置 service_dir 中的 .lua 是完整新版 Service，只部署；该目录中的 .patch 是一次性 Service 更新脚本，只更新现存实例、不部署。其他目录中的 .lua 是完整普通模块：已登记时同时更新运行时和部署文件，未登记时仅部署。.patch 不能出现在 service_dir 之外。
+发布包内部路径对应宿主 root_path 下的实际路径。递归扫描全部 .lua 和 .patch，并先冻结内容、检查语法。配置 service_path 中的 .lua 是完整新版 Service，只部署；该目录中的 .patch 是一次性 Service 更新脚本，只更新现存实例、不部署。其他目录中的 .lua 是完整普通模块：已登记时同时更新运行时和部署文件，未登记时仅部署。.patch 不能出现在 service_path 之外。
 
 .lua 与 .patch 无须成对出现；允许仅 Service 源码、仅 Service Patch、仅普通模块，以及没有任何运行时目标的纯文件发布。Service .patch 必须匹配至少一个已登记且支持内部更新的目标；未匹配返回 HU_TARGET_MISSING，不支持则返回 HU_SERVICE_PATCH_UNSUPPORTED。普通模块名称仍按实际路径登记，例如 config.settings、lualib.player_logic。不同路径映射到同一普通模块名或同一 Service Patch 名时拒绝整包；其他普通文件忽略，符号链接和特殊文件拒绝。
 
@@ -197,7 +197,7 @@ return M
 
 ## 一次性 Service 更新脚本
 
-service_dir 为 service 时，service/player_service.patch 返回构建函数，接收现存 Service 私有 state 根表：
+service_path 为 service 时，service/player_service.patch 返回构建函数，接收现存 Service 私有 state 根表：
 
 ```lua
 return function(state)
@@ -237,10 +237,10 @@ migrate 接收独立旧状态快照，返回完整候选状态。Activate 先原
 管理端仅调用 begin({path=...}) 接受正式发布，通过 status({batch_id=...}) 查询终态。begin 成功表示请求已接受，不表示发布完成：
 
 ~~~lua
-local begun = skynet.call(controller_handle, "hotupgrade", "begin", {path = "current"})
+local begun = skynet.call(hotupgrade_service_handle, "hotupgrade", "begin", {path = "current"})
 assert(begun.ok, begun.message)
 while true do
-    local status = skynet.call(controller_handle, "hotupgrade", "status", {batch_id = begun.batch_id})
+    local status = skynet.call(hotupgrade_service_handle, "hotupgrade", "status", {batch_id = begun.batch_id})
     assert(status.ok, status.message)
     local phase = status.record.phase
     if phase == "COMPLETED" then
@@ -279,7 +279,7 @@ status 不带 batch_id 返回生命周期概览；带 batch_id 还返回当前�
 正常失败已由 HotUpgrade 确认恢复时不需要 resolve_deployment。仅在 FAILED_LOCKED 下，宿主先核实实际文件、运行时、目标 patching/本地事务和缓存，完成必要的人工恢复或版本收敛，再使用现有确认：
 
 ~~~lua
-local resolved = skynet.call(controller_handle, "hotupgrade", "resolve_deployment",
+local resolved = skynet.call(hotupgrade_service_handle, "hotupgrade", "resolve_deployment",
 {
     batch_id = batch_id,
     confirmed = true,
@@ -294,7 +294,7 @@ assert(resolved.ok, resolved.message)
 
 ## 文件边界与验证
 
-Native 提供 resolve(path[, relative_dir])、list_lua(patch_root, path) 和 Controller 内部使用的 read_file(root_path, relative_file)、replace_file(root_path, relative_file, source_or_nil)；相对目录检查与递归扫描共用路径安全校验，拒绝越界路径、链接及特殊文件。Controller 不设目标 Service、模块声明、Patch Lua 文件数或源码字节数硬上限；扫描与冻结规模由实际 Patch 和运行时可用资源决定。宿主在扫描/冻结期间保持 Patch 目录不变；扫描和读取不是抵抗并发目录替换的原子安全边界。冻结后更新和部署只使用本次源码，不重新读取发布包。正式目录应由本次 Controller 独占部署，不支持外部并发修改；文件操作沿用逐级路径检查，临时文件替换不提供跨文件磁盘原子性或断电恢复。replace_file 的 nil 内容仅用于删除本批原本不存在的新增文件；已有文件保留原权限，新文件使用 0644。
+Native 提供 resolve(path[, relative_dir])、list_lua(patch_path, path) 和 Controller 内部使用的 read_file(root_path, relative_file)、replace_file(root_path, relative_file, source_or_nil)；相对目录检查与递归扫描共用路径安全校验，拒绝越界路径、链接及特殊文件。Controller 不设目标 Service、模块声明、Patch Lua 文件数或源码字节数硬上限；扫描与冻结规模由实际 Patch 和运行时可用资源决定。宿主在扫描/冻结期间保持 Patch 目录不变；扫描和读取不是抵抗并发目录替换的原子安全边界。冻结后更新和部署只使用本次源码，不重新读取发布包。正式目录应由本次 Controller 独占部署，不支持外部并发修改；文件操作沿用逐级路径检查，临时文件替换不提供跨文件磁盘原子性或断电恢复。replace_file 的 nil 内容仅用于删除本批原本不存在的新增文件；已有文件保留原权限，新文件使用 0644。
 
 待创建记录也占用 Controller 内存。每个目标的同一模块仍同时只保留一项首次加载许可。登记和许可记录由当前 Controller 持有，不建立后台发现、自动超时清理或持久化恢复；宿主负责保持实际 Service 生命周期与控制面一致。Service 或调用方在关键区间异常退出、许可取消 RPC 无法送达时，屏障会保留；须核对实际状态并受控重启，不得假定操作已完成。
 
