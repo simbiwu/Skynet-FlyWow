@@ -156,13 +156,13 @@ local function scenario(overrides)
     end
     local registry = {}
     -- 提供只读测试索引。
-    function registry.load() return
+    function registry.build_index() return
     {
         count = 1,
     }
     end
     -- 只登记 command=1001。
-    function registry.find(index, command)
+    function registry.find_command(index, command)
         if command == 1001 then return
         {
             id            = 1001,

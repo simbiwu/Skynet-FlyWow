@@ -1,12 +1,12 @@
 local skynet = require "skynet"
 
 skynet.start(function()
-    local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+    local hotupgrade_handle = skynet.uniqueservice("flywow_hotupgrade_service")
     local hot = require "flywow_hotupgrade"
     local root = os.getenv("HOTUPGRADE_LESSON_ROOT")
 
     -- 初始化 Controller。
-    local result = skynet.call(hotupgrade_service_handle, "lua", "init",
+    local result = skynet.call(hotupgrade_handle, "lua", "init",
     {
         patch_path = root .. "/patches",
         root_path = root .. "/host",
@@ -28,7 +28,7 @@ skynet.start(function()
         before.player.schema_version, before.player.attack)
 
     -- 开始发布 V2。
-    local begun = skynet.call(hotupgrade_service_handle, "hotupgrade", "begin",
+    local begun = skynet.call(hotupgrade_handle, "hotupgrade", "begin",
     {
         path = "v2",
     })
@@ -40,7 +40,7 @@ skynet.start(function()
 
     -- 等待该批次执行完毕。
     while true do
-        local status = skynet.call(hotupgrade_service_handle, "hotupgrade", "status",
+        local status = skynet.call(hotupgrade_handle, "hotupgrade", "status",
         {
             batch_id = begun.batch_id,
         })

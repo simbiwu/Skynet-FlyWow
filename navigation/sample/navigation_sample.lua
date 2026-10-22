@@ -1,6 +1,6 @@
 -- 通过公开 Lua API 加载地图、规划并提交一次单位移动，然后释放 Context。
 local skynet = require "skynet"
-local function run()
+local function run_navigation_sample()
     local bmap_path = assert(os.getenv("FLYWOW_NAVIGATION_SAMPLE_MAP"))
     local navigation = require "flywow_navigation"
     local map = assert(navigation.load_map(bmap_path))
@@ -27,7 +27,7 @@ local function run()
     context:close()
 end
 skynet.start(function()
-    local ok, message = xpcall(run, debug.traceback)
+    local ok, message = xpcall(run_navigation_sample, debug.traceback)
     if ok then print("FLYWOW_NAVIGATION_SAMPLE_OK")
     else skynet.error("FLYWOW_NAVIGATION_SAMPLE_FAILED: " .. tostring(message)) end
     io.stdout:flush()

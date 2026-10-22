@@ -18,8 +18,8 @@ namespace flywow_logger
 {
 namespace
 {
-constexpr std::size_t max_text_size = 8192;
-constexpr std::size_t file_buffer_size = 64 * 1024;
+constexpr std::size_t kMaxTextSize = 8192;
+constexpr std::size_t kFileBufferSize = 64 * 1024;
 
 // 按路径的每一级递归创建目录。
 // 已存在且确实是目录时继续；若路径中有普通文件或权限不足，直接抛出启动错误。
@@ -55,7 +55,7 @@ void create_directory(const std::string& path)
 // 控制字符替换为 '?'，换行和回车保留为可读转义；最多处理 8 KiB。
 std::string single_line(const std::string& text)
 {
-    const std::size_t size = std::min(text.size(), max_text_size);
+    const std::size_t size = std::min(text.size(), kMaxTextSize);
     std::string result;
     result.reserve(size + 32);
 
@@ -185,7 +185,7 @@ bool LogSink::open_day(std::chrono::system_clock::time_point now)
 
     day_ = date;
     // 只设置 stdio 缓冲，不在每条普通日志后 fflush；ERROR 由 write 单独刷新。
-    std::setvbuf(file_, nullptr, _IOFBF, file_buffer_size);
+    std::setvbuf(file_, nullptr, _IOFBF, kFileBufferSize);
     return true;
 }
 

@@ -10,9 +10,9 @@ HotUpgrade 在现存 Skynet Service、现存 Lua State 内更新受信 Lua 代�
 
 ```lua
 skynet.start(function()
-    local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+    local hotupgrade_handle = skynet.uniqueservice("flywow_hotupgrade_service")
     local hotupgrade = require "flywow_hotupgrade" -- 必须在协程内加载；模块顶部的唯一服务查询会 yield。
-    local initialized = skynet.call(hotupgrade_service_handle, "lua", "init",
+    local initialized = skynet.call(hotupgrade_handle, "lua", "init",
     {
         patch_path = "./config/hotupgrade",
         root_path = ".",
@@ -237,10 +237,10 @@ migrate 接收独立旧状态快照，返回完整候选状态。Activate 先原
 管理端仅调用 begin({path=...}) 接受正式发布，通过 status({batch_id=...}) 查询终态。begin 成功表示请求已接受，不表示发布完成：
 
 ~~~lua
-local begun = skynet.call(hotupgrade_service_handle, "hotupgrade", "begin", {path = "current"})
+local begun = skynet.call(hotupgrade_handle, "hotupgrade", "begin", {path = "current"})
 assert(begun.ok, begun.message)
 while true do
-    local status = skynet.call(hotupgrade_service_handle, "hotupgrade", "status", {batch_id = begun.batch_id})
+    local status = skynet.call(hotupgrade_handle, "hotupgrade", "status", {batch_id = begun.batch_id})
     assert(status.ok, status.message)
     local phase = status.record.phase
     if phase == "COMPLETED" then
@@ -277,7 +277,7 @@ status 不带 batch_id 返回生命周期概览；带 batch_id 还返回当前�
 正常失败已由 HotUpgrade 确认恢复时不需要 resolve_deployment。仅在 FAILED_LOCKED 下，宿主先核实实际文件、运行时、目标 patching/本地事务和缓存，完成必要的人工恢复或版本收敛，再使用现有确认：
 
 ~~~lua
-local resolved = skynet.call(hotupgrade_service_handle, "hotupgrade", "resolve_deployment",
+local resolved = skynet.call(hotupgrade_handle, "hotupgrade", "resolve_deployment",
 {
     batch_id = batch_id,
     confirmed = true,

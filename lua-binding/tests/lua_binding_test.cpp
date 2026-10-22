@@ -86,7 +86,42 @@ template <typename T> int echo(lua_State *state)
     return lua_binding.returnValues(value);
 }
 
-int conversionBoundaries(lua_State *state)
+int uint(lua_State *state)
+{
+    return echo<std::uint32_t>(state);
+}
+
+int uint64(lua_State *state)
+{
+    return echo<std::uint64_t>(state);
+}
+
+int signed_value(lua_State *state)
+{
+    return echo<std::int64_t>(state);
+}
+
+int byte(lua_State *state)
+{
+    return echo<std::int8_t>(state);
+}
+
+int boolean(lua_State *state)
+{
+    return echo<bool>(state);
+}
+
+int string(lua_State *state)
+{
+    return echo<std::string>(state);
+}
+
+int float_value(lua_State *state)
+{
+    return echo<float>(state);
+}
+
+int conversion_boundaries(lua_State *state)
 {
     LuaBinding    lua_binding(state);
     auto         *env   = environment(lua_binding);
@@ -105,13 +140,13 @@ int conversionBoundaries(lua_State *state)
     return lua_binding.returnValues(true);
 }
 
-int invalidReturn(lua_State *state)
+int invalid_return(lua_State *state)
 {
     LuaBinding lua_binding(state);
     return lua_binding.returnValues(1, std::numeric_limits<std::uint64_t>::max());
 }
 
-int tableOperations(lua_State *state)
+int table_operations(lua_State *state)
 {
     LuaBinding lua_binding(state);
     auto      *env = environment(lua_binding);
@@ -155,7 +190,7 @@ int tableOperations(lua_State *state)
     return lua_binding.returnValues(child, moved);
 }
 
-int dropTemporary(lua_State *state)
+int drop_temporary(lua_State *state)
 {
     LuaBinding lua_binding(state);
     LuaTable   weak;
@@ -165,7 +200,7 @@ int dropTemporary(lua_State *state)
     return lua_binding.returnValues();
 }
 
-int arrayLengths(lua_State *state)
+int array_lengths(lua_State *state)
 {
     LuaBinding lua_binding(state);
     LuaTable   table;
@@ -250,7 +285,7 @@ int iterate(lua_State *state)
     return lua_binding.returnValues(numeric_keys, children);
 }
 
-int countMetamethod(lua_State *state)
+int count_metamethod(lua_State *state)
 {
     LuaBinding lua_binding(state);
     return lua_binding.returnValues(23);
@@ -260,7 +295,7 @@ int metatables(lua_State *state)
 {
     LuaBinding lua_binding(state);
     LuaTable   meta = lua_binding.newTable();
-    require(meta.setFunction("__index", &countMetamethod), "metamethod registration");
+    require(meta.setFunction("__index", &count_metamethod), "metamethod registration");
     LuaTable table = lua_binding.newTable();
     require(table.setMetatable(meta), "setmetatable failed");
     LuaTable read_meta;
@@ -271,7 +306,7 @@ int metatables(lua_State *state)
     return lua_binding.returnValues(table);
 }
 
-int newTracked(lua_State *state)
+int new_tracked(lua_State *state)
 {
     LuaBinding lua_binding(state);
     auto      *env  = environment(lua_binding);
@@ -288,7 +323,7 @@ int newTracked(lua_State *state)
     return lua_binding.returnValues(object);
 }
 
-int readTracked(lua_State *state)
+int read_tracked(lua_State *state)
 {
     LuaBinding lua_binding(state);
     Tracked   *object = nullptr;
@@ -299,7 +334,7 @@ int readTracked(lua_State *state)
     return lua_binding.returnValues(object->value, object);
 }
 
-int userdataGcIdempotent(lua_State *state)
+int userdata_gc_idempotent(lua_State *state)
 {
     LuaBinding binding(state);
 
@@ -325,7 +360,7 @@ int userdataGcIdempotent(lua_State *state)
     return binding.returnValues(true);
 }
 
-int userdataErrors(lua_State *state)
+int userdata_errors(lua_State *state)
 {
     LuaBinding lua_binding(state);
     LuaTable   meta;
@@ -356,7 +391,7 @@ int userdataErrors(lua_State *state)
     lua_settop(state, stack_top);
     require(original_collector != nullptr && collector_unchanged,
             "duplicate registration replaced the original collector");
-    require(!meta.setFunction("__gc", &countMetamethod), "GC overwritten by registration");
+    require(!meta.setFunction("__gc", &count_metamethod), "GC overwritten by registration");
     require(!meta.writeValue("__gc", nullptr), "GC removed by field write");
     Tracked *pointer = nullptr;
     require(!lua_binding.newUserdata("missing.Type", pointer, environment(lua_binding)),
@@ -367,7 +402,7 @@ int userdataErrors(lua_State *state)
     return lua_binding.returnValues(true);
 }
 
-int newTiny(lua_State *state)
+int new_tiny(lua_State *state)
 {
     LuaBinding lua_binding(state);
     Tiny      *object = nullptr;
@@ -382,7 +417,7 @@ int counters(lua_State *state)
     return lua_binding.returnValues(env->constructed, env->destroyed, Tiny::destroyed);
 }
 
-int useClosure(lua_State *state)
+int run(lua_State *state)
 {
     LuaBinding lua_binding(state);
     int        counter = 0;
@@ -404,7 +439,7 @@ int useClosure(lua_State *state)
     return lua_binding.returnValues(counter, object);
 }
 
-int makeClosure(lua_State *state)
+int make_closure(lua_State *state)
 {
     LuaBinding lua_binding(state);
     auto      *env    = environment(lua_binding);
@@ -414,12 +449,12 @@ int makeClosure(lua_State *state)
     require(captured.writeValue("marker", 17), "captured table setup");
     auto functions = lua_binding.newTable();
     require(
-        functions.setFunction("run", &useClosure, 0, captured, static_cast<void *>(env), object),
+        functions.setFunction("run", &run, 0, captured, static_cast<void *>(env), object),
         "closure registration failed");
     return lua_binding.returnValues(functions);
 }
 
-int readMap(lua_State *state)
+int read_map(lua_State *state)
 {
     LuaBinding    lua_binding(state);
     LuaTable      request;
@@ -431,7 +466,7 @@ int readMap(lua_State *state)
     return lua_binding.returnValues(map_id);
 }
 
-int openTest(lua_State *state)
+int registerTestModule(lua_State *state)
 {
     LuaBinding lua_binding(state);
     void      *pointer = nullptr;
@@ -440,35 +475,35 @@ int openTest(lua_State *state)
     LuaTable meta;
     require(lua_binding.registerUserdata<Tracked>(kTracked, meta), "tracked registration failed");
     require(lua_binding.registerUserdata<Tiny>(kTiny, meta), "tiny registration failed");
-    require(module.setFunction("uint", &echo<std::uint32_t>) &&
-                module.setFunction("uint64", &echo<std::uint64_t>) &&
-                module.setFunction("signed", &echo<std::int64_t>) &&
-                module.setFunction("byte", &echo<std::int8_t>) &&
-                module.setFunction("boolean", &echo<bool>) &&
-                module.setFunction("string", &echo<std::string>) &&
-                module.setFunction("float", &echo<float>),
+    require(module.setFunction("uint", &uint) &&
+                module.setFunction("uint64", &uint64) &&
+                module.setFunction("signed", &signed_value) &&
+                module.setFunction("byte", &byte) &&
+                module.setFunction("boolean", &boolean) &&
+                module.setFunction("string", &string) &&
+                module.setFunction("float", &float_value),
             "scalar registration failed");
-    require(module.setFunction("conversion_boundaries", &conversionBoundaries, pointer) &&
-                module.setFunction("invalid_return", &invalidReturn) &&
-                module.setFunction("table_operations", &tableOperations, pointer) &&
-                module.setFunction("drop_temporary", &dropTemporary) &&
-                module.setFunction("array_lengths", &arrayLengths) &&
+    require(module.setFunction("conversion_boundaries", &conversion_boundaries, pointer) &&
+                module.setFunction("invalid_return", &invalid_return) &&
+                module.setFunction("table_operations", &table_operations, pointer) &&
+                module.setFunction("drop_temporary", &drop_temporary) &&
+                module.setFunction("array_lengths", &array_lengths) &&
                 module.setFunction("iterate", &iterate, pointer) &&
                 module.setFunction("metatables", &metatables) &&
-                module.setFunction("new_tracked", &newTracked, pointer) &&
-                module.setFunction("read_tracked", &readTracked) &&
-                module.setFunction("userdata_errors", &userdataErrors, pointer) &&
-                module.setFunction("userdata_gc_idempotent", &userdataGcIdempotent) &&
-                module.setFunction("new_tiny", &newTiny) &&
+                module.setFunction("new_tracked", &new_tracked, pointer) &&
+                module.setFunction("read_tracked", &read_tracked) &&
+                module.setFunction("userdata_errors", &userdata_errors, pointer) &&
+                module.setFunction("userdata_gc_idempotent", &userdata_gc_idempotent) &&
+                module.setFunction("new_tiny", &new_tiny) &&
                 module.setFunction("counters", &counters, pointer) &&
-                module.setFunction("make_closure", &makeClosure, pointer) &&
-                module.setFunction("read_map", &readMap),
+                module.setFunction("make_closure", &make_closure, pointer) &&
+                module.setFunction("read_map", &read_map),
             "operation registration failed");
     return lua_binding.returnValues(module);
 }
 
 // 对照基线仅用于测量同一个固定参数的 raw 读取，不作为生产模块或新公开接口。
-int rawReadMap(lua_State *state)
+int raw_read_map(lua_State *state)
 {
     // [request] -> [request, key]；rawget 消耗 key 并压入字段值，不触发 __index。
     lua_pushliteral(state, "map_id");
@@ -486,7 +521,7 @@ int rawReadMap(lua_State *state)
     return 1;
 }
 
-void run(lua_State *state, const char *script)
+void runScript(lua_State *state, const char *script)
 {
     // 本测试脚本不显式返回值，因此成功后栈高不变；失败时错误对象留在栈顶供下方读取。
     if (luaL_dostring(state, script) != LUA_OK)
@@ -511,14 +546,14 @@ std::unique_ptr<lua_State, StateDeleter> createState(TestEnvironment *environmen
     environment->state = state.get();
     luaL_openlibs(state.get());
 
-    // 建立测试模块：push 函数和借用环境指针使栈从 [] 变为 [openTest, env]；
+    // 建立测试模块：push 函数和借用环境指针使栈从 [] 变为 [registerTestModule, env]；
     // lua_call 消耗两项并压回模块 table，setglobal 消耗 table，栈恢复为空。
-    lua_pushcfunction(state.get(), &openTest);
+    lua_pushcfunction(state.get(), &registerTestModule);
     lua_pushlightuserdata(state.get(), environment);
     lua_call(state.get(), 1, 1);
     lua_setglobal(state.get(), "binding");
     // 注册只用于性能对照的 raw 回调：push 函数后 setglobal 消耗函数，栈仍为空。
-    lua_pushcfunction(state.get(), &rawReadMap);
+    lua_pushcfunction(state.get(), &raw_read_map);
     lua_setglobal(state.get(), "raw_read_map");
     return state;
 }
@@ -622,9 +657,9 @@ assert(created == 3 and destroyed == 3, "manual and automatic GC destroyed userd
 void measure(lua_State *state)
 {
     const auto begin = std::chrono::steady_clock::now();
-    run(state, "local t={map_id=17}; for i=1,100000 do assert(raw_read_map(t)==17) end");
+    runScript(state, "local t={map_id=17}; for i=1,100000 do assert(raw_read_map(t)==17) end");
     const auto middle = std::chrono::steady_clock::now();
-    run(state, "local t={map_id=17}; for i=1,100000 do assert(binding.read_map(t)==17) end");
+    runScript(state, "local t={map_id=17}; for i=1,100000 do assert(binding.read_map(t)==17) end");
     const auto end = std::chrono::steady_clock::now();
     std::cout << "READ_TABLE_100000 raw_us="
               << std::chrono::duration_cast<std::chrono::microseconds>(middle - begin).count()
@@ -647,7 +682,7 @@ void testConcurrentStates()
                 {
                     TestEnvironment env;
                     auto            state = createState(&env);
-                    run(state.get(), "for i=1,100 do local o=binding.new_tracked(false); "
+                    runScript(state.get(), "for i=1,100 do local o=binding.new_tracked(false); "
                                      "assert(binding.read_tracked(o)==7) end");
                     state.reset();
                     require(env.constructed == 100 && env.destroyed == 100,
@@ -681,13 +716,13 @@ int main()
         TestEnvironment second_env;
         auto            first  = createState(&first_env);
         auto            second = createState(&second_env);
-        run(first.get(), kScalarTests);
-        run(first.get(), kTableTests);
-        run(first.get(), kUserdataTests);
+        runScript(first.get(), kScalarTests);
+        runScript(first.get(), kTableTests);
+        runScript(first.get(), kUserdataTests);
         // 第二个 State 拥有独立 metatable/registry/闭包，只读 T 标记允许共享。
-        run(second.get(), "assert(binding.uint(0)==0); object=binding.new_tracked(false)");
+        runScript(second.get(), "assert(binding.uint(0)==0); object=binding.new_tracked(false)");
         require(first_env.constructed == 3 && second_env.constructed == 1, "State counters shared");
-        run(first.get(), "collectgarbage('collect')");
+        runScript(first.get(), "collectgarbage('collect')");
         require(second_env.destroyed == 0, "other State GC touched object");
         second.reset(); // lua_close 也必须执行仍存活对象的统一 __gc。
         require(second_env.destroyed == 1, "State close missed destructor");

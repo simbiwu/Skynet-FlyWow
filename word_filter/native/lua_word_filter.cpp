@@ -34,7 +34,7 @@ bool readFilter(LuaBinding &lua_binding, LuaFilter *&output) {
   return lua_binding.readUserdata(1, kFilterMeta, output);
 }
 
-int createFilter(lua_State *state)
+int create_filter(lua_State *state)
 {
   LuaBinding lua_binding(state);
   LuaTable keywords;
@@ -94,7 +94,7 @@ int createFilter(lua_State *state)
   return lua_binding.returnValues(filter);
 }
 
-int findMatches(lua_State *state)
+int find(lua_State *state)
 {
   LuaBinding lua_binding(state);
   LuaFilter *filter = nullptr;
@@ -163,14 +163,14 @@ extern "C" int luaopen_flywow_word_filter_native(lua_State *state)
   }
 
   LuaTable methods = lua_binding.newTable();
-  if (!methods.setFunction("find", findMatches) ||
+  if (!methods.setFunction("find", find) ||
       !metatable.writeValue("__index", methods)) {
     return lua_binding.pushError();
   }
 
   LuaTable module = lua_binding.newTable();
-  if (!module.setFunction("new", createFilter) ||
-      !module.setFunction("find", findMatches)) {
+  if (!module.setFunction("new", create_filter) ||
+      !module.setFunction("find", find)) {
     return lua_binding.pushError();
   }
   return lua_binding.returnValues(module);

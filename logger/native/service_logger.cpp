@@ -33,7 +33,7 @@ struct Logger
     // Logger 独占 LogSink；释放 Logger 时先刷新并关闭文件。
     std::unique_ptr<flywow_logger::LogSink> sink;
 
-    // 以 source handle 为键登记来源，容量受 max_sources 限制。
+    // 以 source handle 为键登记来源，容量受 kMaxSources 限制。
     std::unordered_map<uint32_t, ServiceEntry> services;
 
     // 最低日志级别：0=debug，1=normal，2=error。
@@ -46,9 +46,9 @@ struct Logger
     ServiceEntry overflow;
 };
 
-constexpr std::size_t max_sources = 4096;
-constexpr int error_level = static_cast<int>(flywow_logger::LogLevel::Error);
-constexpr std::size_t log_header_size = 2;
+constexpr std::size_t kMaxSources = 4096;
+constexpr int kErrorLevel = static_cast<int>(flywow_logger::LogLevel::kError);
+constexpr std::size_t kLogHeaderSize = 2;
 
 // 回复控制请求的调用方。
 // source 和 session 来自当前消息；session 为 0 表示单向消息，不应发送响应。
@@ -75,7 +75,7 @@ ServiceEntry& source_entry(Logger& logger, uint32_t source)
         return found->second;
     }
 
-    if (logger.services.size() < max_sources)
+    if (logger.services.size() < kMaxSources)
     {
         return logger.services.emplace(source, ServiceEntry{}).first->second;
     }
@@ -98,7 +98,7 @@ void learn_launch_name(ServiceEntry& entry, const char* bytes, std::size_t size)
     const std::size_t first = launch.compare(0, 6, "snlua ") == 0 ? 6 : 0;
     const std::size_t end = launch.find(' ', first);
     entry.name = launch.substr(first,
-        end == std::string::npos ? flywow_logger::max_service_name_size : std::min(end - first, flywow_logger::max_service_name_size));
+        end == std::string::npos ? flywow_logger::kMaxServiceNameSize : std::min(end - first, flywow_logger::kMaxServiceNameSize));
 }
 
 // 处理 Logger Service 的消息。
@@ -146,7 +146,7 @@ int callback(skynet_context* context, void* ud, int type, int session,
 
         // 第三阶段：先处理不产生普通日志行的控制消息。
         // F 是同步刷新请求，必须使用原 session 唤醒 skynet.call。
-        if (command == flywow_logger::command_flush && size == 1)
+        if (command == flywow_logger::kCommandFlush && size == 1)
         {
             reply(context, source, session, logger.sink->flush());
             return 0;
@@ -160,7 +160,7 @@ int callback(skynet_context* context, void* ud, int type, int session,
         }
 
         // U 不带正文，只删除当前 source 的名称登记。
-        if (command == flywow_logger::command_unregister && size == 1)
+        if (command == flywow_logger::kCommandUnregister && size == 1)
         {
             logger.services.erase(source);
             return 0;
@@ -170,12 +170,12 @@ int callback(skynet_context* context, void* ud, int type, int session,
 
         // R 后面的内容是 Lua Service 名称；Native Logger 保存它用于日志展示。
         // overflow 来源不保存名称，防止来源登记表继续增长。
-        if (command == flywow_logger::command_register)
+        if (command == flywow_logger::kCommandRegister)
         {
             if (&entry != &logger.overflow && size > 1)
             {
                 const std::size_t name_size = std::min(
-                    size - 1, flywow_logger::max_service_name_size);
+                    size - 1, flywow_logger::kMaxServiceNameSize);
                 entry.name.assign(bytes + 1, name_size);
             }
 
@@ -190,10 +190,10 @@ int callback(skynet_context* context, void* ud, int type, int session,
         }
 
         // L 消息的第二个字节是等级；没有合法等级的文本按原生日志处理。
-        int level = error_level;
+        int level = kErrorLevel;
         std::size_t offset = 0;
-        const bool is_log_command = command == flywow_logger::command_log;
-        const bool has_level_byte = size >= log_header_size;
+        const bool is_log_command = command == flywow_logger::kCommandLog;
+        const bool has_level_byte = size >= kLogHeaderSize;
         const char level_byte = has_level_byte ? bytes[1] : '\0';
         const bool has_valid_level = is_log_command &&
             has_level_byte &&
@@ -203,7 +203,7 @@ int callback(skynet_context* context, void* ud, int type, int session,
         if (has_valid_level)
         {
             level = level_byte - '0';
-            offset = log_header_size;
+            offset = kLogHeaderSize;
         }
 
         if (level < logger.minimum)
@@ -220,8 +220,8 @@ int callback(skynet_context* context, void* ud, int type, int session,
         // 第六阶段：复制并限制正文，再交给 LogSink。
         // data 只借用到 callback 返回，不能把 bytes 指针保存到 Logger 状态。
         const std::size_t length = size - offset;
-        std::string text(bytes + offset, std::min(length, flywow_logger::max_message_size));
-        if (length > flywow_logger::max_message_size)
+        std::string text(bytes + offset, std::min(length, flywow_logger::kMaxMessageSize));
+        if (length > flywow_logger::kMaxMessageSize)
         {
             text += " [TRUNCATED]";
         }

@@ -294,7 +294,7 @@ LuaTable cellResultTable(LuaBinding &lua_binding, const flywow_navigation::GridP
 }
 
 /// query_cell(id,version,position)：按当前 map_id 查询并校验资产版本；只读、不 yield。
-int queryCell(lua_State *state)
+int query_cell(lua_State *state)
 {
     LuaBinding    lua_binding(state);
     void         *registry_pointer = nullptr;
@@ -448,7 +448,7 @@ bool readPathQuery(LuaBinding &lua_binding, PathQuery &query)
 }
 
 /// find_path(unit_id,start,end,self_id)：同步规划，返回独占 Path/cursor。
-int findPath(lua_State *state)
+int find_path(lua_State *state)
 {
     LuaBinding    lua_binding(state);
     PathQuery     query;
@@ -477,7 +477,7 @@ int findPath(lua_State *state)
 }
 
 /// find_path_to_range：搜索进入指定通用中心距范围的可站立位置；不定义战斗规则。
-int findPathToRange(lua_State *state)
+int find_path_to_range(lua_State *state)
 {
     LuaBinding    lua_binding(state);
     PathQuery     query;
@@ -782,7 +782,7 @@ bool readCellDynamicEntryRule(LuaBinding &lua_binding, int index, CellDynamicEnt
 
 /// set_cell_rule(grid_x,grid_z,rule)：零基格坐标；rule 为 allow/block/default。
 /// 成功返回 true；失败返回 nil,error。只影响当前 Battle，规则变化不移动已有单位。
-int setCellRule(lua_State *state)
+int set_cell_rule(lua_State *state)
 {
     LuaBinding            lua_binding(state);
     LuaNavigationContext *owner  = nullptr;
@@ -844,7 +844,7 @@ int unit_radius_mm(lua_State *state)
 }
 
 /// map_version：返回该 Context 固定地图的资产版本。
-int mapVersion(lua_State *state)
+int map_version(lua_State *state)
 {
     LuaBinding            binding(state);
     LuaNavigationContext *owner = nullptr;
@@ -873,7 +873,7 @@ int close(lua_State *state)
 }
 
 /// count：返回 Path 世界点数量，不修改 Path。
-int pathCount(lua_State *state)
+int count(lua_State *state)
 {
     LuaBinding lua_binding(state);
     LuaPath   *path = nullptr;
@@ -885,7 +885,7 @@ int pathCount(lua_State *state)
 }
 
 /// world_point：Lua 1-based index 对应的毫米 WorldPosition；越界返回 nil,error。
-int pathWorldPoint(lua_State *state)
+int world_point(lua_State *state)
 {
     LuaBinding   lua_binding(state);
     LuaPath     *path  = nullptr;
@@ -904,7 +904,7 @@ int pathWorldPoint(lua_State *state)
 }
 
 /// length_mm：XZ 折线总长度，单位毫米。
-int pathLengthMm(lua_State *state)
+int length_mm(lua_State *state)
 {
     LuaBinding lua_binding(state);
     LuaPath   *path = nullptr;
@@ -916,7 +916,7 @@ int pathLengthMm(lua_State *state)
 }
 
 /// status：查询终点 reached/partial，不代表单位已走完路径。
-int pathStatus(lua_State *state)
+int status(lua_State *state)
 {
     LuaBinding binding(state);
     LuaPath   *path = nullptr;
@@ -936,9 +936,9 @@ bool registerPath(LuaBinding &lua_binding)
         return false;
     }
     auto methods = lua_binding.newTable();
-    return methods.setFunction("count", &pathCount) && methods.setFunction("status", &pathStatus) &&
-           methods.setFunction("world_point", &pathWorldPoint) &&
-           methods.setFunction("length_mm", &pathLengthMm) && meta.writeValue("__index", methods);
+    return methods.setFunction("count", &count) && methods.setFunction("status", &status) &&
+           methods.setFunction("world_point", &world_point) &&
+           methods.setFunction("length_mm", &length_mm) && meta.writeValue("__index", methods);
 }
 
 // 空中入口全部使用具名 record；这里只转换合同，不维护第二套 Context/Path 类型。
@@ -1165,6 +1165,21 @@ int sweep_air(lua_State *state)
     return airBoundary<sweepAir>(state);
 }
 
+int find_air_path(lua_State *state)
+{
+    return airBoundary<findAirPath>(state);
+}
+
+int move_air(lua_State *state)
+{
+    return airBoundary<moveAir>(state);
+}
+
+int advance_air_path(lua_State *state)
+{
+    return airBoundary<advanceAirPath>(state);
+}
+
 bool registerContext(LuaBinding &lua_binding)
 {
     LuaTable meta;
@@ -1175,13 +1190,13 @@ bool registerContext(LuaBinding &lua_binding)
     auto methods = lua_binding.newTable();
     return methods.setFunction("set_air_obstacle", &set_air_obstacle) &&
            methods.setFunction("remove_air_obstacle", &remove_air_obstacle) &&
-           methods.setFunction("find_air_path", &airBoundary<findAirPath>) &&
+           methods.setFunction("find_air_path", &find_air_path) &&
            methods.setFunction("sweep_air", &sweep_air) &&
-           methods.setFunction("move_air", &airBoundary<moveAir>) &&
-           methods.setFunction("advance_air_path", &airBoundary<advanceAirPath>) &&
-           methods.setFunction("find_path", &findPath) &&
-           methods.setFunction("set_cell_rule", &setCellRule) &&
-           methods.setFunction("find_path_to_range", &findPathToRange) &&
+           methods.setFunction("move_air", &move_air) &&
+           methods.setFunction("advance_air_path", &advance_air_path) &&
+           methods.setFunction("find_path", &find_path) &&
+           methods.setFunction("set_cell_rule", &set_cell_rule) &&
+           methods.setFunction("find_path_to_range", &find_path_to_range) &&
            methods.setFunction("find_path_to_unit_range", &find_path_to_unit_range) &&
            methods.setFunction("place_unit", &place_unit) &&
            methods.setFunction("move_unit", &move_unit) &&
@@ -1189,7 +1204,7 @@ bool registerContext(LuaBinding &lua_binding)
            methods.setFunction("advance_path", &advance_path) &&
            methods.setFunction("cell_size_mm", &cell_size_mm) &&
            methods.setFunction("unit_radius_mm", &unit_radius_mm) &&
-           methods.setFunction("map_version", &mapVersion) &&
+           methods.setFunction("map_version", &map_version) &&
            methods.setFunction("close", &close) && meta.writeValue("__index", methods);
 }
 
@@ -1207,7 +1222,7 @@ extern "C" int luaopen_flywow_navigation_native(lua_State *state)
     void *maps   = &MapRegistry::Instance(); // closure 只借用，单例 owner 覆盖所有 State。
     if (!module.setFunction("load_navigation_profiles", &load_navigation_profiles) ||
         !module.setFunction("load_map", &load_map, maps) ||
-        !module.setFunction("query_cell", &queryCell, maps) ||
+        !module.setFunction("query_cell", &query_cell, maps) ||
         !module.setFunction("new_context", &new_context, maps))
     {
         return lua_binding.pushError();

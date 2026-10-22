@@ -149,7 +149,7 @@ std::string challenge(Context* c, const char* hello)
 }
 
 // 创建独占 userdata 和 challenge；参数 hello 为 67 字节。失败返回稳定 Lua 错误，不执行 I/O/yield。
-int create(lua_State *state)
+int create_crypto_context(lua_State *state)
 {
     LuaBinding lua_binding(state);
     std::string hello;
@@ -177,7 +177,7 @@ int create(lua_State *state)
 }
 
 // 验证33字节客户端证明并返回33字节服务端证明；常量时间比较，成功即擦除secret。
-int proof(lua_State *state)
+int verify(lua_State *state)
 {
     LuaBinding lua_binding(state);
     Context *context = nullptr;
@@ -231,9 +231,9 @@ extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
     LuaTable metatable;
     if (!lua_binding.registerUserdata<Context>(TYPE, metatable)) return lua_binding.pushError();
     LuaTable methods = lua_binding.newTable();
-    if (!methods.setFunction("verify", proof) || !methods.setFunction("close", close) ||
+    if (!methods.setFunction("verify", verify) || !methods.setFunction("close", close) ||
         !metatable.writeValue("__index", methods)) return lua_binding.pushError();
     LuaTable module = lua_binding.newTable();
-    if (!module.setFunction("new", create)) return lua_binding.pushError();
+    if (!module.setFunction("new", create_crypto_context)) return lua_binding.pushError();
     return lua_binding.returnValues(module);
 }

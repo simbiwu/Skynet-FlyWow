@@ -301,12 +301,12 @@ logic = hot.require("player_logic")
 local skynet = require "skynet"
 
 skynet.start(function()
-    local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+    local hotupgrade_handle = skynet.uniqueservice("flywow_hotupgrade_service")
     local hot = require "flywow_hotupgrade"
 
     local root = os.getenv("HOTUPGRADE_LESSON_ROOT")
 
-    local result = skynet.call(hotupgrade_service_handle, "lua", "init",
+    local result = skynet.call(hotupgrade_handle, "lua", "init",
     {
         patch_path = root .. "/patches",
         root_path = root .. "/host",
@@ -341,7 +341,7 @@ end)
 我们从 `skynet.start()` 的回调进入，先执行：
 
 ```lua
-local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+local hotupgrade_handle = skynet.uniqueservice("flywow_hotupgrade_service")
 ```
 
 这里使用的是 **Skynet 原生 `uniqueservice()`**，创建或取得进程中的唯一 HotUpgrade Service。
@@ -355,7 +355,7 @@ HotUpgrade Service 启动后，在自己的 Lua State 中加载 `flywow_hotupgra
 随后我们的主 Service 发送：
 
 ```lua
-skynet.call(hotupgrade_service_handle, "lua", "init", ...)
+skynet.call(hotupgrade_handle, "lua", "init", ...)
 ```
 
 注意，现在仍然是主 Service 在执行。`skynet.call()` 会使当前调用协程等待 Controller 的回复。
@@ -397,7 +397,7 @@ local first_handle = hot.newservice("player_service")
 ```lua
 function M.newservice(service_name, ...)
     -- 基础设施转发未知启动签名，固定 n 以保留参数个数和 nil。
-    local answer = skynet.call(hotupgrade_service_handle, "hotupgrade", "newservice",
+    local answer = skynet.call(hotupgrade_handle, "hotupgrade", "newservice",
         {service_name = service_name, arguments = table.pack(...)})
     assert(type(answer) == "table" and answer.ok,
         tostring(type(answer) == "table" and answer.code) .. ": " ..
@@ -406,7 +406,7 @@ function M.newservice(service_name, ...)
 end
 ```
 
-这里的 `hotupgrade_service_handle` 是 HotUpgrade 模块在所在 Lua State 内取得的 HotUpgrade Service handle。
+这里的 `hotupgrade_handle` 是 HotUpgrade 模块在所在 Lua State 内取得的 HotUpgrade Service handle。
 
 函数把创建请求发送给 Controller。主 Service 当前协程等待回复。
 
@@ -488,7 +488,7 @@ local metadata =
     modules = names,
     has_service_update = service_update ~= nil,
 }
-local ok, answer = pcall(skynet.call, hotupgrade_service_handle, "hotupgrade", "register", metadata)
+local ok, answer = pcall(skynet.call, hotupgrade_handle, "hotupgrade", "register", metadata)
 ```
 
 注意，这个请求里没有 `state`，没有 `business`，也没有 `initial_load`。
@@ -962,12 +962,12 @@ V2 初始化为 `"剑"`、schema 2。
 local skynet = require "skynet"
 
 skynet.start(function()
-    local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+    local hotupgrade_handle = skynet.uniqueservice("flywow_hotupgrade_service")
     local hot = require "flywow_hotupgrade"
     local root = os.getenv("HOTUPGRADE_LESSON_ROOT")
 
     -- 初始化 Controller。
-    local result = skynet.call(hotupgrade_service_handle, "lua", "init",
+    local result = skynet.call(hotupgrade_handle, "lua", "init",
     {
         patch_path = root .. "/patches",
         root_path = root .. "/host",
@@ -989,7 +989,7 @@ skynet.start(function()
         before.player.schema_version, before.player.attack)
 
     -- 开始发布 V2。
-    local begun = skynet.call(hotupgrade_service_handle, "hotupgrade", "begin",
+    local begun = skynet.call(hotupgrade_handle, "hotupgrade", "begin",
     {
         path = "v2",
     })
@@ -1001,7 +1001,7 @@ skynet.start(function()
 
     -- 等待该批次执行完毕。
     while true do
-        local status = skynet.call(hotupgrade_service_handle, "hotupgrade", "status",
+        local status = skynet.call(hotupgrade_handle, "hotupgrade", "status",
         {
             batch_id = begun.batch_id,
         })
@@ -1065,7 +1065,7 @@ end)
 前面的 V1 创建和登记过程已经讲过，现在从主 Service 的这条 RPC 开始：
 
 ```lua
-local begun = skynet.call(hotupgrade_service_handle, "hotupgrade", "begin",
+local begun = skynet.call(hotupgrade_handle, "hotupgrade", "begin",
 {
     path = "v2",
 })
@@ -1073,7 +1073,7 @@ local begun = skynet.call(hotupgrade_service_handle, "hotupgrade", "begin",
 
 代码来源是 `hotupgrade/lesson4/lesson4_main.lua` 的 `skynet.start()` 回调。
 
-`hotupgrade_service_handle` 来自之前的 `skynet.uniqueservice()`，`path="v2"` 则表示选择 Controller 配置的 `patch_path` 下的 `v2` 目录。
+`hotupgrade_handle` 来自之前的 `skynet.uniqueservice()`，`path="v2"` 则表示选择 Controller 配置的 `patch_path` 下的 `v2` 目录。
 
 这是一条跨 Service 的 RPC。主 Service 发送请求后 yield，等待 Controller 回复。
 

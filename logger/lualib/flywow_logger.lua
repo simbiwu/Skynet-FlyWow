@@ -3,67 +3,62 @@
 --- 由 logger/lualib/flywow_logger_preload.lua 自动安装，业务不必逐个 require。
 local skynet = require "skynet"
 
--- 保存 Skynet 原始日志入口：skynet.error 实际指向 Native 的 c.error，
--- c.error 会把文本消息投递给名为 logger 的 Service，最终进入 flywow_logger callback。
--- install() 会替换 skynet.error；适配器必须调用 original_error，不能再次调用
--- skynet.error，否则会重新进入适配器并造成递归。
-local original_error = skynet.error
+-- 与 logger/native/flywow_logger.h 的 kCommand* 常量保持一致；这些字符是 Lua/Native 共用的内部消息合同。
+local LOGGER_COMMAND_LOG = "L"
+local LOGGER_COMMAND_REGISTER = "R"
+local LOGGER_COMMAND_UNREGISTER = "U"
+local LOGGER_COMMAND_FLUSH = "F"
 
-local logger = {}
-
--- 级别数值越大越严重；这个顺序同时用于最低等级过滤和 Native Logger 写盘。
-local levels =
+-- 数值与 Native LogLevel 枚举对应；越大越严重，并参与本地过滤和 Native 写盘等级识别。
+local LOG_LEVELS =
 {
-    debug  = 0,
-    normal = 1,
-    error  = 2,
+    debug  = 0, -- 对应 Native LogLevel::kDebug，最低严重等级。
+    normal = 1, -- 对应 Native LogLevel::kNormal，常规运行日志。
+    error  = 2, -- 对应 Native LogLevel::kError，错误日志且为默认等级。
 }
 
+-- 与 Native kMaxServiceNameSize 保持相同上限；两种语言各自校验自己的消息入口。
+local MAX_SERVICE_NAME_SIZE = 128
+
+-- 保存 Skynet 原始日志入口，避免替换后适配器递归调用自身。
+local original_error = skynet.error
+local logger = {}
 local logger_is_installed = false
-
--- Service 名称在登记消息中的最大长度；日志正文由 Native Logger 统一限制。
-local max_service_name_size = 128
-
---- Logger 消息的第一个字符是命令，Native callback 按第一个字符选择处理分支：
---- L=日志，后面跟等级和正文；R=登记 Service 名称；U=注销 Service；
---- F=刷新日志文件。发送端直接拼接命令和正文，不增加额外协议前缀。
---- 把日志等级和正文拼成一个字符串后交给 Skynet 原始日志入口。
---- L+等级位于正文前面，Native callback 读取前两个字符；参数正文之间用一个空格。
-
 
 --- 登记当前 Lua Service 的展示名称。
 --- 这里集中把 Service 名称转换为 Logger 的 R 消息，让 Native Logger 映射 source handle。
 ---@param service_name string 已限制长度的 Service 名称
 local function send_service_register(service_name)
-    original_error("R" .. service_name)
+    original_error(LOGGER_COMMAND_REGISTER .. service_name)
 end
 
 --- 通知 Native Logger 当前 Service 即将退出。
 --- 这里集中把退出动作转换为 Logger 的 U 消息，清理来源登记。
 local function send_service_unregister()
-    original_error("U")
+    original_error(LOGGER_COMMAND_UNREGISTER)
 end
 
 --- 创建 Native Logger 的刷新请求。
 --- 这里集中把刷新动作转换为 Logger 的 F 消息，调用方再通过 skynet.call 等待结果。
 local function make_flush_request()
-    return "F"
+    return LOGGER_COMMAND_FLUSH
 end
 
 --- 解析 skynet.error 的最后一个等级参数并异步发送。
 --- 未传等级默认 error；其余参数转成字符串后用一个空格连接。
-local function make_adapter(minimum)
+--- Native 消息格式为命令字符、等级数字、正文；等级与正文之间不插入分隔符。
+local function make_adapter(min_level)
     return function(...) -- VARARG_ALLOWED WHY: 保持 skynet.error 的未知参数个数与 nil 兼容。
         -- 取出可选等级；等级参数不再作为正文发送。
         local log_arguments = table.pack(...)
-        local level = levels[log_arguments[log_arguments.n]]
+        local level = LOG_LEVELS[log_arguments[log_arguments.n]]
         if level ~= nil then
             log_arguments.n = log_arguments.n - 1
         else
-            level = levels.error
+            level = LOG_LEVELS.error
         end
 
-        if level < minimum then
+        if level < min_level then
             return
         end
 
@@ -74,7 +69,7 @@ local function make_adapter(minimum)
         end
 
         local body = table.concat(parts, " ")
-        original_error("L" .. tostring(level) .. body)
+        original_error(LOGGER_COMMAND_LOG .. tostring(level) .. body)
     end
 end
 
@@ -93,14 +88,14 @@ function logger.install()
     -- 第一阶段：读取当前进程的最低日志级别。
     local configured_level = skynet.getenv("flywow_logger_level")
     local level_name = configured_level or "normal"
-    local minimum = assert(levels[level_name], "invalid flywow_logger_level")
+    local min_level = assert(LOG_LEVELS[level_name], "invalid flywow_logger_level")
 
     -- 第二阶段：登记当前 Service，让 Native 日志包含可读名称和 source handle。
-    local service_name = tostring(SERVICE_NAME or "unknown"):sub(1, max_service_name_size)
+    local service_name = tostring(SERVICE_NAME or "unknown"):sub(1, MAX_SERVICE_NAME_SIZE)
     send_service_register(service_name)
 
     -- 第三阶段：替换当前 Lua State 的入口，同时保存原始退出函数。
-    skynet.error = make_adapter(minimum)
+    skynet.error = make_adapter(min_level)
 
     local exit = skynet.exit
     --- 正常退出前注销名称；不等待 Logger，名称消息与本 Service 日志保持发送顺序。

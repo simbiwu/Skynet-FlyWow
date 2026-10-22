@@ -5,7 +5,7 @@ local hotupgrade_result = require "flywow_hotupgrade_error"
 local hotupgrade_common = require "flywow_hotupgrade_common"
 local hotupgrade_native = require "flywow_hotupgrade_native"
 local hotupgrade_module_patch = require "flywow_hotupgrade_module_patch"
-local hotupgrade_service_handle = skynet.uniqueservice("flywow_hotupgrade_service")
+local hotupgrade_handle = skynet.uniqueservice("flywow_hotupgrade_service")
 local M =
 {
     patching = false, -- prepare 起禁止新业务进入，finish 或确认恢复后解除。
@@ -36,7 +36,7 @@ skynet.register_protocol({name = "hotupgrade", id = hotupgrade_common.PROTOCOL_I
 ---@return integer handle
 function M.newservice(service_name, ...)
     -- 基础设施转发未知启动签名，固定 n 以保留参数个数和 nil。
-    local answer = skynet.call(hotupgrade_service_handle, "hotupgrade", "newservice",
+    local answer = skynet.call(hotupgrade_handle, "hotupgrade", "newservice",
         {service_name = service_name, arguments = table.pack(...)})
     assert(type(answer) == "table" and answer.ok,
         tostring(type(answer) == "table" and answer.code) .. ": " ..
@@ -57,7 +57,7 @@ function M.uniqueservice(name_or_global, ...)
         name = arguments[1]
         arguments = table.pack(table.unpack(arguments, 2, arguments.n))
     end
-    local answer = skynet.call(hotupgrade_service_handle, "hotupgrade", "uniqueservice",
+    local answer = skynet.call(hotupgrade_handle, "hotupgrade", "uniqueservice",
         {service_name = name, global = global, arguments = arguments})
     assert(type(answer) == "table" and answer.ok,
         tostring(type(answer) == "table" and answer.code) .. ": " ..
@@ -70,7 +70,7 @@ end
 ---@param handle integer newservice 返回的待登记 Service
 ---@return FlyWowHotUpgradeResult
 function M.cancel_service_creation(handle)
-    return skynet.call(hotupgrade_service_handle, "hotupgrade", "cancel_service_creation", {handle = handle})
+    return skynet.call(hotupgrade_handle, "hotupgrade", "cancel_service_creation", {handle = handle})
 end
 
 local function restore_service(txn)
@@ -174,14 +174,20 @@ local function stage_service(source)
     return staged
 end
 
+---@alias FlyWowHotUpgradeServiceCommand
+---| "prepare"
+---| "update"
+---| "abort"
+---| "finish"
+
 --- 当前 State 的控制入口；请求只携带源码与批次号，不传递业务状态、函数或私有表。
 --- prepare 通过业务 queue 等待排空，允许 yield；update/abort/finish 必须同步。
----@param command string prepare/update/abort/finish
+---@param command FlyWowHotUpgradeServiceCommand Controller Service 分发的稳定控制命令
 ---@param request table batch_id、sequence；update 另含 modules 和可选 service_source
 ---@param source integer 由 Skynet 提供的真实调用来源
 ---@return FlyWowHotUpgradeResult 恢复不确定时保持 patching=true
 local function handle_upgrade(command, request, source)
-    if not module_state.registration or source ~= hotupgrade_service_handle then
+    if not module_state.registration or source ~= hotupgrade_handle then
         return hotupgrade_result.failure("HU_UNAUTHORIZED", "控制来源不匹配")
     end
 
@@ -397,7 +403,7 @@ function M.register_service(registration)
         modules = names,
         has_service_update = service_update ~= nil,
     }
-    local ok, answer = pcall(skynet.call, hotupgrade_service_handle, "hotupgrade", "register", metadata)
+    local ok, answer = pcall(skynet.call, hotupgrade_handle, "hotupgrade", "register", metadata)
     module_state.registration_complete = true
     module_state.registered = ok and type(answer) == "table" and answer.ok == true
     for _, thread in ipairs(module_state.registration_waiters) do
@@ -459,7 +465,7 @@ function M.require(name)
     local added_declaration = false -- 只回退本次新增的本地模块声明。
     local ok, message = pcall(function()
         if module_state.registration and not module_state.declared_modules[canonical_name] then
-            local answer = skynet.call(hotupgrade_service_handle, "hotupgrade",
+            local answer = skynet.call(hotupgrade_handle, "hotupgrade",
                 "begin_module_load", {name = canonical_name})
             assert(type(answer) == "table" and answer.ok and type(answer.permit_id) == "string",
                 tostring(type(answer) == "table" and answer.code) .. ": " ..
@@ -513,7 +519,7 @@ function M.require(name)
             added_declaration = true
         end
         if permit_id then
-            local answer = skynet.call(hotupgrade_service_handle, "hotupgrade",
+            local answer = skynet.call(hotupgrade_handle, "hotupgrade",
                 "register_module", {name = canonical_name, permit_id = permit_id})
             assert(type(answer) == "table" and answer.ok,
                 "模块登记失败: " .. tostring(type(answer) == "table" and answer.message or answer))
@@ -532,7 +538,7 @@ function M.require(name)
         end
         if permit_id then
             -- 登记响应丢失时许可可能已消费；重复取消不会改变其他操作的许可。
-            pcall(skynet.call, hotupgrade_service_handle, "hotupgrade",
+            pcall(skynet.call, hotupgrade_handle, "hotupgrade",
                 "cancel_module_load", {name = canonical_name, permit_id = permit_id})
         end
     end

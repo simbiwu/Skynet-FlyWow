@@ -13,9 +13,9 @@ void* flywow_logger_probe_native_create()
 int flywow_logger_probe_native_init(void*, skynet_context* context, const char*)
 {
     flywow_logger::register_service(context, "native_probe");
-    flywow_logger::log_write(context, flywow_logger::LogLevel::Debug, "NATIVE_DEBUG");
-    flywow_logger::log_write(context, flywow_logger::LogLevel::Normal, "NATIVE_NORMAL");
-    flywow_logger::log_write(context, flywow_logger::LogLevel::Error, "NATIVE_ERROR");
+    flywow_logger::log_write(context, flywow_logger::LogLevel::kDebug, "NATIVE_DEBUG");
+    flywow_logger::log_write(context, flywow_logger::LogLevel::kNormal, "NATIVE_NORMAL");
+    flywow_logger::log_write(context, flywow_logger::LogLevel::kError, "NATIVE_ERROR");
     return 0;
 }
 

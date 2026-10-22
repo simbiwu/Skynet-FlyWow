@@ -26,23 +26,23 @@ namespace flywow_logger
 {
 enum class LogLevel
 {
-    Debug  = 0,
-    Normal = 1,
-    Error  = 2
+    kDebug  = 0,
+    kNormal = 1,
+    kError  = 2
 };
 
-constexpr std::size_t max_message_size = 8192;
-constexpr std::size_t max_service_name_size = 128;
+constexpr std::size_t kMaxMessageSize = 8192;
+constexpr std::size_t kMaxServiceNameSize = 128;
 
 // Logger 文本消息的第一个字符是保留命令；Native callback 按字符选择处理分支。
 // L：后面跟 0/1/2 等级和正文，表示写入一条日志。
 // R：后面跟 Service 名称，建立 source handle 到可读名称的映射。
 // U：不带正文，注销当前 source handle 的名称映射。
 // F：不带正文，请求立即刷新当前日志文件。
-constexpr char command_log        = 'L';
-constexpr char command_register   = 'R';
-constexpr char command_unregister = 'U';
-constexpr char command_flush      = 'F';
+constexpr char kCommandLog        = 'L';
+constexpr char kCommandRegister   = 'R';
+constexpr char kCommandUnregister = 'U';
+constexpr char kCommandFlush      = 'F';
 
 // 返回日志级别的展示名称。
 // 无内存分配、无 I/O、无共享状态；未知枚举按 ERROR 展示，避免静默降低严重程度。
@@ -50,9 +50,9 @@ inline const char* level_name(LogLevel level)
 {
     switch (level)
     {
-    case LogLevel::Debug:
+    case LogLevel::kDebug:
         return "DEBUG";
-    case LogLevel::Normal:
+    case LogLevel::kNormal:
         return "NORMAL";
     default:
         return "ERROR";
@@ -86,8 +86,8 @@ inline void log_write(skynet_context* context, LogLevel level, const char* messa
 
     try
     {
-        const int severity = level == LogLevel::Debug ? 0 :
-            level == LogLevel::Normal ? 1 : 2;
+        const int severity = level == LogLevel::kDebug ? 0 :
+            level == LogLevel::kNormal ? 1 : 2;
         const bool custom = enabled(context);
 
         // 过滤尽量在发送前完成，避免低等级日志占用 Skynet 消息队列。
@@ -102,18 +102,18 @@ inline void log_write(skynet_context* context, LogLevel level, const char* messa
             }
         }
 
-        const std::size_t length = ::strnlen(message, max_message_size + 1);
+        const std::size_t length = ::strnlen(message, kMaxMessageSize + 1);
         std::string text(message, length);
-        if (text.size() > max_message_size)
+        if (text.size() > kMaxMessageSize)
         {
-            text.resize(max_message_size);
+            text.resize(kMaxMessageSize);
             text += " [TRUNCATED]";
         }
 
         if (custom)
         {
             // Native Logger 会识别 L 和等级，去掉两个命令字节后写盘。
-            skynet_error(context, "%c%d%s", command_log, severity, text.c_str());
+            skynet_error(context, "%c%d%s", kCommandLog, severity, text.c_str());
         }
         else
         {
@@ -136,7 +136,7 @@ inline void register_service(skynet_context* context, const char* name)
         return;
     }
 
-    skynet_error(context, "%c%.*s", command_register,
-        static_cast<int>(max_service_name_size), name);
+    skynet_error(context, "%c%.*s", kCommandRegister,
+        static_cast<int>(kMaxServiceNameSize), name);
 }
 }

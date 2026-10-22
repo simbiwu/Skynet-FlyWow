@@ -1,6 +1,6 @@
 -- 用公开 Lua API 演示内存词库、命中位置及文本替换。
 local skynet = require "skynet"
-local function run()
+local function run_word_filter_sample()
     local word_filter = require "flywow_word_filter"
     local filter, create_error = word_filter.new({keywords = {"外挂", "she"}})
     assert(filter, create_error)
@@ -16,7 +16,7 @@ local function run()
     print("替换：" .. replaced)
 end
 skynet.start(function()
-    local ok, message = xpcall(run, debug.traceback)
+    local ok, message = xpcall(run_word_filter_sample, debug.traceback)
     if ok then print("FLYWOW_WORD_FILTER_SAMPLE_OK")
     else skynet.error("FLYWOW_WORD_FILTER_SAMPLE_FAILED: " .. tostring(message)) end
     io.stdout:flush()

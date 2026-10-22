@@ -29,43 +29,43 @@ local M =
 }
 
 -- Native 失败时以第二返回值返回带 code 字段的错误对象。
-local function native_code(value)
-    if type(value) == "table" then
-        return value.code or "HU_NATIVE_ERROR"
+local function native_code(native_error)
+    if type(native_error) == "table" then
+        return native_error.code or "HU_NATIVE_ERROR"
     end
 
     return "HU_NATIVE_ERROR"
 end
 
 -- 宿主根目录相对 Lua 路径对应 Controller 使用的唯一模块登记名。
-local function module_name(path)
-    if path:sub(-4) ~= ".lua" or path:find("\\", 1, true) then
+local function module_name(relative_path)
+    if relative_path:sub(-4) ~= ".lua" or relative_path:find("\\", 1, true) then
         return nil
     end
 
-    return path:sub(1, -5):gsub("/", ".")
+    return relative_path:sub(1, -5):gsub("/", ".")
 end
 
 -- 递归扫描选定 Patch 目录，检查语法并冻结同一批次的全部源码。
-local function load_files(patch_base_path, selected_path, identity)
-    local paths, code = hotupgrade_native.list_lua(patch_base_path, selected_path)
+local function load_files(patch_base_path, selected_patch_path, patch_identity)
+    local paths, code = hotupgrade_native.list_lua(patch_base_path, selected_patch_path)
     code = native_code(code)
     if not paths and code == "HU_PATCH_EMPTY" then
         return hotupgrade_result.success({entries = {}})
     end
 
     if not paths then
-        return hotupgrade_result.failure(code, "Patch 目录扫描失败: " .. selected_path)
+        return hotupgrade_result.failure(code, "Patch 目录扫描失败: " .. selected_patch_path)
     end
 
     table.sort(paths)
 
     local entries = {}
     for _, relative in ipairs(paths) do
-        local source, failure = hotupgrade_native.read_file(patch_base_path, selected_path .. "/" .. relative)
+        local source, failure = hotupgrade_native.read_file(patch_base_path, selected_patch_path .. "/" .. relative)
         if source == nil or source == false then
             return hotupgrade_result.failure(source == false and "HU_FILE_NOT_FOUND" or native_code(failure),
-                "发布包读取失败: " .. selected_path .. "/" .. relative)
+                "发布包读取失败: " .. selected_patch_path .. "/" .. relative)
         end
         -- load 只编译并检查语法，不执行返回的 chunk；失败时 syntax_error 用于诊断。
         -- @路径标记错误中的文件名，t 只接受文本源码，最后的空表是 chunk 的运行环境。
@@ -74,25 +74,25 @@ local function load_files(patch_base_path, selected_path, identity)
             return hotupgrade_result.failure("HU_MODULE_SYNTAX", syntax_error)
         end
         entries[#entries + 1] = {file = relative, source = source}
-        identity[#identity + 1] = relative
+        patch_identity[#patch_identity + 1] = relative
     end
 
     return hotupgrade_result.success({entries = entries})
 end
 
 -- 汇总模块与 Service 文件；Patch 身份仅由路径和文件名组成。
-local function build_patch(patch_base_path, selected_path, service_path)
-    local identity = {}        -- 当前 Patch 的路径身份字段，不是内容 hash。
-    local loaded = load_files(patch_base_path, selected_path, identity)
-    if not loaded.ok then
-        return loaded
+local function build_patch(patch_base_path, selected_patch_path, service_path)
+    local patch_identity = {}        -- 当前 Patch 的路径身份字段，不是内容 hash。
+    local loaded_files = load_files(patch_base_path, selected_patch_path, patch_identity)
+    if not loaded_files.ok then
+        return loaded_files
     end
 
     local modules        = {}                 -- 按规范模块名归集普通 .lua，供已登记目标更新。
     local services       = {}                 -- 按 Service 模块名归集仅供现存实例执行的 .patch。
     local files          = {}                 -- 冻结的完整 .lua，正式发布时部署；不含 .patch。
     local service_prefix = service_path .. "/" -- 此目录下的 .lua 仅部署，.patch 才匹配 Service。
-    for _, entry in ipairs(loaded.entries) do
+    for _, entry in ipairs(loaded_files.entries) do
         local is_service = entry.file:sub(1, #service_prefix) == service_prefix
         local is_patch = entry.file:sub(-6) == ".patch"
         if is_patch and not is_service then
@@ -121,9 +121,9 @@ local function build_patch(patch_base_path, selected_path, service_path)
         return hotupgrade_result.failure("HU_PATCH_EMPTY", "发布包至少要有一个 .lua 或 Service .patch")
     end
 
-    table.sort(identity)
-    local identity_parts = {tostring(#selected_path) .. ":" .. selected_path}
-    for _, entry in ipairs(identity) do
+    table.sort(patch_identity)
+    local identity_parts = {tostring(#selected_patch_path) .. ":" .. selected_patch_path}
+    for _, entry in ipairs(patch_identity) do
         identity_parts[#identity_parts + 1] = tostring(#entry) .. ":" .. entry
     end
 
@@ -891,8 +891,21 @@ function M:resolve_deployment(request)
     return hotupgrade_result.success()
 end
 
+---@alias FlyWowHotUpgradeManagementCommand
+---| "register"
+---| "begin"
+---| "resolve_deployment"
+---| "uniqueservice"
+---| "newservice"
+---| "cancel_service_creation"
+---| "begin_module_load"
+---| "register_module"
+---| "cancel_module_load"
+---| "status"
+---| "abort"
+
 --- 管理命令不做远程认证；宿主掌握 Controller handle，登记来源由消息头确定。
----@param command string begin/resolve_deployment/newservice/uniqueservice/cancel_service_creation/register/begin_module_load/register_module/cancel_module_load/status/abort
+---@param command FlyWowHotUpgradeManagementCommand Controller Service 分发的稳定管理命令
 ---@param request FlyWowHotUpgradeManagementRequest|FlyWowHotUpgradeTargetMetadata|table 命令请求
 ---@param source integer Skynet 真实调用方
 ---@return FlyWowHotUpgradeResult 可判别的管理结果；目标控制调用可能 yield
