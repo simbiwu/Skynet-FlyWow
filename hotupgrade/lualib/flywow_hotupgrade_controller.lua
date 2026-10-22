@@ -757,23 +757,38 @@ function M:run_batch(batch, request)
         batch.files = loaded.patch.files
         batch.targets = loaded.targets
         batch.target_count = #loaded.targets
-        -- 所有目标先通过 Prepare 再执行 Update；全批成功后才部署文件。
         self.phase = "APPLYING"
-        for _, command in ipairs({"prepare", "update"}) do
-            batch.phase = command:upper()
-            for _, target in ipairs(batch.targets) do
-                if batch.cancelled then
-                    batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
-                    return
-                end
-                batch.current_service_handle = target.service_handle
-                target.participated = true
-                local answer = self:step(batch, target, command)
-                if not answer.ok then
-                    target.result = answer
-                    batch.error = answer
-                    return
-                end
+
+        -- 逐个调用 before_upgrade；全部目标成功后才进入 Update。
+        batch.phase = "PREPARE"
+        for _, target in ipairs(batch.targets) do
+            if batch.cancelled then
+                batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
+                return
+            end
+            batch.current_service_handle = target.service_handle
+            target.participated = true
+            local answer = self:step(batch, target, "prepare")
+            if not answer.ok then
+                target.result = answer
+                batch.error = answer
+                return
+            end
+        end
+
+        -- Prepare 已确认全部业务排空，现在逐个更新现存目标。
+        batch.phase = "UPDATE"
+        for _, target in ipairs(batch.targets) do
+            if batch.cancelled then
+                batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
+                return
+            end
+            batch.current_service_handle = target.service_handle
+            local answer = self:step(batch, target, "update")
+            if not answer.ok then
+                target.result = answer
+                batch.error = answer
+                return
             end
         end
 

@@ -62,6 +62,19 @@ local rejected = patch.stage({
     {name = "b", source = "error('second module failed')"},
 })
 assert(not rejected.ok and simple.value() == 1)
+-- 多模块提交与恢复都使用同一批记录，保留各模块根表和旧字段引用。
+local second = package.loaded.b
+local old_first_value = simple.value
+local old_second_value = second.value
+local combined = patch.stage({
+    {name = "b", source = "return {value = function() return 20 end, added = true}"},
+    {name = "a", source = "return {value = function() return 10 end}"},
+})
+assert(combined.ok and patch.commit(combined.stage).ok)
+assert(package.loaded.a == simple and package.loaded.b == second)
+assert(simple.value() == 10 and second.value() == 20 and second.added)
+assert(patch.abort(combined.stage).ok)
+assert(simple.value == old_first_value and second.value == old_second_value and second.added == nil)
 package.loaded.a = {export_state = function() return {} end}
 assert(not patch.stage({{name = "a", source = "return {}"}}).ok)
 package.loaded.a = {
@@ -246,8 +259,8 @@ registration.before_upgrade = function()
 end
 local preparing = coroutine.create(function() assert(target_control("prepare", 3).ok) end)
 assert(coroutine.resume(preparing) and hotupgrade.patching)
-assert(target_control("update", 3).code == "HU_SAFEPOINT_REQUIRED")
-assert(coroutine.resume(preparing))
+assert(coroutine.status(preparing) == "suspended")
+assert(coroutine.resume(preparing) and coroutine.status(preparing) == "dead")
 local update_steps = {}
 local original_stage = patch.stage
 local original_commit = patch.commit
@@ -263,18 +276,20 @@ registration.after_upgrade = function()
     update_steps[#update_steps + 1] = "after_upgrade"
     return true
 end
-assert(target_control("update", 4).ok and hotupgrade.patching)
+assert(target_control("update", 3).ok and hotupgrade.patching)
 patch.stage = original_stage
 patch.commit = original_commit
 registration.after_upgrade = nil
 assert(table.concat(update_steps, ",") == "stage,commit,after_upgrade")
-assert(target_control("finish", 4).ok and not hotupgrade.patching)
-assert(target_control("abort", 4).ok and not hotupgrade.patching)
+assert(target_control("update", 3).code == "HU_PHASE_INVALID")
+assert(target_control("finish", 3).ok and not hotupgrade.patching)
+assert(target_control("abort", 3).ok and not hotupgrade.patching)
 registration.before_upgrade = function() return true end
 assert(target_control("prepare", 5).ok and target_control("update", 5).ok)
 local original_finish = patch.finish
 patch.finish = function() return {ok = false, code = "HU_FIXTURE_FINISH_FAILED"} end
 assert(target_control("finish", 5).code == "HU_FIXTURE_FINISH_FAILED" and hotupgrade.patching)
+assert(target_control("update", 5).code == "HU_PHASE_INVALID")
 patch.finish = original_finish
 assert(target_control("abort", 5).ok and not hotupgrade.patching)
 assert(target_control("stage", 6).code == "HU_UNKNOWN_COMMAND")

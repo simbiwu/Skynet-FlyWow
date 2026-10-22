@@ -224,15 +224,20 @@ scenarios['matching'] = function()
     assert(c.phase == "IDLE" and module_state.last_control_command_by_service_handle[10] == "abort")
     assert(module_state.last_control_command_by_service_handle[20] == "abort")
     module_state.injected_control_failure = nil
+    module_state.operations = {}
     local started = publish(c, {path = "module"})
     module_state.control_hook = function(_handle, command)
         if command == "prepare" then coroutine.yield() end
     end
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(c.phase == "APPLYING" and c:handle_command("abort", {batch_id = started.batch_id}, 1).ok)
+    assert(c.phase == "APPLYING" and #module_state.operations == 1)
+    assert(module_state.operations[1] == "10:prepare")
+    assert(c:handle_command("abort", {batch_id = started.batch_id}, 1).ok)
+    assert(#module_state.operations == 1, "取消等待当前 Prepare 返回，不能并发发送 Abort")
     module_state.control_hook = nil
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(c:handle_command("status", {batch_id = started.batch_id}, 1).record.phase == "ABORTED")
+    assert(table.concat(module_state.operations, ",") == "10:prepare,10:abort")
     module_state.injected_control_failure = {service_handle = 10, command = "finish"}
     status = publish_and_complete_module_batch()
     assert(status.recovery_required and status.record.phase == "RECOVERY_REQUIRED")

@@ -135,9 +135,12 @@ end
 
 业务返回值和异常由业务自己定义。HotUpgrade 不管理 queue、不包装业务返回值，也不计数业务协程。queue 内的业务可以正常 yield；脱离该 queue 的协程不在排空保证范围内。
 
-register_service 必须提供 before_upgrade 函数；缺失或非函数会在登记时以 HU_INVALID_OPTIONS 拒绝。每次 Prepare 建立本地事务并设置 hot.patching=true 后都会调用该回调。回调允许 yield，必须通过上述同一个 queue 等待此前已进入的业务全部退出，例如 return business_queue(function() return true end)。只有 true 或 {ok=true} 确认业务安全点；回调失败、拒绝或异常均使 Prepare 失败，不能进入 Update。框架不轮询或超时放行业务。
+register_service 必须提供 before_upgrade 函数；缺失或非函数会在登记时以 HU_INVALID_OPTIONS 拒绝。每次 Prepare 建立本地事务并设置 hot.patching=true 后都会调用该回调。回调允许 yield，必须通过上述同一个 queue 等待此前已进入的业务全部退出，例如 return business_queue(function() return true end)。Prepare 不维护额外阶段状态或比较回调前后的事务表身份；目标控制 RPC 由 Controller 串行等待，管理端取消只设置批次取消标志，待当前调用返回后才发送 Abort。只有 true 或 {ok=true} 确认业务安全点；回调失败、拒绝或异常均使 Prepare 失败，不能进入 Update。框架不轮询或超时放行业务。
 
 全部目标 Prepare 成功后才开始逐目标 Update。Update 中 Stage 只构建候选和保存快照，Activate 同步提交模块、Service 状态和函数，再执行 after_upgrade。after_upgrade 只检查已提交状态，不得 yield 或产生外部副作用；false 或异常触发组合恢复。
+
+普通模块 Stage 依赖 Controller 已完成的路径映射、语法检查、模块名去重与连续数组构建，不重复校验这些输入。Stage 在目标 Lua State 内检查线上及候选导出，准备隔离状态，并按输入顺序保存模块记录；每条记录集中持有线上根表、候选与旧字段，供 Commit 安装和 Abort 恢复。Commit/Abort 核对根表身份后，字段覆盖函数直接执行原地替换。
+
 
 Finish 释放旧快照并结束本地事务后将 hot.patching 设为 false。Abort 恢复 Service 状态及函数、普通模块导出和快照，全部确认恢复成功后才清理事务并解除 patching。Prepare 失败仍保留本地事务以便 Abort；恢复失败或无法确认时保留恢复信息和 patching=true。
 

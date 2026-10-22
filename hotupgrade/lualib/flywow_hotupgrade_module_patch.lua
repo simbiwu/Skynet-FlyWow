@@ -59,10 +59,9 @@ function M.restore_state(live, fields)
 end
 
 --- 原地覆盖模块导出字段；各字段引用直接安装，保留导出表身份。
----@param live table 已持有的线上表
+---@param live table Commit/Abort 已确认身份和元表的线上表
 ---@param fields table 完整新字段；调用者保证与 live 隔离
 local function replace_exports(live, fields)
-    assert(type(live) == "table" and getmetatable(live) == nil, "线上表身份或元表发生变化")
     for key in pairs(live) do
         rawset(live, key, nil)
     end
@@ -117,35 +116,30 @@ local function check_exports(exports, name)
 end
 
 --- 编译全部源码后加载候选和迁移模块私有状态；受信顶层及钩子必须同步且无外部副作用。
----@param entries table[] 含 name/source 的完整模块源码数组
+---@param entries table[] Controller 已校验并去重的 name/source 连续数组；按传入顺序处理
 ---@return FlyWowHotUpgradeResult 成功含 stage；失败不安装线上导出。
 function M.stage(entries)
     if module_state.active then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "模块 Stage 尚未结束")
     end
 
-    local module_stage = {entries = {}, order = {}, old = {}, committed = false}
+    -- 本 State 从 Stage 持有到 Finish/Abort；每条记录集中保存候选及恢复所需的旧字段。
+    local module_stage =
+    {
+        entries   = {},    -- 按输入顺序保存模块记录；Commit 安装候选，Abort 恢复各记录的旧字段。
+        committed = false, -- 开始写线上字段前置为 true；即使部分提交失败，Abort 也会执行恢复。
+    }
     local ok, message = pcall(function()
-        assert(type(entries) == "table", "模块列表必须是数组")
-        local entry_count = 0
-        for index in pairs(entries) do
-            entry_count = entry_count + 1
-            assert(math.type(index) == "integer" and index >= 1 and index <= #entries, "模块列表有空洞")
-        end
-
-        assert(entry_count == #entries, "模块列表有空洞")
-
+        -- 数组结构、模块名、源码及唯一性已由 Controller 建立；这里只检查本 State 的实际对象。
         -- 先编译全部 Patch 并保存每个线上模块的旧字段。
         for _, item in ipairs(entries) do
-            assert(type(item) == "table" and type(item.name) == "string" and item.name ~= "" and type(item.source) == "string",
-                "模块名和源码无效")
-            assert(not module_stage.entries[item.name], "模块重复")
             local live = package.loaded[item.name]
             check_exports(live, item.name)
             local fields = {}
             for key, value in pairs(live) do
                 fields[key] = value
             end
+
             -- 只引用已加载依赖；不执行新的依赖加载链，不代表提供安全沙箱。
             local env = setmetatable({require = function(name)
                 local dependency = package.loaded[name]
@@ -153,16 +147,20 @@ function M.stage(entries)
                 return dependency
             end}, {__index = _G})
             local chunk = assert(load(item.source, "@" .. item.name, "t", env))
-            module_stage.entries[item.name] = {live = live, chunk = chunk}
-            module_stage.order[#module_stage.order + 1] = item.name
-            module_stage.old[item.name] = fields
+            module_stage.entries[#module_stage.entries + 1] =
+            {
+                name      = item.name, -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
+                live      = live,      -- 原模块根表；提交与恢复始终原地修改它的字段。
+                old       = fields,    -- 旧导出字段及原引用；保留至 Finish 或恢复成功。
+                chunk     = chunk,     -- 第一轮编译的源码；第二轮执行后释放。
+                candidate = nil,       -- 第二轮准备的新导出；Commit 时整体安装其字段。
+            }
         end
 
         -- 再执行候选模块，检查导出并迁移隔离的私有状态。
-        for _, name in ipairs(module_stage.order) do
-            local entry = module_stage.entries[name]
+        for _, entry in ipairs(module_stage.entries) do
             local candidate = entry.chunk()
-            check_exports(candidate, name)
+            check_exports(candidate, entry.name)
             assert(candidate ~= entry.live, "候选须返回新的导出表")
             for key, value in pairs(candidate) do
                 assert(entry.live[key] == nil or type(entry.live[key]) == type(value), "导出字段类型变化")
@@ -195,16 +193,14 @@ function M.commit(module_stage)
 
     local ok, message = pcall(function()
         -- 先确认所有根表身份仍有效；全部通过后才开始修改线上导出。
-        for _, name in ipairs(module_stage.order) do
-            local entry = module_stage.entries[name]
-            assert(package.loaded[name] == entry.live and getmetatable(entry.live) == nil,
+        for _, entry in ipairs(module_stage.entries) do
+            assert(package.loaded[entry.name] == entry.live and getmetatable(entry.live) == nil,
                 "模块身份在 Stage 后改变")
         end
 
         -- 所有候选已在 Stage 完成检查，现在原地替换每个模块的完整导出字段。
         module_stage.committed = true
-        for _, name in ipairs(module_stage.order) do
-            local entry = module_stage.entries[name]
+        for _, entry in ipairs(module_stage.entries) do
             replace_exports(entry.live, entry.candidate)
         end
     end)
@@ -219,13 +215,12 @@ function M.abort(module_stage)
 
     -- 尝试恢复每个模块并收集全部故障；单个模块失败不跳过其他模块。
     local errors = {}
-    for _, name in ipairs(module_stage.order) do
-        local entry = module_stage.entries[name]
+    for _, entry in ipairs(module_stage.entries) do
         local ok, message = pcall(function()
-            assert(package.loaded[name] == entry.live and getmetatable(entry.live) == nil,
-                "模块缓存身份或元表变化: " .. name)
+            assert(package.loaded[entry.name] == entry.live and getmetatable(entry.live) == nil,
+                "模块缓存身份或元表变化: " .. entry.name)
             if module_stage.committed then
-                replace_exports(entry.live, module_stage.old[name])
+                replace_exports(entry.live, entry.old)
             end
         end)
         if not ok then
@@ -248,7 +243,6 @@ function M.finish(module_stage)
     end
 
     module_stage.entries = {}
-    module_stage.old = {}
     module_state.active = nil
     return hotupgrade_result.success()
 end

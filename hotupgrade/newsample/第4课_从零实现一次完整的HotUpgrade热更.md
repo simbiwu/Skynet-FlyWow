@@ -1456,22 +1456,43 @@ Controller
 batch.targets = loaded.targets
 batch.target_count = #loaded.targets
 self.phase = "APPLYING"
-for _, command in ipairs({"prepare", "update"}) do
-    batch.phase = command:upper()
-    for _, target in ipairs(batch.targets) do
-        if batch.cancelled then
-            batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
-            return
-        end
-        batch.current_service_handle = target.service_handle
-        target.participated = true
-        local answer = self:step(batch, target, command)
-        if not answer.ok then
-            target.result = answer
-            batch.error = answer
-            return
-        end
+
+-- 逐个调用 before_upgrade；全部目标成功后才进入 Update。
+batch.phase = "PREPARE"
+for _, target in ipairs(batch.targets) do
+    if batch.cancelled then
+        batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
+        return
     end
+    batch.current_service_handle = target.service_handle
+    target.participated = true
+    local answer = self:step(batch, target, "prepare")
+    if not answer.ok then
+        target.result = answer
+        batch.error = answer
+        return
+    end
+end
+
+-- Prepare 已确认全部业务排空，现在逐个更新现存目标。
+batch.phase = "UPDATE"
+for _, target in ipairs(batch.targets) do
+    if batch.cancelled then
+        batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
+        return
+    end
+    batch.current_service_handle = target.service_handle
+    local answer = self:step(batch, target, "update")
+    if not answer.ok then
+        target.result = answer
+        batch.error = answer
+        return
+    end
+end
+
+if batch.cancelled then
+    batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
+    return
 end
 ```
 
@@ -1479,11 +1500,7 @@ end
 
 `hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:run_batch()`。
 
-这里最重要的一点，是外层循环：
-
-```lua
-for _, command in ipairs({"prepare", "update"}) do
-```
+这里将 Prepare 和 Update 写成两个顺序执行的循环。Controller 先等待全部 Prepare 成功返回，再开始 Update。
 
 假设将来有多个 PlayerService 需要更新，那么执行顺序是：
 
@@ -1607,13 +1624,12 @@ if command == "prepare" then
     if module_state.active_transaction then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "当前批次已在处理中")
     end
-    local txn = {batch_id = request.batch_id, sequence = request.sequence, phase = "QUIESCING"}
-    module_state.active_transaction = txn
+
+    module_state.active_transaction = {batch_id = request.batch_id, sequence = request.sequence}
     M.patching = true
+
     local ok, answer = pcall(module_state.registration.before_upgrade)
-    if module_state.active_transaction ~= txn or not M.patching then
-        return hotupgrade_result.failure("HU_STALE_TRANSACTION", "等待时批次已结束")
-    end
+
     if not ok then
         return hotupgrade_result.failure("HU_PREPARE_FAILED", tostring(answer))
     end
@@ -1621,19 +1637,18 @@ if command == "prepare" then
         return hotupgrade_result.failure("HU_SAFEPOINT_REQUIRED",
             type(answer) == "table" and (answer.message or answer.code) or "before_upgrade 未确认业务安全点")
     end
-    txn.phase = "QUIESCED"
     return hotupgrade_result.success()
 end
 ```
 
 登记时必须提供 before_upgrade 函数，因此这里直接调用它；每次 Prepare 仍要实际运行回调，确认本批业务队列已经排空。这段才真正开始改变 PlayerService 的运行状态。
 
-它先创建 `txn`，保存本次批次身份，并将阶段设置成 `QUIESCING`。
+它只建立本批次的本地记录，供后续 Update、Abort 和 Finish 保存、读取及清理快照，不为 Prepare 另设阶段状态。
 
 然后：
 
 ```lua
-module_state.active_transaction = txn
+module_state.active_transaction = {batch_id = request.batch_id, sequence = request.sequence}
 M.patching = true
 ```
 
@@ -1673,11 +1688,7 @@ end
 
 此时，因为 `hot.patching=true` 已经阻止新的受控业务加入，框架便取得了业务安全点。
 
-`handle_upgrade()` 将：
-
-`txn.phase = "QUIESCED"`
-
-随后返回 `{ok=true}`，通过 PlayerService 的 `skynet.retpack()` 回复 Controller。
+`handle_upgrade()` 在回调确认排空后直接返回 `{ok=true}`，通过 PlayerService 的 `skynet.retpack()` 回复 Controller。
 
 Controller 中先前 yield 的 `M:step()` 恢复，接着返回 `M:run_batch()`。
 
@@ -1696,8 +1707,7 @@ Controller
 
 原 PlayerService
     hot.patching = true
-    module_state.active_transaction = txn
-    txn.phase = QUIESCED
+    module_state.active_transaction = {batch_id, sequence}
 
     logic.version() = "v1"
     state.equip = "刀"
@@ -1721,9 +1731,7 @@ Controller
 
 现在 `M:run_batch()` 已经完成所有目标的 Prepare。
 
-外层循环进入第二轮：
-
-`command = "update"`
+Controller 将 `batch.phase` 设为 `"UPDATE"`，并进入独立的 Update 循环。
 
 于是 Controller 再次调用：
 
@@ -1760,8 +1768,8 @@ PlayerService 收到消息后，经本地 `skynet.dispatch("hotupgrade", ...)` �
 
 ```lua
 if command == "update" then
-    if txn.phase ~= "QUIESCED" then
-        return hotupgrade_result.failure("HU_SAFEPOINT_REQUIRED", "Prepare 尚未确认业务安全点")
+    if txn.phase ~= nil then
+        return hotupgrade_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
     -- Stage 只准备候选和快照，不写线上导出或状态。
     for _, entry in ipairs(request.modules or {}) do
@@ -1823,10 +1831,9 @@ Controller 之前使用 `load()`，只检查发布包的语法，没有执行模
 
 ```lua
 -- 再执行候选模块，检查导出并迁移隔离的私有状态。
-for _, name in ipairs(module_stage.order) do
-    local entry = module_stage.entries[name]
+for _, entry in ipairs(module_stage.entries) do
     local candidate = entry.chunk()
-    check_exports(candidate, name)
+    check_exports(candidate, entry.name)
     assert(candidate ~= entry.live, "候选须返回新的导出表")
     for key, value in pairs(candidate) do
         assert(entry.live[key] == nil or type(entry.live[key]) == type(value), "导出字段类型变化")
@@ -2109,7 +2116,6 @@ return hotupgrade_result.success()
 
 ```lua
 local function replace_exports(live, fields)
-    assert(type(live) == "table" and getmetatable(live) == nil, "线上表身份或元表发生变化")
     for key in pairs(live) do
         rawset(live, key, nil)
     end

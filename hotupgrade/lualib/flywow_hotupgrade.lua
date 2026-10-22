@@ -224,15 +224,10 @@ local function handle_upgrade(command, request, source)
             return hotupgrade_result.failure("HU_UPGRADE_BUSY", "当前批次已在处理中")
         end
 
-        local txn = {batch_id = request.batch_id, sequence = request.sequence, phase = "QUIESCING"}
-        module_state.active_transaction = txn
+        module_state.active_transaction = {batch_id = request.batch_id, sequence = request.sequence}
         M.patching = true
 
         local ok, answer = pcall(module_state.registration.before_upgrade)
-
-        if module_state.active_transaction ~= txn or not M.patching then
-            return hotupgrade_result.failure("HU_STALE_TRANSACTION", "等待时批次已结束")
-        end
 
         if not ok then
             return hotupgrade_result.failure("HU_PREPARE_FAILED", tostring(answer))
@@ -241,7 +236,6 @@ local function handle_upgrade(command, request, source)
             return hotupgrade_result.failure("HU_SAFEPOINT_REQUIRED",
                 type(answer) == "table" and (answer.message or answer.code) or "before_upgrade 未确认业务安全点")
         end
-        txn.phase = "QUIESCED"
         return hotupgrade_result.success()
     end
 
@@ -255,8 +249,8 @@ local function handle_upgrade(command, request, source)
     end
 
     if command == "update" then
-        if txn.phase ~= "QUIESCED" then
-            return hotupgrade_result.failure("HU_SAFEPOINT_REQUIRED", "Prepare 尚未确认业务安全点")
+        if txn.phase ~= nil then
+            return hotupgrade_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
         end
         -- Stage 只准备候选和快照，不写线上导出或状态。
         for _, entry in ipairs(request.modules or {}) do
