@@ -20,6 +20,7 @@ namespace FlyWow.Navigation.Editor
             {
                 throw new ArgumentNullException(nameof(bytes));
             }
+
             return Compute(bytes, 0, bytes.Length);
         }
 

@@ -13,7 +13,7 @@ local module_state =
 local function inspect()
     return
     {
-        handle = skynet.self(),
+        service_handle = skynet.self(),
         version = module_state.player_logic.version(),
         equip = module_state.player_state.equip,
         schema_version = module_state.player_state.schema_version,

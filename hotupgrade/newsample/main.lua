@@ -17,13 +17,13 @@ skynet.start(function()
     end
 
     -- 创建第一个 PlayerService，执行 V1。
-    local first_handle = hot.newservice("player_service")
-    local initialized = skynet.call(first_handle, "lua", "init")
+    local first_service_handle = hot.newservice("player_service")
+    local initialized = skynet.call(first_service_handle, "lua", "init")
     if not initialized.ok then
         error(initialized.message)
     end
 
-    local before = skynet.call(first_handle, "lua", "inspect")
+    local before = skynet.call(first_service_handle, "lua", "inspect")
     print("发布前:", before.player.version, before.player.equip,
         before.player.schema_version, before.player.attack)
 
@@ -61,12 +61,12 @@ skynet.start(function()
     end
 
     -- 检查原 PlayerService。
-    local after = skynet.call(first_handle, "lua", "inspect")
+    local after = skynet.call(first_service_handle, "lua", "inspect")
 
     print("发布后:", after.player.version, after.player.equip,
         after.player.schema_version, after.player.attack)
 
-    print("原 handle 保持:", first_handle == after.player.handle)
+    print("原 Service handle 保持:", first_service_handle == after.player.service_handle)
     print("原状态根表保持:", after.player.state_same)
     print("原模块根表保持:",
         before.player.module_id == after.player.module_id)
@@ -76,17 +76,17 @@ skynet.start(function()
     print("原 Service patching:", after.player_service.patching)
 
     -- 创建第二个 PlayerService，直接运行 V2。
-    local second_handle = hot.newservice("player_service")
-    local second_initialized = skynet.call(second_handle, "lua", "init")
+    local second_service_handle = hot.newservice("player_service")
+    local second_initialized = skynet.call(second_service_handle, "lua", "init")
     if not second_initialized.ok then
         error(second_initialized.message)
     end
 
-    local second = skynet.call(second_handle, "lua", "inspect")
+    local second = skynet.call(second_service_handle, "lua", "inspect")
 
     print("新 PlayerService:", second.player.version, second.player.equip,
         second.player.schema_version, second.player.attack)
-    print("两个 Service 的 handle 不同:", second_handle ~= first_handle)
+    print("两个 Service 的 handle 不同:", second_service_handle ~= first_service_handle)
 
     io.stdout:flush()
     os.exit(0)

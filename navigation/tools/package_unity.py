@@ -21,10 +21,12 @@ def package(source, output):
     for item in assets:
         if not item.name.endswith('.meta') and not Path(str(item) + '.meta').is_file():
             raise ValueError('UPM_META_MISSING: ' + str(item))
+
     output.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix='.navigation-', suffix='.tgz', dir=output)
     os.close(descriptor)
     temporary = Path(temporary)
+
     try:
         with temporary.open('wb') as stream:
             with gzip.GzipFile(fileobj=stream, mode='wb', filename='', mtime=0) as compressed:
@@ -41,6 +43,7 @@ def package(source, output):
                         else:
                             archive.addfile(info)
         digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+
         result = output / ('flywow-navigation-' + digest + '.tgz')
         if result.exists():
             if hashlib.sha256(result.read_bytes()).hexdigest() != digest:
@@ -60,6 +63,7 @@ def main():
                         help='开发接入：显式更新宿主 manifest 的相对包依赖')
     args = parser.parse_args()
     artifact = package(Path(__file__).resolve().parents[1] / 'unity', args.output)
+
     if args.manifest:
         # 源码仍只有 framework/unity；这里只更新调用方明确选择的工程依赖。
         definition = json.loads(args.manifest.read_text(encoding='utf-8-sig'))
@@ -67,6 +71,7 @@ def main():
         definition['dependencies']['com.flywow.navigation'] = 'file:' + relative.replace(os.sep, '/')
         definition['testables'] = sorted(set(definition.get('testables', []) + ['com.flywow.navigation']))
         content = json.dumps(definition, ensure_ascii=False, indent=2) + '\n'
+
         # 保留标准两空格排版，并在完整写盘后替换，避免留下半份 manifest。
         descriptor, staging = tempfile.mkstemp(prefix='.navigation-manifest-', dir=args.manifest.parent)
         os.close(descriptor)

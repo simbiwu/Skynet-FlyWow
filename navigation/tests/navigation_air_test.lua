@@ -2,6 +2,7 @@
 local root, native_dir, bmap_path, airnav_path = ...
 package.path = root .. "/navigation/lualib/?.lua;" .. package.path
 package.cpath = native_dir .. "/?.so;" .. package.cpath
+
 local navigation = require "flywow_navigation"
 
 ---@param x integer
@@ -48,7 +49,9 @@ for _ = 1, 100 do
     end
     assert(result.status == "moving")
 end
+
 assert(reached)
+
 local result = assert(context:sweep_air
 {
     from           = position(250, 10100, 1750),
@@ -57,6 +60,7 @@ local result = assert(context:sweep_air
     exclude_handle = 1,
 })
 assert(result.kind == "static" and result.time_numerator and result.time_denominator)
+
 local value, err = context:move_air { handle = 1, target = position(250, 1000, 1750) }
 error_code(value, err, "BLOCKED")
 assert(context:remove_air_obstacle { handle = 1 })
@@ -76,6 +80,7 @@ local old = assert(context:sweep_air
     body = { radius_mm = 0, half_height_mm = 0 },
 })
 assert(old.kind == "static")
+
 local fresh = assert(navigation.new_context(17, { buckets = 2 }))
 value, err = fresh:sweep_air
 {
@@ -84,6 +89,7 @@ value, err = fresh:sweep_air
     body = { radius_mm = 0, half_height_mm = 0 },
 }
 error_code(value, err, "QUERY_BUDGET_EXCEEDED")
+
 context:close()
 context:close()
 value, err = context:remove_air_obstacle { handle = 1 }

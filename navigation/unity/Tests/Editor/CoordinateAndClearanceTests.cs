@@ -38,6 +38,7 @@ namespace FlyWow.Navigation.Tests
             {
                 snapshot.cells[i].flags = NavCellFlags.Walkable;
             }
+
             snapshot.cells[snapshot.IndexOf(1, 2)].flags = 0;
 
             NavigationMapClearance.Compute(snapshot);

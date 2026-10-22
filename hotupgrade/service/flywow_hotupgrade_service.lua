@@ -26,6 +26,7 @@ skynet.start(function()
             skynet.retpack(answer)
         end
     end)
+
     skynet.dispatch("hotupgrade", function(session, source, command, request)
         local answer
         if not controller_initialized then

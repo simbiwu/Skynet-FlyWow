@@ -18,15 +18,15 @@ skynet.start(function()
             error(initialized.code .. ": " .. initialized.message)
         end
 
-        local first_handle = hotupgrade.newservice("player_service")
-        local first_started = skynet.call(first_handle, "lua", "init")
+        local first_service_handle = hotupgrade.newservice("player_service")
+        local first_started = skynet.call(first_service_handle, "lua", "init")
         if not first_started.ok then
             error(first_started.code .. ": " .. first_started.message)
         end
 
-        local before = skynet.call(first_handle, "lua", "inspect")
-        print(string.format("V1 handle=%d module=%s equip=%s level=%d schema=%d attack=%d",
-            first_handle, before.version, before.equip, before.level, before.schema_version, before.attack))
+        local before = skynet.call(first_service_handle, "lua", "inspect")
+        print(string.format("V1 service_handle=%d module=%s equip=%s level=%d schema=%d attack=%d",
+            first_service_handle, before.version, before.equip, before.level, before.schema_version, before.attack))
 
         local batch = skynet.call(hotupgrade_handle, "hotupgrade", "begin", {path = "v2"})
         if not batch.ok then
@@ -59,18 +59,18 @@ skynet.start(function()
             error("等待发布完成超时")
         end
 
-        local after = skynet.call(first_handle, "lua", "inspect")
-        print(string.format("V2 existing handle=%d module=%s equip=%s level=%d schema=%d attack=%d",
-            first_handle, after.version, after.equip, after.level, after.schema_version, after.attack))
+        local after = skynet.call(first_service_handle, "lua", "inspect")
+        print(string.format("V2 existing service_handle=%d module=%s equip=%s level=%d schema=%d attack=%d",
+            first_service_handle, after.version, after.equip, after.level, after.schema_version, after.attack))
 
-        local second_handle = hotupgrade.newservice("player_service")
-        local second_started = skynet.call(second_handle, "lua", "init")
+        local second_service_handle = hotupgrade.newservice("player_service")
+        local second_started = skynet.call(second_service_handle, "lua", "init")
         if not second_started.ok then
             error(second_started.code .. ": " .. second_started.message)
         end
-        local created = skynet.call(second_handle, "lua", "inspect")
-        print(string.format("V2 new handle=%d module=%s equip=%s level=%d schema=%d attack=%d",
-            second_handle, created.version, created.equip, created.level, created.schema_version, created.attack))
+        local created = skynet.call(second_service_handle, "lua", "inspect")
+        print(string.format("V2 new service_handle=%d module=%s equip=%s level=%d schema=%d attack=%d",
+            second_service_handle, created.version, created.equip, created.level, created.schema_version, created.attack))
 
         print("HOTUPGRADE_SAMPLE_OK")
     end, debug.traceback)

@@ -257,6 +257,7 @@ int loadMap(lua_State *state)
         return lua_binding.pushError();
     if (!lua_binding.isNoneOrNil(2) && air_path.empty())
         return lua_binding.pushError(kInvalidArgument, "explicit airnav path is empty");
+
     const auto loaded = maps->Load(path, air_path);
     if (!loaded.ok())
         return lua_binding.pushError(flywow_navigation::NavErrorName(loaded.error), loaded.detail);
@@ -275,6 +276,7 @@ int loadMap(lua_State *state)
         !table.writeValue("map_version", metadata.map_version) ||
         !table.writeValue("content_sha256", content_sha256))
         return lua_binding.pushError();
+
     return lua_binding.returnValues(table);
 }
 
@@ -436,6 +438,7 @@ bool readPathQuery(LuaBinding &lua_binding, PathQuery &query)
     {
         return false;
     }
+
     query.profiles = NavigationProfileRegistry::Instance().Snapshot();
     if (query.profiles == nullptr)
     {
@@ -572,6 +575,7 @@ bool readMoveAgent(LuaBinding &lua_binding, LuaNavigationContext *&owner,
         lua_binding.setError("INVALID_AGENT", "navigation profiles are not loaded");
         return false;
     }
+
     const auto *profile = findNavigationProfile(lua_binding, *profiles, unit_id);
     if (profile == nullptr)
     {
@@ -714,6 +718,7 @@ int advance_path(lua_State *state)
     {
         return lua_binding.pushError();
     }
+
     const auto profiles = NavigationProfileRegistry::Instance().Snapshot();
     if (profiles == nullptr)
     {
@@ -834,6 +839,7 @@ int unit_radius_mm(lua_State *state)
     {
         return binding.pushError();
     }
+
     const auto profiles = NavigationProfileRegistry::Instance().Snapshot();
     if (profiles == nullptr)
     {
@@ -975,6 +981,7 @@ int setAirObstacle(lua_State *state)
     const auto result = flywow_navigation::setAirObstacle(*owner->context, {handle}, box);
     if (!result.ok())
         return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
+
     return lua_binding.returnValues(true);
 }
 int removeAirObstacle(lua_State *state)
@@ -990,6 +997,7 @@ int removeAirObstacle(lua_State *state)
     const auto result = flywow_navigation::removeAirObstacle(*owner->context, {handle});
     if (!result.ok())
         return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
+
     return lua_binding.returnValues(true);
 }
 int sweepAir(lua_State *state)
@@ -1023,6 +1031,7 @@ int sweepAir(lua_State *state)
         !out.writeValue("time_numerator", std::to_string(hit.time.numerator)) ||
         !out.writeValue("time_denominator", std::to_string(hit.time.denominator)))
         return lua_binding.pushError();
+
     return lua_binding.returnValues(out);
 }
 int findAirPath(lua_State *state)

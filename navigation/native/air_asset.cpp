@@ -104,6 +104,7 @@ AssetHash sha256(const std::uint8_t *data, std::size_t size)
         h[6] += g;
         h[7] += v;
     }
+
     AssetHash out{};
     for (unsigned i = 0; i < 32; ++i)
     {
@@ -120,11 +121,13 @@ NavResult<AirAsset> readAirAsset(const std::string &path, const BMapMetadata &m,
     {
         return fail(NavError::kIoError, "cannot open airnav");
     }
+
     const auto length = in.tellg();
     if (length < 96 || length > 32 * 1024 * 1024)
     {
         return fail(NavError::kInvalidAirAsset, "airnav length outside limit");
     }
+
     std::vector<std::uint8_t> file(static_cast<std::size_t>(length));
     in.seekg(0);
     in.read(reinterpret_cast<char *>(file.data()), length);
@@ -132,11 +135,13 @@ NavResult<AirAsset> readAirAsset(const std::string &path, const BMapMetadata &m,
     {
         return fail(NavError::kTruncated, "short airnav read");
     }
+
     const auto *p = file.data();
     if (std::memcmp(p, "AIRN", 4) || little(p + 4, 2) != 1 || little(p + 6, 2) != 96)
     {
         return fail(NavError::kInvalidAirAsset, "AIRN V1 header required");
     }
+
     const std::uint32_t fields[] = {m.map_id,
                                     m.map_version,
                                     m.width,
@@ -155,6 +160,7 @@ NavResult<AirAsset> readAirAsset(const std::string &path, const BMapMetadata &m,
     {
         return fail(NavError::kAssetMismatch, "airnav BMAP SHA-256 mismatch");
     }
+
     const auto records = little(p + 72, 4), intervals = little(p + 76, 4);
     if (little(p + 36, 4) || little(p + 80, 8) || little(p + 88, 8) ||
         records > std::uint64_t(m.width) * m.height || intervals > 1048576 ||
@@ -162,12 +168,14 @@ NavResult<AirAsset> readAirAsset(const std::string &path, const BMapMetadata &m,
     {
         return fail(NavError::kInvalidAirAsset, "airnav counts/reserved/length invalid");
     }
+
     AirAsset out;
     out.bmap_hash = hash;
     out.air_hash  = sha256(p, file.size());
     out.present   = true;
     out.cells.reserve(records);
     out.intervals.reserve(intervals);
+
     std::uint32_t offset = 0;
     for (std::size_t i = 0; i < records; ++i)
     {
@@ -193,6 +201,7 @@ NavResult<AirAsset> readAirAsset(const std::string &path, const BMapMetadata &m,
         offset += c.count;
         out.cells.push_back(c);
     }
+
     if (offset != intervals)
     {
         return fail(NavError::kInvalidAirAsset, "unreferenced air intervals");

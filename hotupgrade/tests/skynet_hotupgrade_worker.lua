@@ -130,7 +130,7 @@ skynet.start(function()
             -- 仅测试诊断用的只读观察，不是生产业务入口。
             answer =
             {
-                handle = skynet.self(), marker_token = tostring(marker),
+                service_handle = skynet.self(), marker_token = tostring(marker),
                 state_identity = service_state == service_state_identity,
                 lua_state_identity = marker == original_marker,
                 module_identity = logic == module_identity and package.loaded.test_worker_logic == logic
@@ -229,7 +229,7 @@ skynet.start(function()
             assert(skynet.call(skynet.uniqueservice("flywow_hotupgrade_service"), "hotupgrade", "status", {}).lifecycle.pending_module_loads == 0)
             answer = true
         elseif command == "cancel_creation" then
-            answer = hotupgrade.cancel_service_creation(request.handle)
+            answer = hotupgrade.cancel_service_creation(request.service_handle)
         elseif command == "declare_slow" then
             -- 仅测试暂停实际模块执行，形成可观察的许可窗口；生产模块顶层仍须同步。
             local original_require = _G.require

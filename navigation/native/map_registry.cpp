@@ -48,6 +48,7 @@ NavResult<std::shared_ptr<const GridMap>> MapRegistry::Find(std::uint32_t map_id
         return NavResult<std::shared_ptr<const GridMap>>::Failure(NavError::kMapNotFound,
                                                                   detail.str());
     }
+
     // 在锁内复制 shared_ptr，离开函数后释放锁；调用方查询 Cell/A* 时不占 Registry 锁。
     return NavResult<std::shared_ptr<const GridMap>>::Success(iterator->second);
 }

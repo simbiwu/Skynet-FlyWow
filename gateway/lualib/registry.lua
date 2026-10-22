@@ -54,6 +54,7 @@ function M.build_index(definitions)
         }
         count = count + 1
     end
+
     assert(count > 0, "gateway registry must contain at least one command")
 
     return

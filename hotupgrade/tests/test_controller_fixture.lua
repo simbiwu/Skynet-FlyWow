@@ -3,9 +3,9 @@ local hotupgrade_common = require "flywow_hotupgrade_common"
 local module_state =
 {
     pending_control_coroutines     = {},    -- 测试替身排队的 Controller 控制面协程。
-    last_control_command_by_handle = {},    -- 各目标最近收到的控制步骤。
+    last_control_command_by_service_handle = {},    -- 各目标最近收到的控制步骤。
     shared_environment             = {},    -- 模拟 Skynet 跨 State 的只写一次环境。
-    launch_handle                  = nil,   -- 原生创建替身将返回的真实 handle。
+    launch_service_handle                  = nil,   -- 原生创建替身将返回的真实 Service handle。
     launch_hook                    = nil,   -- 在原生创建尚未返回时注入登记或启动失败。
     launches                       = {},    -- 记录实际进入原生创建的逻辑名和完整参数。
     killed                         = {},    -- 验证只有创建者取消时才终止对应待登记 Service。
@@ -36,11 +36,11 @@ package.loaded.skynet =
         if module_state.launch_hook then
             module_state.launch_hook(...)
         end
-        return module_state.launch_handle
+        return module_state.launch_service_handle
     end,
     wait = function() coroutine.yield() end,
     wakeup = function(co) assert(coroutine.resume(co)) end,
-    kill = function(handle) module_state.killed[handle] = true end,
+    kill = function(service_handle) module_state.killed[service_handle] = true end,
     fork = function(fn)
         local co = coroutine.create(fn)
         module_state.pending_control_coroutines[#module_state.pending_control_coroutines + 1] = function()
@@ -48,14 +48,14 @@ package.loaded.skynet =
             assert(ok, message)
         end
     end,
-    call = function(handle, protocol, command, request)
+    call = function(service_handle, protocol, command, request)
         assert(protocol == "hotupgrade" and request.sequence > 0)
-        module_state.operations[#module_state.operations + 1] = handle .. ":" .. command
-        module_state.last_control_command_by_handle[handle] = command
+        module_state.operations[#module_state.operations + 1] = service_handle .. ":" .. command
+        module_state.last_control_command_by_service_handle[service_handle] = command
         if module_state.control_hook then
-            module_state.control_hook(handle, command)
+            module_state.control_hook(service_handle, command)
         end
-        if module_state.injected_control_failure and module_state.injected_control_failure.handle == handle and module_state.injected_control_failure.command == command then
+        if module_state.injected_control_failure and module_state.injected_control_failure.service_handle == service_handle and module_state.injected_control_failure.command == command then
             if module_state.injected_control_failure.unknown then
                 error("injected RPC result unknown")
             end
@@ -142,27 +142,27 @@ local function publish(instance, request)
     return instance:handle_command("begin", {path = request.path}, 1)
 end
 
-local function managed_register(instance, metadata, handle, service_name)
+local function managed_register(instance, metadata, service_handle, service_name)
     service_name = service_name or "skynet_hotupgrade_worker"
-    module_state.launch_handle = handle
+    module_state.launch_service_handle = service_handle
     local created = instance:handle_command("newservice", {service_name = service_name, arguments = {n = 0}}, 1)
     if not created.ok then
         return created
     end
-    assert(instance.creation_handles[handle].service_name == service_name)
-    local registered = instance:handle_command("register", metadata, handle)
+    assert(instance.creation_handles[service_handle].service_name == service_name)
+    local registered = instance:handle_command("register", metadata, service_handle)
     if registered.ok then
-        assert(instance.targets[handle].service_name == service_name)
+        assert(instance.targets[service_handle].service_name == service_name)
     end
     return registered
 end
 
-local function register_module(instance, name, handle)
-    local allowed = instance:handle_command("begin_module_load", {name = name}, handle)
+local function register_module(instance, name, service_handle)
+    local allowed = instance:handle_command("begin_module_load", {name = name}, service_handle)
     if not allowed.ok then
         return allowed
     end
-    return instance:handle_command("register_module", {name = name, permit_id = allowed.permit_id}, handle)
+    return instance:handle_command("register_module", {name = name, permit_id = allowed.permit_id}, service_handle)
 end
 
 local metadata = {modules = {"lualib.test_worker_logic"}, has_service_update = false}

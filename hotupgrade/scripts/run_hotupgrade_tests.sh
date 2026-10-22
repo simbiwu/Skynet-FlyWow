@@ -24,7 +24,7 @@ cp -a build/hotupgrade-tests/host build/hotupgrade-tests/host-original
 cd "$FRAMEWORK_DIR/../.."
 LOG="$FRAMEWORK_DIR/build/hotupgrade-tests/skynet.log"
 : > "$LOG"
-for group in deployment deploy_failure service_file lifecycle preload host_paths custom_paths patch_match identity_queue prepare_missing prepare_false prepare_error optional_service declaration bad_functions stage_failure activation_after_failure activation_custom_failure activation_custom_success activation_custom_success_failure multiple_targets partial abort recovery_restore recovery_module; do
+for group in deployment deploy_failure service_file lifecycle preload host_paths custom_paths patch_match identity_queue registration_missing prepare_false prepare_error optional_service declaration bad_functions stage_failure activation_after_failure activation_custom_failure activation_custom_success activation_custom_success_failure multiple_targets partial abort recovery_restore recovery_module; do
     rm -rf -- "$FRAMEWORK_DIR/build/hotupgrade-tests/host"
     cp -a "$FRAMEWORK_DIR/build/hotupgrade-tests/host-original" "$FRAMEWORK_DIR/build/hotupgrade-tests/host"
     HOTUPGRADE_TEST_GROUP="$group" timeout 45 "$SKYNET_ROOT/skynet" \

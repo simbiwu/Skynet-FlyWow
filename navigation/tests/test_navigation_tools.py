@@ -57,6 +57,7 @@ class NavigationToolsTests(unittest.TestCase):
         bmap = bytes.fromhex((fixtures / 'bmap_v1.txt').read_text())
         air = bytes.fromhex((fixtures / 'airnav_v1.txt').read_text())
         asset.verify_air(air, bmap)
+
         mutations = [(0, 0), (4, 2), (36, 1), (40, air[40] ^ 1),
                      (80, 1), (96, 255), (100, 1), (104, 65)]
         for offset, value in mutations:
@@ -65,9 +66,11 @@ class NavigationToolsTests(unittest.TestCase):
                 damaged[offset] = value
                 with self.assertRaises(ValueError):
                     asset.verify_air(damaged, bmap)
+
         for damaged in (air[:-1], air + b'\0', bytes(32*1024*1024+1)):
             with self.assertRaises(ValueError):
                 asset.verify_air(damaged, bmap)
+
         self.bmap.write_bytes(bmap)
         self.metadata.update(width=12, height=12, origin_mm=[-1000, -1000],
                              payload_crc32=f'{zlib.crc32(bmap[64:]):08X}',
@@ -78,6 +81,7 @@ class NavigationToolsTests(unittest.TestCase):
         air_path = self.root / 'map.airnav'
         air_path.write_bytes(air)
         self.write_manifest()
+
         self.assertEqual(asset.verify(self.bmap, self.manifest, airnav=air_path), self.metadata)
         with self.assertRaisesRegex(ValueError, 'EXPLICIT_PATH_REQUIRED'):
             asset.verify(self.bmap, self.manifest)

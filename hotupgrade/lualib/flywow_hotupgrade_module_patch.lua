@@ -73,6 +73,7 @@ local function replace_exports(live, fields)
 end
 
 local function check_exports(exports, name)
+    -- 先校验顶层导出并收集嵌套表，seen 允许数据图共享引用和循环引用。
     assert(type(exports) == "table" and getmetatable(exports) == nil, name .. " 必须导出普通表")
     local pending = {} -- 待检查的嵌套表；迭代遍历避免深层数据造成递归栈溢出。
     local seen = {}    -- 每张嵌套表只检查一次，允许共享引用与嵌套表之间的循环。
@@ -96,6 +97,7 @@ local function check_exports(exports, name)
         check_value(value)
     end
 
+    -- 遍历嵌套数据图，校验键和值类型并拒绝元表和根表回指。
     while #pending > 0 do
         local nested = table.remove(pending)
         for key, value in pairs(nested) do
@@ -106,6 +108,7 @@ local function check_exports(exports, name)
         end
     end
 
+    -- 模块私有状态钩子是额外合同，必须成对提供且都为函数。
     assert((exports.export_state == nil) == (exports.import_state == nil), name .. " 状态钩子须成对")
     if exports.export_state ~= nil then
         assert(type(exports.export_state) == "function" and type(exports.import_state) == "function",
@@ -131,6 +134,7 @@ function M.stage(entries)
         end
 
         assert(entry_count == #entries, "模块列表有空洞")
+
         -- 先编译全部 Patch 并保存每个线上模块的旧字段。
         for _, item in ipairs(entries) do
             assert(type(item) == "table" and type(item.name) == "string" and item.name ~= "" and type(item.source) == "string",
@@ -190,12 +194,14 @@ function M.commit(module_stage)
     end
 
     local ok, message = pcall(function()
+        -- 先确认所有根表身份仍有效；全部通过后才开始修改线上导出。
         for _, name in ipairs(module_stage.order) do
             local entry = module_stage.entries[name]
             assert(package.loaded[name] == entry.live and getmetatable(entry.live) == nil,
                 "模块身份在 Stage 后改变")
         end
 
+        -- 所有候选已在 Stage 完成检查，现在原地替换每个模块的完整导出字段。
         module_stage.committed = true
         for _, name in ipairs(module_stage.order) do
             local entry = module_stage.entries[name]
@@ -211,6 +217,7 @@ function M.abort(module_stage)
         return hotupgrade_result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
     end
 
+    -- 尝试恢复每个模块并收集全部故障；单个模块失败不跳过其他模块。
     local errors = {}
     for _, name in ipairs(module_stage.order) do
         local entry = module_stage.entries[name]
@@ -226,6 +233,7 @@ function M.abort(module_stage)
         end
     end
 
+    -- 只有所有旧导出都确认恢复后才释放 Stage 和旧快照。
     if #errors > 0 then
         return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
     end

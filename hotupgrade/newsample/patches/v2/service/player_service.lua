@@ -11,7 +11,7 @@ local initial_load
 local function inspect()
     return
     {
-        handle = skynet.self(),
+        service_handle = skynet.self(),
         version = logic.version(),
         equip = state.equip,
         schema_version = state.schema_version,

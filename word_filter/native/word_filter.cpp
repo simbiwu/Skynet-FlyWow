@@ -60,11 +60,13 @@ namespace flywow_word_filter
         {
             throw std::runtime_error("already_built");
         }
+
         if (keywords_.size() >= flywow_max_keywords || keyword.size() > flywow_max_keyword_bytes ||
             keyword.size() > flywow_max_dictionary_bytes - dictionary_byte_count_)
         {
             throw std::runtime_error("dictionary_limit");
         }
+
         flywow_normalized_text normalized;
         if (!normalize_utf8(keyword, normalized, normalization_options))
         {
@@ -179,6 +181,7 @@ namespace flywow_word_filter
             results.clear();
             return false;
         }
+
         if (!find_normalized(normalized, results))
         {
             return false;
@@ -306,6 +309,7 @@ namespace flywow_word_filter
         {
             throw std::runtime_error("text_limit");
         }
+
         result.clear();
 
         const std::uint8_t *bytes       = reinterpret_cast<const std::uint8_t *>(source_text.data());
@@ -497,6 +501,7 @@ namespace flywow_word_filter
         {
             code_point += 'a' - 'A';
         }
+
         return code_point;
     }
 
@@ -509,18 +514,21 @@ namespace flywow_word_filter
         {
             return true;
         }
+
         if (compact_options.ignore_control &&
             ((code_point < 0x20 && code_point != '\t' && code_point != '\r' && code_point != '\n') ||
              code_point == 0x7F))
         {
             return true;
         }
+
         if (compact_options.ignore_ascii_punctuation &&
             ((code_point >= 0x21 && code_point <= 0x2F) || (code_point >= 0x3A && code_point <= 0x40) ||
              (code_point >= 0x5B && code_point <= 0x60) || (code_point >= 0x7B && code_point <= 0x7E)))
         {
             return true;
         }
+
         if (compact_options.ignore_zero_width &&
             ((code_point >= 0x200B && code_point <= 0x200F) || code_point == 0x2028 || code_point == 0x2029 ||
              code_point == 0x2060 || code_point == 0xFEFF))
@@ -537,6 +545,7 @@ namespace flywow_word_filter
             text.push_back(static_cast<char>(code_point - flywow_invalid_byte_base));
             return;
         }
+
         append_utf8_char(code_point, text);
     }
 

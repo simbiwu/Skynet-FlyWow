@@ -26,6 +26,7 @@ namespace FlyWow.Navigation.Editor
             {
                 throw new System.InvalidOperationException("NAVIGATION_EXAMPLE_TARGET_EXISTS");
             }
+
             Scene scene =
                 EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
             GameObject        root = new GameObject("NavigationMap");

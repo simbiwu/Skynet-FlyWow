@@ -34,6 +34,7 @@ namespace FlyWow.Navigation.Editor
                 throw new InvalidOperationException("AIRNAV_COORDINATE_OVERFLOW");
             return checked((long)(lower ? Math.Floor(scaled) : Math.Ceiling(scaled)));
         }
+
         public static long FloorDiv(long a, long b)
         {
             return a / b - ((a < 0 && a % b != 0) ? 1 : 0);
@@ -43,6 +44,7 @@ namespace FlyWow.Navigation.Editor
         {
             if (!root.exportAirNavigation)
                 return null;
+
             var air      = new AirNavSnapshot();
             int rawCount = 0;
             foreach (Collider collider in UnityEngine.Object.FindObjectsByType<Collider>(
@@ -52,6 +54,7 @@ namespace FlyWow.Navigation.Editor
                     !collider.gameObject.activeInHierarchy ||
                     (root.airObstacleLayers.value & (1 << collider.gameObject.layer)) == 0)
                     continue;
+
                 // 旋转 BoxCollider 及其它 Collider 都以世界 bounds 保守覆盖，可能关闭模型通道。
                 if (!(collider is BoxCollider) ||
                     collider.transform.rotation != Quaternion.identity)
@@ -75,6 +78,7 @@ namespace FlyWow.Navigation.Editor
         {
             if (minX > maxX || minZ > maxZ || minY > maxY)
                 throw new ArgumentException("AIRNAV_BOUNDS");
+
             // checked 相减防止作者的极端 int64 坐标绕回地图内。
             long rx = checked(minX - map.originXMm), rz = checked(minZ - map.originZMm);
             long x0 = FloorDiv(rx, map.cellSizeMm), z0 = FloorDiv(rz, map.cellSizeMm);
@@ -88,6 +92,7 @@ namespace FlyWow.Navigation.Editor
             z0      = Math.Max(0, z0);
             x1      = Math.Min(map.width - 1, x1);
             z1      = Math.Min(map.height - 1, z1);
+
             for (long z = z0; z <= z1; ++z)
             {
                 for (long x = x0; x <= x1; ++x)
@@ -105,6 +110,7 @@ namespace FlyWow.Navigation.Editor
                 }
             }
         }
+
         public static void Canonicalize(AirNavSnapshot air)
         {
             foreach (List<AirNavInterval> list in air.cells.Values)
@@ -126,15 +132,18 @@ namespace FlyWow.Navigation.Editor
                     }
                 }
                 list.RemoveRange(output, list.Count - output);
+
                 if (output > 64)
                     throw new InvalidOperationException("AIRNAV_CELL_INTERVAL_CAPACITY");
             }
         }
+
         private static void Put(byte[] bytes, int offset, ulong value, int size)
         {
             for (int i = 0; i < size; ++i)
                 bytes[offset + i] = (byte)(value >> (i * 8));
         }
+
         private static ulong Get(byte[] bytes, int offset, int size)
         {
             ulong value = 0;
@@ -142,6 +151,7 @@ namespace FlyWow.Navigation.Editor
                 value |= (ulong)bytes[offset + i] << (i * 8);
             return value;
         }
+
         private static byte[] Hash(byte[] data)
         {
             using (SHA256 sha = SHA256.Create()) return sha.ComputeHash(data);
@@ -236,6 +246,7 @@ namespace FlyWow.Navigation.Editor
                 throw new InvalidOperationException("AIRNAV_PAIR_OR_CANONICAL");
             return air;
         }
+
         public static void Write(NavigationMapSnapshot map, AirNavSnapshot air, string bmap,
                                  string output)
         {

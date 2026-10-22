@@ -27,6 +27,7 @@ NavResult<bool> NavigationProfileRegistry::Load(std::vector<NavigationProfile> n
               {
                   return lhs.unit_id < rhs.unit_id;
               });
+
     for (std::size_t index = 0; index < navigation_profiles.size(); ++index)
     {
         const auto valid = ValidateNavigationProfile(navigation_profiles[index]);

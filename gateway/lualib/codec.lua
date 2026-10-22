@@ -27,6 +27,7 @@ function M.new(codec_config)
     assert(type(codec_config.descriptor_path) == "string" and codec_config.descriptor_path ~= "",
            "gateway descriptor_path is required")
     assert(type(codec_config.registry) == "table", "gateway registry is required")
+
     local descriptor_bytes = read_file(codec_config.descriptor_path)
     assert(pb.load(descriptor_bytes),
            "cannot load protobuf descriptor: " .. codec_config.descriptor_path)

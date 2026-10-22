@@ -22,9 +22,11 @@ namespace FlyWow.Navigation.Editor
             {
                 throw new ArgumentException("NAVIGATION_CANDIDATE_ARGUMENT");
             }
+
             Directory.CreateDirectory(outputRoot);
             string stage = Path.Combine(outputRoot, ".staging-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(stage);
+
             try
             {
                 string map = Path.Combine(stage, "map.bmap");
@@ -34,6 +36,7 @@ namespace FlyWow.Navigation.Editor
                     AirNavWriter.Write(snapshot, air, map, airPath);
                 string hash = air == null ? ContentHash(map) : PackageHash(map, airPath);
                 BMapManifestWriter.Write(snapshot, map, air == null ? null : airPath, hash);
+
                 string target = Path.Combine(outputRoot, "map-" + snapshot.mapId + "-v" +
                                                              snapshot.mapVersion + "-" + hash);
                 if (Directory.Exists(target))

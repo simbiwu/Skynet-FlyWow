@@ -165,7 +165,7 @@ local initial_load
 local function inspect()
     return
     {
-        handle = skynet.self(),
+        service_handle = skynet.self(),
         version = logic.version(),
         equip = state.equip,
         schema_version = state.schema_version,
@@ -316,16 +316,16 @@ skynet.start(function()
         error(result.message)
     end
 
-    local first_handle = hot.newservice("player_service")
-    local initialized = skynet.call(first_handle, "lua", "init")
+    local first_service_handle = hot.newservice("player_service")
+    local initialized = skynet.call(first_service_handle, "lua", "init")
     if not initialized.ok then
         error(initialized.message)
     end
 
-    local response = skynet.call(first_handle, "lua", "inspect")
+    local response = skynet.call(first_service_handle, "lua", "inspect")
     local player = response.player
 
-    print("handle:", player.handle)
+    print("service_handle:", player.service_handle)
     print("version:", player.version)
     print("equip:", player.equip)
     print("schema:", player.schema_version)
@@ -379,7 +379,7 @@ skynet.call(hotupgrade_handle, "lua", "init", ...)
 现在主 Service 执行：
 
 ```lua
-local first_handle = hot.newservice("player_service")
+local first_service_handle = hot.newservice("player_service")
 ```
 
 这个函数不是 `skynet.newservice()` 的简单别名。它需要通过 Controller 建立受管理的创建记录。
@@ -402,7 +402,7 @@ function M.newservice(service_name, ...)
     assert(type(answer) == "table" and answer.ok,
         tostring(type(answer) == "table" and answer.code) .. ": " ..
         tostring(type(answer) == "table" and answer.message or answer))
-    return answer.handle
+    return answer.service_handle
 end
 ```
 
@@ -438,10 +438,10 @@ Skynet 创建 PlayerService 并返回 handle 后，Controller 将 handle 保存�
 因此：
 
 ```lua
-local first_handle = hot.newservice("player_service")
+local first_service_handle = hot.newservice("player_service")
 ```
 
-执行完毕后，`first_handle` 是一个真实的 Skynet Service handle。
+执行完毕后，`first_service_handle` 是一个真实的 Skynet Service handle。
 
 但现在有一个容易忽略的区别：
 
@@ -452,7 +452,7 @@ Controller 仍然保留刚才的待创建记录。
 所以主 Service 接着执行：
 
 ```lua
-local initialized = skynet.call(first_handle, "lua", "init")
+local initialized = skynet.call(first_service_handle, "lua", "init")
 ```
 
 这才是前面我们编写的 PlayerService 真正执行 `initialize()` 的时刻。
@@ -550,10 +550,10 @@ Controller 收到 `"register"` 后，由：
     hot.newservice("player_service")
             ↓ RPC
 HotUpgrade Service：M:newservice()
-    skynet.newservice() → 返回 first_handle
+    skynet.newservice() → 返回 first_service_handle
             ↓
 主 Service
-    skynet.call(first_handle, "lua", "init")
+    skynet.call(first_service_handle, "lua", "init")
             ↓ RPC
 PlayerService：Lua dispatch → initialize()
     hot.require() → hot.register_service()
@@ -574,9 +574,9 @@ HotUpgrade Service
     sequence = 0
     creation_count = 0
     module_load_count = 0
-    targets[first_handle] = 已登记的目标元数据
+    targets[first_service_handle] = 已登记的目标元数据
 
-PlayerService（first_handle）
+PlayerService（first_service_handle）
     hot.patching = false
     module_state.active_transaction = nil
 
@@ -600,7 +600,7 @@ PlayerService（first_handle）
 
 这里应该能够清楚区分三个对象：
 
-`first_handle` 是 Service 的标识；`state` 是 PlayerService Lua State 内的一张 table；`logic` 是同一个 Lua State 内已经加载的普通模块导出 table。
+`first_service_handle` 是 Service 的标识；`state` 是 PlayerService Lua State 内的一张 table；`logic` 是同一个 Lua State 内已经加载的普通模块导出 table。
 
 它们不是同一类对象，也没有通过 Controller 直接共享。
 
@@ -769,7 +769,7 @@ V2 判断 `"剑"`，加 21。
 
 现在解决第二个问题。
 
-`first_handle` 对应的 PlayerService 已经运行，它内部的 `state` 还是：
+`first_service_handle` 对应的 PlayerService 已经运行，它内部的 `state` 还是：
 
 ```lua
 {
@@ -856,7 +856,7 @@ local initial_load
 local function inspect()
     return
     {
-        handle = skynet.self(),
+        service_handle = skynet.self(),
         version = logic.version(),
         equip = state.equip,
         schema_version = state.schema_version,
@@ -978,13 +978,13 @@ skynet.start(function()
     end
 
     -- 创建第一个 PlayerService，执行 V1。
-    local first_handle = hot.newservice("player_service")
-    local initialized = skynet.call(first_handle, "lua", "init")
+    local first_service_handle = hot.newservice("player_service")
+    local initialized = skynet.call(first_service_handle, "lua", "init")
     if not initialized.ok then
         error(initialized.message)
     end
 
-    local before = skynet.call(first_handle, "lua", "inspect")
+    local before = skynet.call(first_service_handle, "lua", "inspect")
     print("发布前:", before.player.version, before.player.equip,
         before.player.schema_version, before.player.attack)
 
@@ -1022,12 +1022,12 @@ skynet.start(function()
     end
 
     -- 检查原 PlayerService。
-    local after = skynet.call(first_handle, "lua", "inspect")
+    local after = skynet.call(first_service_handle, "lua", "inspect")
 
     print("发布后:", after.player.version, after.player.equip,
         after.player.schema_version, after.player.attack)
 
-    print("原 handle 保持:", first_handle == after.player.handle)
+    print("原 Service handle 保持:", first_service_handle == after.player.service_handle)
     print("原状态根表保持:", after.player.state_same)
     print("原模块根表保持:",
         before.player.module_id == after.player.module_id)
@@ -1037,17 +1037,17 @@ skynet.start(function()
     print("原 Service patching:", after.player_service.patching)
 
     -- 创建第二个 PlayerService，直接运行 V2。
-    local second_handle = hot.newservice("player_service")
-    local second_initialized = skynet.call(second_handle, "lua", "init")
+    local second_service_handle = hot.newservice("player_service")
+    local second_initialized = skynet.call(second_service_handle, "lua", "init")
     if not second_initialized.ok then
         error(second_initialized.message)
     end
 
-    local second = skynet.call(second_handle, "lua", "inspect")
+    local second = skynet.call(second_service_handle, "lua", "inspect")
 
     print("新 PlayerService:", second.player.version, second.player.equip,
         second.player.schema_version, second.player.attack)
-    print("两个 Service 的 handle 不同:", second_handle ~= first_handle)
+    print("两个 Service 的 handle 不同:", second_service_handle ~= first_service_handle)
 
     io.stdout:flush()
     os.exit(0)
@@ -1096,9 +1096,6 @@ function M:begin(request)
     end
     if self.active_batch then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "已有发布屏障")
-    end
-    if request.dry_run ~= nil then
-        return hotupgrade_result.failure("HU_INVALID_REQUEST", "不支持 dry_run")
     end
     local path = request.path
     self.sequence = self.sequence + 1
@@ -1325,7 +1322,7 @@ for _, record in pairs(self.targets) do
     local service = loaded.patch.services[record.service_name]
     if service and not record.has_service_update then
         return hotupgrade_result.failure("HU_SERVICE_PATCH_UNSUPPORTED", request.path .. "/" .. service.entry_file
-            .. ": 目标 " .. record.handle .. " 未提供 Service 内部更新入口")
+            .. ": 目标 " .. record.service_handle .. " 未提供 Service 内部更新入口")
     end
 
     if service then
@@ -1335,7 +1332,7 @@ for _, record in pairs(self.targets) do
     if #modules > 0 or service then
         targets[#targets + 1] =
         {
-            handle = record.handle,
+            service_handle = record.service_handle,
             modules = modules,
             service_source = service and service.source,
             service_entry_file = service and service.entry_file,
@@ -1346,7 +1343,7 @@ end
 
 这是 `M:load_patch()` 中的连续代码，没有重新编写算法。
 
-Controller 从 `self.targets` 取出此前登记的 `first_handle`。
+Controller 从 `self.targets` 取出此前登记的 `first_service_handle`。
 
 它发现这个 Service 已声明：
 
@@ -1356,13 +1353,13 @@ Controller 从 `self.targets` 取出此前登记的 `first_handle`。
 
 同时，该 Service 的 `service_name` 是 `player_service`，与发布包中的 `service/player_service.patch` 匹配，而且登记时声明支持 Service 内部更新。
 
-所以本次将 `first_handle` 加入更新目标。
+所以本次将 `first_service_handle` 加入更新目标。
 
 得到的目标记录可以理解为：
 
 ```lua
 {
-    handle = first_handle,
+    service_handle = first_service_handle,
     modules = {
         {
             name = "lualib.player_logic",
@@ -1414,7 +1411,7 @@ lualib/player_logic.lua
 service/player_service.lua
 ```
 
-`batch.targets` 则只有一个目标，即 `first_handle`。
+`batch.targets` 则只有一个目标，即 `first_service_handle`。
 
 到这里，Controller 终于可以开始联系 PlayerService。
 
@@ -1424,7 +1421,7 @@ service/player_service.lua
 Controller
     phase = DEPLOYING → 即将进入 APPLYING
     active_batch = batch
-    batch.targets = {first_handle}
+    batch.targets = {first_service_handle}
     batch.target_count = 1
     batch.files = {player_logic.lua, player_service.lua}
 
@@ -1466,7 +1463,7 @@ for _, command in ipairs({"prepare", "update"}) do
             batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
             return
         end
-        batch.current_handle = target.handle
+        batch.current_service_handle = target.service_handle
         target.participated = true
         local answer = self:step(batch, target, command)
         if not answer.ok then
@@ -1494,7 +1491,7 @@ for _, command in ipairs({"prepare", "update"}) do
 
 而不是更新完第一个 Service，再去准备第二个。
 
-我们这里只有一个 `first_handle`，因此当前执行的是：
+我们这里只有一个 `first_service_handle`，因此当前执行的是：
 
 `self:step(batch, target, "prepare")`
 
@@ -1516,7 +1513,7 @@ function M:step(batch, target, command)
     end
 
     batch.control_started = true
-    local ok, answer = pcall(skynet.call, target.handle, "hotupgrade", command, request)
+    local ok, answer = pcall(skynet.call, target.service_handle, "hotupgrade", command, request)
     if not ok or type(answer) ~= "table" or type(answer.ok) ~= "boolean" then
         return hotupgrade_result.failure("HU_RPC_FAILED", tostring(answer), command)
     end
@@ -1530,7 +1527,7 @@ end
 
 这段调用里有几个具体对象：
 
-`target.handle` 是 `first_handle`，也就是我们创建的原 PlayerService。
+`target.service_handle` 是 `first_service_handle`，也就是我们创建的原 PlayerService。
 
 `command` 当前是 `"prepare"`。
 
@@ -1547,7 +1544,7 @@ HotUpgrade Service                             PlayerService
  M:run_batch()
    └── M:step(batch,target,"prepare")
          │
-         └── skynet.call(first_handle, "hotupgrade", "prepare", request)
+         └── skynet.call(first_service_handle, "hotupgrade", "prepare", request)
                                                 │
                                                 └── skynet.dispatch("hotupgrade")
                                                       └── handle_upgrade("prepare")
@@ -1613,9 +1610,6 @@ if command == "prepare" then
     local txn = {batch_id = request.batch_id, sequence = request.sequence, phase = "QUIESCING"}
     module_state.active_transaction = txn
     M.patching = true
-    if not module_state.registration.before_upgrade then
-        return hotupgrade_result.failure("HU_SAFEPOINT_REQUIRED", "未提供 before_upgrade，不能确认业务已排空")
-    end
     local ok, answer = pcall(module_state.registration.before_upgrade)
     if module_state.active_transaction ~= txn or not M.patching then
         return hotupgrade_result.failure("HU_STALE_TRANSACTION", "等待时批次已结束")
@@ -1632,7 +1626,7 @@ if command == "prepare" then
 end
 ```
 
-这段才真正开始改变 PlayerService 的运行状态。
+登记时必须提供 before_upgrade 函数，因此这里直接调用它；每次 Prepare 仍要实际运行回调，确认本批业务队列已经排空。这段才真正开始改变 PlayerService 的运行状态。
 
 它先创建 `txn`，保存本次批次身份，并将阶段设置成 `QUIESCING`。
 
@@ -1697,7 +1691,7 @@ Controller 中先前 yield 的 `M:step()` 恢复，接着返回 `M:run_batch()`�
 Controller
     phase = APPLYING
     batch.phase = PREPARE
-    batch.targets = {first_handle}
+    batch.targets = {first_service_handle}
     batch.control_started = true
 
 原 PlayerService
@@ -1756,7 +1750,7 @@ end
 
 它不包含完整的 V2 `service/player_service.lua`，因为那个文件是之后部署给未来新 Service 使用的。
 
-Controller 通过 `skynet.call()` 把更新请求发送给 `first_handle`，当前协程再次 yield。
+Controller 通过 `skynet.call()` 把更新请求发送给 `first_service_handle`，当前协程再次 yield。
 
 PlayerService 收到消息后，经本地 `skynet.dispatch("hotupgrade", ...)` 进入：
 
@@ -2022,7 +2016,7 @@ PlayerService 线上 state
 Controller
     phase = APPLYING
     batch.phase = UPDATE
-    正在等待 first_handle 的 Update RPC
+    正在等待 first_service_handle 的 Update RPC
 
 原 PlayerService
     hot.patching = true
@@ -2258,7 +2252,7 @@ business.load = 新的 V2 闭包
 Controller
     phase = APPLYING
     batch.phase = UPDATE
-    已收到 first_handle 的 Update 成功
+    已收到 first_service_handle 的 Update 成功
 
 原 PlayerService
     hot.patching = true
@@ -2432,7 +2426,7 @@ Skynet
 batch.phase = "PUBLISH_DECIDED"
 batch.decided = true
 for _, target in ipairs(batch.targets) do
-    batch.current_handle = target.handle
+    batch.current_service_handle = target.service_handle
     target.result = self:step(batch, target, "finish")
     if not target.result.ok then
         batch.error = hotupgrade_result.failure("HU_RECOVERY_REQUIRED",
@@ -2455,7 +2449,7 @@ batch.phase = batch.error and "RECOVERY_REQUIRED" or "COMPLETED"
 
 这表示 Controller 已经确认本批次的所有运行时 Update 和正式文件部署都成功了。
 
-随后，Controller 通过此前学习过的 `M:step()`，向 `first_handle` 发送：
+随后，Controller 通过此前学习过的 `M:step()`，向 `first_service_handle` 发送：
 
 `handle_upgrade("finish")`
 
@@ -2617,9 +2611,9 @@ Controller 完成批次之后，我们最初编写的 `lesson4_main.lua` 正在�
 
 ### 检查已经运行的 PlayerService
 
-现在主 Service 向原来的 `first_handle` 发送：
+现在主 Service 向原来的 `first_service_handle` 发送：
 
-`skynet.call(first_handle, "lua", "inspect")`
+`skynet.call(first_service_handle, "lua", "inspect")`
 
 这是我们自己编写的 `lesson4_main.lua` 中的 RPC。
 
@@ -2637,7 +2631,7 @@ Controller 完成批次之后，我们最初编写的 `lesson4_main.lua` 正在�
 
 | 检查项目 | 预期结果 |
 |---|---|
-| `handle` | 等于原 `first_handle` |
+| `handle` | 等于原 `first_service_handle` |
 | `version` | `v2` |
 | `equip` | 剑 |
 | `schema_version` | `2` |
@@ -2659,7 +2653,7 @@ Controller 完成批次之后，我们最初编写的 `lesson4_main.lua` 正在�
 原实例验收完毕后，主 Service 执行：
 
 ```lua
-local second_handle = hot.newservice("player_service")
+local second_service_handle = hot.newservice("player_service")
 ```
 
 这行来自我们最终版本 `lesson4_main.lua` 的 `skynet.start()` 回调。
@@ -2699,7 +2693,7 @@ state =
 因此第二个 PlayerService 初始化后直接具有：
 
 ```text
-second_handle
+second_service_handle
     新的 Skynet Service handle
     新的 Lua State
 
@@ -2721,12 +2715,12 @@ second_handle
 因此，两个 Service 虽然最终计算出相同的攻击力，但得到 V2 的路径完全不同：
 
 ```text
-原 PlayerService（first_handle 不变）
+原 PlayerService（first_service_handle 不变）
     V1 入口启动 → V1 状态和模块
     → Prepare → Update → Finish
     → 现存对象更新为 V2
 
-新 PlayerService（second_handle 是新 handle）
+新 PlayerService（second_service_handle 是新 handle）
     加载 V2 Service 入口 → 加载 V2 普通模块
     → 初始化 V2 状态
     → 直接运行完整 V2
@@ -2855,7 +2849,7 @@ bash hotupgrade/lesson4/run.sh ../skynet
 发布批次: <batch_id>
 
 发布后: v2 剑 2 121
-原 handle 保持: true
+原 Service handle 保持: true
 原状态根表保持: true
 原模块根表保持: true
 模块缓存别名保持: true

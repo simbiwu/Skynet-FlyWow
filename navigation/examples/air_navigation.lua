@@ -16,6 +16,7 @@ local function position(x, y, z)
 end
 
 assert(navigation.load_map(bmap_path, airnav_path))
+
 local context = assert(navigation.new_context(17))
 assert(context:set_air_obstacle
 {
@@ -31,6 +32,7 @@ local path = assert(context:find_air_path
     body           = { radius_mm = 50, half_height_mm = 200 },
     exclude_handle = 1,
 })
+
 for _ = 1, 100 do
     local result, err = context:advance_air_path { handle = 1, path = path, distance_mm = 100 }
     assert(result, err and err.code)

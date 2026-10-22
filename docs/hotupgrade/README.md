@@ -40,12 +40,12 @@ init 失败可修正后重试，成功后重复 init 返回 HU_ALREADY_INITIALIZ
 纳入 HotUpgrade 管理的 Service 必须由创建者使用受管理入口启动；Controller 自身和非受管理 Service 继续使用原生入口。宿主可通过原生 uniqueservice 获取相同 handle，用于 begin/status 等管理命令；业务 Service 的 HotUpgrade API 不再接收 handle：
 
 ```lua
-local handle = hotupgrade.newservice("player_service", "原有启动参数")
+local service_handle = hotupgrade.newservice("player_service", "原有启动参数")
 -- newservice 仅转交原生启动参数，返回后不额外等待业务 init 或 register_service。
-local called, initialized = pcall(skynet.call, handle, "lua", "init", player_config)
+local called, initialized = pcall(skynet.call, service_handle, "lua", "init", player_config)
 if not called or type(initialized) ~= "table" or not initialized.ok then
     -- 只可取消尚未登记的 Service；Controller 核验创建者、终止 Service 并清理待创建记录。
-    local cancelled = hotupgrade.cancel_service_creation(handle)
+    local cancelled = hotupgrade.cancel_service_creation(service_handle)
     assert(cancelled.ok, tostring(cancelled.code) .. ": " .. tostring(cancelled.message))
     error(type(initialized) == "table" and initialized.message or tostring(initialized))
 end
@@ -62,9 +62,9 @@ register_service 只发送原有元数据，Controller 仅按消息头真实 sou
 ### 受管理本地唯一服务
 
 ```lua
-local handle = hotupgrade.uniqueservice("player", zone_id)
+local service_handle = hotupgrade.uniqueservice("player", zone_id)
 -- 明确拒绝：抛出含 HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED 的异常，不启动 Service。
-local global_handle = hotupgrade.uniqueservice(true, "player", zone_id)
+local global_service_handle = hotupgrade.uniqueservice(true, "player", zone_id)
 ```
 
 唯一键是本 Controller 内的原始逻辑 Service 名称。首次创建先建立该名称的在途预留，再复用受管理 newservice 流程；同名并发请求等待同一创建结果，原生创建返回后一起取得相同 handle。只有首次请求的启动参数生效，后续重复请求的参数不改变实例。不同名称可启动不同 Service；已有 handle 即使在发布期间也直接返回，尚未创建的新逻辑键须等待发布成功。
@@ -135,7 +135,7 @@ end
 
 业务返回值和异常由业务自己定义。HotUpgrade 不管理 queue、不包装业务返回值，也不计数业务协程。queue 内的业务可以正常 yield；脱离该 queue 的协程不在排空保证范围内。
 
-register_service 的 before_upgrade 在 Prepare 建立本地事务并设置 hot.patching=true 后调用。该回调允许 yield，必须通过上述同一个 queue 等待此前已进入的业务全部退出，例如 return business_queue(function() return true end)。只有 true 或 {ok=true} 确认业务安全点；缺失、失败或异常均使 Prepare 失败，不能进入 Update。框架不轮询或超时放行业务。
+register_service 必须提供 before_upgrade 函数；缺失或非函数会在登记时以 HU_INVALID_OPTIONS 拒绝。每次 Prepare 建立本地事务并设置 hot.patching=true 后都会调用该回调。回调允许 yield，必须通过上述同一个 queue 等待此前已进入的业务全部退出，例如 return business_queue(function() return true end)。只有 true 或 {ok=true} 确认业务安全点；回调失败、拒绝或异常均使 Prepare 失败，不能进入 Update。框架不轮询或超时放行业务。
 
 全部目标 Prepare 成功后才开始逐目标 Update。Update 中 Stage 只构建候选和保存快照，Activate 同步提交模块、Service 状态和函数，再执行 after_upgrade。after_upgrade 只检查已提交状态，不得 yield 或产生外部副作用；false 或异常触发组合恢复。
 

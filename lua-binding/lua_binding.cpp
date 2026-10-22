@@ -120,6 +120,7 @@ const std::string &LuaBinding::errorCode() const
 {
     return error_code_;
 }
+
 const std::string &LuaBinding::errorMessage() const
 {
     return error_message_;
@@ -246,6 +247,7 @@ bool LuaBinding::pushValue(std::nullptr_t)
     lua_pushnil(state_);
     return true;
 }
+
 bool LuaBinding::pushValue(void *value)
 {
     // [S] -> [S, lightuserdata]；只保存地址，Lua 不析构或释放它指向的资源。

@@ -61,6 +61,7 @@ void NavigationContext::BeginQuery()
         }
         query_generation_ = 1;
     }
+
     heap_size_     = 0;
     visited_nodes_ = 0;
 }
@@ -104,6 +105,7 @@ NavResult<bool> NavigationContext::SetCellDynamicEntryRule(const GridPos       &
     {
         dynamic_entry_rules_.insert(entry, CellDynamicEntryOverride{grid, rule});
     }
+
     return NavResult<bool>::Success(true);
 }
 
@@ -177,6 +179,7 @@ NavResult<bool> NavigationContext::setAirLimits(const AirLimits &l)
         return NavResult<bool>::Failure(NavError::kInvalidArgument,
                                         "air limits invalid or already active");
     }
+
     air_limits_ = l;
     return NavResult<bool>::Success(true);
 }
@@ -184,6 +187,7 @@ std::size_t NavigationContext::airMemoryBytes() const noexcept
 {
     if (!air_)
         return 0;
+
     return sizeof(AirState) +
            air_->objects.size() * (sizeof(AirBox) + sizeof(std::uint64_t) + 3 * sizeof(void *)) +
            air_->links.size() * (sizeof(std::pair<std::uint32_t, std::uint64_t>) + sizeof(bool) +

@@ -30,6 +30,7 @@ skynet.start(function()
                 command_id = 1101,
                 data = {code = "OK", battle_id = 42, seat_id = 1},
             })
+
             skynet.send(module_state.gateway_service_handle, "lua", "send_data",
             {
                 gateway_epoch = message.gateway_epoch,

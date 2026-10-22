@@ -171,13 +171,13 @@ package.loaded.skynet =
     pack = function() end,
     unpack = function() end,
     getenv = function() return "build/hotupgrade-tests/host" end,
-    call = function(handle, _protocol, command, request)
-        assert(handle == 99)
+    call = function(hotupgrade_service_handle, _protocol, command, request)
+        assert(hotupgrade_service_handle == 99)
         if command == "register" then
             return {ok = true}
         elseif command == "newservice" or command == "uniqueservice" then
             forwarded[command] = request
-            return {ok = true, handle = command == "newservice" and 101 or 102}
+            return {ok = true, service_handle = command == "newservice" and 101 or 102}
         elseif command == "cancel_service_creation" then
             forwarded.cancel = request
             return {ok = true}
@@ -220,33 +220,33 @@ assert(forwarded.uniqueservice.arguments.n == 3 and forwarded.uniqueservice.argu
 assert(hotupgrade.uniqueservice(true, "global_name", "arg") == 102)
 assert(forwarded.uniqueservice.global and forwarded.uniqueservice.service_name == "global_name")
 assert(forwarded.uniqueservice.arguments.n == 1 and forwarded.uniqueservice.arguments[1] == "arg")
-assert(hotupgrade.cancel_service_creation(101).ok and forwarded.cancel.handle == 101)
+assert(hotupgrade.cancel_service_creation(101).ok and forwarded.cancel.service_handle == 101)
 assert(unique_calls == 1, "controller lookup happens exactly once per Lua State")
 local rejected_registration = hotupgrade.register_service({service_module = "fixture"})
 assert(not rejected_registration.ok and rejected_registration.code == "HU_INVALID_OPTIONS")
 local registration = {}
+local missing_before_upgrade = hotupgrade.register_service(registration)
+assert(not missing_before_upgrade.ok and missing_before_upgrade.code == "HU_INVALID_OPTIONS")
+registration.before_upgrade = function() return true end
 assert(hotupgrade.register_service(registration).ok)
 local function target_control(command, sequence)
     control_dispatch(1, 99, command, {batch_id = "fixture:" .. sequence, sequence = sequence})
     return control_answer
 end
-assert(target_control("prepare", 1).code == "HU_SAFEPOINT_REQUIRED" and hotupgrade.patching)
-assert(target_control("update", 1).code == "HU_SAFEPOINT_REQUIRED")
-assert(target_control("abort", 1).ok and not hotupgrade.patching)
 registration.before_upgrade = function() return false end
-assert(target_control("prepare", 2).code == "HU_SAFEPOINT_REQUIRED" and hotupgrade.patching)
-assert(target_control("abort", 2).ok and not hotupgrade.patching)
+assert(target_control("prepare", 1).code == "HU_SAFEPOINT_REQUIRED" and hotupgrade.patching)
+assert(target_control("abort", 1).ok and not hotupgrade.patching)
 registration.before_upgrade = function() error("unsafe") end
-assert(target_control("prepare", 3).code == "HU_PREPARE_FAILED" and hotupgrade.patching)
-assert(target_control("abort", 3).ok and not hotupgrade.patching)
+assert(target_control("prepare", 2).code == "HU_PREPARE_FAILED" and hotupgrade.patching)
+assert(target_control("abort", 2).ok and not hotupgrade.patching)
 registration.before_upgrade = function()
     assert(hotupgrade.patching)
     coroutine.yield()
     return {ok = true}
 end
-local preparing = coroutine.create(function() assert(target_control("prepare", 4).ok) end)
+local preparing = coroutine.create(function() assert(target_control("prepare", 3).ok) end)
 assert(coroutine.resume(preparing) and hotupgrade.patching)
-assert(target_control("update", 4).code == "HU_SAFEPOINT_REQUIRED")
+assert(target_control("update", 3).code == "HU_SAFEPOINT_REQUIRED")
 assert(coroutine.resume(preparing))
 local update_steps = {}
 local original_stage = patch.stage

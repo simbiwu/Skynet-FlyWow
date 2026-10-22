@@ -212,6 +212,7 @@ namespace FlyWow.Navigation.Editor
             double u = (v2x * v1z - v1x * v2z) / denominator;
             // v 是 XZ 投影中沿 a->c 方向的重心坐标。
             double v = (v0x * v2z - v2x * v0z) / denominator;
+
             // epsilon 只容忍三角形边界的浮点误差，不能扩大实际可走区域。
             const double epsilon = 1e-6;
             if (u < -epsilon || v < -epsilon || u + v > 1.0 + epsilon)

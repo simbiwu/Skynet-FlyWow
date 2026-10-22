@@ -3,7 +3,9 @@
 --- 输入：框架根、Native 目录、BMAP 路径；输出：断言通过标记，失败退出非零。
 package.path = arg[1] .. "/navigation/lualib/?.lua;" .. package.path
 package.cpath = arg[2] .. "/?.so;" .. package.cpath
+
 local navigation = require "flywow_navigation"
+
 --- 超限文件在分配文件缓冲前拒绝；这里只读 sparse 文件的长度，不消费 128 MiB。
 local oversized, size_error = navigation.load_map(arg[4])
 assert(oversized == nil and size_error.code == "BMAP_SIZE_OVERFLOW")
@@ -44,6 +46,7 @@ local invalid_profiles, invalid_profile_error = navigation.load_navigation_profi
     { unit_id = 1, radius_mm = "invalid", max_step_mm = 1000, max_slope_permille = 1000 },
 })
 assert(invalid_profiles == nil and invalid_profile_error.code == "INVALID_ARGUMENT")
+
 assert(navigation.load_navigation_profiles(profiles))
 local first = assert(navigation.new_context(17))
 local second = assert(navigation.new_context(17))
@@ -108,10 +111,12 @@ end)
 assert(id_ok)
 assert(invalid_map_id == nil)
 assert(map_id_error.code == "INVALID_ARGUMENT")
+
 local replacement_map, replacement_error = navigation.load_map(arg[5])
 assert(replacement_map, replacement_error and replacement_error.message)
 assert(replacement_map.map_id == 17 and replacement_map.map_version == 3)
 assert(first:map_version() == 2) -- 已有 Context 固定旧地图。
+
 local old_map_query, old_map_error = navigation.query_cell(17, 2, start)
 assert(old_map_query == nil and old_map_error.code == "MAP_VERSION_MISMATCH")
 assert(navigation.query_cell(17, 3, start).walkable)
@@ -122,10 +127,12 @@ local closed, closed_error = first:find_path(1, start, goal, 1)
 assert(closed == nil and closed_error.code == "CONTEXT_CLOSED")
 assert(second:release_unit(1))
 second:close()
+
 -- 真实调用覆盖 record 中的 Path userdata、推进结果和 Range 查询，确保迁移保持合同。
 local third = assert(navigation.new_context(17))
 assert(third:map_version() == 3)
 assert(third:cell_size_mm() == 500)
+
 assert(third:place_unit(1, 7, start))
 local third_path = assert(third:find_path(1, start, goal, 7))
 local paused = assert(third:advance_path({
@@ -136,6 +143,7 @@ local paused = assert(third:advance_path({
     from_world  = start,
 }))
 assert(paused.status == "moving" and not paused.moved and paused.consumed_mm == 0)
+
 local advanced = assert(third:advance_path({
     unit_id          = 1,
     unit_instance_id = 7,
@@ -145,6 +153,7 @@ local advanced = assert(third:advance_path({
 }))
 assert(advanced.status == "reached" and advanced.moved)
 assert(advanced.position.x_mm == goal.x_mm and advanced.position.y_mm == 0)
+
 assert(third:move_unit(1, 7, goal, goal))
 assert(third:find_path_to_range(1, goal, start, 500, 7):count() > 0)
 local wrong_path, wrong_path_error = third:advance_path({

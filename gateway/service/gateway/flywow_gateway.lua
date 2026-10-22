@@ -226,6 +226,7 @@ local function emit_event(event)
                  " command=", tostring(event.command or "-"),
                  " code=", tostring(event.code or "-"),
                  " message=", tostring(event.message or "-"))
+
     if module_state.gateway_config.observer_service then
         skynet.send(module_state.gateway_config.observer_service, "lua", "gateway_event", event)
     end
@@ -329,17 +330,20 @@ local function detach_connection(connection, reason)
     if connection == nil or connection.closed then
         return false
     end
+
     connection.closed = true
     module_state.handshake.close(connection.handshake)
     module_state.connections[connection.id] = nil
     module_state.connections_by_fd[connection.fd] = nil
     module_state.client_count = module_state.client_count - 1
+
     skynet.send(module_state.gateway_config.handler_service, "lua", "gateway_disconnect",
     {
         gateway_epoch = module_state.epoch,
         connection_id = connection.id,
     }
     )
+
     emit_event(
         {
             kind          = "close",
@@ -366,6 +370,7 @@ local function close_transport(connection, code, reason)
     end
 
     connection.close_requested = true
+
     if connection.transport == "websocket" and not websocket.is_close(connection.fd) then
         websocket.close(connection.fd, code or 1001, reason or "closed")
     elseif socket.invalid(connection.fd) then
@@ -867,6 +872,7 @@ function ws_handler.message(id, payload, opcode)
     if not connection or connection.closed then
         return
     end
+
     if opcode ~= "binary" then
         emit_event(
         {
@@ -926,6 +932,7 @@ function ws_handler.error(id, message)
         connection_id = connection and connection.id or id,
     }
     )
+
     detach_connection(connection, "websocket error")
 end
 
@@ -943,6 +950,7 @@ function ws_handler.warning(ws_object, size)
             pending_kb    = size,
         }
         )
+
         if size >= module_state.gateway_config.write_warning_close_kb then
             detach_connection(connection, "write backpressure")
             close_transport(connection, 1013, "server backpressure")

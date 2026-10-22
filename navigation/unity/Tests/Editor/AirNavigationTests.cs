@@ -19,6 +19,7 @@ namespace FlyWow.Navigation.Tests
                 .Select(i => Convert.ToByte(hex.Substring(i * 2, 2), 16))
                 .ToArray();
         }
+
         private static NavigationMapSnapshot Map()
         {
             return new NavigationMapSnapshot {
@@ -36,6 +37,7 @@ namespace FlyWow.Navigation.Tests
                             .ToArray()
             };
         }
+
         private static AirNavSnapshot Air()
         {
             var air = new AirNavSnapshot();
@@ -48,6 +50,7 @@ namespace FlyWow.Navigation.Tests
             });
             return air;
         }
+
         [Test]
         public void UnityWriterMatchesNativeGoldenAndRejectsInvalidPair()
         {
@@ -62,6 +65,7 @@ namespace FlyWow.Navigation.Tests
                 BMapWriter.Write(map, temporary);
                 CollectionAssert.AreEqual(ground, File.ReadAllBytes(temporary));
                 CollectionAssert.AreEqual(expected, AirNavWriter.Encode(map, air, ground));
+
                 Assert.That(AirNavWriter.Decode(expected, map, ground).cells.Count, Is.EqualTo(2));
                 byte[] corrupt = (byte[])expected.Clone();
                 corrupt[40] ^= 1;
@@ -80,6 +84,7 @@ namespace FlyWow.Navigation.Tests
                 File.Delete(temporary);
             }
         }
+
         [Test]
         public void ExplicitColliderLayerExportsClosedBoundariesAndMergesIntervals()
         {
@@ -94,11 +99,13 @@ namespace FlyWow.Navigation.Tests
                 box.transform.position               = new Vector3(-0.5f, 5f, -0.5f);
                 box.AddComponent<BoxCollider>().size = new Vector3(0f, 10f, 0f);
                 Physics.SyncTransforms();
+
                 Assert.That(AirNavWriter.Sample(root, Map()), Is.Null);
                 root.exportAirNavigation = true;
                 var sampled              = AirNavWriter.Sample(root, Map());
                 // x=z=-500mm 正好在格线，四个相邻闭格都被覆盖。
                 Assert.That(sampled.cells.Keys, Is.EquivalentTo(new uint[] { 0, 1, 12, 13 }));
+
                 var air = new AirNavSnapshot();
                 int raw = 0;
                 AirNavWriter.AddBounds(air, Map(), -500, -500, -500, -500, 0, 10000, ref raw);
@@ -112,6 +119,7 @@ namespace FlyWow.Navigation.Tests
                 UnityEngine.Object.DestroyImmediate(owner);
             }
         }
+
         [Test]
         public void CompletePackageIdentityIncludesAirAndFailureRemovesStage()
         {
@@ -123,6 +131,7 @@ namespace FlyWow.Navigation.Tests
                 var    air   = Air();
                 string old   = NavigationAssetPublisher.WriteCandidate(map, output);
                 string first = NavigationAssetPublisher.WriteCandidate(map, output, air);
+
                 Assert.That(first, Is.Not.EqualTo(old));
                 Assert.That(NavigationAssetPublisher.WriteCandidate(map, output, air),
                             Is.EqualTo(first));

@@ -52,6 +52,7 @@ std::shared_ptr<const GridMap> MakeSynthetic(std::uint32_t width, std::uint32_t 
             cell.height_mm       = 0;
         }
     }
+
     return std::make_shared<const GridMap>(meta, std::move(cells));
 }
 
@@ -105,6 +106,7 @@ void RunCase(std::uint32_t width, std::uint32_t height)
     int           no_path         = 0;
 
     const auto all_begin = std::chrono::steady_clock::now();
+
     for (int i = 0; i < kQueries; ++i)
     {
         const WorldPosition start  = RandomWalkable(*map, seed);
@@ -126,11 +128,13 @@ void RunCase(std::uint32_t width, std::uint32_t height)
         }
     }
     const auto   all_end = std::chrono::steady_clock::now();
+
     // 整组 QPS 的时间范围还包括端点抽样、记录统计及循环内结果释放；
     // 因此不能直接用单次延迟的平均值倒数替代这里的 QPS。
     const double seconds = std::chrono::duration<double>(all_end - all_begin).count();
 
     const std::size_t cells              = map->cell_count();
+
     // 仅估算 Context 固定数组下界；不包含 vector capacity 余量、footprint、
     // GridMap、Path、allocator metadata，因此不能当作进程实测内存。
     const std::size_t node_scratch_bytes = cells * sizeof(NavigationContext::NodeScratch);

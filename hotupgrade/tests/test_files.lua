@@ -19,16 +19,16 @@ assert(not controller.initialize({}).ok)
 assert(controller.initialize(controller_config).ok)
 local c = controller
 -- 此文件只测扫描/路径；以原生创建替身为虚拟目标建立合法的待登记记录。
-local function register_fixture(instance, handle, metadata, service_name)
+local function register_fixture(instance, service_handle, metadata, service_name)
     local skynet = require "skynet"
     local original_newservice = skynet.newservice
-    skynet.newservice = function() return handle end
+    skynet.newservice = function() return service_handle end
     local created = instance:handle_command("newservice",
         {service_name = service_name, arguments = {n = 0}}, 1)
     skynet.newservice = original_newservice
-    assert(created.ok and instance.creation_handles[handle].service_name == service_name)
-    local registered = instance:handle_command("register", metadata, handle)
-    assert(registered.ok and instance.targets[handle].service_name == service_name)
+    assert(created.ok and instance.creation_handles[service_handle].service_name == service_name)
+    local registered = instance:handle_command("register", metadata, service_handle)
+    assert(registered.ok and instance.targets[service_handle].service_name == service_name)
     return registered
 end
 assert(register_fixture(c, 10, {modules = {"lualib.test_worker_logic"},

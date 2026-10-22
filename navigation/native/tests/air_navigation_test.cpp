@@ -33,10 +33,12 @@ void operator delete(void *memory) noexcept
 {
     std::free(memory);
 }
+
 void operator delete(void *memory, std::size_t) noexcept
 {
     std::free(memory);
 }
+
 using namespace flywow_navigation;
 namespace
 {
@@ -53,10 +55,12 @@ std::shared_ptr<const GridMap> map(bool building = true)
     }
     return std::make_shared<const GridMap>(m, std::move(cells), std::move(air));
 }
+
 WorldPosition point(std::int64_t x, std::int64_t y, std::int64_t z)
 {
     return {x, y, z};
 }
+
 void hashVectors()
 {
     auto check = [](const std::string &input, const char *expected)
@@ -78,6 +82,7 @@ void hashVectors()
     check(std::string(1000000, 'a'),
           "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
 }
+
 std::vector<std::uint8_t> golden(const char *name)
 {
     std::ifstream file(std::string(FLYWOW_AIR_GOLDEN_ROOT) + "/" + name + ".txt");
@@ -89,6 +94,7 @@ std::vector<std::uint8_t> golden(const char *name)
         bytes.push_back(std::uint8_t(std::stoul(hex.substr(i, 2), nullptr, 16)));
     return bytes;
 }
+
 void assets()
 {
     auto base = std::filesystem::temp_directory_path() / "flywow_air_golden_native";
@@ -101,6 +107,7 @@ void assets()
     auto bmap = golden("bmap_v1"), air = golden("airnav_v1");
     write("map.bmap", bmap);
     write("map.airnav", air);
+
     const auto path = (base / "map.bmap").string(), component = (base / "map.airnav").string();
     auto      &registry = MapRegistry::Instance();
     auto       old      = registry.Load(path, component);
@@ -109,6 +116,7 @@ void assets()
     auto              replacement = registry.Load(path);
     assert(replacement.ok() && !replacement.value->airAsset().present);
     assert(ctx.map()->airAsset().present && ctx.map() != replacement.value);
+
     for (std::size_t at : {std::size_t(4), std::size_t(8), std::size_t(36), std::size_t(40),
                            std::size_t(72), std::size_t(96), std::size_t(108), std::size_t(143)})
     {
@@ -118,6 +126,7 @@ void assets()
         assert(!registry.Load(path, component).ok());
         assert(registry.Find(17).value == replacement.value);
     }
+
     auto truncated = air;
     truncated.pop_back();
     write("map.airnav", truncated);
@@ -130,12 +139,15 @@ void assets()
     std::filesystem::resize_file(base / "map.airnav", 32 * 1024 * 1024 + 1);
     assert(!registry.Load(path, component).ok());
     assert(!registry.Load(path, (base / "missing.airnav").string()).ok());
+
     std::filesystem::remove_all(base);
 }
+
 void geometry()
 {
     NavigationContext ctx(map());
     assert(ctx.airMemoryBytes() == 0);
+
     AirBody body{50, 200};
     auto    a = point(250, 10100, 1750), b = point(2750, 10100, 1750);
     auto    sweep = sweepAir(ctx, a, b, body);
@@ -173,6 +185,7 @@ void geometry()
                             point(-750, INT64_MAX - 201, -750), body, {}, AirPolicy{true, 0});
     assert(extreme.ok() && extreme.value.kind == AirHitKind::kStatic);
 }
+
 void dynamicAndAdvance()
 {
     NavigationContext ctx(map(false)), other(map(false));
@@ -186,6 +199,7 @@ void dynamicAndAdvance()
     const auto old = ctx.airState().objects.at(1);
     assert(moveAir(ctx, {1}, end).error == NavError::kBlocked);
     assert(ctx.airState().objects.at(1).min.x_mm == old.min.x_mm);
+
     assert(setAirObstacle(ctx, {2}, {{999, 2900, -800}, {1001, 3100, -700}}).ok());
     assert(sweepAir(ctx, start, end, body, {1}).value.kind == AirHitKind::kClear);
     auto path = findAirPath(ctx, start, end, 1000, body, {1});
@@ -217,6 +231,7 @@ void dynamicAndAdvance()
     auto tie = sweepAir(ctx, point(0, 1000, 0), point(2000, 1000, 0), {0, 0});
     assert(tie.ok() && tie.value.handle.value == 3);
 }
+
 void resourceBoundaries()
 {
     NavigationContext ctx(map(false));
@@ -227,6 +242,7 @@ void resourceBoundaries()
     assert(box.max.x_mm - box.min.x_mm == 1 && box.max.z_mm - box.min.z_mm == 3 &&
            box.max.y_mm - box.min.y_mm == 101);
     assert(box.min.y_mm == 950 && box.max.y_mm == 1051);
+
     const auto count = ctx.airState().links.size();
     for (int k = 0; k < 25; ++k)
     {
@@ -249,6 +265,7 @@ void resourceBoundaries()
         assert(setAirObstacle(objects, {i}, {{1, 0, 1}, {2, 10, 2}}).ok());
     assert(setAirObstacle(objects, {4097}, {{1, 0, 1}, {2, 10, 2}}).error ==
            NavError::kCapacityExceeded);
+
     BMapMetadata m{1, 1, 128, 128, 500, 0, 0, 0};
     auto         large =
         std::make_shared<const GridMap>(m, std::vector<NavCell>(128 * 128, NavCell{0, 1, 0, 10}));
@@ -263,6 +280,7 @@ void resourceBoundaries()
     assert(links.airState().links.size() == 262144);
     assert(removeAirObstacle(links, {1}).ok());
     assert(setAirObstacle(links, {1025}, {{1, 0, 1}, {2, 10, 2}}).ok());
+
     for (bool nodes : {false, true})
     {
         NavigationContext small(map());

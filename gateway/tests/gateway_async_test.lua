@@ -267,6 +267,7 @@ message.gateway_epoch = current_epoch
 message.data = { fail = true }
 e.dispatch(0, 7, "send_data", message)
 assert(#e.writes == 1, "encoding failure must not close healthy connection")
+
 message.data = { result = 2 }
 e.dispatch(0, 999, "send_data", message)
 assert(#e.writes == 2, "Gateway does not validate the reply source identity")
@@ -308,6 +309,7 @@ e.accept(10, "peer-a")
 resume(e.forks[2])
 e.accept(11, "peer-b")
 resume(e.forks[3])
+
 local targeted =
 {
     gateway_epoch = e.sends[1][3].gateway_epoch,
@@ -319,18 +321,22 @@ local targeted =
 e.dispatch(0, 7, "send_data", targeted)
 assert(#e.writes == 1 and e.writes[1][1] == 10, "target push must not broadcast")
 assert(e.writes[1][2] == frame(7), "push needs no correlation field")
+
 local epoch = targeted.gateway_epoch
 targeted.gateway_epoch = "old"
 e.dispatch(0, 7, "send_data", targeted)
 assert(#e.writes == 1, "old epoch push must be dropped")
+
 targeted.gateway_epoch = epoch
 e.ready = false
 e.dispatch(0, 7, "send_data", targeted)
 assert(#e.writes == 1, "not-ready push must be dropped")
+
 e.ready = true
 targeted.connection_id = 0
 e.dispatch(0, 7, "send_data", targeted)
 assert(#e.writes == 3, "broadcast still reaches both ready connections")
+
 targeted.connection_id = 1
 e.dispatch(0, 7, "close", targeted)
 resume(e.forks[4])

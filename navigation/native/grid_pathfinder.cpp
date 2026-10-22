@@ -769,10 +769,12 @@ NavResult<bool> ValidatePathImpl(NavigationContext &context, const NavigationPro
     {
         return NavResult<bool>::Failure(valid_profile.error, valid_profile.detail);
     }
+
     if (path.count() == 0)
     {
         return NavResult<bool>::Failure(NavError::kNoPath, "empty path");
     }
+
     const GridMap &map   = *context.map();
     const auto     first = map.WorldToGrid(path.WorldPoint(0));
     if (!first.ok())
@@ -835,6 +837,7 @@ static NavResult<Path> FindPathImpl(NavigationContext &context, const Navigation
     {
         return NavResult<Path>::Failure(NavError::kOutOfBounds, "end outside map");
     }
+
     GoalPolicy goal;
     goal.exact        = !range_goal;
     goal.exact_grid   = end_grid.value;
@@ -1087,6 +1090,7 @@ NavResult<Path> GridPathfinder::FindPath(NavigationContext &context, const Navig
         return NavResult<Path>::Failure(NavError::kInvalidArgument,
                                         "NavigationAgent requires a valid handle and profile");
     }
+
     QueryPolicy policy;
     policy.dynamic_policy = &dynamic_policy;
     policy.context        = &context;
@@ -1109,6 +1113,7 @@ NavResult<Path> GridPathfinder::FindPathToRange(NavigationContext     &context,
         return NavResult<Path>::Failure(NavError::kInvalidArgument,
                                         "NavigationAgent requires a valid handle and profile");
     }
+
     QueryPolicy policy;
     policy.dynamic_policy = &dynamic_policy;
     policy.context        = &context;

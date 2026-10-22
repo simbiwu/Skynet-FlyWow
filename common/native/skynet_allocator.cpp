@@ -13,6 +13,7 @@ namespace
 void *allocate(std::size_t size)
 {
     if (void *memory = je_malloc(size == 0 ? 1 : size)) return memory;
+
     throw std::bad_alloc();
 }
 
@@ -20,12 +21,15 @@ void *allocateAligned(std::size_t size, std::size_t alignment)
 {
     const std::size_t payload = size == 0 ? 1 : size;
     if (payload > std::numeric_limits<std::size_t>::max() - alignment - sizeof(void *)) throw std::bad_alloc();
+
     void *base = je_malloc(payload + alignment - 1 + sizeof(void *));
     if (base == nullptr) throw std::bad_alloc();
+
     const auto start = reinterpret_cast<std::uintptr_t>(base) + sizeof(void *);
     const auto address = (start + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
     auto *result = reinterpret_cast<void *>(address);
     reinterpret_cast<void **>(result)[-1] = base;
+
     return result;
 }
 

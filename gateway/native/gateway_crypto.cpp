@@ -57,8 +57,10 @@ void hmac(const unsigned char* key, const std::string& message, unsigned char* o
 {
     Handle<EVP_MAC, EVP_MAC_free> algorithm(EVP_MAC_fetch(nullptr, "HMAC", nullptr), EVP_MAC_free);
     check(bool(algorithm), "CRYPTO_PROVIDER");
+
     Handle<EVP_MAC_CTX, EVP_MAC_CTX_free> ctx(EVP_MAC_CTX_new(algorithm.get()), EVP_MAC_CTX_free);
     check(bool(ctx), "CRYPTO_ALLOC");
+
     char digest[] = "SHA256";
     OSSL_PARAM params[] =
     {
@@ -77,6 +79,7 @@ std::string challenge(Context* c, const char* hello)
 {
     Handle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> gen(EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr), EVP_PKEY_CTX_free);
     check(bool(gen), "CRYPTO_ALLOC");
+
     char group[] = "prime256v1";
     OSSL_PARAM group_params[] =
     {
@@ -85,6 +88,7 @@ std::string challenge(Context* c, const char* hello)
     };
     check(EVP_PKEY_keygen_init(gen.get()) == 1 && EVP_PKEY_CTX_set_params(gen.get(), group_params) == 1 &&
           EVP_PKEY_generate(gen.get(), &c->key) == 1, "CRYPTO_KEYGEN");
+
     Handle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> import(EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr), EVP_PKEY_CTX_free);
     check(bool(import), "CRYPTO_ALLOC");
     OSSL_PARAM peer_params[] =
@@ -98,8 +102,10 @@ std::string challenge(Context* c, const char* hello)
         EVP_PKEY_fromdata(import.get(), &raw_peer, EVP_PKEY_PUBLIC_KEY, peer_params) == 1;
     Handle<EVP_PKEY, EVP_PKEY_free> peer(raw_peer, EVP_PKEY_free);
     check(imported, "INVALID_PUBLIC_KEY");
+
     Handle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> verify(EVP_PKEY_CTX_new(peer.get(), nullptr), EVP_PKEY_CTX_free);
     check(bool(verify) && EVP_PKEY_public_check(verify.get()) == 1, "INVALID_PUBLIC_KEY");
+
     std::string response(99, '\0');
     response[0] = 2;
     response[1] = 1;
@@ -107,6 +113,7 @@ std::string challenge(Context* c, const char* hello)
     check(EVP_PKEY_get_octet_string_param(c->key, OSSL_PKEY_PARAM_PUB_KEY,
           reinterpret_cast<unsigned char*>(&response[2]), 65, &size) == 1 && size == 65, "CRYPTO_PUBLIC_KEY");
     check(RAND_bytes(reinterpret_cast<unsigned char*>(&response[67]), 32) == 1, "CRYPTO_RANDOM");
+
     Handle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> derive(EVP_PKEY_CTX_new(c->key, nullptr), EVP_PKEY_CTX_free);
     check(bool(derive), "CRYPTO_ALLOC");
     struct Shared
@@ -118,20 +125,25 @@ std::string challenge(Context* c, const char* hello)
             OPENSSL_cleanse(bytes, sizeof(bytes));
         }
     } z;
+
     size = sizeof(z.bytes);
     check(EVP_PKEY_derive_init(derive.get()) == 1 && EVP_PKEY_derive_set_peer(derive.get(), peer.get()) == 1 &&
           EVP_PKEY_derive(derive.get(), z.bytes, &size) == 1 && size == 32, "CRYPTO_DERIVE");
+
     std::string transcript(hello, 67);
     transcript += response;
     unsigned int hash_size = 0;
     check(EVP_Digest(transcript.data(), transcript.size(), c->hash.data(), &hash_size, EVP_sha256(), nullptr) == 1 &&
           hash_size == 32, "CRYPTO_HASH");
+
     std::string info = "flywow/handshake/v1";
     info.append(reinterpret_cast<const char*>(c->hash.data()), 32);
+
     Handle<EVP_KDF, EVP_KDF_free> algorithm(EVP_KDF_fetch(nullptr, "HKDF", nullptr), EVP_KDF_free);
     check(bool(algorithm), "CRYPTO_PROVIDER");
     Handle<EVP_KDF_CTX, EVP_KDF_CTX_free> kdf(EVP_KDF_CTX_new(algorithm.get()), EVP_KDF_CTX_free);
     check(bool(kdf), "CRYPTO_ALLOC");
+
     char digest[] = "SHA256";
     OSSL_PARAM params[] =
     {
@@ -142,6 +154,7 @@ std::string challenge(Context* c, const char* hello)
         OSSL_PARAM_construct_end()
     };
     check(EVP_KDF_derive(kdf.get(), c->secret.data(), 32, params) == 1, "CRYPTO_HKDF");
+
     EVP_PKEY_free(c->key);
     c->key    = nullptr;
     c->active = true;
@@ -154,14 +167,17 @@ int create_crypto_context(lua_State *state)
     LuaBinding lua_binding(state);
     std::string hello;
     if (!lua_binding.readValue(1, hello)) return lua_binding.pushError();
+
     if (hello.size() != 67 || hello[0] != 1 || hello[1] != 1 ||
         static_cast<unsigned char>(hello[2]) != 4)
     {
         lua_binding.setError("HANDSHAKE_HELLO", "invalid handshake hello");
         return lua_binding.pushError();
     }
+
     Context *context = nullptr;
     if (!lua_binding.newUserdata(TYPE, context)) return lua_binding.pushError();
+
     std::string response;
     try
     {
@@ -173,6 +189,7 @@ int create_crypto_context(lua_State *state)
         lua_binding.setError(error.what(), error.what());
         return lua_binding.pushError();
     }
+
     return lua_binding.returnValues(context, response);
 }
 
@@ -184,19 +201,23 @@ int verify(lua_State *state)
     std::string bytes;
     if (!lua_binding.readUserdata(1, TYPE, context) || !lua_binding.readValue(2, bytes))
         return lua_binding.pushError();
+
     if (!context->active || bytes.size() != 33 || bytes[0] != 3)
     {
         clear(context);
         lua_binding.setError("HANDSHAKE_PROOF", "invalid handshake proof");
         return lua_binding.pushError();
     }
+
     std::array<unsigned char,32> expected = {};
     std::string message = "client-proof";
     message.append(reinterpret_cast<const char*>(context->hash.data()), 32);
     hmac(context->secret.data(), message, expected.data());
+
     try
     {
         check(CRYPTO_memcmp(expected.data(), bytes.data() + 1, 32) == 0, "HANDSHAKE_PROOF");
+
         message = "server-ready";
         message.append(reinterpret_cast<const char*>(context->hash.data()), 32);
         std::string response(33, '\0');
@@ -230,9 +251,11 @@ extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
     LuaBinding lua_binding(state);
     LuaTable metatable;
     if (!lua_binding.registerUserdata<Context>(TYPE, metatable)) return lua_binding.pushError();
+
     LuaTable methods = lua_binding.newTable();
     if (!methods.setFunction("verify", verify) || !methods.setFunction("close", close) ||
         !metatable.writeValue("__index", methods)) return lua_binding.pushError();
+
     LuaTable module = lua_binding.newTable();
     if (!module.setFunction("new", create_crypto_context)) return lua_binding.pushError();
     return lua_binding.returnValues(module);

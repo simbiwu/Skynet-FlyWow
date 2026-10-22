@@ -273,6 +273,7 @@ bool resolveFile(const std::string &root_argument, const std::string &relative,
         {
             return false;
         }
+
         struct stat attributes;
         if (lstat(path.c_str(), &attributes) != 0)
         {
@@ -313,15 +314,18 @@ int read_file(lua_State *state)
         std::string root;     // Controller 配置的正式文件根目录。
         std::string relative; // 本次完整 .lua 的根目录相对路径。
         std::string path;     // 逐级校验后用于同步文件操作的绝对路径。
+        // 先读取正式文件根目录和目标文件相对路径，再按根目录边界校验文件路径。
         if (!binding.readValue(1, root) || !binding.readValue(2, relative))
         {
             return binding.pushError();
         }
+
         if (!resolveFile(root, relative, false, path))
         {
             return binding.pushError("HU_INVALID_PATH", relative);
         }
 
+        // 路径确认后打开普通文件；缺失文件返回 false，其余读取错误返回 HU_ 错误。
         FileHandle file{open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK)};
         if (file.descriptor < 0)
         {
@@ -336,6 +340,7 @@ int read_file(lua_State *state)
         {
             return binding.pushError("HU_INVALID_PATH", relative);
         }
+
         std::string contents;
         char buffer[8192]; // 每次读取 8 KiB；只限制读取块，不限制文件总大小。
         for (;;)
@@ -355,6 +360,7 @@ int read_file(lua_State *state)
             }
             contents.append(buffer, static_cast<std::size_t>(count));
         }
+
         // returnValues 把完整字节复制到 Lua 字符串；C++ contents 随后正常释放。
         return binding.returnValues(contents);
     }
@@ -387,6 +393,8 @@ int replace_file(lua_State *state)
         {
             return binding.pushError("HU_INVALID_PATH", relative);
         }
+
+        // 恢复原先不存在的文件时删除部署文件；其他情况走临时文件替换。
         if (removing)
         {
             if (unlink(path.c_str()) != 0 && errno != ENOENT)
@@ -396,6 +404,7 @@ int replace_file(lua_State *state)
             return binding.returnValues(true);
         }
 
+        // 沿用原文件权限，把完整内容写入同目录临时文件后再替换正式文件。
         struct stat attributes;
         mode_t mode = 0644; // 新代码文件默认可读、owner 可写；覆盖时沿用原文件权限。
         if (lstat(path.c_str(), &attributes) == 0)
@@ -427,6 +436,7 @@ int replace_file(lua_State *state)
             }
             offset += static_cast<std::size_t>(count);
         }
+
         const bool closed = close(file.descriptor) == 0;
         file.descriptor = -1;
         if (!written || !closed || rename(temporary.c_str(), path.c_str()) != 0)
@@ -460,6 +470,7 @@ int resolve(lua_State *state)
         {
             return binding.pushError();
         }
+
         std::string output;
         bool resolved = false;
         if (lua_gettop(state) >= 2)
@@ -510,6 +521,7 @@ int list_lua(lua_State *state)
         {
             return binding.pushError();
         }
+
         std::vector<std::string> paths;
         const int                status = listLuaFiles(root, relative, paths);
         if (status != 0)

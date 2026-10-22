@@ -19,6 +19,7 @@ void run(const char *name, unsigned width, unsigned height, unsigned wall, unsig
     const unsigned                  first = std::string(name) == "unreachable" ? 0 : 1;
     for (unsigned z = first; z < first + wall; ++z)
         static_cells[z * width + width / 2] = {0, 10000};
+
     for (auto &cell : static_cells)
     {
         asset.cells.push_back({cell.first, unsigned(asset.intervals.size()), 1});
@@ -27,12 +28,14 @@ void run(const char *name, unsigned width, unsigned height, unsigned wall, unsig
     wall     = unsigned(static_cells.size());
     auto map = std::make_shared<const GridMap>(meta, std::move(cells), std::move(asset));
     NavigationContext ctx(map);
+
     if (budget)
     {
         AirLimits l;
         l.buckets = 100;
         ctx.setAirLimits(l);
     }
+
     for (unsigned i = 0; i < objects; ++i)
     {
         // 同格不同高度的密集盒同时保留；查询必须枚举候选，不能依赖“遇到一个就假成功”。
@@ -42,10 +45,12 @@ void run(const char *name, unsigned width, unsigned height, unsigned wall, unsig
         if (!result.ok())
             throw std::runtime_error("benchmark setup failed");
     }
+
     const WorldPosition start{750, 1000, 2250}, end{std::int64_t(width) * 500 - 750, 1000, 2250};
     // 初始化与加载不计时；热身后每场景连续 10000 次。
     for (int i = 0; i < 10; ++i)
         findAirPath(ctx, start, end, 1000, {50, 100});
+
     std::vector<double> times;
     times.reserve(10000);
     std::map<std::string, unsigned> statuses;
@@ -64,6 +69,7 @@ void run(const char *name, unsigned width, unsigned height, unsigned wall, unsig
         if (result.ok())
             length = result.value.length_mm();
     }
+
     std::sort(times.begin(), times.end());
     const auto dense =
         map->cell_count() * (sizeof(NavigationContext::NodeScratch) + sizeof(std::int32_t) +

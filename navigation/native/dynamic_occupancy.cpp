@@ -98,6 +98,7 @@ NavigationAgentHandle DynamicOccupancy::FirstOccupantAt(const GridPos &grid) con
     {
         return {};
     }
+
     const auto &occupants = occupants_[IndexOf(grid)];
     return occupants.empty() ? NavigationAgentHandle{} : occupants.front();
 }
@@ -112,6 +113,7 @@ bool DynamicOccupancy::IsBlocked(const GridPos        &grid,
     {
         return true;
     }
+
     for (const NavigationAgentHandle handle : occupants_[IndexOf(grid)])
     {
         if (handle != ignore_handle)
@@ -181,6 +183,7 @@ NavResult<bool> DynamicOccupancy::Move(NavigationAgentHandle handle, const Navig
         {
             AddHandleAt(grid, handle);
         }
+
         return NavResult<bool>::Success(true);
     }
 
@@ -192,6 +195,7 @@ NavResult<bool> DynamicOccupancy::Move(NavigationAgentHandle handle, const Navig
     {
         occupants_[IndexOf(grid)].reserve(occupants_[IndexOf(grid)].size() + 1);
     }
+
     for (const GridPos &grid : current->cells)
     {
         RemoveHandleAt(grid, handle);
@@ -220,6 +224,7 @@ NavResult<bool> DynamicOccupancy::Release(NavigationAgentHandle handle)
     {
         return NavResult<bool>::Success(true);
     }
+
     for (const GridPos &grid : current->cells)
     {
         RemoveHandleAt(grid, handle);

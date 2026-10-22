@@ -37,13 +37,13 @@ class NavigationBindingTests(unittest.TestCase):
                 text=True, capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('FLYWOW_AIR_BINDING_OK', result.stdout)
+
             example = subprocess.run([os.environ['SKYNET_LUA'],
                 str(root / 'navigation/examples/air_navigation.lua'), str(root),
                 os.environ['NAVIGATION_NATIVE_DIR'], str(bmap), str(air)],
                 text=True, capture_output=True, timeout=15)
             self.assertEqual(example.returncode, 0, example.stdout + example.stderr)
             self.assertIn('FLYWOW_AIR_EXAMPLE_OK', example.stdout)
-
 
     def run_binding_script(self, script_name, marker, clearance=1):
         root = Path(__file__).resolve().parents[2]

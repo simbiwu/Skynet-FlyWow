@@ -196,6 +196,7 @@ NavResult<AirSweepResult> sweep(NavigationContext &ctx, AirState &s, WorldPositi
         return fail<AirSweepResult>(NavError::kOutOfBounds,
                                     "air endpoints/body outside coordinate range");
     }
+
     const std::int64_t right = m.origin_x_mm + std::int64_t(m.width) * m.cell_size_mm;
     const std::int64_t top   = m.origin_z_mm + std::int64_t(m.height) * m.cell_size_mm;
     if (minus(std::min(a.x_mm, b.x_mm), body.x_low) < m.origin_x_mm ||
@@ -205,6 +206,7 @@ NavResult<AirSweepResult> sweep(NavigationContext &ctx, AirState &s, WorldPositi
     {
         return fail<AirSweepResult>(NavError::kOutOfBounds, "air volume crosses map boundary");
     }
+
     AirSweepResult best;
     auto           hit = [&](const AirBox &box, AirHitKind kind, U handle, std::uint32_t cell)
     {
@@ -230,6 +232,7 @@ NavResult<AirSweepResult> sweep(NavigationContext &ctx, AirState &s, WorldPositi
         const auto high_x     = plus(plus(std::max(ax, bx), body.x_high), 1);
         const auto low_z      = minus(minus(std::min(az, bz), body.z_low), 1);
         const auto high_z     = plus(plus(std::max(az, bz), body.z_high), 1);
+
         const auto floor_cell = [&](std::int64_t v, std::int32_t origin) -> std::int64_t
         {
             const auto relative = v - origin;
@@ -239,6 +242,7 @@ NavResult<AirSweepResult> sweep(NavigationContext &ctx, AirState &s, WorldPositi
         const auto z0 = std::max<std::int64_t>(0, floor_cell(low_z, m.origin_z_mm));
         const auto x1 = std::min<std::int64_t>(m.width - 1, floor_cell(high_x, m.origin_x_mm));
         const auto z1 = std::min<std::int64_t>(m.height - 1, floor_cell(high_z, m.origin_z_mm));
+
         for (auto zz = z0; zz <= z1; ++zz)
         {
             for (auto xx = x0; xx <= x1; ++xx)
@@ -256,8 +260,10 @@ NavResult<AirSweepResult> sweep(NavigationContext &ctx, AirState &s, WorldPositi
                     if (cached != empty_cache->end() && *cached == cell)
                         continue;
                 }
+
                 if (!take(s.stats.buckets, s.limits.buckets))
                     return false;
+
                 bool       height_empty = !policy.check_terrain;
                 const auto low_y = minus(a.y_mm, body.y_low), high_y = plus(a.y_mm, body.y_high);
                 AirBox     column{{m.origin_x_mm + xx * m.cell_size_mm, kMin,
@@ -274,6 +280,7 @@ NavResult<AirSweepResult> sweep(NavigationContext &ctx, AirState &s, WorldPositi
                         policy.clearance_mm;
                     hit(terrain, AirHitKind::kStatic, 0, cell);
                 }
+
                 const auto &asset  = map.airAsset();
                 auto        record = std::lower_bound(asset.cells.begin(), asset.cells.end(), cell,
                                                       [](const AirCell &c, std::uint32_t id)
@@ -292,6 +299,7 @@ NavResult<AirSweepResult> sweep(NavigationContext &ctx, AirState &s, WorldPositi
                         hit(column, AirHitKind::kStatic, 0, cell);
                     }
                 }
+
                 for (auto it = s.links.lower_bound({cell, 0});
                      it != s.links.end() && it->first.first == cell; ++it)
                 {
@@ -306,8 +314,10 @@ NavResult<AirSweepResult> sweep(NavigationContext &ctx, AirState &s, WorldPositi
                         hit(box, AirHitKind::kDynamic, handle, cell);
                     }
                 }
+
                 if (empty_cache && height_empty)
                     empty_cache->insert(cached, cell);
+
             }
         }
         return true;
@@ -365,9 +375,11 @@ NavResult<bool> set(NavigationContext &ctx, AirState &s, NavigationAgentHandle h
     {
         return fail<bool>(NavError::kInvalidArgument, "air AABB/handle invalid");
     }
+
     const auto a = ctx.map()->WorldToGrid(box.min), b = ctx.map()->WorldToGrid(box.max);
     if (!a.ok() || !b.ok())
         return fail<bool>(NavError::kOutOfBounds, "air AABB outside map");
+
     // 闭下边界位于格线时必须同时关联左/下格；地图边界外不建立桶。
     auto x0 = a.value.x, z0 = a.value.z;
     if ((box.min.x_mm - m.origin_x_mm) % m.cell_size_mm == 0 && x0 > 0)
@@ -376,11 +388,13 @@ NavResult<bool> set(NavigationContext &ctx, AirState &s, NavigationAgentHandle h
         --z0;
     const U count = U(b.value.x - x0 + 1) * U(b.value.z - z0 + 1);
     auto    old   = s.objects.find(h.value);
+
     if (count > s.limits.object_links ||
         (old == s.objects.end() && s.objects.size() == s.limits.objects))
     {
         return fail<bool>(NavError::kCapacityExceeded, "air dynamic object/link capacity");
     }
+
     // 旧关联数只遍历旧盒覆盖的有界区域；不扫描 Context 的全部关联。
     std::vector<std::pair<std::uint32_t, U>> previous;
     previous.reserve(s.limits.object_links);
@@ -402,6 +416,7 @@ NavResult<bool> set(NavigationContext &ctx, AirState &s, NavigationAgentHandle h
     {
         return fail<bool>(NavError::kCapacityExceeded, "air total link capacity");
     }
+
     // 所有可能失败的分配先完成；C++17 相同 allocator 的 map merge 转移节点不分配。
     std::map<std::pair<std::uint32_t, U>, bool> prepared;
     for (int z = z0; z <= b.value.z; ++z)
@@ -409,6 +424,7 @@ NavResult<bool> set(NavigationContext &ctx, AirState &s, NavigationAgentHandle h
         for (int x = x0; x <= b.value.x; ++x)
             prepared.emplace(std::make_pair(std::uint32_t(U(z) * m.width + x), h.value), true);
     }
+
     std::map<U, AirBox> object;
     if (old == s.objects.end())
         object.emplace(h.value, box);
@@ -427,6 +443,7 @@ NavResult<WorldPosition> move(NavigationContext &ctx, AirState &s, NavigationAge
     const auto it = s.objects.find(h.value);
     if (it == s.objects.end())
         return fail<WorldPosition>(NavError::kInvalidArgument, "air handle not registered");
+
     const auto &box = it->second;
     const auto dx = distance(box.max.x_mm, box.min.x_mm), dy = distance(box.max.y_mm, box.min.y_mm),
                dz = distance(box.max.z_mm, box.min.z_mm);
@@ -437,6 +454,7 @@ NavResult<WorldPosition> move(NavigationContext &ctx, AirState &s, NavigationAge
     body.y_high = dy - dy / 2;
     body.z_low  = dz / 2;
     body.z_high = dz - dz / 2;
+
     if (!validBody(target, body))
         return fail<WorldPosition>(NavError::kInvalidArgument, "air body Y overflow");
     // 奇数毫米边长使用向下的中点；移动保存六个面相对中心的距离，不改变体积。

@@ -52,12 +52,14 @@ namespace FlyWow.Navigation.Editor
                 NavigationMapClearance.Compute(snapshot);
                 NavigationMapValidator.ValidateSnapshot(roots[0], snapshot);
                 ValidateCandidate?.Invoke(roots[0], snapshot);
+
                 if (string.IsNullOrWhiteSpace(roots[0].exportDirectory))
                 {
                     throw new InvalidOperationException("NAVIGATION_EXPORT_DIRECTORY_REQUIRED");
                 }
                 string outputDirectory = Path.GetFullPath(
                     Path.Combine(Application.dataPath, "..", roots[0].exportDirectory));
+
                 NavigationAssetPublisher.WriteCandidate(snapshot, outputDirectory,
                     AirNavWriter.Sample(roots[0], snapshot));
                 LastSnapshot = snapshot;

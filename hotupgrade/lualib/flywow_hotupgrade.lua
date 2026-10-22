@@ -33,7 +33,7 @@ skynet.register_protocol({name = "hotupgrade", id = hotupgrade_common.PROTOCOL_I
 --- 启动参数遵循 skynet.newservice 的原有约束；失败抛出含 HU_ 错误码的异常。
 ---@param service_name string 原生 Skynet Service 入口名
 ---@param ... any 原样转交原生 newservice 的启动参数
----@return integer handle
+---@return integer service_handle
 function M.newservice(service_name, ...)
     -- 基础设施转发未知启动签名，固定 n 以保留参数个数和 nil。
     local answer = skynet.call(hotupgrade_handle, "hotupgrade", "newservice",
@@ -41,14 +41,14 @@ function M.newservice(service_name, ...)
     assert(type(answer) == "table" and answer.ok,
         tostring(type(answer) == "table" and answer.code) .. ": " ..
         tostring(type(answer) == "table" and answer.message or answer))
-    return answer.handle
+    return answer.service_handle
 end
 
 --- 仅本 Controller 内的本地唯一服务；可能等待发布或在途唯一创建。
 --- true 重载明确抛出 HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED，不启动 Service。
 ---@param name_or_global string|boolean 逻辑名，或 true 表示后续首参为全局逻辑名
 ---@param ... any 完整启动参数；首次请求的参数生效
----@return integer handle
+---@return integer service_handle
 function M.uniqueservice(name_or_global, ...)
     local arguments = table.pack(...)
     local global = name_or_global == true
@@ -62,15 +62,16 @@ function M.uniqueservice(name_or_global, ...)
     assert(type(answer) == "table" and answer.ok,
         tostring(type(answer) == "table" and answer.code) .. ": " ..
         tostring(type(answer) == "table" and answer.message or answer))
-    return answer.handle
+    return answer.service_handle
 end
 
 --- 创建者在业务 init 失败后取消尚未登记的 Service；Controller 负责终止并解除屏障。
 --- 已登记、未知 handle 或非创建者请求均明确拒绝；可能 yield。
----@param handle integer newservice 返回的待登记 Service
+---@param service_handle integer newservice 返回的待登记 Service handle
 ---@return FlyWowHotUpgradeResult
-function M.cancel_service_creation(handle)
-    return skynet.call(hotupgrade_handle, "hotupgrade", "cancel_service_creation", {handle = handle})
+function M.cancel_service_creation(service_handle)
+    return skynet.call(hotupgrade_handle, "hotupgrade", "cancel_service_creation",
+        {service_handle = service_handle})
 end
 
 local function restore_service(txn)
@@ -90,6 +91,7 @@ local function restore_service(txn)
             end
         end
     end)
+
     for name, fn in pairs(staged.old_functions) do
         rawset(service_update.functions, name, fn)
     end
@@ -98,6 +100,7 @@ local function restore_service(txn)
 end
 
 local function abort(txn)
+    -- 先尝试恢复 Service 私有状态，再恢复模块导出；一个失败也继续另一项。
     local errors = {}
     local ok, message = pcall(restore_service, txn)
     if not ok then
@@ -113,6 +116,7 @@ local function abort(txn)
         end
     end
 
+    -- 任何恢复项失败都保留关闭状态；只有全部恢复成功才释放事务。
     if #errors > 0 then
         txn.phase = "RECOVERY_REQUIRED"
         return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
@@ -131,16 +135,20 @@ local function stage_service(source)
         return nil
     end
 
+    -- 执行受信 Patch 构建函数并校验结果；此时尚不写入线上状态。
     local service_update = assert(module_state.registration.service_update, "Service 未提供内部更新入口")
     local chunk = assert(load(source, "=Service Patch", "t", _G))
     local build = chunk()
     assert(type(build) == "function", "Service Patch 必须返回构建函数")
     local patch = build(service_update.state)
+
     assert(type(patch) == "table" and getmetatable(patch) == nil, "Service 构建结果必须是普通表")
     assert(patch.migrate == nil or type(patch.migrate) == "function", "migrate 必须是函数")
     assert(patch.functions == nil or (type(patch.functions) == "table"
         and getmetatable(patch.functions) == nil), "functions 必须是普通表")
     assert(patch.migrate or (patch.functions and next(patch.functions)), "Service Patch 没有更新内容")
+
+    -- 保存本次可能替换的旧函数，Activate 失败时逐字段恢复。
     local staged =
     {
         patch = patch,       -- 仅本 State 持有的新函数和迁移函数。
@@ -153,6 +161,7 @@ local function stage_service(source)
         staged.old_functions[name] = rawget(service_update.functions, name)
     end
 
+    -- 迁移只接触隔离快照，并在 Stage 完成前生成独立候选状态。
     if patch.migrate then
         if service_update.snapshot then
             staged.old_state = service_update.snapshot(service_update.state)
@@ -187,6 +196,7 @@ end
 ---@param source integer 由 Skynet 提供的真实调用来源
 ---@return FlyWowHotUpgradeResult 恢复不确定时保持 patching=true
 local function handle_upgrade(command, request, source)
+    -- 先核验 Controller 来源和批次请求；校验通过后才触碰活动事务。
     if not module_state.registration or source ~= hotupgrade_handle then
         return hotupgrade_result.failure("HU_UNAUTHORIZED", "控制来源不匹配")
     end
@@ -213,16 +223,17 @@ local function handle_upgrade(command, request, source)
         if module_state.active_transaction then
             return hotupgrade_result.failure("HU_UPGRADE_BUSY", "当前批次已在处理中")
         end
+
         local txn = {batch_id = request.batch_id, sequence = request.sequence, phase = "QUIESCING"}
         module_state.active_transaction = txn
         M.patching = true
-        if not module_state.registration.before_upgrade then
-            return hotupgrade_result.failure("HU_SAFEPOINT_REQUIRED", "未提供 before_upgrade，不能确认业务已排空")
-        end
+
         local ok, answer = pcall(module_state.registration.before_upgrade)
+
         if module_state.active_transaction ~= txn or not M.patching then
             return hotupgrade_result.failure("HU_STALE_TRANSACTION", "等待时批次已结束")
         end
+
         if not ok then
             return hotupgrade_result.failure("HU_PREPARE_FAILED", tostring(answer))
         end
@@ -293,6 +304,7 @@ local function handle_upgrade(command, request, source)
                 assert(module_state.registration.after_upgrade() ~= false, "after_upgrade 拒绝更新")
             end
         end)
+
         if not ok then
             local restored = abort(txn)
             return restored.ok and hotupgrade_result.failure("HU_ACTIVATE_FAILED", tostring(message)) or restored
@@ -329,13 +341,14 @@ end
 
 ---@class FlyWowHotUpgradeRegistration
 ---@field service_update? FlyWowHotUpgradeServiceUpdate 可选 Service 内部状态/函数更新入口
----@field before_upgrade? fun():boolean|table prepare 设置 patching 后调用，允许 yield；须通过业务自己的 queue 确认此前业务结束。true 或 {ok=true} 才允许 Update，缺失或失败则 Abort
+---@field before_upgrade fun():boolean|table 注册必填；每次 Prepare 设置 patching 后调用，允许 yield；须通过业务自己的 queue 确认此前业务结束。true 或 {ok=true} 才允许 Update，失败则 Abort
 ---@field after_upgrade? fun():boolean Update 内 Activate 提交模块与 Service 状态后、finish 前调用；false 或异常触发组合恢复。只检查已提交状态，不得产生外部副作用或 yield
 
 --- 登记现存 Service；仅元数据跨 Service 传递。可能 yield，成功前宿主不能宣布 READY。
----@param registration FlyWowHotUpgradeRegistration 本 State 配置及可选 Service 更新入口
+---@param registration FlyWowHotUpgradeRegistration 本 State 必须提供 before_upgrade；service_update 可选
 ---@return FlyWowHotUpgradeResult 登记结果
 function M.register_service(registration)
+    -- 先验证回调与可选更新入口合同；检查完成前不安装 dispatch 或登记状态。
     if module_state.registration then
         return hotupgrade_result.failure("HU_DUPLICATE_SERVICE", "当前 State 已登记")
     end
@@ -347,7 +360,7 @@ function M.register_service(registration)
         return hotupgrade_result.failure("HU_INVALID_OPTIONS", "不再接受 service_module")
     end
 
-    if registration.before_upgrade ~= nil and type(registration.before_upgrade) ~= "function" then
+    if type(registration.before_upgrade) ~= "function" then
         return hotupgrade_result.failure("HU_INVALID_OPTIONS", "before_upgrade 必须为函数")
     end
 
@@ -377,6 +390,7 @@ function M.register_service(registration)
         return hotupgrade_result.failure("HU_LIFECYCLE_PENDING", "本 State 仍有模块首次加载，完成后再登记 Service")
     end
 
+    -- 合同有效后固定本地登记配置并安装接收器，再向 Controller 登记元数据。
     module_state.registration = registration
     skynet.dispatch("hotupgrade", function(session, source, command, request)
         local ok, answer = pcall(handle_upgrade, command, request, source)
@@ -392,6 +406,7 @@ function M.register_service(registration)
             skynet.retpack(answer)
         end
     end)
+    -- 收集完整模块声明并排序，形成跨 Service 传递的稳定元数据快照。
     local names = {}
     for name in pairs(module_state.declared_modules) do
         names[#names + 1] = name
@@ -404,6 +419,7 @@ function M.register_service(registration)
         has_service_update = service_update ~= nil,
     }
     local ok, answer = pcall(skynet.call, hotupgrade_handle, "hotupgrade", "register", metadata)
+    -- 发布登记 RPC 的最终结果，再唤醒等待首次 require 的协程。
     module_state.registration_complete = true
     module_state.registered = ok and type(answer) == "table" and answer.ok == true
     for _, thread in ipairs(module_state.registration_waiters) do
@@ -419,6 +435,7 @@ end
 ---@param name string 宿主原有 require 名；Controller 使用实际文件的根目录相对路径登记
 ---@return table 当前 State 的稳定模块导出表
 function M.require(name)
+    -- 先解析原始 require 名对应的宿主文件身份，后续缓存和登记都以该路径核对。
     assert(type(name) == "string" and name ~= "", "模块名无效")
     local root_path = assert(skynet.getenv(hotupgrade_common.ROOT_PATH_ENV),
         "HU_NOT_INITIALIZED: 须先初始化 Controller，再声明可更新模块")
@@ -436,6 +453,7 @@ function M.require(name)
     local canonical_name = relative_path:sub(1, -5):gsub("/", ".")
     assert(canonical_name ~= "", "HU_INVALID_PATH: 模块文件路径无效")
 
+    -- 当前 State 已进入首次登记时先等待 Controller 结果，避免声明越过登记快照。
     if module_state.registration and not module_state.registered then
         if not module_state.registration_complete then
             local thread = coroutine.running()
@@ -445,6 +463,7 @@ function M.require(name)
         assert(module_state.registered, "HU_SERVICE_NOT_REGISTERED: 首次登记失败，须终止本次启动")
     end
 
+    -- 同一规范路径首次加载串行化，等待者完成后重新检查缓存和声明。
     local loading = module_state.module_loads[canonical_name]
     if loading then
         local thread = coroutine.running()
@@ -456,6 +475,7 @@ function M.require(name)
 
     loading = {owner = coroutine.running(), waiters = {}}
     module_state.module_loads[canonical_name] = loading
+    -- 建立本次加载的回滚边界；许可、缓存别名和声明必须整体完成或恢复。
     local permit_id                 -- 仅已登记 Service 的首次声明持有，完成登记或失败取消后释放。
     local cached_value              -- 许可恢复后读取的原名缓存，失败时原样恢复。
     local previous_alias            -- 许可恢复后读取的规范别名，不清除合法既有缓存。
@@ -525,6 +545,7 @@ function M.require(name)
                 "模块登记失败: " .. tostring(type(answer) == "table" and answer.message or answer))
         end
     end)
+    -- 任一步失败都恢复原名缓存、规范别名和本次新增的本地声明。
     if not ok then
         if snapshot_taken then
             package.loaded[name] = cached_value
@@ -543,10 +564,13 @@ function M.require(name)
         end
     end
 
+    -- 释放首次加载锁并唤醒等待者，让它们重新检查模块状态。
     module_state.module_loads[canonical_name] = nil
     for _, thread in ipairs(loading.waiters) do
         skynet.wakeup(thread)
     end
+
+    -- 回滚和清理完成后才把错误返回给 require 调用方。
     if not ok then
         error(message, 0)
     end

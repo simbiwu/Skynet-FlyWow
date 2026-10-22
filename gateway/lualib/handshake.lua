@@ -28,8 +28,10 @@ function M.new(handshake_config)
     local now = assert(handshake_config.now)
     local max_pending = assert(handshake_config.max_pending)
     local timeout_ticks = assert(handshake_config.timeout_ticks)
+
     assert(math.type(max_pending) == "integer" and max_pending > 0)
     assert(math.type(timeout_ticks) == "integer" and timeout_ticks > 0 and timeout_ticks < 0x80000000)
+
     local pending = 0
     local manager = {}
 
@@ -102,6 +104,7 @@ function M.new(handshake_config)
     function manager.receive(handshake_input)
         local context = handshake_input.context
         local bytes   = handshake_input.bytes
+
         if manager.expired(context) then
             manager.close(context)
             return nil, "HANDSHAKE_TIMEOUT"
@@ -111,6 +114,7 @@ function M.new(handshake_config)
             manager.close(context)
             return nil, "HANDSHAKE_FRAME"
         end
+
         if context.phase == "hello" then
             if bytes:byte(1) ~= 1 or bytes:byte(2) ~= 1 then
                 manager.close(context)
@@ -126,6 +130,7 @@ function M.new(handshake_config)
             context.phase = "proof"
             return response
         end
+
         if context.phase == "proof" then
             local ok, response = pcall(context.crypto.verify, context.crypto, bytes)
             if not ok then
@@ -135,6 +140,7 @@ function M.new(handshake_config)
             context.phase = "confirm"
             return response, nil, true
         end
+
         manager.close(context)
         return nil, "HANDSHAKE_STATE"
     end
@@ -158,6 +164,8 @@ function M.new(handshake_config)
     function manager.ready(context)
         return context ~= nil and context.phase == "ready"
     end
+
     return manager
 end
+
 return M

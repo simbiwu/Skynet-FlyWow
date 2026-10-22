@@ -416,6 +416,7 @@ void TestAreaCostChangesRoute()
         }
     }
     assert(left_middle_row);
+
     assert(GridPathfinder::ValidatePathStatic(ctx, p, r.value).ok());
 }
 

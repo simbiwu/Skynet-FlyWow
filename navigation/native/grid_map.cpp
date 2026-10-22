@@ -49,6 +49,7 @@ NavResult<GridPos> GridMap::WorldToGrid(const WorldPosition &world) const
         return NavResult<GridPos>::Failure(NavError::kOutOfBounds,
                                            "world position outside BMAP V1 coordinate range");
     }
+
     const std::int64_t relative_x = // 相对 Grid 起点的世界 X 偏移，毫米；允许负数。
         world.x_mm - metadata_.origin_x_mm;
     const std::int64_t relative_z = // 相对 Grid 起点的世界 Z 偏移，毫米；允许负数。
@@ -77,6 +78,7 @@ NavResult<GridPos> GridMap::WorldToGrid(const WorldPosition &world) const
         return NavResult<GridPos>::Failure(NavError::kOutOfBounds,
                                            "world position outside map bounds");
     }
+
     return NavResult<GridPos>::Success(grid);
 }
 
@@ -121,6 +123,7 @@ NavResult<NavCell> GridMap::QueryWorld(const WorldPosition &world) const
     {
         return NavResult<NavCell>::Failure(grid.error, grid.detail);
     }
+
     return NavResult<NavCell>::Success(cells_[IndexOf(grid.value)]);
 }
 
@@ -155,6 +158,7 @@ std::int64_t GridMap::FloorDiv(std::int64_t value, std::int64_t divisor)
     {
         throw std::invalid_argument("divisor must be positive");
     }
+
     std::int64_t       quotient  = value / divisor;
     const std::int64_t remainder = value % divisor;
     // C++ 的 -1/500 是 0，但原点左侧 1mm 必须归到 -1 格。

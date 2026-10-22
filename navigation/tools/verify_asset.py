@@ -17,18 +17,22 @@ def verify(bmap, manifest, map_id=None, map_version=None, airnav=None):
     """
     if bmap.stat().st_size > 128 * 1024 * 1024 or manifest.stat().st_size > 65536:
         raise ValueError('NAVIGATION_ASSET_SIZE_LIMIT')
+
     # 同时限制实际读取，防止 stat 后文件增长使一次分配绕过上限。
     with bmap.open('rb') as stream:
         data = stream.read(128 * 1024 * 1024 + 1)
     if len(data) > 128 * 1024 * 1024:
         raise ValueError('NAVIGATION_ASSET_SIZE_LIMIT')
+
     with manifest.open('rb') as stream:
         text = stream.read(65537)
     if len(text) > 65536:
         raise ValueError('NAVIGATION_ASSET_SIZE_LIMIT')
+
     metadata = json.loads(text.decode('utf-8-sig'))
     if not isinstance(metadata, dict):
         raise ValueError('NAVIGATION_MANIFEST_INVALID')
+
     if len(data) < 64 or data[:4] != b'BMAP':
         raise ValueError('BMAP_HEADER_INVALID')
     fmt, header_size = struct.unpack_from('<HH', data, 4)
@@ -37,16 +41,20 @@ def verify(bmap, manifest, map_id=None, map_version=None, airnav=None):
     payload_size, payload_crc, header_crc = struct.unpack_from('<III', data, 44)
     if fmt != 1 or header_size != 64 or stride != 8:
         raise ValueError('BMAP_UNSUPPORTED_FORMAT')
+
     if not identity or not version or not width or not height or not cell_size:
         raise ValueError('BMAP_METADATA_INVALID')
     if len(data) != 64 + width * height * 8 or payload_size != len(data) - 64:
         raise ValueError('BMAP_SIZE_MISMATCH')
+
     header = bytearray(data[:64])
     header[52:56] = bytes(4)
     if zlib.crc32(header) != header_crc or zlib.crc32(data[64:]) != payload_crc:
         raise ValueError('BMAP_CRC_MISMATCH')
+
     if metadata.get('space_type') != 'ground_2_5d' or metadata.get('coordinate_axes') != 'x,y_height,z':
         raise ValueError('NAVIGATION_SPACE_UNSUPPORTED')
+
     expected = dict(format_version=fmt, map_id=identity, map_version=version,
                     width=width, height=height, cell_size_mm=cell_size,
                     origin_mm=list(struct.unpack_from('<ii', data, 28)),
@@ -65,6 +73,7 @@ def verify(bmap, manifest, map_id=None, map_version=None, airnav=None):
             raise ValueError('AIRNAV_MANIFEST_CAPABILITY')
         if airnav.stat().st_size > 32 * 1024 * 1024:
             raise ValueError('AIRNAV_SIZE_LIMIT')
+
         with airnav.open('rb') as stream:
             air = stream.read(32 * 1024 * 1024 + 1)
         verify_air(air, data)
@@ -94,6 +103,7 @@ def verify_air(air, bmap):
     if records > width * height or count > 1048576 or len(air) != 96 + records*12 + count*16:
         raise ValueError('AIRNAV_LENGTH')
     expected, previous = 0, -1
+
     for i in range(records):
         cell, offset, length = struct.unpack_from('<III', air, 96+i*12)
         if cell <= previous or cell >= width*height or offset != expected or not 1 <= length <= 64 or offset+length > count:
@@ -106,6 +116,7 @@ def verify_air(air, bmap):
             last = high
         expected += length
         previous = cell
+
     if expected != count:
         raise ValueError('AIRNAV_UNREFERENCED_INTERVAL')
 
