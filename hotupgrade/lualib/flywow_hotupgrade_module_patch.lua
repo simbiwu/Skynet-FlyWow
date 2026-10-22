@@ -7,61 +7,72 @@ local module_state =
     active = nil, -- 本 State 唯一候选和旧快照，保留至 finish/abort。
 }
 
---- 复制普通数据图；保留图内共享与循环，不复制函数、userdata、线程或带元表对象。
---- 非普通业务对象必须由所属 Service 的显式快照/恢复函数处理。
----@param value any 要隔离的数据
----@param destination? table 内部恢复时指定现存根表；调用前须保存独立旧快照
----@return any snapshot 独立数据图；不支持的值抛出错误，调用边界负责转换结果。
-function M.copy_state(value, destination)
-    local seen = {} -- 当前复制过程的旧表到新表映射，不保留在线上状态中。
-    local count = 0 -- 限制一次快照的节点/字段数，避免错误状态图耗尽控制阶段资源。
-    local function copy(item, depth)
-        local kind = type(item)
-        if kind ~= "table" then
-            assert(kind == "nil" or kind == "string" or kind == "boolean" or kind == "number",
-                "状态快照只接受普通数据")
-            return item
+--- 将普通状态数据图从 source_graph 复制到 target_graph，保留共享引用和循环引用。
+--- 恢复时复用目标根表；若来源中的 self 指向来源根表，复制后 self 会指向目标根表。
+---@param source_graph any 待复制的状态数据图
+---@param target_graph? table 可选的现存根表；提供时先清空，再原地写入复制结果
+---@return any copied_graph 新建的复制结果；提供 target_graph 时返回该目标根表
+local function copy_state_graph(source_graph, target_graph)
+    local copied_tables = {} -- 源表到目标表的映射，用于保留共享引用和循环引用。
+    local field_count = 0 -- 当前快照复制的字段数；达到上限时拒绝继续复制。
+    local function copy_state_value(source_value, nesting_depth)
+        local value_type = type(source_value)
+        if value_type ~= "table" then
+            assert(value_type == "nil" or value_type == "string" or value_type == "boolean"
+                or value_type == "number", "状态快照只接受普通数据")
+            return source_value
         end
 
-        assert(getmetatable(item) == nil, "状态对象需要显式快照和恢复处理")
-        if seen[item] then
-            return seen[item]
+        assert(getmetatable(source_value) == nil, "状态对象需要显式快照和恢复处理")
+        if copied_tables[source_value] then
+            return copied_tables[source_value]
         end
 
-        assert(depth <= 64, "状态快照嵌套超过 64 层")
-        local target = {}
-        if depth == 1 and destination then
-            target = destination
-            assert(target ~= item and getmetatable(target) == nil, "快照必须与线上根表隔离")
-            for key in pairs(target) do
-                rawset(target, key, nil)
+        assert(nesting_depth <= 128, "状态快照嵌套超过 128 层")
+        local target_table = {}
+        if nesting_depth == 1 and target_graph then
+            target_table = target_graph
+            assert(target_table ~= source_value and getmetatable(target_table) == nil,
+                "快照必须与线上根表隔离")
+            for key in pairs(target_table) do
+                rawset(target_table, key, nil)
             end
         end
-        seen[item] = target
-        for key, child in pairs(item) do
-            count = count + 1
-            assert(count <= 10000, "状态快照超过 10000 个字段")
+        copied_tables[source_value] = target_table
+        for key, child_source in pairs(source_value) do
+            field_count = field_count + 1
+            assert(field_count <= 10000, "状态快照超过 10000 个字段")
             assert(type(key) == "string" or type(key) == "number" or type(key) == "boolean",
                 "状态字段必须使用标量键")
-            target[key] = copy(child, depth + 1)
+            target_table[key] = copy_state_value(child_source, nesting_depth + 1)
         end
 
-        return target
+        return target_table
     end
 
-    return copy(value, 1)
+    return copy_state_value(source_graph, 1)
 end
 
---- 原地恢复普通数据图；根循环重新指向 live，不让候选表取代线上根身份。
-function M.restore_state(live, fields)
-    assert(type(live) == "table" and type(fields) == "table", "状态必须为表")
-    M.copy_state(fields, live)
+--- 创建与来源隔离的普通数据图快照。
+---@param source_graph any 要隔离的状态数据图
+---@return any state_snapshot 独立快照；遇到不支持的数据时抛出错误
+function M.snapshot_state(source_graph)
+    return copy_state_graph(source_graph)
+end
+
+--- 将 source_graph 恢复到 target_graph；目标根表原地更新，身份保持不变。
+---@param source_graph table 独立的普通状态快照
+---@param target_graph table 需要原地恢复的线上状态根表
+function M.restore_state(source_graph, target_graph)
+    assert(type(source_graph) == "table" and type(target_graph) == "table", "状态必须为表")
+    copy_state_graph(source_graph, target_graph)
 end
 
 --- 原地覆盖模块导出字段；各字段引用直接安装，保留导出表身份。
 ---@param live table Commit/Abort 已确认身份和元表的线上表
 ---@param fields table 完整新字段；调用者保证与 live 隔离
 local function replace_exports(live, fields)
+    --热更路径要求模块导出表没有元表，回滚前也会检查这一点。所以在当前约束下，普通赋值和 rawset 的效果相同。
     for key in pairs(live) do
         rawset(live, key, nil)
     end
@@ -72,42 +83,25 @@ local function replace_exports(live, fields)
 end
 
 local function check_exports(exports, name)
-    -- 先校验顶层导出并收集嵌套表，seen 允许数据图共享引用和循环引用。
-    assert(type(exports) == "table" and getmetatable(exports) == nil, name .. " 必须导出普通表")
-    local pending = {} -- 待检查的嵌套表；迭代遍历避免深层数据造成递归栈溢出。
-    local seen = {}    -- 每张嵌套表只检查一次，允许共享引用与嵌套表之间的循环。
-    local function check_value(value)
-        local kind = type(value)
-        if kind == "table" then
-            assert(value ~= exports, name .. " 嵌套导出不得引用模块根导出表")
-            assert(getmetatable(value) == nil, name .. " 嵌套导出必须是无元表普通表")
-            if not seen[value] then
+    assert(type(exports) == "table" and getmetatable(exports) == nil, name .. " 必须导出无元表根表")
+    local pending = {exports}
+    local seen = {[exports] = true}
+    while #pending > 0 do
+        local current = table.remove(pending)
+        for key, value in next, current do
+            assert(key ~= exports and value ~= exports, name .. " 导出数据不得引用模块根导出表")
+            if type(key) == "table" and not seen[key] then
+                seen[key] = true
+                pending[#pending + 1] = key
+            end
+            if type(value) == "table" and not seen[value] then
                 seen[value] = true
                 pending[#pending + 1] = value
             end
-        else
-            assert(kind == "function" or kind == "number" or kind == "string" or kind == "boolean",
-                name .. " 导出包含不支持的类型: " .. kind)
         end
     end
 
-    for key, value in pairs(exports) do
-        assert(type(key) == "string", name .. " 顶层导出字段名必须是字符串")
-        check_value(value)
-    end
-
-    -- 遍历嵌套数据图，校验键和值类型并拒绝元表和根表回指。
-    while #pending > 0 do
-        local nested = table.remove(pending)
-        for key, value in pairs(nested) do
-            local kind = type(key)
-            assert(kind == "string" or kind == "number" or kind == "boolean",
-                name .. " 嵌套导出键必须是字符串、数字或布尔值")
-            check_value(value)
-        end
-    end
-
-    -- 模块私有状态钩子是额外合同，必须成对提供且都为函数。
+    -- 模块私有状态钩子在单个版本内成对提供；跨版本是否迁移由 Stage 决定。
     assert((exports.export_state == nil) == (exports.import_state == nil), name .. " 状态钩子须成对")
     if exports.export_state ~= nil then
         assert(type(exports.export_state) == "function" and type(exports.import_state) == "function",
@@ -162,15 +156,9 @@ function M.stage(entries)
             local candidate = entry.chunk()
             check_exports(candidate, entry.name)
             assert(candidate ~= entry.live, "候选须返回新的导出表")
-            for key, value in pairs(candidate) do
-                assert(entry.live[key] == nil or type(entry.live[key]) == type(value), "导出字段类型变化")
-            end
-
-            assert((entry.live.export_state == nil) == (candidate.import_state == nil),
-                "新旧模块缺少配对状态钩子")
-            if entry.live.export_state then
-                -- 新版只能接触独立数据；旧闭包仍持有自己的状态，Abort 恢复旧导出即可。
-                local snapshot = M.copy_state(entry.live.export_state())
+            -- 只有旧版提供快照且新版提供导入钩子时才迁移；缺少任一方就使用新版初始化状态。
+            if entry.live.export_state and candidate.import_state then
+                local snapshot = M.snapshot_state(entry.live.export_state())
                 assert(candidate.import_state(snapshot) ~= false, "模块拒绝状态导入")
             end
             entry.candidate = candidate

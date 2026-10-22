@@ -1771,13 +1771,7 @@ if command == "update" then
     if txn.phase ~= nil then
         return hotupgrade_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
-    -- Stage 只准备候选和快照，不写线上导出或状态。
-    for _, entry in ipairs(request.modules or {}) do
-        if not module_state.declared_modules[entry.name] then
-            return hotupgrade_result.failure("HU_MODULE_NOT_REGISTERED", tostring(entry.name))
-        end
-    end
-
+    -- Controller 已按本 State 的登记模块筛选 Patch；Stage 准备候选和快照，不写线上状态。
     local staged = hotupgrade_module_patch.stage(request.modules or {})
     if not staged.ok then
         return staged
@@ -1835,15 +1829,10 @@ for _, entry in ipairs(module_stage.entries) do
     local candidate = entry.chunk()
     check_exports(candidate, entry.name)
     assert(candidate ~= entry.live, "候选须返回新的导出表")
-    for key, value in pairs(candidate) do
-        assert(entry.live[key] == nil or type(entry.live[key]) == type(value), "导出字段类型变化")
-    end
 
-    assert((entry.live.export_state == nil) == (candidate.import_state == nil),
-        "新旧模块缺少配对状态钩子")
-    if entry.live.export_state then
-        -- 新版只能接触独立数据；旧闭包仍持有自己的状态，Abort 恢复旧导出即可。
-        local snapshot = M.copy_state(entry.live.export_state())
+    -- 只有旧版提供快照且新版提供导入钩子时才迁移；缺少任一方就使用新版初始化状态。
+    if entry.live.export_state and candidate.import_state then
+        local snapshot = M.snapshot_state(entry.live.export_state())
         assert(candidate.import_state(snapshot) ~= false, "模块拒绝状态导入")
     end
     entry.candidate = candidate
@@ -1903,6 +1892,8 @@ local function stage_service(source)
     {
         patch = patch,       -- 仅本 State 持有的新函数和迁移函数。
         old_functions = {}, -- 本次将替换的现有函数，不处理未列出的字段。
+        has_old_state = false,
+        has_next_state = false,
         touched = false,    -- 首次线上写入前置 true，部分提交同样必须恢复。
     }
     for name, fn in pairs(patch.functions or {}) do
@@ -1915,18 +1906,22 @@ local function stage_service(source)
         if service_update.snapshot then
             staged.old_state = service_update.snapshot(service_update.state)
             local isolated = service_update.snapshot(service_update.state)
-            assert(type(staged.old_state) == "table" and type(isolated) == "table"
-                and staged.old_state ~= service_update.state and isolated ~= staged.old_state
-                and isolated ~= service_update.state, "自定义快照必须独立")
+            assert(staged.old_state ~= service_update.state and isolated ~= service_update.state
+                and (type(staged.old_state) ~= "table" or type(isolated) ~= "table"
+                    or staged.old_state ~= isolated), "自定义快照不得复用线上状态根表或同一快照表")
+            staged.has_old_state = true
             staged.next_state = patch.migrate(isolated)
+            assert(staged.next_state ~= service_update.state, "迁移候选不得复用线上状态根表")
+            staged.has_next_state = true
         else
-            staged.old_state = hotupgrade_module_patch.copy_state(service_update.state)
-            staged.next_state = patch.migrate(hotupgrade_module_patch.copy_state(staged.old_state))
-            staged.next_state = hotupgrade_module_patch.copy_state(staged.next_state)
+            staged.old_state = hotupgrade_module_patch.snapshot_state(service_update.state)
+            staged.has_old_state = true
+            staged.next_state = patch.migrate(hotupgrade_module_patch.snapshot_state(staged.old_state))
+            assert(type(staged.next_state) == "table" and staged.next_state ~= service_update.state,
+                "默认迁移须返回独立状态表")
+            staged.next_state = hotupgrade_module_patch.snapshot_state(staged.next_state)
+            staged.has_next_state = true
         end
-
-        assert(type(staged.next_state) == "table" and staged.next_state ~= service_update.state,
-            "迁移须返回完整独立候选状态")
     end
 
     return staged
@@ -2076,11 +2071,11 @@ local ok, message = pcall(function()
     if staged then
         local service_update = module_state.registration.service_update
         staged.touched = true
-        if staged.next_state then
+        if staged.has_next_state then
             if service_update.commit then
                 assert(service_update.commit(service_update.state, staged.next_state) ~= false, "Service 拒绝提交")
             else
-                hotupgrade_module_patch.restore_state(service_update.state, staged.next_state)
+                hotupgrade_module_patch.restore_state(staged.next_state, service_update.state)
             end
         end
 
@@ -2170,16 +2165,16 @@ state.equip = "刀"
 
 随后，因为本例没有自定义 `commit()`，框架调用：
 
-`hotupgrade_module_patch.restore_state(service_update.state, staged.next_state)`
+`hotupgrade_module_patch.restore_state(staged.next_state, service_update.state)`
 
 虽然这里使用的函数名叫 `restore_state`，但它负责的是把一份普通数据图的字段**原地应用到指定根表**。
 
 对应源码：
 
 ```lua
-function M.restore_state(live, fields)
-    assert(type(live) == "table" and type(fields) == "table", "状态必须为表")
-    M.copy_state(fields, live)
+function M.restore_state(source_graph, target_graph)
+    assert(type(source_graph) == "table" and type(target_graph) == "table", "状态必须为表")
+    copy_state_graph(source_graph, target_graph)
 end
 ```
 
@@ -2187,9 +2182,9 @@ end
 
 调用时：
 
-`live` 是原 PlayerService 的 `state`。
+`target_graph` 是原 PlayerService 的 `state`。
 
-`fields` 是 Stage 生成的 `next_state`。
+`source_graph` 是 Stage 生成的 `next_state`。
 
 执行结束后，原 `state` 的字段已经成为：
 

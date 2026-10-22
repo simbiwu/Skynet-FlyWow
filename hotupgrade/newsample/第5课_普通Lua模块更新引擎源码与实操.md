@@ -333,15 +333,10 @@ function M.stage(entries)
             local candidate = entry.chunk()
             check_exports(candidate, entry.name)
             assert(candidate ~= entry.live, "候选须返回新的导出表")
-            for key, value in pairs(candidate) do
-                assert(entry.live[key] == nil or type(entry.live[key]) == type(value), "导出字段类型变化")
-            end
 
-            assert((entry.live.export_state == nil) == (candidate.import_state == nil),
-                "新旧模块缺少配对状态钩子")
-            if entry.live.export_state then
-                -- 新版只能接触独立数据；旧闭包仍持有自己的状态，Abort 恢复旧导出即可。
-                local snapshot = M.copy_state(entry.live.export_state())
+            -- 只有旧版提供快照且新版提供导入钩子时才迁移；缺少任一方就使用新版初始化状态。
+            if entry.live.export_state and candidate.import_state then
+                local snapshot = M.snapshot_state(entry.live.export_state())
                 assert(candidate.import_state(snapshot) ~= false, "模块拒绝状态导入")
             end
             entry.candidate = candidate
@@ -458,9 +453,6 @@ Stage 在这里尚未结束，所以现在不会返回给实验脚本。
 local candidate = entry.chunk()
 check_exports(candidate, entry.name)
 assert(candidate ~= entry.live, "候选须返回新的导出表")
-for key, value in pairs(candidate) do
-    assert(entry.live[key] == nil or type(entry.live[key]) == type(value), "导出字段类型变化")
-end
 ```
 
 这段是 `M.stage()` 第二轮循环的开头。这里才真正调用 `chunk()`，执行我们的 V2 `player_logic.lua`。
@@ -478,16 +470,14 @@ local M =
 
 这段代码来自我们自己编写的 `hotupgrade/lesson5/v2/player_logic.lua` 的文件顶部。它会创建**新的候选导出表**以及**新的 V2 私有 count**，与旧模块不是同一张表，也不是同一份 upvalue。
 
-随后 `check_exports(candidate, entry.name)` 验证候选导出；`candidate ~= entry.live` 明确禁止候选返回正在使用的旧导出根表。另一个循环禁止新版与旧版**同名顶层字段改变类型**。例如 V1 `version` 是函数，V2 也应当是函数；新版新增 `new_tag`、删除 `legacy_tag` 则允许。
+随后 `check_exports(candidate, entry.name)` 验证候选导出；`candidate ~= entry.live` 明确禁止候选返回正在使用的旧导出根表。引擎不限制新版与旧版同名字段的 Lua 类型，提交时由候选表完整决定导出字段；业务方按自己的模块更新方案处理调用方兼容性。
 
 再往下 Stage 处理私有状态：
 
 ```lua
-assert((entry.live.export_state == nil) == (candidate.import_state == nil),
-    "新旧模块缺少配对状态钩子")
-if entry.live.export_state then
-    -- 新版只能接触独立数据；旧闭包仍持有自己的状态，Abort 恢复旧导出即可。
-    local snapshot = M.copy_state(entry.live.export_state())
+-- 只有旧版提供快照且新版提供导入钩子时才迁移；缺少任一方就使用新版初始化状态。
+if entry.live.export_state and candidate.import_state then
+    local snapshot = M.snapshot_state(entry.live.export_state())
     assert(candidate.import_state(snapshot) ~= false, "模块拒绝状态导入")
 end
 entry.candidate = candidate
@@ -498,7 +488,7 @@ entry.chunk = nil
 
 `entry.live.export_state()` 调用的是 **V1 模块导出表中的旧函数**。它访问旧闭包捕获的 `count=2`，返回 `{count=2}`。
 
-`M.copy_state()` 把结果复制成独立普通数据图，避免新模块直接持有旧模块返回的可变状态对象。然后，Stage 调用 **V2 候选导出表** 中的 `candidate.import_state(snapshot)`。
+`M.snapshot_state()` 把结果复制成独立普通数据图，避免新模块直接持有旧模块返回的可变状态对象。然后，Stage 调用 **V2 候选导出表** 中的 `candidate.import_state(snapshot)`。
 
 V2 `import_state()` 将自己刚刚创建的 `count=0` 改为 `count=2`。
 
@@ -552,7 +542,7 @@ module_state.active = module_stage
 
 **Stage 已经准备好未来要安装的 V2，但业务当前访问的仍是 V1。**
 
-## 四、Stage 为什么还需要 `check_exports()` 与 `copy_state()`？
+## 四、Stage 为什么还需要 `check_exports()` 与 `snapshot_state()`？
 
 刚才为了保持调用链连续，我们先跟完了整个 Stage。现在两个辅助函数已经实际出现，而且它们分别影响候选是否可接受、模块私有状态是否与旧对象隔离。这里直接把它们理解清楚，不另起一套例子。
 
@@ -566,42 +556,25 @@ module_state.active = module_stage
 
 ```lua
 local function check_exports(exports, name)
-    -- 先校验顶层导出并收集嵌套表，seen 允许数据图共享引用和循环引用。
-    assert(type(exports) == "table" and getmetatable(exports) == nil, name .. " 必须导出普通表")
-    local pending = {} -- 待检查的嵌套表；迭代遍历避免深层数据造成递归栈溢出。
-    local seen = {}    -- 每张嵌套表只检查一次，允许共享引用与嵌套表之间的循环。
-    local function check_value(value)
-        local kind = type(value)
-        if kind == "table" then
-            assert(value ~= exports, name .. " 嵌套导出不得引用模块根导出表")
-            assert(getmetatable(value) == nil, name .. " 嵌套导出必须是无元表普通表")
-            if not seen[value] then
+    assert(type(exports) == "table" and getmetatable(exports) == nil, name .. " 必须导出无元表根表")
+    local pending = {exports}
+    local seen = {[exports] = true}
+    while #pending > 0 do
+        local current = table.remove(pending)
+        for key, value in next, current do
+            assert(key ~= exports and value ~= exports, name .. " 导出数据不得引用模块根导出表")
+            if type(key) == "table" and not seen[key] then
+                seen[key] = true
+                pending[#pending + 1] = key
+            end
+            if type(value) == "table" and not seen[value] then
                 seen[value] = true
                 pending[#pending + 1] = value
             end
-        else
-            assert(kind == "function" or kind == "number" or kind == "string" or kind == "boolean",
-                name .. " 导出包含不支持的类型: " .. kind)
         end
     end
 
-    for key, value in pairs(exports) do
-        assert(type(key) == "string", name .. " 顶层导出字段名必须是字符串")
-        check_value(value)
-    end
-
-    -- 遍历嵌套数据图，校验键和值类型并拒绝元表和根表回指。
-    while #pending > 0 do
-        local nested = table.remove(pending)
-        for key, value in pairs(nested) do
-            local kind = type(key)
-            assert(kind == "string" or kind == "number" or kind == "boolean",
-                name .. " 嵌套导出键必须是字符串、数字或布尔值")
-            check_value(value)
-        end
-    end
-
-    -- 模块私有状态钩子是额外合同，必须成对提供且都为函数。
+    -- 模块私有状态钩子在单个版本内成对提供；跨版本是否迁移由 Stage 决定。
     assert((exports.export_state == nil) == (exports.import_state == nil), name .. " 状态钩子须成对")
     if exports.export_state ~= nil then
         assert(type(exports.export_state) == "function" and type(exports.import_state) == "function",
@@ -610,24 +583,16 @@ local function check_exports(exports, name)
 end
 ```
 
-这段函数不是为了限制正常 Lua 所有可能的写法，而是为**当前这套原地更新算法**限定可处理的导出结构。
+这段函数只检查原地更新所必需的边界：模块根导出必须是无元表 table，候选必须是新根表，且导出数据图不能直接或间接引用该根表。根表由引擎保留身份并覆盖字段；如果嵌套数据仍指向候选根表，提交后这个引用就不会指向线上根表。
 
-它要求模块根表是没有元表的普通 table，顶层键只能是字符串；非 table 的导出值只能是函数、数字、字符串或布尔值，不能把 userdata、thread 等对象直接作为普通模块导出。嵌套 table 也不能带元表，嵌套表之间允许共享或循环，但禁止直接或间接引用模块根表本身。
+根表字段、嵌套表、键和值都保留 Lua 自身支持的类型。引擎不复制嵌套对象，也不要求新旧版本同名字段保持相同类型；提交按候选根表的字段整体替换，业务方决定自己的 API 和状态兼容方式。
 
-`pending` 和 `seen` 的配合用于遍历嵌套 table，而不是递归遍历所有 Lua 对象。`seen` 可以避免一个嵌套表被重复检查，也不会因为嵌套表之间有环而无限循环。
+`pending` 和 `seen` 只用于遍历表键和值中嵌套的 table，查找对候选根表的回指。使用原始 `next` 遍历，不调用嵌套表的 `__pairs`。
 
-本例的 `settings = {bonus=5}` 和 V2 `{bonus=21}` 都符合这个合同。`version`、`make_load`、`next_count` 等都是函数，也符合。
+模块私有状态钩子在单个版本内仍须成对提供。只有旧版提供 `export_state` 且候选版提供 `import_state` 时才迁移；否则候选版本按自身初始化状态运行。
+### `snapshot_state()` 复制的不是模块导出表
 
-这里要区分两项检查：
-
-- `check_exports()` 检查单个模块自身的导出结构是否合法。
-- `M.stage()` 中随后的 `type(entry.live[key]) == type(value)` 检查旧、新版本**同名顶层字段**的类型兼容性。
-
-所以 V2 能够新增 `new_tag`、删除 `legacy_tag`，但不能把原来的 `version()` 从函数改成字符串。普通模块的“完整版本”指整个导出字段集合由新版决定，不代表新版必须保留旧版的所有字段。
-
-### `copy_state()` 复制的不是模块导出表
-
-`M.stage()` 调用 `M.copy_state()` 时，传入的是：
+`M.stage()` 调用 `M.snapshot_state()` 时，传入的是：
 
 ```lua
 entry.live.export_state()
@@ -635,57 +600,78 @@ entry.live.export_state()
 
 这句来自 `M.stage()` 的私有状态迁移分支。它返回的是我们 V1 模块自己导出的 `{count=2}` 数据，而不是 `logic` 模块导出根表。
 
-源码文件仍是 `hotupgrade/lualib/flywow_hotupgrade_module_patch.lua`。下面是实际 `M.copy_state()`：
+源码文件仍是 `hotupgrade/lualib/flywow_hotupgrade_module_patch.lua`。下面展示共享图复制逻辑，以及实际的 `M.snapshot_state()` 和 `M.restore_state()` 两个入口：
 
 ```lua
-function M.copy_state(value, destination)
-    local seen = {} -- 当前复制过程的旧表到新表映射，不保留在线上状态中。
-    local count = 0 -- 限制一次快照的节点/字段数，避免错误状态图耗尽控制阶段资源。
-    local function copy(item, depth)
-        local kind = type(item)
-        if kind ~= "table" then
-            assert(kind == "nil" or kind == "string" or kind == "boolean" or kind == "number",
-                "状态快照只接受普通数据")
-            return item
+--- 将普通状态数据图从 source_graph 复制到 target_graph，保留共享引用和循环引用。
+--- 恢复时复用目标根表；若来源中的 self 指向来源根表，复制后 self 会指向目标根表。
+---@param source_graph any 待复制的状态数据图
+---@param target_graph? table 可选的现存根表；提供时先清空，再原地写入复制结果
+---@return any copied_graph 新建的复制结果；提供 target_graph 时返回该目标根表
+local function copy_state_graph(source_graph, target_graph)
+    local copied_tables = {} -- 源表到目标表的映射，用于保留共享引用和循环引用。
+    local field_count = 0 -- 当前快照复制的字段数；达到上限时拒绝继续复制。
+    local function copy_state_value(source_value, nesting_depth)
+        local value_type = type(source_value)
+        if value_type ~= "table" then
+            assert(value_type == "nil" or value_type == "string" or value_type == "boolean"
+                or value_type == "number", "状态快照只接受普通数据")
+            return source_value
         end
 
-        assert(getmetatable(item) == nil, "状态对象需要显式快照和恢复处理")
-        if seen[item] then
-            return seen[item]
+        assert(getmetatable(source_value) == nil, "状态对象需要显式快照和恢复处理")
+        if copied_tables[source_value] then
+            return copied_tables[source_value]
         end
 
-        assert(depth <= 64, "状态快照嵌套超过 64 层")
-        local target = {}
-        if depth == 1 and destination then
-            target = destination
-            assert(target ~= item and getmetatable(target) == nil, "快照必须与线上根表隔离")
-            for key in pairs(target) do
-                rawset(target, key, nil)
+        assert(nesting_depth <= 64, "状态快照嵌套超过 64 层")
+        local target_table = {}
+        if nesting_depth == 1 and target_graph then
+            target_table = target_graph
+            assert(target_table ~= source_value and getmetatable(target_table) == nil,
+                "快照必须与线上根表隔离")
+            for key in pairs(target_table) do
+                rawset(target_table, key, nil)
             end
         end
-        seen[item] = target
-        for key, child in pairs(item) do
-            count = count + 1
-            assert(count <= 10000, "状态快照超过 10000 个字段")
+        copied_tables[source_value] = target_table
+        for key, child_source in pairs(source_value) do
+            field_count = field_count + 1
+            assert(field_count <= 10000, "状态快照超过 10000 个字段")
             assert(type(key) == "string" or type(key) == "number" or type(key) == "boolean",
                 "状态字段必须使用标量键")
-            target[key] = copy(child, depth + 1)
+            target_table[key] = copy_state_value(child_source, nesting_depth + 1)
         end
 
-        return target
+        return target_table
     end
 
-    return copy(value, 1)
+    return copy_state_value(source_graph, 1)
+end
+
+--- 创建与来源隔离的普通数据图快照。
+---@param source_graph any 要隔离的状态数据图
+---@return any state_snapshot 独立快照；遇到不支持的数据时抛出错误
+function M.snapshot_state(source_graph)
+    return copy_state_graph(source_graph)
+end
+
+--- 将 source_graph 恢复到 target_graph；目标根表原地更新，身份保持不变。
+---@param source_graph table 独立的普通状态快照
+---@param target_graph table 需要原地恢复的线上状态根表
+function M.restore_state(source_graph, target_graph)
+    assert(type(source_graph) == "table" and type(target_graph) == "table", "状态必须为表")
+    copy_state_graph(source_graph, target_graph)
 end
 ```
 
-这份实现有两个用途。Stage 私有状态迁移时不提供 `destination`，得到一份独立的数据图；Service 状态原地提交或恢复时，另一个函数 `restore_state(live, fields)` 会指定旧的 `live` 根表为 `destination`，只更新其内容。
+两个 API 分别表达两种操作：`snapshot_state(source_graph)` 创建独立快照；`restore_state(source_graph, target_graph)` 将来源快照写入目标状态根表，保留目标根表身份。两者共用内部图复制逻辑，但调用方不再通过可选的第二个参数切换操作模式。
 
-但是这两个调用场景的对象不同，不能因为它们都用 `copy_state()`，就误以为普通模块的 `logic` 根表也是靠 `copy_state()` 更新的。**普通模块根表由后面讲到的 `replace_exports()` 更新。**
+这与普通模块导出表更新是两件事。**普通模块根表由后面讲到的 `replace_exports()` 更新。**
 
-对于图结构，`seen` 保存源 table 到目标 table 的对应关系，能够保留嵌套表之间的共享和循环。`depth` 限制嵌套深度为 64，`count` 限制本次复制遍历的字段数量为 10000。键只允许字符串、数字或布尔值，值只允许普通数据及符合合同的嵌套表。
+内部映射 `copied_tables` 保存源 table 到目标 table 的对应关系，保留嵌套表之间的共享和循环。`nesting_depth` 限制嵌套深度为 64，`field_count` 限制本次复制遍历的字段数量为 10000。键只允许字符串、数字或布尔值，值只允许普通数据及符合合同的嵌套表。
 
-本例只有 `{count=2}`，因此 `copy_state()` 新建一张普通表，把数字 2 复制过去。V2 `import_state(snapshot)` 拿到独立的 table，而不是对 V1 私有 upvalue 的直接引用。
+本例只有 `{count=2}`，因此 `snapshot_state()` 新建一张普通表，把数字 2 复制过去。V2 `import_state(snapshot)` 拿到独立的 table，而不是对 V1 私有 upvalue 的直接引用。
 
 ## 五、第三阶段：Commit 怎样保留模块表身份，又换掉所有导出字段？
 
@@ -1074,16 +1060,10 @@ local ok, answer = pcall(skynet.call, target.service_handle, "hotupgrade", comma
 
 ```lua
 if command == "update" then
-    if txn.phase ~= "QUIESCED" then
-        return hotupgrade_result.failure("HU_SAFEPOINT_REQUIRED", "Prepare 尚未确认业务安全点")
+    if txn.phase ~= nil then
+        return hotupgrade_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
-    -- Stage 只准备候选和快照，不写线上导出或状态。
-    for _, entry in ipairs(request.modules or {}) do
-        if not module_state.declared_modules[entry.name] then
-            return hotupgrade_result.failure("HU_MODULE_NOT_REGISTERED", tostring(entry.name))
-        end
-    end
-
+    -- Controller 已按本 State 的登记模块筛选 Patch；Stage 准备候选和快照，不写线上状态。
     local staged = hotupgrade_module_patch.stage(request.modules or {})
     if not staged.ok then
         return staged
@@ -1106,11 +1086,11 @@ if command == "update" then
         if staged then
             local service_update = module_state.registration.service_update
             staged.touched = true
-            if staged.next_state then
+            if staged.has_next_state then
                 if service_update.commit then
                     assert(service_update.commit(service_update.state, staged.next_state) ~= false, "Service 拒绝提交")
                 else
-                    hotupgrade_module_patch.restore_state(service_update.state, staged.next_state)
+                    hotupgrade_module_patch.restore_state(staged.next_state, service_update.state)
                 end
             end
 
@@ -1239,7 +1219,7 @@ PlayerService / flywow_hotupgrade_module_patch.lua
 
 经过前面真实源码和实验，现在可以准确说明 `export_state/import_state` 的使用范围。
 
-正常更新中，`entry.live.export_state()` 从旧模块闭包中导出一份普通数据；`copy_state()` 将它隔离；`candidate.import_state(snapshot)` 再将它导入新的候选模块闭包。导入成功后，新的 `count` 值就由 V2 函数自己的 upvalue 维护。
+正常更新中，`entry.live.export_state()` 从旧模块闭包中导出一份普通数据；`snapshot_state()` 将它隔离；`candidate.import_state(snapshot)` 再将它导入新的候选模块闭包。导入成功后，新的 `count` 值就由 V2 函数自己的 upvalue 维护。
 
 这不是在修改 `old_load` 或其他旧闭包，也不是让所有旧函数引用自动转向新函数。
 
@@ -1265,7 +1245,7 @@ cached_next()
 
 这段是根据我们 `player_logic.lua` 给出的**调用方式示意**，不是框架的源码。它只用于说明为何缓存的旧函数引用仍具有旧版行为。
 
-`export_state()` 返回值还必须满足 `copy_state()` 的普通数据图合同。它不能直接把 Lua 函数、userdata、线程或带元表对象作为需要拷贝的状态值交给引擎。状态钩子必须成对定义在模块导出表上；既不能只留一边，也不能返回 `false` 来假装迁移成功。
+`export_state()` 返回值还必须满足 `snapshot_state()` 的普通数据图合同。它不能直接把 Lua 函数、userdata、线程或带元表对象作为需要拷贝的状态值交给引擎。状态钩子必须成对定义在模块导出表上；既不能只留一边，也不能返回 `false` 来假装迁移成功。
 
 在设计普通模块时，如果没有需要跨版本继承的私有状态，**不用为了符合形式而增加这两个钩子**。我们本课放入 `count`，只是为了亲眼验证当前引擎的迁移流程。
 
@@ -1338,8 +1318,8 @@ Finish:             v2   121   100
    · 保存 old（旧顶层导出字段）
    · load(source) 编译完整 V2
    · chunk() 执行得到 candidate
-   · check_exports(candidate) / 检查同名字段类型
-   · export_state → copy_state → import_state
+   · check_exports(candidate) / 验证候选导出结构
+   · export_state → snapshot_state → import_state
    · module_state.active = module_stage
                │
                ▼

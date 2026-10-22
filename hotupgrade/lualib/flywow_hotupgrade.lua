@@ -83,11 +83,11 @@ local function restore_service(txn)
     local service_update = module_state.registration.service_update
     -- 自定义恢复只处理 Service 自己的对象；即使它失败也继续尝试还原函数字段。
     local ok, message = pcall(function()
-        if staged.old_state then
+        if staged.has_old_state then
             if service_update.restore then
                 assert(service_update.restore(service_update.state, staged.old_state) ~= false, "Service 拒绝恢复")
             else
-                hotupgrade_module_patch.restore_state(service_update.state, staged.old_state)
+                hotupgrade_module_patch.restore_state(staged.old_state, service_update.state)
             end
         end
     end)
@@ -153,6 +153,8 @@ local function stage_service(source)
     {
         patch = patch,       -- 仅本 State 持有的新函数和迁移函数。
         old_functions = {}, -- 本次将替换的现有函数，不处理未列出的字段。
+        has_old_state = false, -- 区分没有状态快照与自定义快照值为 nil。
+        has_next_state = false, -- 区分没有迁移结果与自定义候选值为 nil。
         touched = false,    -- 首次线上写入前置 true，部分提交同样必须恢复。
     }
     for name, fn in pairs(patch.functions or {}) do
@@ -166,18 +168,22 @@ local function stage_service(source)
         if service_update.snapshot then
             staged.old_state = service_update.snapshot(service_update.state)
             local isolated = service_update.snapshot(service_update.state)
-            assert(type(staged.old_state) == "table" and type(isolated) == "table"
-                and staged.old_state ~= service_update.state and isolated ~= staged.old_state
-                and isolated ~= service_update.state, "自定义快照必须独立")
+            assert(staged.old_state ~= service_update.state and isolated ~= service_update.state
+                and (type(staged.old_state) ~= "table" or type(isolated) ~= "table"
+                    or staged.old_state ~= isolated), "自定义快照不得复用线上状态根表或同一快照表")
+            staged.has_old_state = true
             staged.next_state = patch.migrate(isolated)
+            assert(staged.next_state ~= service_update.state, "迁移候选不得复用线上状态根表")
+            staged.has_next_state = true
         else
-            staged.old_state = hotupgrade_module_patch.copy_state(service_update.state)
-            staged.next_state = patch.migrate(hotupgrade_module_patch.copy_state(staged.old_state))
-            staged.next_state = hotupgrade_module_patch.copy_state(staged.next_state)
+            staged.old_state = hotupgrade_module_patch.snapshot_state(service_update.state)
+            staged.has_old_state = true
+            staged.next_state = patch.migrate(hotupgrade_module_patch.snapshot_state(staged.old_state))
+            assert(type(staged.next_state) == "table" and staged.next_state ~= service_update.state,
+                "默认迁移须返回独立状态表")
+            staged.next_state = hotupgrade_module_patch.snapshot_state(staged.next_state)
+            staged.has_next_state = true
         end
-
-        assert(type(staged.next_state) == "table" and staged.next_state ~= service_update.state,
-            "迁移须返回完整独立候选状态")
     end
 
     return staged
@@ -196,14 +202,9 @@ end
 ---@param source integer 由 Skynet 提供的真实调用来源
 ---@return FlyWowHotUpgradeResult 恢复不确定时保持 patching=true
 local function handle_upgrade(command, request, source)
-    -- 先核验 Controller 来源和批次请求；校验通过后才触碰活动事务。
-    if not module_state.registration or source ~= hotupgrade_handle then
+    -- 先核验 Controller 来源；批次身份由 Controller 生成，再与本地事务记录比对。
+    if source ~= hotupgrade_handle then
         return hotupgrade_result.failure("HU_UNAUTHORIZED", "控制来源不匹配")
-    end
-
-    if type(request) ~= "table" or type(request.batch_id) ~= "string"
-        or math.type(request.sequence) ~= "integer" then
-        return hotupgrade_result.failure("HU_INVALID_REQUEST", "批次身份无效")
     end
 
     if command ~= "prepare" and command ~= "update" and command ~= "abort" and command ~= "finish" then
@@ -252,14 +253,8 @@ local function handle_upgrade(command, request, source)
         if txn.phase ~= nil then
             return hotupgrade_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
         end
-        -- Stage 只准备候选和快照，不写线上导出或状态。
-        for _, entry in ipairs(request.modules or {}) do
-            if not module_state.declared_modules[entry.name] then
-                return hotupgrade_result.failure("HU_MODULE_NOT_REGISTERED", tostring(entry.name))
-            end
-        end
-
-        local staged = hotupgrade_module_patch.stage(request.modules or {})
+        -- Controller 已按本 State 的登记模块筛选 Patch；Stage 准备候选和快照，不写线上状态。
+        local staged = hotupgrade_module_patch.stage(request.modules)
         if not staged.ok then
             return staged
         end
@@ -281,11 +276,11 @@ local function handle_upgrade(command, request, source)
             if staged then
                 local service_update = module_state.registration.service_update
                 staged.touched = true
-                if staged.next_state then
+                if staged.has_next_state then
                     if service_update.commit then
                         assert(service_update.commit(service_update.state, staged.next_state) ~= false, "Service 拒绝提交")
                     else
-                        hotupgrade_module_patch.restore_state(service_update.state, staged.next_state)
+                        hotupgrade_module_patch.restore_state(staged.next_state, service_update.state)
                     end
                 end
 

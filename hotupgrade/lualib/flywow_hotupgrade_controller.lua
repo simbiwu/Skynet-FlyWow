@@ -201,7 +201,7 @@ end
 ---@class FlyWowHotUpgradeControlRequest
 ---@field batch_id string Controller Service handle 与本进程递增序号组成；仅在该 Controller 生命周期有效
 ---@field sequence integer 当前批次严格递增的序号，目标用来拒绝迟到消息
----@field modules? table[] update 使用的 name/source 完整模块数组；不含业务对象
+---@field modules? table[] Controller 按目标登记集合筛选、按模块名排序的 name/source 模块数组；不含业务对象
 ---@field service_source? string update 使用的可选一次性 Service 脚本源码
 
 ---@class FlyWowHotUpgradeManagementRequest
@@ -338,83 +338,19 @@ function M:wait_lifecycle()
     return hotupgrade_result.success()
 end
 
---- 只协调本 Controller 内的逻辑唯一名，不调用原生唯一服务管理器。
---- 在途重复请求等待同一创建结果；失败释放预留，既有 handle 在发布期间也可直接返回。
----@param request FlyWowHotUpgradeServiceCreationRequest
----@param source integer 原请求者的真实消息来源；仅首次创建者拥有取消权
----@return FlyWowHotUpgradeResult 成功时包含 service_handle；全局和特殊启动合同明确拒绝
-function M:uniqueservice(request, source)
-    -- 先验证唯一创建合同，再决定复用现有实例、等待在途创建或发起新创建。
-    if request.global == true then
-        return hotupgrade_result.failure("HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED", "受管理唯一服务只支持本 Controller 内的本地唯一")
-    end
-
-    if math.type(source) ~= "integer" or source <= 0 or type(request.service_name) ~= "string"
-        or not request.service_name:match("^[%w_.%-]+$") or type(request.arguments) ~= "table"
-        or math.type(request.arguments.n) ~= "integer" or request.arguments.n < 0
-        or (request.global ~= nil and type(request.global) ~= "boolean") then
-        return hotupgrade_result.failure("HU_INVALID_REQUEST", "需要创建者、逻辑 Service 名和完整启动参数")
-    end
-
-    if request.service_name == "snaxd" then
-        return hotupgrade_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "snaxd 不满足受管理 Service 自行调用 register_service 的登记合同")
-    end
-
-    local unique = self.unique_services[request.service_name]
-    if unique then
-        if unique.service_handle then
-            return hotupgrade_result.success({service_handle = unique.service_handle})
-        end
-        if self.phase == "FAILED_LOCKED" then
-            return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "发布失败，唯一创建请求未开始")
-        end
-        local waiter = coroutine.running()
-        unique.waiters[waiter] = true
-        skynet.wait(waiter)
-        unique.waiters[waiter] = nil
-        return unique.error or hotupgrade_result.success({service_handle = unique.service_handle})
-    end
-
-    unique = {waiters = {}}
-    self.unique_services[request.service_name] = unique
-    local ok, answer = pcall(self.newservice, self, request, source, request.service_name)
-    if not ok then
-        answer = hotupgrade_result.failure("HU_SERVICE_CREATE_FAILED", tostring(answer))
-    end
-    if answer.ok then
-        unique.service_handle = answer.service_handle
-    else
-        unique.error = answer
-        if self.unique_services[request.service_name] == unique then
-            self.unique_services[request.service_name] = nil
-        end
-    end
-    for waiter in pairs(unique.waiters) do
-        skynet.wakeup(waiter)
-    end
-    return answer
+local function valid_service_creation_request(request, source)
+    return math.type(source) == "integer" and source > 0 and type(request.service_name) == "string"
+        and request.service_name:match("^[%w_.%-]+$") and type(request.arguments) == "table"
+        and math.type(request.arguments.n) == "integer" and request.arguments.n >= 0
+        and (request.global == nil or type(request.global) == "boolean")
 end
 
---- 受管理 Service 的启动入口；参数原样转交原生 newservice，不接管业务 init。
---- 原生调用会 yield；返回 handle 后仍未登记的 Service 继续持有屏障。
----@param request FlyWowHotUpgradeServiceCreationRequest
----@param source integer 创建者的真实消息来源
+--- 已校验请求的共同创建过程；原生调用可能 yield，返回 handle 后仍持有登记屏障。
+---@param request FlyWowHotUpgradeServiceCreationRequest 已校验的创建请求
+---@param source integer 已校验的真实创建者来源
 ---@param unique_name? string 仅本地唯一入口在内部传入的逻辑预留名
 ---@return FlyWowHotUpgradeResult 成功时包含 service_handle
-function M:newservice(request, source, unique_name)
-    -- 校验启动请求和生命周期门禁后才建立待创建记录并调用原生入口。
-    if math.type(source) ~= "integer" or source <= 0 or type(request.service_name) ~= "string"
-        or not request.service_name:match("^[%w_.%-]+$")
-        or type(request.arguments) ~= "table"
-        or math.type(request.arguments.n) ~= "integer" or request.arguments.n < 0
-        or (request.global ~= nil and type(request.global) ~= "boolean") then
-        return hotupgrade_result.failure("HU_INVALID_REQUEST", "需要创建者、Service 名和启动参数")
-    end
-
-    if request.service_name == "snaxd" then
-        return hotupgrade_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "snaxd 不满足受管理 Service 自行调用 register_service 的登记合同")
-    end
-
+local function start_service(self, request, source, unique_name)
     local admitted = self:wait_lifecycle()
     if not admitted.ok then
         return admitted
@@ -446,6 +382,76 @@ function M:newservice(request, source, unique_name)
     creation.returned = true
     self:wake_registration()
     return hotupgrade_result.success({service_handle = service_handle})
+end
+
+--- 只协调本 Controller 内的逻辑唯一名，不调用原生唯一服务管理器。
+--- 在途重复请求等待同一创建结果；失败释放预留，既有 handle 在发布期间也可直接返回。
+---@param request FlyWowHotUpgradeServiceCreationRequest
+---@param source integer 原请求者的真实消息来源；仅首次创建者拥有取消权
+---@return FlyWowHotUpgradeResult 成功时包含 service_handle；全局和特殊启动合同明确拒绝
+function M:uniqueservice(request, source)
+    -- 先验证唯一创建合同，再决定复用现有实例、等待在途创建或发起新创建。
+    if request.global == true then
+        return hotupgrade_result.failure("HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED", "受管理唯一服务只支持本 Controller 内的本地唯一")
+    end
+
+    if not valid_service_creation_request(request, source) then
+        return hotupgrade_result.failure("HU_INVALID_REQUEST", "需要创建者、逻辑 Service 名和完整启动参数")
+    end
+
+    if request.service_name == "snaxd" then
+        return hotupgrade_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "snaxd 不满足受管理 Service 自行调用 register_service 的登记合同")
+    end
+
+    local unique = self.unique_services[request.service_name]
+    if unique then
+        if unique.service_handle then
+            return hotupgrade_result.success({service_handle = unique.service_handle})
+        end
+        if self.phase == "FAILED_LOCKED" then
+            return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "发布失败，唯一创建请求未开始")
+        end
+        local waiter = coroutine.running()
+        unique.waiters[waiter] = true
+        skynet.wait(waiter)
+        unique.waiters[waiter] = nil
+        return unique.error or hotupgrade_result.success({service_handle = unique.service_handle})
+    end
+
+    unique = {waiters = {}}
+    self.unique_services[request.service_name] = unique
+    local ok, answer = pcall(start_service, self, request, source, request.service_name)
+    if not ok then
+        answer = hotupgrade_result.failure("HU_SERVICE_CREATE_FAILED", tostring(answer))
+    end
+    if answer.ok then
+        unique.service_handle = answer.service_handle
+    else
+        unique.error = answer
+        if self.unique_services[request.service_name] == unique then
+            self.unique_services[request.service_name] = nil
+        end
+    end
+    for waiter in pairs(unique.waiters) do
+        skynet.wakeup(waiter)
+    end
+    return answer
+end
+
+--- Controller 命令入口：校验请求后创建普通 Service。
+---@param request FlyWowHotUpgradeServiceCreationRequest
+---@param source integer 创建者的真实消息来源
+---@param unique_name? string 仅本地唯一入口在内部传入的逻辑预留名
+---@return FlyWowHotUpgradeResult 成功时包含 service_handle
+function M:newservice(request, source, unique_name)
+    if not valid_service_creation_request(request, source) then
+        return hotupgrade_result.failure("HU_INVALID_REQUEST", "需要创建者、Service 名和启动参数")
+    end
+    if request.service_name == "snaxd" then
+        return hotupgrade_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "snaxd 不满足受管理 Service 自行调用 register_service 的登记合同")
+    end
+
+    return start_service(self, request, source, unique_name)
 end
 
 --- 创建者在业务初始化失败后显式终止尚未登记的 Service；不自动超时清理。
@@ -556,8 +562,8 @@ end
 ---@return FlyWowHotUpgradeResult
 function M:register(request, service_handle)
     -- 先校验登记元数据并构造模块集合，失败时不写入 Controller 目标表。
-    if math.type(service_handle) ~= "integer" or type(request) ~= "table"
-        or type(request.modules) ~= "table" or type(request.has_service_update) ~= "boolean" then
+    if math.type(service_handle) ~= "integer" or type(request.modules) ~= "table"
+        or type(request.has_service_update) ~= "boolean" then
         return hotupgrade_result.failure("HU_INVALID_OPTIONS", "登记元数据无效")
     end
     if request.service_module ~= nil then

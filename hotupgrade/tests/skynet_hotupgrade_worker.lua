@@ -40,26 +40,26 @@ local function initialize(request)
     worker_test_config = request
     local service_update = {state = service_state, functions = business}
     if worker_test_config.custom then
-        service_update.snapshot = function(value)
-            return require("flywow_hotupgrade_module_patch").copy_state(value)
+        service_update.snapshot = function(source_state)
+            return require("flywow_hotupgrade_module_patch").snapshot_state(source_state)
         end
         service_update.commit = function(value, candidate)
             value.equip = candidate.equip
             error("partial service commit")
         end
-        service_update.restore = function(value, snapshot)
+        service_update.restore = function(target_state, source_snapshot)
             if worker_test_config.restore_failure then
                 error("service restore failed")
             end
-            require("flywow_hotupgrade_module_patch").restore_state(value, snapshot)
+            require("flywow_hotupgrade_module_patch").restore_state(source_snapshot, target_state)
         end
     end
     if worker_test_config.custom_success then
         -- 模拟不可直接复制的业务对象，快照只包含它可迁移的普通数据。
         setmetatable(service_state.nested, {})
-        service_update.snapshot = function(value)
-            return {equip = value.equip, level = value.level, schema_version = value.schema_version,
-                nested = {count = value.nested.count}}
+        service_update.snapshot = function(source_state)
+            return {equip = source_state.equip, level = source_state.level,
+                schema_version = source_state.schema_version, nested = {count = source_state.nested.count}}
         end
         service_update.commit = function(value, next_state)
             value.equip = next_state.equip

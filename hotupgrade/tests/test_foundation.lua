@@ -3,14 +3,14 @@ local patch = require "flywow_hotupgrade_module_patch"
 local graph = {nested = {count = 7}}
 graph.self = graph
 graph.shared = graph.nested
-local snapshot = patch.copy_state(graph)
+local snapshot = patch.snapshot_state(graph)
 assert(snapshot ~= graph and snapshot.self == snapshot and snapshot.shared == snapshot.nested)
 snapshot.nested.count = 8
 assert(graph.nested.count == 7)
-patch.restore_state(graph, snapshot)
+patch.restore_state(snapshot, graph)
 assert(graph.self == graph and graph.nested.count == 8 and graph.shared == graph.nested)
-assert(not pcall(patch.copy_state, {resource = io.stdout}))
-assert(not pcall(patch.copy_state, setmetatable({}, {})))
+assert(not pcall(patch.snapshot_state, {resource = io.stdout}))
+assert(not pcall(patch.snapshot_state, setmetatable({}, {})))
 
 local old_state = {count = 7} -- 故意导出私有表本身，验证框架额外隔离。
 local live =
@@ -75,8 +75,9 @@ assert(package.loaded.a == simple and package.loaded.b == second)
 assert(simple.value() == 10 and second.value() == 20 and second.added)
 assert(patch.abort(combined.stage).ok)
 assert(simple.value == old_first_value and second.value == old_second_value and second.added == nil)
-package.loaded.a = {export_state = function() return {} end}
-assert(not patch.stage({{name = "a", source = "return {}"}}).ok)
+package.loaded.a = {export_state = function() return {old = true} end, import_state = function() end}
+local reset_state = patch.stage({{name = "a", source = "return {}"}})
+assert(reset_state.ok and patch.abort(reset_state.stage).ok)
 package.loaded.a = {
     value = function() return 1 end,
     export_state = function() return {} end,
