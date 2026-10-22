@@ -26,3 +26,5 @@
 - skynet_config.lua：本示例使用的 Skynet、FlyWow 和宿主代码搜索路径。
 
 PlayerService 的 skynet.queue() 是更新安全点的一部分：更新前停止新业务，再等待正在执行的业务结束。V1 攻击值是 105；发布后原实例的装备状态迁移为“剑”，业务函数更新为 V2，攻击值变成 120。新实例从已部署的 V2 文件启动，也得到 120。
+
+Service Patch 的 `migrate` 只返回要改的字段；未提供字段保留，嵌套 Table 递归合并，`nil` 不用于删除字段。

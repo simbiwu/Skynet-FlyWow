@@ -1086,7 +1086,7 @@ if command == "update" then
         if staged then
             local service_update = module_state.registration.service_update
             staged.touched = true
-            if staged.has_next_state then
+            if staged.next_state then
                 if service_update.commit then
                     assert(service_update.commit(service_update.state, staged.next_state) ~= false, "Service 拒绝提交")
                 else

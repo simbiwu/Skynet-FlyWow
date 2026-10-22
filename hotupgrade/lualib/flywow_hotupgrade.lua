@@ -83,7 +83,7 @@ local function restore_service(txn)
     local service_update = module_state.registration.service_update
     -- 自定义恢复只处理 Service 自己的对象；即使它失败也继续尝试还原函数字段。
     local ok, message = pcall(function()
-        if staged.has_old_state then
+        if staged.old_state then
             if service_update.restore then
                 assert(service_update.restore(service_update.state, staged.old_state) ~= false, "Service 拒绝恢复")
             else
@@ -129,6 +129,34 @@ local function abort(txn)
     return hotupgrade_result.success()
 end
 
+-- 只把 Patch 提供的字段合入候选状态；遗漏字段保留，nil 不表达删除。
+local function merge_service_state(target_state, update_state)
+    local update_targets = {} -- 更新表到候选表的映射，用于终止循环并保持 Patch 的共享引用。
+    local function merge_table(target_table, source_table, nesting_depth)
+        local mapped_target = update_targets[source_table]
+        if mapped_target then
+            return mapped_target
+        end
+
+        assert(nesting_depth <= hotupgrade_common.MAX_STATE_DEPTH, "Service 状态更新嵌套超过限制")
+        update_targets[source_table] = target_table
+        for key, update_value in pairs(source_table) do
+            local current_value = rawget(target_table, key)
+            if type(update_value) == "table" then
+                if type(current_value) == "table" then
+                    rawset(target_table, key, merge_table(current_value, update_value, nesting_depth + 1))
+                else
+                    rawset(target_table, key, merge_table({}, update_value, nesting_depth + 1))
+                end
+            else
+                rawset(target_table, key, update_value)
+            end
+        end
+        return target_table
+    end
+    merge_table(target_state, update_state, 1)
+end
+
 -- 只在业务安全点已确认时执行受信同步脚本；此函数不提供安全沙箱或副作用撤销。
 local function stage_service(source)
     if not source then
@@ -153,8 +181,6 @@ local function stage_service(source)
     {
         patch = patch,       -- 仅本 State 持有的新函数和迁移函数。
         old_functions = {}, -- 本次将替换的现有函数，不处理未列出的字段。
-        has_old_state = false, -- 区分没有状态快照与自定义快照值为 nil。
-        has_next_state = false, -- 区分没有迁移结果与自定义候选值为 nil。
         touched = false,    -- 首次线上写入前置 true，部分提交同样必须恢复。
     }
     for name, fn in pairs(patch.functions or {}) do
@@ -163,27 +189,25 @@ local function stage_service(source)
         staged.old_functions[name] = rawget(service_update.functions, name)
     end
 
-    -- 迁移只接触隔离快照，并在 Stage 完成前生成独立候选状态。
+    -- 迁移只接触隔离快照；将部分更新递归合入完整候选，不改线上状态。
     if patch.migrate then
         if service_update.snapshot then
             staged.old_state = service_update.snapshot(service_update.state)
-            local isolated = service_update.snapshot(service_update.state)
-            assert(staged.old_state ~= service_update.state and isolated ~= service_update.state
-                and (type(staged.old_state) ~= "table" or type(isolated) ~= "table"
-                    or staged.old_state ~= isolated), "自定义快照不得复用线上状态根表或同一快照表")
-            staged.has_old_state = true
-            staged.next_state = patch.migrate(isolated)
-            assert(staged.next_state ~= service_update.state, "迁移候选不得复用线上状态根表")
-            staged.has_next_state = true
+            assert(type(staged.old_state) == "table" and staged.old_state ~= service_update.state,
+                "自定义快照必须返回独立状态表")
         else
             staged.old_state = hotupgrade_module_patch.snapshot_state(service_update.state)
-            staged.has_old_state = true
-            staged.next_state = patch.migrate(hotupgrade_module_patch.snapshot_state(staged.old_state))
-            assert(type(staged.next_state) == "table" and staged.next_state ~= service_update.state,
-                "默认迁移须返回独立状态表")
-            staged.next_state = hotupgrade_module_patch.snapshot_state(staged.next_state)
-            staged.has_next_state = true
         end
+
+        local isolated = hotupgrade_module_patch.snapshot_state(staged.old_state)
+        local update_state = patch.migrate(isolated)
+        assert(type(update_state) == "table" and update_state ~= service_update.state,
+            "migrate 必须返回部分状态更新表")
+        update_state = hotupgrade_module_patch.snapshot_state(update_state)
+
+        staged.next_state = hotupgrade_module_patch.snapshot_state(staged.old_state)
+        merge_service_state(staged.next_state, update_state)
+        staged.next_state = hotupgrade_module_patch.snapshot_state(staged.next_state)
     end
 
     return staged
@@ -276,7 +300,7 @@ local function handle_upgrade(command, request, source)
             if staged then
                 local service_update = module_state.registration.service_update
                 staged.touched = true
-                if staged.has_next_state then
+                if staged.next_state then
                     if service_update.commit then
                         assert(service_update.commit(service_update.state, staged.next_state) ~= false, "Service 拒绝提交")
                     else
@@ -324,8 +348,8 @@ end
 ---@class FlyWowHotUpgradeServiceUpdate
 ---@field state table 现存 Service 私有状态表；更新只改其字段，不替换该表。
 ---@field functions table Service 原有业务函数表；Patch 只替换本次列出的现有函数字段。
----@field snapshot? fun(state:table):table Stage 开始迁移前生成与线上对象隔离的快照；与 commit、restore 成组提供。
----@field commit? fun(state:table, next_state:table) Activate 内同步原地应用候选状态；不得 yield 或写外部权威数据。
+---@field snapshot? fun(state:table):table Stage 开始迁移前生成与线上对象隔离的普通状态图快照；与 commit、restore 成组提供。
+---@field commit? fun(state:table, next_state:table) Activate 内同步原地应用合并后的完整候选状态；不得 yield 或写外部权威数据。
 ---@field restore? fun(state:table, old_state:table) 提交失败时同步恢复快照；返回 false 或抛错会保持 patching=true。
 
 ---@class FlyWowHotUpgradeRegistration

@@ -28,7 +28,7 @@ local function copy_state_graph(source_graph, target_graph)
             return copied_tables[source_value]
         end
 
-        assert(nesting_depth <= 128, "状态快照嵌套超过 128 层")
+        assert(nesting_depth <= hotupgrade_common.MAX_STATE_DEPTH, "状态快照嵌套超过限制")
         local target_table = {}
         if nesting_depth == 1 and target_graph then
             target_table = target_graph
@@ -90,11 +90,18 @@ local function check_exports(exports, name)
         local current = table.remove(pending)
         for key, value in next, current do
             assert(key ~= exports and value ~= exports, name .. " 导出数据不得引用模块根导出表")
-            if type(key) == "table" and not seen[key] then
-                seen[key] = true
-                pending[#pending + 1] = key
+            if current == exports then
+                assert(type(key) == "string", name .. " 顶层导出字段名必须是字符串")
+            else
+                assert(type(key) == "string" or type(key) == "number" or type(key) == "boolean",
+                    name .. " 嵌套导出键必须是字符串、数字或布尔值")
             end
-            if type(value) == "table" and not seen[value] then
+
+            local value_type = type(value)
+            assert(value_type == "function" or value_type == "number" or value_type == "string"
+                or value_type == "boolean" or value_type == "table", name .. " 导出值类型不受支持")
+            if value_type == "table" and not seen[value] then
+                assert(getmetatable(value) == nil, name .. " 嵌套导出表不得带元表")
                 seen[value] = true
                 pending[#pending + 1] = value
             end

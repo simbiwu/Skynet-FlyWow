@@ -36,9 +36,7 @@ return function(state)
     return {
         migrate = function(old)
             assert(old.schema_version == 1)
-            old.equip = "剑"
-            old.schema_version = 2
-            return old
+            return {equip = "剑", schema_version = 2}
         end,
         functions = {
             load = function(item)
@@ -67,7 +65,18 @@ local cases =
     end]]}},
     state_only = {service = {["skynet_hotupgrade_worker.patch"] = [[return function()
         return {migrate = function(old)
-            return {equip = "剑", level = old.level, schema_version = 2}
+            local nested = {count = 8}
+            nested.self = nested
+            local updates = {
+                equip = "剑",
+                schema_version = 2,
+                nested = nested,
+                ranks = {[1] = 9},
+                mode = {phase = "v2"},
+                replaced = "v2",
+            }
+            updates.obsolete = nil
+            return updates
         end}
     end]]}},
     bad_functions = {service = {["skynet_hotupgrade_worker.patch"] = [[return function()

@@ -18,7 +18,13 @@ local package_logic
 local settings
 local cached
 local module_identity
-local service_state = {equip = "刀", level = 50, schema_version = 1, nested = {count = 7}}
+local service_nested = {count = 7, retained = 23}
+local service_state =
+{
+    equip = "刀", level = 50, schema_version = 1, obsolete = true,
+    nested = service_nested, nested_alias = service_nested, ranks = {1, 2, 3}, mode = "legacy", replaced = {old = true},
+}
+service_state.self = service_state
 local nested_identity = service_state.nested
 local service_state_identity = service_state
 local marker = {} -- 仅此 Lua State 中创建的身份标记，用于更新前后比对。
@@ -148,7 +154,16 @@ skynet.start(function()
                 removed = logic.removed, added = logic.added,
                 paused = hotupgrade.patching,
                 nested_count = service_state.nested and service_state.nested.count,
+                nested_retained = service_state.nested and service_state.nested.retained,
+                nested_self_cycle = service_state.nested and service_state.nested.self == service_state.nested,
                 nested_identity = service_state.nested == nested_identity,
+                nested_alias_identity = service_state.nested_alias == service_state.nested,
+                root_cycle = service_state.self == service_state,
+                obsolete = service_state.obsolete,
+                rank_2 = service_state.ranks[2],
+                rank_3 = service_state.ranks[3],
+                mode_phase = type(service_state.mode) == "table" and service_state.mode.phase,
+                replaced_value = service_state.replaced,
                 extra_value = extra_logic and extra_logic.value(),
             }
         elseif command == "check_declarations" then

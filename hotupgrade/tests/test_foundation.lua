@@ -45,7 +45,7 @@ assert(live.value == cached and live.removed and live.added == nil)
 
 local failed = patch.stage({{name = "logic", source = "error('stage failed')"}})
 assert(not failed.ok and live.value() == 7)
-failed = patch.stage({{name = "logic", source = "return {value=function() return 3 end}"}})
+failed = patch.stage({{name = "logic", source = "return {value=function() return 3 end, export_state=function() return {} end}"}})
 assert(not failed.ok and live.value() == 7)
 staged = patch.stage({{name = "logic", source = source}})
 assert(staged.ok and patch.commit(staged.stage).ok)
@@ -134,13 +134,15 @@ for _, invalid_source in ipairs({
     "return {config = {resource = io.stdout}}",
     "return {config = {worker = coroutine.create(function() end)}}",
     "local M = {}; M.config = {deep = {root = M}}; return M",
-    "return {config = 100}",
 }) do
     local invalid = patch.stage({{name = nested_name, source = invalid_source}})
     assert(not invalid.ok)
     assert(package.loaded[nested_name] == nested_live and nested_live.config == old_config)
     assert(nested_live.helper == old_helper and nested_live.removed)
 end
+local scalar_stage = patch.stage({{name = nested_name, source = "return {config = 100}"}})
+assert(scalar_stage.ok and patch.commit(scalar_stage.stage).ok and nested_live.config == 100)
+assert(patch.abort(scalar_stage.stage).ok and nested_live.config == old_config)
 local root_reference = patch.stage({{name = nested_name,
     source = "local M = {}; M.config = {root = M}; return M"}})
 assert(not root_reference.ok and root_reference.message:find("根导出表", 1, true))
@@ -244,7 +246,7 @@ assert(not missing_before_upgrade.ok and missing_before_upgrade.code == "HU_INVA
 registration.before_upgrade = function() return true end
 assert(hotupgrade.register_service(registration).ok)
 local function target_control(command, sequence)
-    control_dispatch(1, 99, command, {batch_id = "fixture:" .. sequence, sequence = sequence})
+    control_dispatch(1, 99, command, {batch_id = "fixture:" .. sequence, sequence = sequence, modules = {}})
     return control_answer
 end
 registration.before_upgrade = function() return false end

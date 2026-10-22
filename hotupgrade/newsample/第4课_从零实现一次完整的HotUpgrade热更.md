@@ -822,15 +822,13 @@ HotUpgrade 之后会在原 PlayerService 的 Lua State 内执行这个函数，�
 
 构建函数返回两部分内容：
 
-`migrate` 接收旧状态的独立快照，生成 V2 候选状态。
+`migrate` 接收旧状态的独立快照，只返回本次要更新的字段。框架先复制旧快照，再把这些字段递归合入候选状态；Patch 没提供的字段会保留。
 
 `functions.load` 是准备替换到现有 `business` 表中的新函数。它直接捕获构建函数收到的 `state` 根表。
 
-这里的 `old_state` 参数目前只作为迁移输入；这个最小业务例子不需要保留旧装备或其他字段。实际游戏中的 `migrate` 通常会从旧快照取出需要延续的数据。
+嵌套 Table 也按同一原则合并。例如旧状态有 `combat = {attack = 100, defense = 40}`，迁移只返回 `combat = {attack = 120}`，结果会保留 `defense = 40`。如果 Patch 提供 `nil`，Lua 不会把它保存为字段，因此本合同不支持删除字段。
 
-注意 `migrate()` 返回的新 table 并不会取代原 PlayerService 的 `state` 根表。
-
-后面框架会把候选字段应用到原来的根表中，保证原有引用不失效。
+迁移返回的部分更新表不会取代原 PlayerService 的 `state` 根表。Activate 阶段会把递归合并后的完整候选状态应用到原根表，保持根表身份。
 
 而 `functions.load` 捕获的，正是这张原来的根表。
 
@@ -1872,28 +1870,61 @@ local ok, service = pcall(stage_service, request.service_source)
 
 完整实现：
 
+文件顶部已加载 flywow_hotupgrade_common；这里使用 MAX_STATE_DEPTH，与状态快照复制共享同一嵌套层数上限。
+
 ```lua
+-- 只把 Patch 提供的字段合入候选状态；遗漏字段保留，nil 不表达删除。
+local function merge_service_state(target_state, update_state)
+    local update_targets = {}
+    local function merge_table(target_table, source_table, nesting_depth)
+        local mapped_target = update_targets[source_table]
+        if mapped_target then
+            return mapped_target
+        end
+
+        assert(nesting_depth <= hotupgrade_common.MAX_STATE_DEPTH, "Service 状态更新嵌套超过限制")
+        update_targets[source_table] = target_table
+        for key, update_value in pairs(source_table) do
+            local current_value = rawget(target_table, key)
+            if type(update_value) == "table" then
+                if type(current_value) == "table" then
+                    rawset(target_table, key, merge_table(current_value, update_value, nesting_depth + 1))
+                else
+                    rawset(target_table, key, merge_table({}, update_value, nesting_depth + 1))
+                end
+            else
+                rawset(target_table, key, update_value)
+            end
+        end
+        return target_table
+    end
+    merge_table(target_state, update_state, 1)
+end
+
+-- 只在业务安全点已确认时执行受信同步脚本；此函数不提供安全沙箱或副作用撤销。
 local function stage_service(source)
     if not source then
         return nil
     end
 
+    -- 执行受信 Patch 构建函数并校验结果；此时尚不写入线上状态。
     local service_update = assert(module_state.registration.service_update, "Service 未提供内部更新入口")
     local chunk = assert(load(source, "=Service Patch", "t", _G))
     local build = chunk()
     assert(type(build) == "function", "Service Patch 必须返回构建函数")
     local patch = build(service_update.state)
+
     assert(type(patch) == "table" and getmetatable(patch) == nil, "Service 构建结果必须是普通表")
     assert(patch.migrate == nil or type(patch.migrate) == "function", "migrate 必须是函数")
     assert(patch.functions == nil or (type(patch.functions) == "table"
         and getmetatable(patch.functions) == nil), "functions 必须是普通表")
     assert(patch.migrate or (patch.functions and next(patch.functions)), "Service Patch 没有更新内容")
+
+    -- 保存本次可能替换的旧函数，Activate 失败时逐字段恢复。
     local staged =
     {
         patch = patch,       -- 仅本 State 持有的新函数和迁移函数。
         old_functions = {}, -- 本次将替换的现有函数，不处理未列出的字段。
-        has_old_state = false,
-        has_next_state = false,
         touched = false,    -- 首次线上写入前置 true，部分提交同样必须恢复。
     }
     for name, fn in pairs(patch.functions or {}) do
@@ -1902,33 +1933,32 @@ local function stage_service(source)
         staged.old_functions[name] = rawget(service_update.functions, name)
     end
 
+    -- 迁移只接触隔离快照；将部分更新递归合入完整候选，不改线上状态。
     if patch.migrate then
         if service_update.snapshot then
             staged.old_state = service_update.snapshot(service_update.state)
-            local isolated = service_update.snapshot(service_update.state)
-            assert(staged.old_state ~= service_update.state and isolated ~= service_update.state
-                and (type(staged.old_state) ~= "table" or type(isolated) ~= "table"
-                    or staged.old_state ~= isolated), "自定义快照不得复用线上状态根表或同一快照表")
-            staged.has_old_state = true
-            staged.next_state = patch.migrate(isolated)
-            assert(staged.next_state ~= service_update.state, "迁移候选不得复用线上状态根表")
-            staged.has_next_state = true
+            assert(type(staged.old_state) == "table" and staged.old_state ~= service_update.state,
+                "自定义快照必须返回独立状态表")
         else
             staged.old_state = hotupgrade_module_patch.snapshot_state(service_update.state)
-            staged.has_old_state = true
-            staged.next_state = patch.migrate(hotupgrade_module_patch.snapshot_state(staged.old_state))
-            assert(type(staged.next_state) == "table" and staged.next_state ~= service_update.state,
-                "默认迁移须返回独立状态表")
-            staged.next_state = hotupgrade_module_patch.snapshot_state(staged.next_state)
-            staged.has_next_state = true
         end
+
+        local isolated = hotupgrade_module_patch.snapshot_state(staged.old_state)
+        local update_state = patch.migrate(isolated)
+        assert(type(update_state) == "table" and update_state ~= service_update.state,
+            "migrate 必须返回部分状态更新表")
+        update_state = hotupgrade_module_patch.snapshot_state(update_state)
+
+        staged.next_state = hotupgrade_module_patch.snapshot_state(staged.old_state)
+        merge_service_state(staged.next_state, update_state)
+        staged.next_state = hotupgrade_module_patch.snapshot_state(staged.next_state)
     end
 
     return staged
 end
 ```
 
-这段函数比较长，但实际只做一件事：**根据本 Service 的登记配置和 Patch 源码，准备状态及函数更新所需的全部候选与旧快照。**
+这里的 `merge_service_state()` 负责递归合并部分更新；`stage_service()` 保存旧快照、运行迁移并生成完整候选状态。两者都只处理隔离数据，不在 Stage 阶段写线上状态。
 
 我们沿执行顺序看。
 
@@ -1980,15 +2010,22 @@ staged.old_state
     schema_version = 1
 ```
 
-再复制一份独立数据交给 `patch.migrate()`。
-
-而我们的 `migrate()` 返回：
+再复制一份独立数据交给 `patch.migrate()`。迁移函数返回的只是部分更新：
 
 ```text
-staged.next_state
+update_state
     equip = "剑"
     schema_version = 2
 ```
+
+框架复制 old_state 得到候选状态，再递归合入 update_state。例如旧状态还包含：
+
+```lua
+level = 50
+combat = {attack = 100, defense = 40}
+```
+
+若 Patch 返回 `combat = {attack = 120}`，完整候选中的 `level` 和 `combat.defense` 仍分别是 50 和 40。两侧都是 Table 时递归合并；否则由 Patch 提供的值覆盖。
 
 现在需要特别区分三份东西：
 
@@ -2004,7 +2041,7 @@ PlayerService 线上 state
 
 此时真正的 `state` 还是 V1。
 
-框架只创建了候选状态，没有把 `state` 替换成 `next_state`。
+框架只创建了递归合并后的完整候选状态，没有在 Stage 阶段修改线上 state；Activate 才把候选字段应用到原根表。
 
 这样，即使 Stage 失败，正常线上对象也不需要先经历一次修改再恢复。
 
@@ -2071,7 +2108,7 @@ local ok, message = pcall(function()
     if staged then
         local service_update = module_state.registration.service_update
         staged.touched = true
-        if staged.has_next_state then
+        if staged.next_state then
             if service_update.commit then
                 assert(service_update.commit(service_update.state, staged.next_state) ~= false, "Service 拒绝提交")
             else
@@ -2184,7 +2221,7 @@ end
 
 `target_graph` 是原 PlayerService 的 `state`。
 
-`source_graph` 是 Stage 生成的 `next_state`。
+`source_graph` 是 Stage 生成的完整 `next_state`：它由旧状态快照和 Patch 的递归部分更新合成。
 
 执行结束后，原 `state` 的字段已经成为：
 
