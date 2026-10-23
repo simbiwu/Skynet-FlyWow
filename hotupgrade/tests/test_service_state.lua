@@ -1,260 +1,178 @@
---- 每个场景使用独立 Lua State，通过真实业务接收入口验证状态合并和组合恢复。
+--- 独立 Lua State 验证直接状态更新、快照边界及组合恢复。
 local common = require "flywow_hotupgrade_common"
-local scenario_name = assert(arg[1], "需要状态合并场景名")
+local scenario_name = assert(arg[1])
 local scenarios = {}
-local shared_patch = [[
-return function()
-    return {
-        migrate = function(old_state)
-            old_state.a.keep_a = 999
-            local shared = {changed = 3}
-            return {a = shared, b = shared}
-        end,
-    }
+local function scenario(source, check, state)
+    return {state = state or {a = {keep_a = 1}, b = {keep_b = 2}}, source = source, check = check}
 end
-]]
-
-local function shared_scenario()
-    return {
-        state = {a = {keep_a = 1}, b = {keep_b = 2}},
-        source = shared_patch,
-        check = function(state)
-            assert(state.a ~= state.b)
-            assert(state.a.changed == 3 and state.a.keep_a == 1 and state.a.keep_b == nil)
-            assert(state.b.changed == 3 and state.b.keep_a == nil and state.b.keep_b == 2)
-        end,
-    }
-end
-scenarios.shared = shared_scenario
-scenarios.custom = function()
-    local scenario = shared_scenario()
-    scenario.custom = true
-    return scenario
-end
-
-scenarios.nested_shared = function()
-    return {
-        state = {a = {keep_a = 1, shared = {left = 11}}, b = {keep_b = 2, shared = {right = 22}}},
-        source = [[return function()
-            return {migrate = function()
-                local shared = {changed = 3}
-                return {a = {shared = shared}, b = {shared = shared}, c = shared, d = shared}
-            end}
-        end]],
-        check = function(state)
-            assert(state.a.keep_a == 1 and state.b.keep_b == 2)
-            assert(state.a.shared ~= state.b.shared and state.c ~= state.d)
-            assert(state.a.shared.changed == 3 and state.a.shared.left == 11 and state.a.shared.right == nil)
-            assert(state.b.shared.changed == 3 and state.b.shared.left == nil and state.b.shared.right == 22)
-            assert(state.c.changed == 3 and state.d.changed == 3)
-        end,
-    }
-end
-
-scenarios.cycles = function()
-    local state = {a = {keep_a = 1}, b = {keep_b = 2}}
-    state.self = state
-    return {
-        state = state,
-        source = [[return function()
-            return {migrate = function()
-                local shared = {changed = 3}
-                shared.self = shared
-                shared.peer = {back = shared}
-                local updates = {a = shared, b = shared}
-                updates.self = updates
-                return updates
-            end}
-        end]],
-        check = function(state)
-            assert(state.self == state and state.a ~= state.b)
-            assert(state.a.self == state.a and state.b.self == state.b)
-            assert(state.a.peer.back == state.a and state.b.peer.back == state.b)
-            assert(state.a.keep_a == 1 and state.b.keep_b == 2)
-            assert(state.a.changed == 3 and state.b.changed == 3)
-        end,
-    }
-end
-
-scenarios.old_alias = function()
-    local shared = {retained = 7}
-    shared.self = shared
-    return {
-        state = {a = shared, b = shared},
-        source = [[return function()
-            return {migrate = function() return {a = {left = 1}, b = {right = 2}} end}
-        end]],
-        check = function(state)
-            assert(state.a == state.b and state.a.self == state.a)
-            assert(state.a.retained == 7 and state.a.left == 1 and state.a.right == 2)
-        end,
-    }
-end
-
-scenarios.types = function()
-    return {
-        state = {nested = {kept = 7}, ranks = {1, 2, 3}, scalar = 4, replaced = {old = true},
-            disabled = true, zero = 5, text = "old", obsolete = true},
-        source = [[return function()
-            return {migrate = function(old_state)
-                old_state.nested.kept = 999
-                local updates = {nested = {changed = 3}, ranks = {[2] = 9}, scalar = {new = true},
-                    replaced = 0, disabled = false, zero = 0, text = "", [false] = {enabled = true}}
-                updates.obsolete = nil
-                return updates
-            end}
-        end]],
-        check = function(state)
-            assert(state.nested.kept == 7 and state.nested.changed == 3)
-            assert(state.ranks[1] == 1 and state.ranks[2] == 9 and state.ranks[3] == 3)
-            assert(state.scalar.new and state.replaced == 0)
-            assert(state.disabled == false and state.zero == 0 and state.text == "")
-            assert(state[false].enabled and state.obsolete)
-        end,
-    }
-end
-
-scenarios.empty = function()
-    local state = {a = {keep_a = 1}}
-    state.self = state
-    return {
-        state = state,
-        source = [[return function()
-            return {migrate = function(old_state) old_state.a.keep_a = 999; return {} end}
-        end]],
-        check = function(state) assert(state.a.keep_a == 1 and state.self == state) end,
-    }
-end
-
-scenarios.returned_snapshot = function()
-    local state = {a = {keep_a = 1}, b = {keep_b = 2}}
-    state.self = state
-    return {
-        state = state,
-        source = [[return function()
-            return {migrate = function(old_state) old_state.a.changed = 3; return old_state end}
-        end]],
-        check = function(state)
-            assert(state.self == state and state.a ~= state.b)
-            assert(state.a.keep_a == 1 and state.a.changed == 3 and state.b.keep_b == 2)
-        end,
-    }
-end
-
-scenarios.expansion = function()
-    return {
-        state = {kept = 7},
-        source = [[return function()
-            return {migrate = function()
-                local shared = {changed = 3}
-                for _ = 1, 14 do shared = {left = shared, right = shared} end
-                return {expanded = shared}
-            end}
-        end]],
-        expected_failure = "HU_SERVICE_STAGE_FAILED",
-        error_text = "状态更新展开超过字段限制",
-        check = function(state) assert(state.kept == 7 and state.expanded == nil) end,
-    }
-end
-
-scenarios.depth = function()
-    return {
-        state = {kept = 7},
-        source = ([[return function()
-            return {migrate = function()
-                local root = {}
-                local child = root
-                for _ = 1, %d do child.next = {}; child = child.next end
-                return root
-            end}
-        end]]):format(common.MAX_STATE_DEPTH),
-        expected_failure = "HU_SERVICE_STAGE_FAILED",
-        error_text = "状态快照嵌套超过限制",
-        check = function(state) assert(state.kept == 7 and state.next == nil) end,
-    }
-end
-
-scenarios.depth_boundary = function()
-    return {
-        state = {kept = 7},
-        source = ([[return function()
-            return {migrate = function()
-                local root = {}
-                local child = root
-                for _ = 2, %d do child.next = {}; child = child.next end
-                child.value = 3
-                return root
-            end}
-        end]]):format(common.MAX_STATE_DEPTH),
-        check = function(state)
-            assert(state.kept == 7)
-            local child = state
-            for _ = 2, common.MAX_STATE_DEPTH do child = child.next end
-            assert(child.value == 3)
-        end,
-    }
-end
-
-scenarios.field_boundary = function()
-    return {
-        state = {[1] = "old"},
-        source = ([[return function()
-            return {migrate = function()
-                local updates = {}
-                for index = 1, %d do updates[index] = index end
-                return updates
-            end}
-        end]]):format(common.MAX_STATE_FIELDS),
-        check = function(state)
-            for index = 1, common.MAX_STATE_FIELDS do assert(state[index] == index) end
-        end,
-    }
-end
-
-scenarios.candidate_size = function()
-    local scenario = scenarios.field_boundary()
-    scenario.state = {kept = 7}
-    scenario.expected_failure = "HU_SERVICE_STAGE_FAILED"
-    scenario.error_text = "状态快照超过字段限制"
-    scenario.check = function(state) assert(state.kept == 7 and state[1] == nil) end
-    return scenario
-end
-
-local function restored_scenario()
-    local scenario = shared_scenario()
-    local old_shared = {retained = 7}
-    scenario.state.first = old_shared
-    scenario.state.second = old_shared
-    scenario.state.self = scenario.state
-    scenario.check_updated = scenario.check
-    scenario.check = function(state)
+local function normal()
+    return scenario([[return function(state)
+        return {update_state = function()
+            state.a.changed = 3
+            state.b.changed = 3
+        end}
+    end]], function(state)
         assert(state.a ~= state.b and state.a.keep_a == 1 and state.b.keep_b == 2)
+        assert(state.a.changed == 3 and state.b.changed == 3)
+    end)
+end
+scenarios.shared = function()
+    return scenario([[return function(state)
+        return {update_state = function()
+            local shared = {changed = 3}
+            state.a = shared
+            state.b = shared
+        end}
+    end]], function(state) assert(state.a == state.b and state.a.changed == 3 and state.a.keep_a == nil) end)
+end
+scenarios.custom = function() local s = normal(); s.custom = true; return s end
+scenarios.nested_shared = function()
+    return scenario([[return function(state)
+        return {update_state = function()
+            local shared = {changed = 3}
+            state.a.shared = shared
+            state.b.shared = shared
+        end}
+    end]], function(state)
+        assert(state.a.keep_a == 1 and state.b.keep_b == 2)
+        assert(state.a.shared == state.b.shared and state.a.shared.changed == 3)
+    end)
+end
+scenarios.cycles = function()
+    return scenario([[return function(state)
+        return {update_state = function()
+            state.self = state
+            state.a.self = state.a
+            state.a.peer = {back = state.a}
+        end}
+    end]], function(state)
+        assert(state.self == state and state.a.self == state.a and state.a.peer.back == state.a)
+        assert(state.a.keep_a == 1)
+    end)
+end
+scenarios.old_alias = function()
+    local shared = {retained = 7}; shared.self = shared
+    return scenario([[return function(state)
+        return {update_state = function() state.a.left = 1; state.b.right = 2 end}
+    end]], function(state)
+        assert(state.a == state.b and state.a.self == state.a)
+        assert(state.a.retained == 7 and state.a.left == 1 and state.b.right == 2)
+    end, {a = shared, b = shared})
+end
+scenarios.types = function()
+    return scenario([[return function(state)
+        return {update_state = function()
+            state.nested.changed = 3
+            state.ranks[2] = 9
+            state.scalar = {new = true}
+            state.replaced = 0
+            state.disabled = false
+            state.zero = 0
+            state.text = ""
+            state[false] = {enabled = true}
+            state.obsolete = nil
+        end}
+    end]], function(state)
+        assert(state.nested.kept == 7 and state.nested.changed == 3)
+        assert(state.ranks[1] == 1 and state.ranks[2] == 9 and state.ranks[3] == 3)
+        assert(state.scalar.new and state.replaced == 0 and state.disabled == false)
+        assert(state.zero == 0 and state.text == "" and state[false].enabled and state.obsolete == nil)
+    end, {nested = {kept = 7}, ranks = {1,2,3}, obsolete = true})
+end
+scenarios.empty = function()
+    return scenario([[return function() return {update_state = function() end} end]],
+        function(state) assert(state.a.keep_a == 1 and state.b.keep_b == 2) end)
+end
+scenarios.direct_fields = normal
+scenarios.expansion = function()
+    return scenario([[return function(state)
+        return {update_state = function()
+            local shared = {changed = 3}
+            for _ = 1, 14 do shared = {left = shared, right = shared} end
+            state.expanded = shared
+        end}
+    end]], function(state)
+        local node = state.expanded
+        for _ = 1, 14 do assert(node.left == node.right); node = node.left end
+        assert(node.changed == 3 and state.a.keep_a == 1)
+    end)
+end
+scenarios.depth_boundary = function()
+    local state = {kept = 7}; local node = state
+    for _ = 2, common.MAX_STATE_DEPTH do node.next = {}; node = node.next end
+    node.value = 3
+    return scenario([[return function(state) return {update_state = function() state.kept = 8 end} end]],
+        function(value) assert(value.kept == 8 and value.next) end, state)
+end
+scenarios.depth = function()
+    local s = scenarios.depth_boundary(); local node = s.state
+    while node.next do node = node.next end
+    node.next = {}
+    s.expected_failure = "HU_SERVICE_STAGE_FAILED"
+    s.error_text = "状态快照嵌套超过限制"
+    s.check = function(state) assert(state.kept == 7) end
+    return s
+end
+scenarios.field_boundary = function()
+    local state = {}
+    for i = 1, common.MAX_STATE_FIELDS do state[i] = i end
+    return scenario([[return function(state) return {update_state = function() state[1] = 9 end} end]],
+        function(value) assert(value[1] == 9 and value[common.MAX_STATE_FIELDS] == common.MAX_STATE_FIELDS) end, state)
+end
+scenarios.snapshot_size = function()
+    local s = scenarios.field_boundary(); s.state.extra = 1
+    s.expected_failure = "HU_SERVICE_STAGE_FAILED"; s.error_text = "状态快照超过字段限制"
+    s.check = function(state) assert(state[1] == 1 and state.extra == 1) end
+    return s
+end
+local function restored()
+    local s = normal()
+    local shared = {retained = 7}
+    s.state.first = shared; s.state.second = shared; s.state.self = s.state
+    s.check_updated = s.check
+    s.check = function(state)
+        assert(state.a.keep_a == 1 and state.b.keep_b == 2)
         assert(state.a.changed == nil and state.b.changed == nil)
         assert(state.first == state.second and state.first.retained == 7 and state.self == state)
     end
-    return scenario
+    return s
 end
-scenarios.abort = function()
-    local scenario = restored_scenario()
-    scenario.abort = true
-    return scenario
-end
-scenarios.recovery = function()
-    local scenario = restored_scenario()
-    scenario.expected_failure = "HU_ACTIVATE_FAILED"
-    return scenario
-end
-scenarios.recovery_retry = function()
-    local scenario = scenarios.recovery()
-    scenario.retry = true
-    return scenario
-end
-scenarios.custom_recovery = function()
-    local scenario = scenarios.recovery()
-    scenario.custom = true
-    return scenario
-end
+scenarios.abort = function() local s = restored(); s.abort = true; return s end
+scenarios.recovery = function() local s = restored(); s.expected_failure = "HU_ACTIVATE_FAILED"; return s end
+scenarios.recovery_retry = function() local s = scenarios.recovery(); s.retry = true; return s end
+scenarios.custom_recovery = function() local s = scenarios.recovery(); s.custom = true; return s end
 
+scenarios.partial_throw = function()
+    local s = restored()
+    s.source = [[return function(state) return {update_state = function()
+        state.a.changed = 99
+        state.a.keep_a = nil
+        state.extra = true
+        error("partial update rejected")
+    end} end]]
+    s.expected_failure = "HU_ACTIVATE_FAILED"
+    s.expected_after_calls = 0
+    local check = s.check
+    s.check = function(state) check(state); assert(state.extra == nil) end
+    return s
+end
+scenarios.legacy = function()
+    local s = normal()
+    s.source = "return function() return {migrate = function() error('must not run') end} end"
+    s.expected_failure = "HU_SERVICE_STAGE_FAILED"
+    s.check = function(state) assert(state.a.keep_a == 1 and state.a.changed == nil) end
+    return s
+end
+scenarios.legacy_functions = function()
+    local s = scenarios.legacy()
+    s.source = "return function() return {update_state = function() error('must not run') end, functions = {}} end"
+    return s
+end
+scenarios.bad_state_callback = function()
+    local s = scenarios.legacy()
+    s.source = "return function() return {update_state = 12} end"
+    return s
+end
 local scenario = assert(scenarios[scenario_name], scenario_name)()
 local receiver -- register_service 安装的真实协议接收器。
 local answer   -- retpack 捕获的控制命令返回值。
@@ -277,9 +195,19 @@ package.loaded.state_merge_logic = live_module
 local service_update = {state = scenario.state, functions = functions}
 if scenario.custom then
     service_update.snapshot = module_patch.snapshot_state
-    service_update.commit = function(target, source) module_patch.restore_state(source, target) end
-    service_update.restore = service_update.commit
+    service_update.restore = function(target, source) module_patch.restore_state(source, target) end
 end
+-- 无效配置不得安装接收器或锁定登记，随后正确配置仍能成功登记。
+local function invalid_registration(config)
+    local result = hotupgrade.register_service({
+        service_update = config,
+        before_upgrade = function() return true end,
+    })
+    assert(not result.ok and result.code == "HU_INVALID_OPTIONS" and receiver == nil)
+end
+invalid_registration({state = scenario.state, functions = functions, snapshot = module_patch.snapshot_state})
+invalid_registration({state = scenario.state, functions = functions, restore = function() end})
+invalid_registration({state = scenario.state, functions = functions, commit = function() end})
 local after_calls = 0 -- Stage 失败时必须仍为零；Activate 后才观察候选。
 assert(hotupgrade.register_service({
     service_update = service_update,
@@ -305,6 +233,7 @@ local function command(name)
 end
 
 assert(command("prepare").ok and hotupgrade.patching)
+assert(scenario.state == state_identity and functions.load == old_function)
 local updated = command("update")
 if scenario.expected_failure then
     assert(not updated.ok and updated.code == scenario.expected_failure, updated.message)
@@ -312,7 +241,7 @@ if scenario.expected_failure then
     if scenario.expected_failure == "HU_SERVICE_STAGE_FAILED" then
         assert(after_calls == 0 and hotupgrade.patching)
     else
-        assert(after_calls == 1 and not hotupgrade.patching)
+        assert(after_calls == (scenario.expected_after_calls or 1) and not hotupgrade.patching)
     end
     assert(command("abort").ok)
     assert(live_module.version == 1)

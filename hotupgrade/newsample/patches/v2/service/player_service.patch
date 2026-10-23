@@ -1,15 +1,12 @@
 return function(state)
     return
     {
-        migrate = function(old_state)
-            return
-            {
-                equip = "剑",
-                schema_version = 2,
-            }
+        update_state = function()
+            assert(state.schema_version == 1, "PlayerService 需要 schema 1")
+            state.equip = "剑"
+            state.schema_version = 2
         end,
-
-        functions =
+        replace_functions =
         {
             load = function(base_attack)
                 if state.equip == "剑" then

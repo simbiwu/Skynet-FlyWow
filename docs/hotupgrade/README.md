@@ -202,74 +202,43 @@ return M
 
 ## 一次性 Service 更新脚本
 
-service_path 为 service 时，service/player_service.patch 返回构建函数，接收现存 Service 私有 state 根表：
+service_path 为 service 时，service/player_service.patch 如下：
 
 ```lua
 return function(state)
     return
     {
-        migrate = function(old_state)
-            assert(old_state.schema_version == 1)
-            return
-            {
-                equip = old_state.equip == "刀" and "剑" or old_state.equip,
-                schema_version = 2,
-            }
+        update_state = function()
+            assert(state.schema_version == 1, "PlayerService 需要 schema 1")
+            state.equip = "剑"
+            state.schema_version = 2
         end,
-        functions =
+        replace_functions =
         {
-            load = function(item)
-                return item.base_attack + (state.equip == "剑" and 20 or 0)
+            load = function(base_attack)
+                if state.equip == "剑" then
+                    return base_attack + 20 + 1
+                end
+
+                return base_attack
             end,
         },
     }
 end
 ```
 
-migrate 接收独立旧状态快照，只返回本次要修改的字段。框架先复制旧状态，再递归合并这些字段：两侧都是 Table 时继续合并；否则用 Patch 提供的值覆盖。Patch 未提供的字段保留；Lua 的 nil 不会保存为字段，因此不支持删除。Activate 将合并后的完整候选应用到现存 state 根表，再直接替换 functions 指定的现有函数字段。未列出的函数保持不变；新函数直接捕获原 state，不增加稳定包装或函数注册表。没有迁移可省略 migrate，没有函数更新可省略 functions，两者都无则不提供 Service Patch。函数级更新仅在 Service 脚本中支持；普通模块仍是完整文件 Patch。
+构建函数接收现存 state，只准备闭包，不修改线上状态。update_state() 不接收参数、不返回候选状态，在 Update 同步提交阶段直接修改现存 state。嵌套赋值、共享引用、循环引用和赋 nil 删除字段均遵循普通 Lua 语义；未修改字段自然保留，不生成候选状态、不递归合并。
 
-Patch 中同一张表被多个路径引用时，各路径分别与自己的旧值合并，不据此建立新的线上共享关系。例如旧状态和完整 Service Patch 如下：
+replace_functions 只列出需要替换的现有业务函数；未列出的函数保持原样，新函数捕获原 state。没有状态修改可省略 update_state，没有函数替换可省略 replace_functions，至少提供一项。旧 migrate / functions 字段不再接受。
 
-```lua
--- Service 原有状态
-local state = {
-    a = {keep_a = 1},
-    b = {keep_b = 2},
-}
-```
+准备阶段保存旧状态快照和旧函数。提交前先标记 touched，再调用 update_state()，随后安装 replace_functions，最后执行 after_upgrade。部分写入抛错及后续失败沿现有 Abort 恢复；恢复失败报告 RECOVERY_REQUIRED 并保持入口关闭。迁移运行错误在 Update 提交时发现。成功 Finish 后清理快照。
 
-```lua
-return function(state)
-    return {
-        migrate = function(old_state)
-            local shared = {changed = 3}
-            return {a = shared, b = shared}
-        end,
-    }
-end
-```
+默认快照支持普通数据图，保留共享和循环关系，最多 128 层、10000 个字段。这是保存恢复快照的限制，不是更新值合并限制。恢复保持线上根表身份，不承诺嵌套表身份。特殊对象由 Service 提供成对回调：
 
-提交后结果是：
+- snapshot(state)：返回与线上可变数据隔离的旧状态快照，可将特殊对象编码为普通表。
+- restore(state, old_state)：恢复现存状态及特殊业务对象；返回 false 或抛错表示恢复失败。
 
-```lua
-print(state.a == state.b) -- false
-print(state.a.changed)    -- 3
-print(state.a.keep_a)     -- 1
-print(state.a.keep_b)     -- nil
-print(state.b.changed)    -- 3
-print(state.b.keep_a)     -- nil
-print(state.b.keep_b)     -- 2
-```
-
-旧状态原有的共享引用仍随快照保留；向同一张旧表的不同路径提供冲突字段，属于 Patch 自身的冲突，不由框架裁决。Patch 中的循环引用只连接当前合并路径上的目标祖先；同一张循环表被不同分支复用时，各分支分别闭合循环。状态根表身份保持不变，不保证嵌套表身份。合并展开最多处理 10000 个字段，嵌套深度最多 128 层；候选状态仍须通过完整快照检查，任何准备失败均不写线上状态。
-
-仅需迁移的 Service 局部变量集中到其私有状态表，不要求把所有状态移入表或独立模块。默认复制普通数据图，保持状态根表身份，嵌套表身份不承诺保持。对 userdata、元表对象或不适合进入表的局部状态，可在登记的 service 中成组提供以下最小内部回调：
-
-- snapshot(state)：返回与线上状态完全隔离的普通数据图 Table。框架调用一次，再通过状态复制器生成迁移输入和候选副本；业务回调负责把不能直接复制的对象编码为普通状态数据。
-- commit(state, next_state)：原地应用递归合并后的完整候选状态，不替换根表；返回 false 或抛错视为提交失败。
-- restore(state, old_state)：根据完整旧状态快照恢复线上状态，不替换根表；返回 false 或抛错导致恢复故障。
-
-自定义回调负责业务对象的隔离、状态迁移校验和恢复；不能把浅拷贝当作隔离保证。所有构建、迁移、检查、提交和恢复回调均为受信同步代码，不得 yield、执行外部 I/O 或产生不可撤销副作用。框架捕获错误，但不提供安全沙箱，不承诺抢占死循环/阻塞 Native、撤销违反合同的副作用或从 OOM/进程退出恢复。
+service_update.commit 已删除，不保留兼容。构建、更新、快照、恢复和检查都必须同步，不得 yield、执行外部 I/O 或产生不可撤销副作用；不得替换整个线上状态根表。框架不提供安全沙箱。
 
 ## 发布生命周期、文件部署与恢复
 

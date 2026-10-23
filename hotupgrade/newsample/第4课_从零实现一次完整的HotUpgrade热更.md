@@ -792,15 +792,12 @@ V2 判断 `"剑"`，加 21。
 return function(state)
     return
     {
-        migrate = function(old_state)
-            return
-            {
-                equip = "剑",
-                schema_version = 2,
-            }
+        update_state = function()
+            assert(state.schema_version == 1, "PlayerService 需要 schema 1")
+            state.equip = "剑"
+            state.schema_version = 2
         end,
-
-        functions =
+        replace_functions =
         {
             load = function(base_attack)
                 if state.equip == "剑" then
@@ -822,15 +819,19 @@ HotUpgrade 之后会在原 PlayerService 的 Lua State 内执行这个函数，�
 
 构建函数返回两部分内容：
 
-`migrate` 接收旧状态的独立快照，只返回本次要更新的字段。框架先复制旧快照，再把这些字段递归合入候选状态；Patch 没提供的字段会保留。
+构建函数接收现存 state，只准备闭包，不修改线上状态。update_state() 不接收参数、不返回候选状态，在 Update 同步提交阶段直接修改现存 state。嵌套赋值、共享引用、循环引用和赋 nil 删除字段均遵循普通 Lua 语义；未修改字段自然保留，不生成候选状态、不递归合并。
 
-`functions.load` 是准备替换到现有 `business` 表中的新函数。它直接捕获构建函数收到的 `state` 根表。
+replace_functions 只列出需要替换的现有业务函数；未列出的函数保持原样，新函数捕获原 state。没有状态修改可省略 update_state，没有函数替换可省略 replace_functions，至少提供一项。旧 migrate / functions 字段不再接受。
 
-嵌套 Table 也按同一原则合并。例如旧状态有 `combat = {attack = 100, defense = 40}`，迁移只返回 `combat = {attack = 120}`，结果会保留 `defense = 40`。如果 Patch 提供 `nil`，Lua 不会把它保存为字段，因此本合同不支持删除字段。
+准备阶段保存旧状态快照和旧函数。提交前先标记 touched，再调用 update_state()，随后安装 replace_functions，最后执行 after_upgrade。部分写入抛错及后续失败沿现有 Abort 恢复；恢复失败报告 RECOVERY_REQUIRED 并保持入口关闭。迁移运行错误在 Update 提交时发现。成功 Finish 后清理快照。
 
-迁移返回的部分更新表不会取代原 PlayerService 的 `state` 根表。Activate 阶段会把递归合并后的完整候选状态应用到原根表，保持根表身份。
+默认快照支持普通数据图，保留共享和循环关系，最多 128 层、10000 个字段。这是保存恢复快照的限制，不是更新值合并限制。恢复保持线上根表身份，不承诺嵌套表身份。特殊对象由 Service 提供成对回调：
 
-而 `functions.load` 捕获的，正是这张原来的根表。
+- snapshot(state)：返回与线上可变数据隔离的旧状态快照，可将特殊对象编码为普通表。
+- restore(state, old_state)：恢复现存状态及特殊业务对象；返回 false 或抛错表示恢复失败。
+
+service_update.commit 已删除，不保留兼容。构建、更新、快照、恢复和检查都必须同步，不得 yield、执行外部 I/O 或产生不可撤销副作用；不得替换整个线上状态根表。框架不提供安全沙箱。
+
 
 ### 编写正式 V2 Service 文件
 
@@ -1922,62 +1923,11 @@ end
 
 这部分是普通模块更新引擎的入口。第 5 课再研究它如何进行完整导出检查和私有状态迁移；现在只需要理解：**Stage 产生候选版本，并保留旧版本的恢复依据，暂不修改线上对象。**
 
-#### 接着 Stage Service 状态和函数
+#### 接着准备 Service 更新回调与恢复快照
 
-普通模块 Stage 成功后，`handle_upgrade("update")` 执行：
-
-```lua
-local ok, service = pcall(stage_service, request.service_source)
-```
-
-这里的 `stage_service()` 不是 Skynet Service，而是 `flywow_hotupgrade.lua` 内的普通本地函数。
-
-它的参数就是 Controller 发来的 `service/player_service.patch` 源码字符串。
-
-我们进入这个函数。
-
-文件：`hotupgrade/lualib/flywow_hotupgrade.lua`
-
-函数：`local function stage_service(patch_source)`
-
-完整实现：
-
-文件顶部已加载 flywow_hotupgrade_common；这里使用 MAX_STATE_DEPTH、MAX_STATE_FIELDS，与状态快照复制统一维护嵌套与字段限制。
+stage_service() 在业务安全点内加载 Patch，完整实现如下：
 
 ```lua
--- 按路径合并部分更新：旧字段保留，Patch 的共享表在不同分支分别应用。
-local function merge_service_state(target_state, update_state)
-    local ancestors   = {} -- 只记录当前递归路径；遇到 Patch 循环时连回本路径的目标祖先。
-    local field_count = 0  -- 本次合并实际展开的字段数，防止共享数据沿多条路径展开后失控。
-
-    local function merge_table(target_table, source_table, nesting_depth)
-        assert(nesting_depth <= hotupgrade_common.MAX_STATE_DEPTH, "Service 状态更新嵌套超过限制")
-        ancestors[source_table] = target_table
-        for key, update_value in pairs(source_table) do
-            field_count = field_count + 1
-            assert(field_count <= hotupgrade_common.MAX_STATE_FIELDS, "Service 状态更新展开超过字段限制")
-            if type(update_value) ~= "table" then
-                rawset(target_table, key, update_value)
-            elseif ancestors[update_value] then
-                -- 循环引用在本分支闭合；不会复用已经完成的兄弟分支。
-                rawset(target_table, key, ancestors[update_value])
-            else
-                local target_child = rawget(target_table, key)
-                if type(target_child) ~= "table" then
-                    target_child = {}
-                end
-                merge_table(target_child, update_value, nesting_depth + 1)
-                rawset(target_table, key, target_child)
-            end
-        end
-
-        ancestors[source_table] = nil
-    end
-
-    merge_table(target_state, update_state, 1)
-end
-
--- 只在业务安全点已确认时执行受信同步脚本；此函数不提供安全沙箱或副作用撤销。
 local function stage_service(patch_source)
     if not patch_source then
         return nil
@@ -1988,29 +1938,31 @@ local function stage_service(patch_source)
     local chunk = assert(load(patch_source, "=Service Patch", "t", _G))
     local build_patch = chunk()
     assert(type(build_patch) == "function", "Service Patch 必须返回构建函数")
+    ---@type FlyWowHotUpgradeServicePatch
     local patch = build_patch(service_update.state)
 
     assert(type(patch) == "table" and getmetatable(patch) == nil, "Service 构建结果必须是普通表")
-    assert(patch.migrate == nil or type(patch.migrate) == "function", "migrate 必须是函数")
-    assert(patch.functions == nil or (type(patch.functions) == "table"
-        and getmetatable(patch.functions) == nil), "functions 必须是普通表")
-    assert(patch.migrate or (patch.functions and next(patch.functions)), "Service Patch 没有更新内容")
+    assert(patch.migrate == nil and patch.functions == nil, "Service Patch 使用 update_state / replace_functions")
+    assert(patch.update_state == nil or type(patch.update_state) == "function", "update_state 必须是函数")
+    assert(patch.replace_functions == nil or (type(patch.replace_functions) == "table"
+        and getmetatable(patch.replace_functions) == nil), "replace_functions 必须是普通表")
+    assert(patch.update_state or (patch.replace_functions and next(patch.replace_functions)), "Service Patch 没有更新内容")
 
     -- 保存本次可能替换的旧函数，Activate 失败时逐字段恢复。
     local staged =
     {
-        patch = patch,       -- 仅本 State 持有的新函数和迁移函数。
-        old_functions = {}, -- 本次将替换的现有函数，不处理未列出的字段。
-        touched = false,    -- 首次线上写入前置 true，部分提交同样必须恢复。
+        patch         = patch, -- 仅本 State 持有的状态更新回调和替换函数。
+        old_functions = {},    -- 本次将替换的现有函数，不处理未列出的字段。
+        touched       = false, -- 首次线上写入前置 true，部分提交同样必须恢复。
     }
-    for name, replacement_function in pairs(patch.functions or {}) do
+    for name, replacement_function in pairs(patch.replace_functions or {}) do
         assert(type(name) == "string" and type(replacement_function) == "function"
             and type(rawget(service_update.functions, name)) == "function", "只能直接替换现有业务函数")
         staged.old_functions[name] = rawget(service_update.functions, name)
     end
 
-    -- 迁移只接触隔离快照；将部分更新递归合入完整候选，不改线上状态。
-    if patch.migrate then
+    -- 只保存恢复快照；更新回调留到提交阶段执行，不创建候选状态或做合并。
+    if patch.update_state then
         if service_update.snapshot then
             staged.old_state = service_update.snapshot(service_update.state)
             assert(type(staged.old_state) == "table" and staged.old_state ~= service_update.state,
@@ -2018,433 +1970,89 @@ local function stage_service(patch_source)
         else
             staged.old_state = hotupgrade_module_patch.snapshot_state(service_update.state)
         end
-
-        local migration_snapshot = hotupgrade_module_patch.snapshot_state(staged.old_state)
-        local update_state = patch.migrate(migration_snapshot)
-        assert(type(update_state) == "table" and update_state ~= service_update.state,
-            "migrate 必须返回部分状态更新表")
-        update_state = hotupgrade_module_patch.snapshot_state(update_state)
-
-        staged.next_state = hotupgrade_module_patch.snapshot_state(staged.old_state)
-        merge_service_state(staged.next_state, update_state)
-        staged.next_state = hotupgrade_module_patch.snapshot_state(staged.next_state)
     end
 
     return staged
 end
 ```
 
-这里的 `merge_service_state()` 负责递归合并部分更新；`stage_service()` 保存旧快照、运行迁移并生成完整候选状态。两者都只处理隔离数据，不在 Stage 阶段写线上状态。
+构建函数接收真实 state，但只创建闭包，update_state 此时没有执行。old_state 是失败恢复快照，old_functions 是涉及的旧函数；准备阶段不生成 next_state。
 
-Patch 中同一张表被多个路径引用时，各路径分别与自己的旧值合并，不据此建立新的线上共享关系。例如旧状态和完整 Service Patch 如下：
+#### 第四次状态快照：准备完成
 
-```lua
--- Service 原有状态
-local state = {
-    a = {keep_a = 1},
-    b = {keep_b = 2},
-}
-```
-
-```lua
-return function(state)
-    return {
-        migrate = function(old_state)
-            local shared = {changed = 3}
-            return {a = shared, b = shared}
-        end,
-    }
-end
-```
-
-提交后结果是：
-
-```lua
-print(state.a == state.b) -- false
-print(state.a.changed)    -- 3
-print(state.a.keep_a)     -- 1
-print(state.a.keep_b)     -- nil
-print(state.b.changed)    -- 3
-print(state.b.keep_a)     -- nil
-print(state.b.keep_b)     -- 2
-```
-
-旧状态原有的共享引用仍随快照保留；向同一张旧表的不同路径提供冲突字段，属于 Patch 自身的冲突，不由框架裁决。Patch 中的循环引用只连接当前合并路径上的目标祖先；同一张循环表被不同分支复用时，各分支分别闭合循环。状态根表身份保持不变，不保证嵌套表身份。合并展开最多处理 10000 个字段，嵌套深度最多 128 层；候选状态仍须通过完整快照检查，任何准备失败均不写线上状态。
-
-实现中的 `ancestors` 只记录当前尚未返回的递归路径，用于处理循环引用；一个分支处理完后就移除记录。同一张 Patch 表随后出现在兄弟分支时，会重新合入该分支自己的旧表，因此不会串联两个旧状态分支。
-
-我们沿执行顺序看。
-
-最初：
-
-```lua
-local service_update = assert(module_state.registration.service_update, ...)
-```
-
-它取得的就是此前 `initialize()` 中登记的：
-
-```lua
-service_update = {state = state, functions = business}
-```
-
-这两行分别来自框架的 `stage_service()` 和我们 V1 `player_service.lua` 的 `initialize()` 登记配置。它们表达的是同一份对象引用关系。
-
-接着：
-
-```lua
-local chunk = assert(load(source, ...))
-local build = chunk()
-local patch = build(service_update.state)
-```
-
-这三句位于框架 `stage_service()` 内。
-
-调用 `load()` 编译 `.patch` 源码。
-
-执行 `chunk()` 得到我们在 `player_service.patch` 最外层返回的 `function(state)`。
-
-随后执行 `build(service_update.state)`，把原 PlayerService 的真实状态根表传进去。
-
-因此，`player_service.patch` 里面新定义的 `functions.load` 所捕获的 `state`，就是现存 Service 的原表，而不是迁移后另外创建的一张表。
-
-后面函数检查新函数是否可以替换已存在的 `business.load`，并把旧函数保存到：
-
-`staged.old_functions.load`
-
-然后开始迁移状态。
-
-我们没有提供自定义的 `snapshot()`、`commit()`、`restore()`，因此使用默认的普通 table 复制与恢复逻辑。
-
-框架先保存一份独立的旧状态快照：
-
-```text
-staged.old_state
-    equip = "刀"
-    schema_version = 1
-```
-
-再复制一份独立数据交给 `patch.migrate()`。迁移函数返回的只是部分更新：
-
-```text
-update_state
-    equip = "剑"
-    schema_version = 2
-```
-
-框架复制 old_state 得到候选状态，再递归合入 update_state。例如旧状态还包含：
-
-```lua
-level = 50
-combat = {attack = 100, defense = 40}
-```
-
-若 Patch 返回 `combat = {attack = 120}`，完整候选中的 `level` 和 `combat.defense` 仍分别是 50 和 40。两侧都是 Table 时递归合并；否则由 Patch 提供的值覆盖。
-
-现在需要特别区分三份东西：
-
-```text
-PlayerService 线上 state
-    equip = "刀"
-    schema_version = 1
-         │
-         ├── old_state：独立旧快照，供恢复使用
-         │
-         └── next_state：独立 V2 候选状态
-```
-
-此时真正的 `state` 还是 V1。
-
-框架只创建了递归合并后的完整候选状态，没有在 Stage 阶段修改线上 state；Activate 才把候选字段应用到原根表。
-
-这样，即使 Stage 失败，正常线上对象也不需要先经历一次修改再恢复。
-
-`stage_service()` 返回 `staged` 后，执行权回到本地 `handle_upgrade("update")`，把它保存到 `txn.service`，并设置：
-
-`txn.phase = "STAGED"`
-
-#### 第四次状态快照：Stage 完成
-
-```text
-Controller
-    phase = APPLYING
-    batch.phase = UPDATE
-    正在等待 first_service_handle 的 Update RPC
-
-原 PlayerService
-    hot.patching = true
-    txn.phase = STAGED
-
-    logic.version() = "v1"
-    state.equip = "刀"
-    state.schema_version = 1
-
-    business.load(100) = 105
-    initial_load(100) = 105
-
-    txn.modules
-        已保存旧模块字段
-        已生成 V2 候选模块
-
-    txn.service
-        old_state = V1 快照
-        next_state = V2 候选状态
-        old_functions.load = V1 闭包
-        patch.functions.load = V2 闭包
-
-正式磁盘
-    player_logic.lua = V1
-    player_service.lua = V1
-```
-
-到这个时间点，我们已经有了所有将要安装的新版本内容，但线上仍然是旧版本。
-
-接下来才是最关键的一步：Activate。
+原 state 与 business.load 尚未改变。批次记录拥有 patch、old_state 和 old_functions，touched 为 false。准备失败通过现有 Abort 清理已准备的普通模块和参与目标。
 
 ### 7. Activate：在原有对象上正式安装 V2
 
-现在继续执行：
-
-`hotupgrade/lualib/flywow_hotupgrade.lua` 的 `handle_upgrade("update")`。
-
-前面已经运行到：
-
-`txn.phase = "STAGED"`
-
-紧接着执行下面这段真实源码：
+现有 Update 先提交普通模块，再同步更新 Service：
 
 ```lua
--- Activate 同步提交；任一步失败先组合恢复，再由 Controller 整批 Abort。
-local installed = hotupgrade_module_patch.commit(txn.modules)
-local ok, message = pcall(function()
-    assert(installed.ok, installed.message)
+        -- Activate 同步提交；任一步失败先组合恢复，再由 Controller 整批 Abort。
+        local installed = hotupgrade_module_patch.commit(txn.modules)
+        local ok, message = pcall(function()
+            assert(installed.ok, installed.message)
+            local staged = txn.service
+            if staged then
+                local service_update = module_state.registration.service_update
+                staged.touched = true
+                if staged.patch.update_state then
+                    staged.patch.update_state()
+                end
+
+                for name, fn in pairs(staged.patch.replace_functions or {}) do
+                    rawset(service_update.functions, name, fn)
+                end
+            end
+
+            if module_state.registration.after_upgrade then
+                assert(module_state.registration.after_upgrade() ~= false, "after_upgrade 拒绝更新")
+            end
+        end)
+
+        if not ok then
+            local restored = abort(txn)
+            return restored.ok and hotupgrade_result.failure("HU_ACTIVATE_FAILED", tostring(message)) or restored
+        end
+```
+
+先置 touched=true，再执行 update_state()，确保回调写到一半抛错也会恢复。随后直接安装 replace_functions 中列出的函数；未列出的函数保留。after_upgrade 在提交后运行，拒绝或异常同样触发组合恢复。
+
+普通模块仍由 hotupgrade_module_patch.commit() 完整替换原模块根表的字段，package.loaded 的根表身份不变。Service 状态由 update_state 直接赋值。例如 state.equip="剑" 后 level 保留原值 50；state.nested.count=8 保留 nested 的其余字段与身份，而 state.nested={} 则替换整个嵌套字段。框架不参与业务状态合并。
+
+失败时复用以下恢复实现：
+
+```lua
+local function restore_service(txn)
     local staged = txn.service
-    if staged then
-        local service_update = module_state.registration.service_update
-        staged.touched = true
-        if staged.next_state then
-            if service_update.commit then
-                assert(service_update.commit(service_update.state, staged.next_state) ~= false, "Service 拒绝提交")
+    if not staged or not staged.touched then
+        return
+    end
+
+    local service_update = module_state.registration.service_update
+    -- 自定义恢复只处理 Service 自己的对象；即使它失败也继续尝试还原函数字段。
+    local ok, message = pcall(function()
+        if staged.old_state then
+            if service_update.restore then
+                assert(service_update.restore(service_update.state, staged.old_state) ~= false, "Service 拒绝恢复")
             else
-                hotupgrade_module_patch.restore_state(staged.next_state, service_update.state)
+                hotupgrade_module_patch.restore_state(staged.old_state, service_update.state)
             end
         end
+    end)
 
-        for name, fn in pairs(staged.patch.functions or {}) do
-            rawset(service_update.functions, name, fn)
-        end
+    for name, fn in pairs(staged.old_functions) do
+        rawset(service_update.functions, name, fn)
     end
 
-    if module_state.registration.after_upgrade then
-        assert(module_state.registration.after_upgrade() ~= false, "after_upgrade 拒绝更新")
-    end
-end)
-if not ok then
-    local restored = abort(txn)
-    return restored.ok and hotupgrade_result.failure("HU_ACTIVATE_FAILED", tostring(message)) or restored
-end
-
-txn.phase = "ACTIVATED"
-return hotupgrade_result.success()
-```
-
-这是同一个 Update RPC 内部的后半段，没有增加新的控制 RPC。
-
-这段代码首先调用：
-
-`hotupgrade_module_patch.commit(txn.modules)`
-
-进入 `flywow_hotupgrade_module_patch.lua` 的 `M.commit()`。
-
-它在通过模块身份检查后，对每个模块调用本文件的 `replace_exports()`。
-
-`replace_exports()` 的完整实现是：
-
-```lua
-local function replace_exports(module_exports, export_fields)
-    for key in pairs(module_exports) do
-        rawset(module_exports, key, nil)
-    end
-
-    for key, value in pairs(export_fields) do
-        rawset(module_exports, key, value)
-    end
+    assert(ok, message)
 end
 ```
 
-这里的 `module_exports` 是已经加载的模块导出根表，也就是 PlayerService 中 `logic` 指向的对象。
-
-`export_fields` 是 Stage 得到的 V2 候选导出字段。
-
-代码先删除原导出字段，再安装新字段。
-
-**它没有把 `package.loaded["lualib.player_logic"]` 改为另一张 table。**
-
-因此原来的：
-
-`logic`
-
-仍指向同一张模块导出表，但 `logic.version()` 已经执行 V2 函数，返回 `"v2"`。
-
-需要特别注意，此时 `business.load` 还没有改变。
-
-它是之前 `logic.make_load(state)` 返回并保存下来的旧闭包，而不是每次调用时都重新从 `logic` 中获取函数。
-
-所以普通模块更新结束后，短暂出现这样的内部状态：
-
-```text
-logic.version() = "v2"
-business.load = V1 闭包
-state.equip = "刀"
-```
-
-这是一次尚未结束的 Activate 内部状态，不是已经开放给业务使用的最终状态。Prepare 阶段建立的安全点仍然有效。
-
-接下来 `handle_upgrade("update")` 开始应用 Service Patch。
-
-它取得：
-
-`module_state.registration.service_update`
-
-也就是原来的 `{state=state, functions=business}`。
-
-先设置：
-
-`staged.touched = true`
-
-这个标记非常重要。一旦开始提交 Service 状态，即使提交过程部分失败，Abort 也需要知道必须尝试恢复。
-
-随后，因为本例没有自定义 `commit()`，框架调用：
-
-`hotupgrade_module_patch.restore_state(staged.next_state, service_update.state)`
-
-虽然这里使用的函数名叫 `restore_state`，但它负责的是把一份普通数据图的字段**原地应用到指定根表**。
-
-对应源码：
-
-```lua
-function M.restore_state(source_graph, target_graph)
-    assert(type(source_graph) == "table" and type(target_graph) == "table", "状态必须为表")
-    copy_state_graph(source_graph, target_graph)
-end
-```
-
-来源是 `hotupgrade/lualib/flywow_hotupgrade_module_patch.lua`。这次由 `handle_upgrade("update")` 的 Activate 分支调用。
-
-调用时：
-
-`target_graph` 是原 PlayerService 的 `state`。
-
-`source_graph` 是 Stage 生成的完整 `next_state`：它由旧状态快照和 Patch 的递归部分更新合成。
-
-执行结束后，原 `state` 的字段已经成为：
-
-```lua
-{
-    equip = "剑",
-    schema_version = 2,
-}
-```
-
-但它的 table 身份没有变化。
-
-原来的 `state_root` 和 Patch 中新函数捕获的 `state`，仍然指向这张表。
-
-接下来更新业务函数：
-
-```lua
-for name, fn in pairs(staged.patch.functions or {}) do
-    rawset(service_update.functions, name, fn)
-end
-```
-
-这段是框架 `handle_upgrade("update")` 的 Activate 代码。
-
-我们的 `staged.patch.functions` 只有一个 `load` 字段。
-
-所以最终执行的效果相当于：
-
-```lua
-business.load = 新的 V2 闭包
-```
-
-这行是帮助理解的等价表达，不是框架源码。
-
-这次更新保留 `business` 表本身，只替换了其中的 `load` 函数字段。
-
-于是：
-
-`business.load(100)` 现在得到 `121`。
-
-而 `initial_load` 是此前独立保存的旧闭包引用，没有任何代码重新给它赋值。
-
-因此它仍然执行 V1 的 `"刀"` 判断。
-
-但它捕获的 `state` 已经被原地迁移成 `"剑"`，所以：
-
-`initial_load(100)` 现在返回 `100`，而不再是 V1 初始状态下的 `105`。
-
-这正好说明：
-
-**旧闭包保留的是旧函数逻辑，不代表它捕获的状态也被冻结在旧版本。**
-
-最后，Activate 调用我们登记的 `after_upgrade()`，检查模块版本、装备、状态版本和攻击计算。检查成功，便把：
-
-`txn.phase = "ACTIVATED"`
-
-并返回 `{ok=true}`。
-
-如果 Activate 中出现错误，当前 Service 会先尝试本地组合恢复；Controller 得知失败后，还会进入整批 Abort。
-
-当前成功路径中，PlayerService 的 Update RPC 到这里已经结束。
+默认 restore_state 将旧快照原地恢复到线上根表，移除更新新增字段，并重建旧数据关系。特殊对象采用成对 snapshot / restore，自定义 commit 已删除。恢复失败仍保持入口关闭。更新和恢复必须同步，不得执行无法撤销的消息、数据库等外部操作。
 
 #### 第五次状态快照：Activate 完成
 
-```text
-Controller
-    phase = APPLYING
-    batch.phase = UPDATE
-    已收到 first_service_handle 的 Update 成功
-
-原 PlayerService
-    hot.patching = true
-    txn.phase = ACTIVATED
-
-    state == state_root
-    state.equip = "剑"
-    state.schema_version = 2
-
-    logic = 原来的模块导出根表
-    logic.version() = "v2"
-
-    business = 原来的业务函数表
-    business.load = V2 闭包
-    business.load(100) = 121
-
-    initial_load = 原 V1 闭包
-    initial_load(100) = 100
-
-    package.loaded["player_logic"] == logic
-    package.loaded["lualib.player_logic"] == logic
-
-    旧模块导出快照：仍保留
-    旧 Service 状态和函数快照：仍保留
-
-正式磁盘
-    player_logic.lua = V1
-    player_service.lua = V1
-```
-
-这里有一个很重要的现象：
-
-**原 PlayerService 已经运行 V2 业务，但正式磁盘文件仍然是 V1。**
-
-这是有意安排的。
-
-如果这时候马上开放业务，后来创建的新 PlayerService 仍会读到旧文件，造成新旧实例版本不一致。
-
-因此，Update 成功后还不能释放旧快照，也不能让 `hot.patching` 变回 `false`。
-
-接下来执行权回到 Controller，继续完成正式文件部署。
+state 已修改，business.load 已替换为捕获原 state 的新闭包，普通模块也已安装 V2。旧快照和旧函数仍保留到 Finish，后续失败可由 Abort 恢复；成功 Finish 才清理恢复数据并开放业务。
 
 ### 8. Controller 怎样部署正式 Lua 文件？
 

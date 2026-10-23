@@ -29,4 +29,4 @@ PlayerService 的 skynet.queue() 是更新安全点的一部分：更新前停�
 
 Prepare 排空期间，队列中已进入的业务仍可正常创建 Service 或首次加载模块。Controller 会等待这些操作完成，并让新增的匹配目标也执行一次 Prepare；全部准备好后才在 Update 前关闭创建和加载门禁，后续请求由框架等待到发布结束。
 
-Service Patch 的 `migrate` 只返回要改的字段；未提供字段保留，嵌套 Table 按状态路径分别递归合并；Patch 复用同一张表不会把两条独立旧状态分支合成一张表，`nil` 不用于删除字段。
+Service Patch 的 update_state() 在 Update 中直接修改现存 state；未修改字段保留，嵌套赋值和赋 nil 删除遵循 Lua 语义。replace_functions 指定要替换的现有函数；旧快照仅用于恢复。

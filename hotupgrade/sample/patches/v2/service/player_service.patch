@@ -2,18 +2,12 @@
 return function(state)
     return
     {
-        migrate = function(old_state)
-            if old_state.schema_version ~= 1 then
-                error("PlayerService 只支持从 schema 1 迁移")
-            end
-
-            return
-            {
-                equip = "剑",
-                schema_version = 2,
-            }
+        update_state = function()
+            assert(state.schema_version == 1, "PlayerService 需要 schema 1")
+            state.equip = "剑"
+            state.schema_version = 2
         end,
-        functions =
+        replace_functions =
         {
             load = function(base_attack)
                 return base_attack + (state.equip == "剑" and 20 or 0)

@@ -1086,15 +1086,11 @@ if command == "update" then
         if staged then
             local service_update = module_state.registration.service_update
             staged.touched = true
-            if staged.next_state then
-                if service_update.commit then
-                    assert(service_update.commit(service_update.state, staged.next_state) ~= false, "Service 拒绝提交")
-                else
-                    hotupgrade_module_patch.restore_state(staged.next_state, service_update.state)
-                end
+            if staged.patch.update_state then
+                staged.patch.update_state()
             end
 
-            for name, fn in pairs(staged.patch.functions or {}) do
+            for name, fn in pairs(staged.patch.replace_functions or {}) do
                 rawset(service_update.functions, name, fn)
             end
         end

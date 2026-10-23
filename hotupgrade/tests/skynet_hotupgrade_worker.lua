@@ -50,10 +50,6 @@ local function initialize(request)
         service_update.snapshot = function(source_state)
             return require("flywow_hotupgrade_module_patch").snapshot_state(source_state)
         end
-        service_update.commit = function(value, candidate)
-            value.equip = candidate.equip
-            error("partial service commit")
-        end
         service_update.restore = function(target_state, source_snapshot)
             if worker_test_config.restore_failure then
                 error("service restore failed")
@@ -68,13 +64,12 @@ local function initialize(request)
             return {equip = source_state.equip, level = source_state.level,
                 schema_version = source_state.schema_version, nested = {count = source_state.nested.count}}
         end
-        service_update.commit = function(value, next_state)
+        service_update.restore = function(value, next_state)
             value.equip = next_state.equip
             value.level = next_state.level
             value.schema_version = next_state.schema_version
             value.nested.count = next_state.nested.count
         end
-        service_update.restore = service_update.commit
     end
     return hotupgrade.register_service(
     {
@@ -90,6 +85,7 @@ local function initialize(request)
             return business_queue(function() return true end)
         end or nil,
         after_upgrade = function()
+            if worker_test_config.custom then error("partial service update") end
             if worker_test_config.after_upgrade_failure then
                 error("after_upgrade failed")
             end

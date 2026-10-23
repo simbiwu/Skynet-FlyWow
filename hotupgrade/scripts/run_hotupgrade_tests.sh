@@ -14,7 +14,7 @@ mkdir -p build/hotupgrade-tests/patches
 "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/prepare_test_packages.lua
 "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_foundation.lua
 # 每个业务接收器场景拥有独立 Lua State，不为测试向生产模块增加 reset 接口。
-for scenario in shared custom nested_shared cycles old_alias types empty returned_snapshot expansion depth depth_boundary field_boundary candidate_size abort recovery recovery_retry custom_recovery; do
+for scenario in shared custom nested_shared cycles old_alias types empty direct_fields expansion depth depth_boundary field_boundary snapshot_size abort recovery recovery_retry custom_recovery partial_throw legacy legacy_functions bad_state_callback; do
     "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_service_state.lua "$scenario"
 done
 CONTROLLER_LOG="$FRAMEWORK_DIR/build/hotupgrade-tests/controller.log"

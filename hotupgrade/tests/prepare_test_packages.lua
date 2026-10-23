@@ -34,11 +34,12 @@ return M
 local service = [[
 return function(state)
     return {
-        migrate = function(old)
-            assert(old.schema_version == 1)
-            return {equip = "剑", schema_version = 2}
+        update_state = function()
+            assert(state.schema_version == 1)
+            state.equip = "剑"
+            state.schema_version = 2
         end,
-        functions = {
+        replace_functions = {
             load = function(item)
                 return item.base_attack + (state.equip == "剑" and 20 or 0)
             end,
@@ -58,42 +59,37 @@ local cases =
     combined = {lualib = {["test_worker_logic.lua"] = module_v2}, service = {["skynet_hotupgrade_worker.patch"] = service}},
     service = {service = {["skynet_hotupgrade_worker.patch"] = service}},
     stage_failure = {lualib = {["test_worker_logic.lua"] = module_v2}, service = {["skynet_hotupgrade_worker.patch"] = [[return function(state)
-        return {migrate = function(old)
-            old.equip = "坏"
-            old.nested.count = 99
+        return {update_state = function()
+            state.equip = "坏"
+            state.nested.count = 99
             error("migration rejected")
         end}
     end]]}},
     functions = {service = {["skynet_hotupgrade_worker.patch"] = [[return function(state)
-        return {functions = {load = function(item)
+        return {replace_functions = {load = function(item)
             return item.base_attack + (state.equip == "剑" and 20 or 0)
         end}}
     end]]}},
-    state_only = {service = {["skynet_hotupgrade_worker.patch"] = [[return function()
-        return {migrate = function(old)
-            local nested = {count = 8}
-            nested.self = nested
-            local updates = {
-                equip = "剑",
-                schema_version = 2,
-                nested = nested,
-                ranks = {[1] = 9},
-                mode = {phase = "v2"},
-                replaced = "v2",
-            }
-            updates.obsolete = nil
-            return updates
+    state_only = {service = {["skynet_hotupgrade_worker.patch"] = [[return function(state)
+        return {update_state = function()
+            state.equip = "剑"
+            state.schema_version = 2
+            state.nested.count = 8
+            state.nested.self = state.nested
+            state.ranks[1] = 9
+            state.mode = {phase = "v2"}
+            state.replaced = "v2"
+            state.obsolete = nil
         end}
     end]]}},
-    state_shared = {service = {["skynet_hotupgrade_worker.patch"] = [[return function()
-        return {migrate = function(old_state)
-            old_state.a.keep_a = 999
-            local shared = {changed = 3}
-            return {a = shared, b = shared}
+    state_shared = {service = {["skynet_hotupgrade_worker.patch"] = [[return function(state)
+        return {update_state = function()
+            state.a.changed = 3
+            state.b.changed = 3
         end}
     end]]}},
     bad_functions = {service = {["skynet_hotupgrade_worker.patch"] = [[return function()
-        return {functions = {load = 12}}
+        return {replace_functions = {load = 12}}
     end]]}},
     extra = {lualib = {["hotupgrade_extra.lua"] = "return {value = function() return 2 end}"}},
     unmatched_module = {lualib = {
