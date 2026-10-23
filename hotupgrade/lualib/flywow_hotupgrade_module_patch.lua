@@ -4,7 +4,7 @@ local hotupgrade_common = require "flywow_hotupgrade_common"
 local M = {}
 local module_state =
 {
-    active = nil, -- 本 State 唯一候选和旧快照，保留至 finish/abort。
+    active_module_stage = nil, -- 当前 State 唯一未完成的模块暂存记录，保留到 finish/abort。
 }
 
 --- 将普通状态数据图从 source_graph 复制到 target_graph，保留共享引用和循环引用。
@@ -83,6 +83,9 @@ local function replace_exports(module_exports, export_fields)
     end
 end
 
+--- 校验候选模块根导出及嵌套数据的类型、键和引用关系。
+---@param module_exports table 候选模块返回的根导出表
+---@param module_name string 模块名称，用于生成错误诊断
 local function check_exports(module_exports, module_name)
     assert(type(module_exports) == "table" and getmetatable(module_exports) == nil, module_name .. " 必须导出无元表根表")
     -- 每张嵌套表只入栈一次，允许数据共享引用或形成循环。
@@ -119,10 +122,10 @@ local function check_exports(module_exports, module_name)
 end
 
 --- 编译全部源码后加载候选和迁移模块私有状态；受信顶层及钩子必须同步且无外部副作用。
----@param entries table[] Controller 已校验并去重的 name/source 连续数组；按传入顺序处理
+---@param module_patches table[] 待暂存模块项；每项包含规范模块名 name 和冻结源码 source。
 ---@return FlyWowHotUpgradeResult 成功含 stage；失败不安装线上导出。
-function M.stage(entries)
-    if module_state.active then
+function M.stage(module_patches)
+    if module_state.active_module_stage then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "模块 Stage 尚未结束")
     end
 
@@ -135,24 +138,19 @@ function M.stage(entries)
     local ok, message = pcall(function()
         -- 数组结构、模块名、源码及唯一性已由 Controller 建立；这里只检查本 State 的实际对象。
         -- 先编译全部 Patch 并保存每个线上模块的旧字段。
-        for _, item in ipairs(entries) do
-            local live = package.loaded[item.name]
-            check_exports(live, item.name)
+        for _, module_patch in ipairs(module_patches) do
+            local live = package.loaded[module_patch.name]
+            check_exports(live, module_patch.name)
             local fields = {}
             for key, value in pairs(live) do
                 fields[key] = value
             end
 
-            -- 只引用已加载依赖；不执行新的依赖加载链，不代表提供安全沙箱。
-            local env = setmetatable({require = function(name)
-                local dependency = package.loaded[name]
-                assert(type(dependency) == "table", "依赖尚未加载: " .. tostring(name))
-                return dependency
-            end}, {__index = _G})
-            local chunk = assert(load(item.source, "@" .. item.name, "t", env))
+            -- 使用 Lua 原生 require；新加载的依赖不属于本次模块回滚。
+            local chunk = assert(load(module_patch.source, "@" .. module_patch.name, "t"))
             module_stage.entries[#module_stage.entries + 1] =
             {
-                name      = item.name, -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
+                name      = module_patch.name, -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
                 live      = live,      -- 原模块根表；提交与恢复始终原地修改它的字段。
                 old       = fields,    -- 旧导出字段及原引用；保留至 Finish 或恢复成功。
                 chunk     = chunk,     -- 第一轮编译的源码；第二轮执行后释放。
@@ -180,13 +178,13 @@ function M.stage(entries)
         return hotupgrade_result.failure("HU_MODULE_STAGE_FAILED", tostring(message))
     end
 
-    module_state.active = module_stage
+    module_state.active_module_stage = module_stage
     return hotupgrade_result.success({stage = module_stage})
 end
 
 --- 业务安全点已确认后同步安装；旧导出保留至 finish，供组合 Service 提交失败时恢复。
 function M.commit(module_stage)
-    if module_state.active ~= module_stage or module_stage.committed then
+    if module_state.active_module_stage ~= module_stage or module_stage.committed then
         return hotupgrade_result.failure("HU_PHASE_INVALID", "模块 Stage 无效或已提交")
     end
 
@@ -208,7 +206,7 @@ end
 
 --- 尽量恢复所有旧表；任一身份变化均报告故障并保留 Stage，以便人工核对。
 function M.abort(module_stage)
-    if module_state.active ~= module_stage then
+    if module_state.active_module_stage ~= module_stage then
         return hotupgrade_result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
     end
 
@@ -237,12 +235,12 @@ end
 
 --- 确认本地模块更新结束并释放旧快照；不负责开放业务入口。
 function M.finish(module_stage)
-    if module_state.active ~= module_stage then
+    if module_state.active_module_stage ~= module_stage then
         return hotupgrade_result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
     end
 
     module_stage.entries = {}
-    module_state.active = nil
+    module_state.active_module_stage = nil
     return hotupgrade_result.success()
 end
 

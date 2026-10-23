@@ -1,5 +1,5 @@
 local framework_root = "./third_party/skynet-flywow"
-local runtime_root = framework_root .. "/build/hotupgrade-newsample"
+local runtime_root = framework_root .. "/build/hotupgrade-newsample/lesson_4"
 
 thread = 4
 harbor = 0
@@ -9,7 +9,7 @@ start = "main"
 lualoader = "./third_party/skynet/lualib/loader.lua"
 
 luaservice = framework_root .. "/hotupgrade/service/?.lua;"
-    .. framework_root .. "/hotupgrade/newsample/?.lua;"
+    .. framework_root .. "/hotupgrade/newsample/lesson_4/?.lua;"
     .. runtime_root .. "/host/service/?.lua;"
     .. "./third_party/skynet/service/?.lua"
 

@@ -37,7 +37,7 @@ old_load              提前创建、捕获 state 的 V1 攻击闭包
 old_settings          提前缓存的 V1 嵌套配置表
 state                 实验模拟的 PlayerService 玩家状态根表
 module_stage          stage() 创建的本次候选及旧快照记录
-module_state.active   更新引擎在当前 Lua State 的活动记录
+module_state.active_module_stage   当前 Lua State 唯一未完成的模块暂存记录
 ```
 
 我们会先实际观察 `stage → commit → abort`，再重新 `stage → commit → finish`。这样同一套 V1/V2 文件同时展示成功提交与恢复的区别。
@@ -278,19 +278,22 @@ V1 私有 count = 2
 local M = {}
 local module_state =
 {
-    active = nil, -- 本 State 唯一候选和旧快照，保留至 finish/abort。
+    active_module_stage = nil, -- 当前 State 唯一未完成的模块暂存记录，保留到 finish/abort。
 }
 ```
 
 这是该源码文件顶部的真实声明。不要把这里的 `module_state` 与 `flywow_hotupgrade.lua` 中的同名私有状态表混淆：**它们属于两个不同的 Lua 模块，只是都运行在当前 PlayerService 的 Lua State 内。**
 
-`module_state.active` 保存的是普通模块更新引擎尚未结束的 Stage。它不是 Controller 的发布批次，也不是 PlayerService 本地的 `active_transaction`。
+`module_state.active_module_stage` 保存的是普通模块更新引擎尚未结束的 Stage。它不是 Controller 的发布批次，也不是 PlayerService 本地的 `active_transaction`。
 
 我们先读完整 `M.stage()`，然后按其两个循环解释对象的创建和变化。这是当前工作区的真实函数：
 
 ```lua
-function M.stage(entries)
-    if module_state.active then
+--- 编译全部源码后加载候选和迁移模块私有状态；受信顶层及钩子必须同步且无外部副作用。
+---@param module_patches table[] 待暂存模块项；每项包含规范模块名 name 和冻结源码 source。
+---@return FlyWowHotUpgradeResult 成功含 stage；失败不安装线上导出。
+function M.stage(module_patches)
+    if module_state.active_module_stage then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "模块 Stage 尚未结束")
     end
 
@@ -303,24 +306,19 @@ function M.stage(entries)
     local ok, message = pcall(function()
         -- 数组结构、模块名、源码及唯一性已由 Controller 建立；这里只检查本 State 的实际对象。
         -- 先编译全部 Patch 并保存每个线上模块的旧字段。
-        for _, item in ipairs(entries) do
-            local live = package.loaded[item.name]
-            check_exports(live, item.name)
+        for _, module_patch in ipairs(module_patches) do
+            local live = package.loaded[module_patch.name]
+            check_exports(live, module_patch.name)
             local fields = {}
             for key, value in pairs(live) do
                 fields[key] = value
             end
 
-            -- 只引用已加载依赖；不执行新的依赖加载链，不代表提供安全沙箱。
-            local env = setmetatable({require = function(name)
-                local dependency = package.loaded[name]
-                assert(type(dependency) == "table", "依赖尚未加载: " .. tostring(name))
-                return dependency
-            end}, {__index = _G})
-            local chunk = assert(load(item.source, "@" .. item.name, "t", env))
+            -- 使用 Lua 原生 require；新加载的依赖不属于本次模块回滚。
+            local chunk = assert(load(module_patch.source, "@" .. module_patch.name, "t"))
             module_stage.entries[#module_stage.entries + 1] =
             {
-                name      = item.name, -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
+                name      = module_patch.name, -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
                 live      = live,      -- 原模块根表；提交与恢复始终原地修改它的字段。
                 old       = fields,    -- 旧导出字段及原引用；保留至 Finish 或恢复成功。
                 chunk     = chunk,     -- 第一轮编译的源码；第二轮执行后释放。
@@ -349,16 +347,16 @@ function M.stage(entries)
         return hotupgrade_result.failure("HU_MODULE_STAGE_FAILED", tostring(message))
     end
 
-    module_state.active = module_stage
+    module_state.active_module_stage = module_stage
     return hotupgrade_result.success({stage = module_stage})
 end
 ```
 
 看起来较长，但它的流程很明确：**第一个循环先处理全部模块的旧导出字段与源码编译，第二个循环再执行候选模块并完成验证和私有状态迁移。** 我们只有一个 `lualib.player_logic`，所以每个循环仅迭代一次。以后一个批次有多个模块时，这个执行顺序仍然成立。
 
-生产调用中，Controller 的 `build_patch()` 负责路径映射、源码类型、语法及去重，并构造连续的模块数组；目标筛选保留这份顺序。引擎依赖这个输入合同，不再重复检查数组空洞、模块名、源码类型和重复名称。本课直接调用内部引擎，也要按这个合同构造输入。Stage 中的 `load()` 仍必须执行，因为它要把冻结源码绑定到当前 State 的候选环境。
+生产调用中，Controller 的 `build_patch()` 负责路径映射、源码类型、语法及去重，并构造连续的模块数组；目标筛选保留这份顺序。引擎依赖这个输入合同，不再重复检查数组空洞、模块名、源码类型和重复名称。本课直接调用内部引擎，也要按这个合同构造输入。Stage 中的 load() 仍必须执行，因为它要把冻结源码编译为候选函数；不传自定义环境时，候选代码使用当前 Lua State 的默认全局环境。
 
-第一句先检查 `module_state.active`。如果上一次 Stage 尚未结束，就不能再开启新的 Stage。这不是 Controller 的排他锁，而是此 Lua State 内更新引擎自己的活动记录。
+第一句先检查 `module_state.active_module_stage`。如果上一次 Stage 尚未结束，就不能再开启新的 Stage。这不是 Controller 的排他锁，而是此 Lua State 内更新引擎自己的活动记录。
 
 接着创建：
 
@@ -378,11 +376,11 @@ local module_stage =
 
 #### 第一轮循环：找到线上表并编译候选
 
-`item.name` 在本例中是 `lualib.player_logic`，`item.source` 就是从 V2 文件读取的完整 Lua 源码。
+`module_patch.name` 在本例中是 `lualib.player_logic`，`module_patch.source` 就是从 V2 文件读取的完整 Lua 源码。
 
 ```lua
-local live = package.loaded[item.name]
-check_exports(live, item.name)
+local live = package.loaded[module_patch.name]
+check_exports(live, module_patch.name)
 local fields = {}
 for key, value in pairs(live) do
     fields[key] = value
@@ -405,18 +403,13 @@ module_stage.entries[1].old.next_count ──→ 原 V1 闭包
 
 它保存的是这些旧值的引用。这样以后 `abort()` 可以把旧字段重新挂回同一张 `live` 根表。它不会克隆函数的 Lua upvalue，也不会保护违反合同而被 Patch 顶层代码直接修改的外部对象。
 
-再往下，源码为这个候选模块创建 `env`，并用 Lua 的 `load()` 编译：
+再往下，源码用 Lua 的 load() 编译候选模块，不额外创建环境表：
 
 ```lua
-local env = setmetatable({require = function(name)
-    local dependency = package.loaded[name]
-    assert(type(dependency) == "table", "依赖尚未加载: " .. tostring(name))
-    return dependency
-end}, {__index = _G})
-local chunk = assert(load(item.source, "@" .. item.name, "t", env))
+local chunk = assert(load(module_patch.source, "@" .. module_patch.name, "t"))
 module_stage.entries[#module_stage.entries + 1] =
 {
-    name      = item.name, -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
+    name      = module_patch.name, -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
     live      = live,      -- 原模块根表；提交与恢复始终原地修改它的字段。
     old       = fields,    -- 旧导出字段及原引用；保留至 Finish 或恢复成功。
     chunk     = chunk,     -- 第一轮编译的源码；第二轮执行后释放。
@@ -424,13 +417,13 @@ module_stage.entries[#module_stage.entries + 1] =
 }
 ```
 
-这是 `M.stage()` 中同一循环的下一段。`load(source, chunkname, "t", env)` 将字符串源码编译为一个可执行 Lua 函数，但**此时还没有执行这个候选函数**。
+这是 M.stage() 中同一循环的下一段。load(source, chunkname, "t") 将字符串源码编译为一个可执行 Lua 函数，并使用当前 Lua State 的默认全局环境；但此时还没有执行这个候选函数。
 
-`"t"` 要求文本源码。`"@" .. item.name` 设置错误信息中的 chunk 名称，便于定位。
+`"t"` 要求文本源码。`"@" .. module_patch.name` 设置错误信息中的 chunk 名称，便于定位。
 
-候选环境对 `require()` 做了限制：只能取得当前 Lua State 中 `package.loaded` 已存在的 table 依赖，不能趁热更偷偷加载一条全新模块依赖链。
+这里没有给 load() 传入自定义环境，候选代码使用当前 Lua State 的默认全局环境。V2 调用的 require 是 Lua 原生 require，可以按普通 Lua 规则加载当前 State 尚未缓存的依赖。加载成功后，新依赖会留在 package.loaded；即使 Stage 或后续发布步骤失败，模块更新引擎也不会卸载它们或回滚它们的模块初始化状态。
 
-然而 `env` 通过 `__index = _G` 仍可访问其他原有全局函数，因此**这不是安全沙箱**。模块顶层和状态钩子应当是受信、同步、无外部副作用的代码，不能在里面启动任务、执行 I/O、写线上业务状态或 yield。框架通过 `pcall` 捕获 Lua 错误，并不能撤销 Patch 代码擅自产生的副作用。
+候选代码直接使用当前 State 的全局环境，因此这不是安全沙箱。模块顶层和状态钩子是受信代码，必须同步且无外部副作用；不能在里面启动任务、执行 I/O、写全局或线上业务状态，或 yield。框架通过 pcall 捕获 Lua 错误，并不能撤销 Patch 代码擅自产生的副作用。
 
 第一轮执行完后，我们的状态是：
 
@@ -501,13 +494,13 @@ V2 `import_state()` 将自己刚刚创建的 `count=0` 改为 `count=2`。
 Stage 退出 `pcall()` 后才设置：
 
 ```lua
-module_state.active = module_stage
+module_state.active_module_stage = module_stage
 return hotupgrade_result.success({stage = module_stage})
 ```
 
 它把本次 Stage 记为当前 Lua State 中唯一的活动模块更新，然后把记录交回调用者。实验脚本接收到 `prepared.stage`，保存为 `module_stage`。
 
-如果这个过程中出现编译错误、导出检查失败或私有状态导入失败，`M.stage()` 返回 `HU_MODULE_STAGE_FAILED`，并且不会把这个失败的 `module_stage` 设置为 `module_state.active`。正常合同下线上旧导出字段仍未被改写。`pcall` 并不提供执行副作用的事务回滚。
+如果这个过程中出现编译错误、导出检查失败或私有状态导入失败，`M.stage()` 返回 `HU_MODULE_STAGE_FAILED`，并且不会把这个失败的 `module_stage` 设置为 `module_state.active_module_stage`。正常合同下线上旧导出字段仍未被改写。`pcall` 并不提供执行副作用的事务回滚。
 
 ### Stage 完成后的第一次状态快照
 
@@ -539,7 +532,7 @@ Stage 记录：module_stage
     committed = false
 
 V2 候选私有 count = 2
-module_state.active = module_stage
+module_state.active_module_stage = module_stage
 ```
 
 **Stage 已经准备好未来要安装的 V2，但业务当前访问的仍是 V1。**
@@ -689,7 +682,7 @@ local committed = module_patch.commit(module_stage)
 
 ```lua
 function M.commit(module_stage)
-    if module_state.active ~= module_stage or module_stage.committed then
+    if module_state.active_module_stage ~= module_stage or module_stage.committed then
         return hotupgrade_result.failure("HU_PHASE_INVALID", "模块 Stage 无效或已提交")
     end
 
@@ -710,7 +703,7 @@ function M.commit(module_stage)
 end
 ```
 
-这段函数从 `module_state.active` 中确认我们传入的是刚刚成功 Stage 的同一个 `module_stage`，并且尚未提交过。随后先检查所有模块的 `package.loaded[entry.name]` 仍指向 Stage 时登记的 `entry.live` 根表。
+这段函数从 `module_state.active_module_stage` 中确认我们传入的是刚刚成功 Stage 的同一个 `module_stage`，并且尚未提交过。随后先检查所有模块的 `package.loaded[entry.name]` 仍指向 Stage 时登记的 `entry.live` 根表。
 
 注意 `entry.name` 是规范名 `lualib.player_logic`。先前保存的 `logic_root` 和 `entry.live` 都是同一张表。`Commit` **不会清空 `package.loaded`，也不会把模块别名改指向候选根表**。
 
@@ -811,7 +804,7 @@ logic.make_load(state) ──→ 新 V2 闭包 ──upvalue──→ 同一个 
 我们此时已经在模块根表上安装 V2，但没有结束本次 Stage：
 
 ```text
-module_state.active = module_stage
+module_state.active_module_stage = module_stage
 module_stage.committed = true
 
 logic == logic_root                    true
@@ -849,7 +842,7 @@ local aborted = module_patch.abort(module_stage)
 
 ```lua
 function M.abort(module_stage)
-    if module_state.active ~= module_stage then
+    if module_state.active_module_stage ~= module_stage then
         return hotupgrade_result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
     end
 
@@ -877,7 +870,7 @@ function M.abort(module_stage)
 end
 ```
 
-函数一开始先确认当前 `module_state.active` 就是传入的 `module_stage`，拒绝撤销其他更新留下的记录。
+函数一开始先确认当前 `module_state.active_module_stage` 就是传入的 `module_stage`，拒绝撤销其他更新留下的记录。
 
 随后按 `module_stage.entries` 的数组顺序遍历每个模块记录。我们的案例只有 `lualib.player_logic`。它先检查 `package.loaded[entry.name]` 仍然是 Stage 时保存的那张旧 `live` 根表，随后根据 `module_stage.committed` 决定是否恢复导出字段。
 
@@ -902,7 +895,7 @@ logic.new_tag                         nil
 
 整个过程没有创建替代的模块根表，也没有让 `package.loaded` 指向另一个对象。**Commit 是在原根表上安装 V2 字段；Abort 是在同一根表上重新安装 V1 字段。**
 
-`abort()` 把每个模块的恢复操作放在独立 `pcall()` 中，是为了一个模块出现恢复错误后，仍继续尝试恢复其他模块，并收集全部失败信息。只要存在任意失败，它就返回 `HU_RECOVERY_REQUIRED`，保留 `module_state.active` 及旧快照，不能声称整个模块更新已经撤销成功。
+`abort()` 把每个模块的恢复操作放在独立 `pcall()` 中，是为了一个模块出现恢复错误后，仍继续尝试恢复其他模块，并收集全部失败信息。只要存在任意失败，它就返回 `HU_RECOVERY_REQUIRED`，保留 `module_state.active_module_stage` 及旧快照，不能声称整个模块更新已经撤销成功。
 
 当前实验只有一个普通模块，没有外部干扰，所以应当成功。`M.abort()` 随后调用 `M.finish(module_stage)` 释放本次 Stage 的记录。它并不是“撤销失败后仍强行释放”，而是**确认所有模块的导出字段都恢复成功后**才释放。
 
@@ -961,7 +954,7 @@ state.equip = "刀"
 
 现在我们已经通过第一次 Abort 回到了 V1 模块导出内容，并手工恢复了实验的 `state.equip="刀"`。
 
-实验入口再次调用 `module_patch.stage(modules)`。因为之前 `M.abort()` 已成功清理 `module_state.active`，这次 Stage 被允许。它重新读取**我们已经保存在 `modules` 里的同一份 V2 源码字符串**、检查当前 V1 的导出、建立新的 Stage，并把 V1 私有 `count=2` 导入新的 V2 候选闭包。
+实验入口再次调用 `module_patch.stage(modules)`。因为之前 `M.abort()` 已成功清理 `module_state.active_module_stage`，这次 Stage 被允许。它重新读取**我们已经保存在 `modules` 里的同一份 V2 源码字符串**、检查当前 V1 的导出、建立新的 Stage，并把 V1 私有 `count=2` 导入新的 V2 候选闭包。
 
 然后第二次 `module_patch.commit(prepared_again.stage)` 再次把 V2 导出字段装入原来的 `logic` 根表。为了模拟整批 Service 更新成功，我们再次把实验的 `state.equip` 改为“剑”。
 
@@ -977,17 +970,17 @@ local finished = module_patch.finish(prepared_again.stage)
 
 ```lua
 function M.finish(module_stage)
-    if module_state.active ~= module_stage then
+    if module_state.active_module_stage ~= module_stage then
         return hotupgrade_result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
     end
 
     module_stage.entries = {}
-    module_state.active = nil
+    module_state.active_module_stage = nil
     return hotupgrade_result.success()
 end
 ```
 
-整个函数就这些代码。它确认传入的是当前正在活动的 Stage，然后清空 `entries`，解除其中候选和旧字段的引用，最后让引擎的 `module_state.active=nil`。
+整个函数就这些代码。它确认传入的是当前正在活动的 Stage，然后清空 `entries`，解除其中候选和旧字段的引用，最后让引擎的 `module_state.active_module_stage=nil`。
 
 **它没有再次执行 V2 文件，没有再次修改 `logic`，也没有把模块表替换成 `candidate`。** 因为 Commit 已经完成了线上字段更新，Finish 只负责丢弃本批次以后不再需要的候选和旧快照引用。
 
@@ -1010,12 +1003,12 @@ logic.settings.bonus = 21
 logic == logic_root = true
 ```
 
-Finish 的一个重要意义是：它**终结本次模块引擎的恢复记录**。后续再以同一个 Stage 记录调用 `M.abort()`，由于 `module_state.active` 已经清空，将返回 `HU_PHASE_INVALID`。如果将来再次发布新版，要重新 Stage，构建新的快照和候选。
+Finish 的一个重要意义是：它**终结本次模块引擎的恢复记录**。后续再以同一个 Stage 记录调用 `M.abort()`，由于 `module_state.active_module_stage` 已经清空，将返回 `HU_PHASE_INVALID`。如果将来再次发布新版，要重新 Stage，构建新的快照和候选。
 
 ### Finish 完成后的最终状态快照
 
 ```text
-module_state.active = nil
+module_state.active_module_stage = nil
 
 logic                         → 原根表，现装载 V2 导出字段
 logic_root                    → 同一根表
@@ -1132,7 +1125,7 @@ Stage 只准备候选，线上表仍是 V1。Commit 才真正修改线上表。�
 
 因此，Module Patch Engine 必须让旧导出字段保留在各模块记录的 `entry.old` 中，直到 Controller 通知当前目标 Finish。若在发布决定前失败，则用 Abort 安装旧字段。若发布决定已经作出，才由 Finish 释放旧快照。
 
-这解释了为什么引擎在 `commit()` 后仍保留 `module_state.active`，不在成功返回后自动释放。
+这解释了为什么引擎在 `commit()` 后仍保留 `module_state.active_module_stage`，不在成功返回后自动释放。
 
 ### 真实 Service 中 Abort 到底多做了什么？
 
@@ -1208,7 +1201,7 @@ PlayerService / flywow_hotupgrade.lua
     active_transaction    当前 Service 的完整本地事务，包含模块和 Service 更新记录
 
 PlayerService / flywow_hotupgrade_module_patch.lua
-    module_state.active   当前 Lua State 中 Module Patch Engine 的候选和旧导出快照
+    module_state.active_module_stage   当前 Lua State 唯一未完成的模块暂存记录
 ```
 
 一个 Controller 批次可以协调多个 PlayerService；每个 PlayerService 都有自己的 Lua State、自己的本地完整事务，以及在该 State 内独立加载的 Module Patch Engine 状态。Controller 不会跨 Lua State 直接拿到 `logic` 或 `module_stage` 这些 Lua table。
@@ -1286,7 +1279,7 @@ Finish:             v2   121   100
 
 验收时不要只看是否打印出 V2。按同一条执行时间线，依次观察下面这些事实：
 
-| 执行位置 | 线上导出版本 | V1 私有 count | V2 私有 count | 旧字段快照 | `module_state.active` |
+| 执行位置 | 线上导出版本 | V1 私有 count | V2 私有 count | 旧字段快照 | `module_state.active_module_stage` |
 |---|---|---:|---:|---|---|
 | 首次 Stage 前 | V1 | 2 | 尚未创建 | 无 | nil |
 | 首次 Stage 后 | V1 | 2 | 2 | 已保存 | 当前 Stage |
@@ -1318,7 +1311,7 @@ Finish:             v2   121   100
    · chunk() 执行得到 candidate
    · check_exports(candidate) / 验证候选导出结构
    · export_state → snapshot_state → import_state
-   · module_state.active = module_stage
+   · module_state.active_module_stage = module_stage
                │
                ▼
    commit(module_stage)
@@ -1336,7 +1329,7 @@ Finish:             v2   121   100
                │               │
                └───────┬───────┘
                        ▼
-              module_state.active = nil
+              module_state.active_module_stage = nil
 ```
 
 最终应该能不查笔记、直接解释以下问题：

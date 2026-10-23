@@ -10,10 +10,10 @@ set -euo pipefail
 # cd 进入该目录后，pwd 将脚本目录解析为绝对路径，因此后续定位不依赖调用位置。
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 
-# newsample 位于 FlyWow/hotupgrade/newsample；向上两级得到 FlyWow 根目录。
-FRAMEWORK_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+# lesson_4 位于 FlyWow/hotupgrade/newsample/lesson_4；向上三级得到 FlyWow 根目录。
+FRAMEWORK_DIR="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
 
-# FlyWow 位于 server/third_party/skynet-flywow；再向上两级得到宿主 server 根目录。
+# FlyWow 位于 server/third_party/skynet-flywow；向上两级得到宿主 server 根目录。
 SERVER_ROOT="$(cd -- "$FRAMEWORK_DIR/../.." && pwd)"
 
 # 必须提供第一个位置参数：Skynet 根目录（其中应有 skynet 可执行文件）。
@@ -22,7 +22,7 @@ SERVER_ROOT="$(cd -- "$FRAMEWORK_DIR/../.." && pwd)"
 SKYNET_ROOT="$(realpath -- "${1:?请传入 Skynet 根目录}")"
 
 # 示例本次生成的宿主文件和 Patch 的运行目录；配置文件也使用这个目录。
-RUNTIME_ROOT="$FRAMEWORK_DIR/build/hotupgrade-newsample"
+RUNTIME_ROOT="$FRAMEWORK_DIR/build/hotupgrade-newsample/lesson_4"
 
 # 删除本示例上次生成的整个运行目录，再重新准备干净目录。
 # 注意：该目录中的现有内容都会被永久删除；不要在其中保存需要保留的文件。

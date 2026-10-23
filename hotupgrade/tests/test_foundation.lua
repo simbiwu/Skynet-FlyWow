@@ -43,6 +43,21 @@ assert(live.added == 42 and live.removed == nil)
 assert(patch.abort(staged.stage).ok)
 assert(live.value == cached and live.removed and live.added == nil)
 
+local dependency_name = "hotupgrade_stage_dependency_fixture"
+local loaded_dependency = {ready = true}
+package.loaded[dependency_name] = nil
+package.preload[dependency_name] = function()
+    return loaded_dependency
+end
+local dependency_stage = patch.stage({{name = "logic", source = [[
+local dependency = require("hotupgrade_stage_dependency_fixture")
+error("stage failed after loading dependency")
+]]}})
+assert(not dependency_stage.ok and live.value() == 7)
+assert(package.loaded[dependency_name] == loaded_dependency)
+package.loaded[dependency_name] = nil
+package.preload[dependency_name] = nil
+
 local failed = patch.stage({{name = "logic", source = "error('stage failed')"}})
 assert(not failed.ok and live.value() == 7)
 failed = patch.stage({{name = "logic", source = "return {value=function() return 3 end, export_state=function() return {} end}"}})
