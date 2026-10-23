@@ -2,7 +2,6 @@
 #include "navigation_profile_registry.h"
 
 #include <algorithm>
-
 #include <utility>
 
 namespace flywow_navigation
@@ -22,6 +21,7 @@ NavResult<bool> NavigationProfileRegistry::Load(std::vector<NavigationProfile> n
                                         "navigation profiles must not be empty");
     }
 
+    // 在锁外排序和校验整份输入；失败不会替换当前可用快照。
     std::sort(navigation_profiles.begin(), navigation_profiles.end(),
               [](const NavigationProfile &lhs, const NavigationProfile &rhs)
               {
@@ -42,6 +42,7 @@ NavResult<bool> NavigationProfileRegistry::Load(std::vector<NavigationProfile> n
         }
     }
 
+    // 构建完成后才获取发布锁；查询者持有的旧 shared_ptr 继续有效。
     auto snapshot = std::make_shared<const SnapshotType>(std::move(navigation_profiles));
     std::lock_guard<std::mutex> lock(mutex_);
     profiles_ = std::move(snapshot);

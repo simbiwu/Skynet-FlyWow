@@ -1,7 +1,7 @@
 --- 职责：宿主通过此入口创建 UTF-8 词库，查询命中或替换文本；聊天处置由业务决定。
 --- 查询同步、无 I/O、无 yield；创建 file 词库时会同步读取文件。对象和返回数据属于当前 Lua State。
---- Native 来源 word_filter/word_filter_native/；构建：bash scripts/build_flywow.sh SKYNET_ROOT word_filter。
---- package.path 加载本文件，package.cpath 加载 build/word_filter_native/flywow_word_filter_native.so。
+--- Native 来源 word_filter/native/；构建：bash scripts/build_flywow.sh SKYNET_ROOT word_filter。
+--- package.path 加载本文件，package.cpath 加载 build/native/flywow_word_filter_native.so。
 local word_filter_native = require "flywow_word_filter_native"
 
 local MAX_KEYWORDS              = 16384
@@ -75,6 +75,7 @@ function M.new(word_filter_config)
         return nil, "invalid_options"
     end
 
+    -- 内存词库借用输入数组；文件词库读取为独立数组，两者共用后续 Native 构建。
     local keywords = word_filter_config.keywords
     if word_filter_config.file ~= nil then
         local file = io.open(word_filter_config.file, "rb")
@@ -113,6 +114,7 @@ function M.new(word_filter_config)
         end
     end
 
+    -- Native 成功后由 Filter 持有词库，输入数组不再参与后续查询。
     local native_handle, error_value = word_filter_native.new(keywords, word_filter_config.compact == true)
     if not native_handle then
         return nil, native_error_code(error_value)
@@ -177,9 +179,10 @@ function Filter:replace(text, replacement)
         return nil, error_code
     end
 
-    local parts = {}
-    local next_source_byte = 1
-    local span_start_byte, span_end_byte
+    local parts = {}           -- 按原文顺序积累保留片段和替换文本，最后一次拼接。
+    local next_source_byte = 1 -- 尚未输出的原文字节起点，区间写出后前移。
+    local span_start_byte      -- 当前合并命中区间起点；nil 表示尚无待输出区间。
+    local span_end_byte        -- 当前合并区间的闭区间终点，与起点一起更新。
 
     --- find 已按起点排序。合并区间使用闭区间 [start,end]，所有位置都是原文 bytes。
     --- 例如 she 同时命中 she/he：两个区间合并为 [1,3]，只输出一次替换文本。

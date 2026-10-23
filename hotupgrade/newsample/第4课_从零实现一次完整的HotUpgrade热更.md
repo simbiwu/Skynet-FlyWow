@@ -537,7 +537,7 @@ Controller 收到 `"register"` 后，由：
 
 处理登记。
 
-它使用 Skynet 消息携带的真实 `source` 作为 PlayerService handle，将元数据保存到 `self.targets[source]`，并通过 `finish_creation()` 移除刚才的待创建记录。
+它使用 Skynet 消息携带的真实 `source` 作为 PlayerService handle，将元数据保存到 `self.service_registrations[source]`，并通过 `finish_creation()` 移除刚才的待创建记录。
 
 登记 RPC 返回成功，PlayerService 的 `initialize()` 才结束；PlayerService 再通过 `skynet.retpack()` 把结果回复给主 Service。
 
@@ -1362,7 +1362,7 @@ end
 
 其中 `patch` 是同一份冻结源码，`registered_services` 是 Controller 当前的登记表，`selected_patch_path` 只用于错误诊断。首次匹配失败仍在任何目标控制 RPC 之前退出；Prepare 后重匹配失败则撤销已经参与的目标。
 
-Controller 从 `self.targets` 取出此前登记的 `first_service_handle`。
+Controller 从 `self.service_registrations` 取出此前登记的 `first_service_handle`。
 
 它发现这个 Service 已声明：
 
@@ -1513,7 +1513,7 @@ while true do
     end
 
     -- 同一份冻结源码覆盖新增登记和模块声明；匹配失败时仍保留旧记录用于 Abort。
-    local matched = match_targets(loaded.patch, self.targets, request.path)
+    local matched = match_targets(loaded.patch, self.service_registrations, request.path)
     if not matched.ok then
         batch.error = matched
         return
@@ -1938,7 +1938,7 @@ local ok, service = pcall(stage_service, request.service_source)
 
 文件：`hotupgrade/lualib/flywow_hotupgrade.lua`
 
-函数：`local function stage_service(source)`
+函数：`local function stage_service(patch_source)`
 
 完整实现：
 
@@ -1978,17 +1978,17 @@ local function merge_service_state(target_state, update_state)
 end
 
 -- 只在业务安全点已确认时执行受信同步脚本；此函数不提供安全沙箱或副作用撤销。
-local function stage_service(source)
-    if not source then
+local function stage_service(patch_source)
+    if not patch_source then
         return nil
     end
 
     -- 执行受信 Patch 构建函数并校验结果；此时尚不写入线上状态。
     local service_update = assert(module_state.registration.service_update, "Service 未提供内部更新入口")
-    local chunk = assert(load(source, "=Service Patch", "t", _G))
-    local build = chunk()
-    assert(type(build) == "function", "Service Patch 必须返回构建函数")
-    local patch = build(service_update.state)
+    local chunk = assert(load(patch_source, "=Service Patch", "t", _G))
+    local build_patch = chunk()
+    assert(type(build_patch) == "function", "Service Patch 必须返回构建函数")
+    local patch = build_patch(service_update.state)
 
     assert(type(patch) == "table" and getmetatable(patch) == nil, "Service 构建结果必须是普通表")
     assert(patch.migrate == nil or type(patch.migrate) == "function", "migrate 必须是函数")
@@ -2003,8 +2003,8 @@ local function stage_service(source)
         old_functions = {}, -- 本次将替换的现有函数，不处理未列出的字段。
         touched = false,    -- 首次线上写入前置 true，部分提交同样必须恢复。
     }
-    for name, fn in pairs(patch.functions or {}) do
-        assert(type(name) == "string" and type(fn) == "function"
+    for name, replacement_function in pairs(patch.functions or {}) do
+        assert(type(name) == "string" and type(replacement_function) == "function"
             and type(rawget(service_update.functions, name)) == "function", "只能直接替换现有业务函数")
         staged.old_functions[name] = rawget(service_update.functions, name)
     end
@@ -2019,8 +2019,8 @@ local function stage_service(source)
             staged.old_state = hotupgrade_module_patch.snapshot_state(service_update.state)
         end
 
-        local isolated = hotupgrade_module_patch.snapshot_state(staged.old_state)
-        local update_state = patch.migrate(isolated)
+        local migration_snapshot = hotupgrade_module_patch.snapshot_state(staged.old_state)
+        local update_state = patch.migrate(migration_snapshot)
         assert(type(update_state) == "table" and update_state ~= service_update.state,
             "migrate 必须返回部分状态更新表")
         update_state = hotupgrade_module_patch.snapshot_state(update_state)
@@ -2260,20 +2260,20 @@ return hotupgrade_result.success()
 `replace_exports()` 的完整实现是：
 
 ```lua
-local function replace_exports(live, fields)
-    for key in pairs(live) do
-        rawset(live, key, nil)
+local function replace_exports(module_exports, export_fields)
+    for key in pairs(module_exports) do
+        rawset(module_exports, key, nil)
     end
 
-    for key, value in pairs(fields) do
-        rawset(live, key, value)
+    for key, value in pairs(export_fields) do
+        rawset(module_exports, key, value)
     end
 end
 ```
 
-这里的 `live` 是已经加载的模块导出根表，也就是 PlayerService 中 `logic` 指向的对象。
+这里的 `module_exports` 是已经加载的模块导出根表，也就是 PlayerService 中 `logic` 指向的对象。
 
-`fields` 是 Stage 得到的 V2 候选导出字段。
+`export_fields` 是 Stage 得到的 V2 候选导出字段。
 
 代码先删除原导出字段，再安装新字段。
 

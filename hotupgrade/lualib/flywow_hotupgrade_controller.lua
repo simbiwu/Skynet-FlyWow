@@ -11,7 +11,7 @@ local M =
     root_path            = nil, -- 已解析的宿主根目录；正式文件读取、替换和恢复共用此边界。
     patch_path           = nil, -- 已解析的受信 Patch 根目录；每个批次从此目录读取冻结源码。
     service_path         = nil, -- Patch 内按 Service 脚本分类的相对目录。
-    targets              = nil, -- 以真实 Service handle 索引登记信息，供 Patch 匹配和批次快照使用。
+    service_registrations = nil, -- 按真实 Service handle 保存登记记录；供许可校验、Patch 匹配和批次快照读取。
     pending_creations    = nil, -- 尚未完成创建或首次登记的记录；完成后由 finish_creation 移除。
     creation_handles     = nil, -- 原生返回的真实 Service handle 到创建记录的索引，用于关联早到登记。
     registration_waiters = nil, -- 等待原生 Service handle 建立映射的登记协程；映射完成后唤醒。
@@ -285,7 +285,7 @@ function M.initialize(controller_config)
         root_path            = root_path,
         patch_path           = patch_path,
         service_path         = controller_config.service_path,
-        targets              = {},
+        service_registrations = {},
         pending_creations    = {},
         creation_handles     = {},
         registration_waiters = {},
@@ -489,7 +489,7 @@ function M:cancel_service_creation(request, source)
     end
 
     local creation = self.creation_handles[request.service_handle]
-    if self.targets[request.service_handle] then
+    if self.service_registrations[request.service_handle] then
         return hotupgrade_result.failure("HU_SERVICE_ALREADY_REGISTERED", "已登记 Service 不能取消创建")
     end
     if not creation or not creation.returned then
@@ -527,8 +527,8 @@ function M:begin_module_load(request, source)
         return admitted
     end
 
-    local target = self.targets[source]
-    if not target then
+    local service_registration = self.service_registrations[source]
+    if not service_registration then
         return hotupgrade_result.failure("HU_SERVICE_NOT_REGISTERED", "模块加载者未登记")
     end
 
@@ -536,14 +536,14 @@ function M:begin_module_load(request, source)
         return hotupgrade_result.failure("HU_INVALID_REQUEST", "模块名无效")
     end
 
-    if target.loading_modules[request.name] then
+    if service_registration.loading_modules[request.name] then
         return hotupgrade_result.failure("HU_MODULE_LOADING", "该模块已有未完成的加载许可")
     end
 
     self.module_sequence = self.module_sequence + 1
     local permit_id = tostring(skynet.self()) .. ":module:" .. self.module_sequence
     self.module_loads[permit_id] = {source = source, name = request.name}
-    target.loading_modules[request.name] = permit_id
+    service_registration.loading_modules[request.name] = permit_id
     self.module_load_count = self.module_load_count + 1
     return hotupgrade_result.success({permit_id = permit_id})
 end
@@ -565,17 +565,17 @@ function M:complete_module_load(request, source, cancel)
         return hotupgrade_result.failure("HU_MODULE_PERMIT_MISMATCH", "模块名与许可不匹配")
     end
 
-    local target = self.targets[source]
-    if not target then
+    local service_registration = self.service_registrations[source]
+    if not service_registration then
         return hotupgrade_result.failure("HU_SERVICE_NOT_REGISTERED", "模块声明者未登记")
     end
 
-    if not cancel and not target.modules[request.name] then
-        target.modules[request.name] = true
+    if not cancel and not service_registration.modules[request.name] then
+        service_registration.modules[request.name] = true
     end
 
     self.module_loads[request.permit_id] = nil
-    target.loading_modules[request.name] = nil
+    service_registration.loading_modules[request.name] = nil
     self.module_load_count = self.module_load_count - 1
     self:wake_batch()
     return hotupgrade_result.success()
@@ -595,7 +595,7 @@ function M:register(request, service_handle)
         return hotupgrade_result.failure("HU_INVALID_OPTIONS", "不再接受 service_module")
     end
 
-    if self.targets[service_handle] then
+    if self.service_registrations[service_handle] then
         return hotupgrade_result.failure("HU_DUPLICATE_SERVICE", "Service 已登记")
     end
 
@@ -632,7 +632,7 @@ function M:register(request, service_handle)
         self.registration_waiters[waiter] = true
         skynet.wait(waiter)
         self.registration_waiters[waiter] = nil
-        if self.targets[service_handle] then
+        if self.service_registrations[service_handle] then
             return hotupgrade_result.failure("HU_DUPLICATE_SERVICE", "Service 已登记")
         end
         creation = self.creation_handles[service_handle]
@@ -651,7 +651,7 @@ function M:register(request, service_handle)
         loading_modules     = {},                          -- 同一 Service/模块同时只允许一项首次加载操作。
         has_service_update  = request.has_service_update,  -- 是否提供本地 Service 状态/函数入口。
     }
-    self.targets[service_handle] = registered_service
+    self.service_registrations[service_handle] = registered_service
     self:finish_creation(creation)
     return hotupgrade_result.success()
 end
@@ -727,7 +727,7 @@ function M:load_patch(request)
         return loaded
     end
 
-    local matched = match_targets(loaded.patch, self.targets, request.path)
+    local matched = match_targets(loaded.patch, self.service_registrations, request.path)
     if not matched.ok then
         return matched
     end
@@ -837,7 +837,7 @@ function M:run_batch(batch, request)
             end
 
             -- 同一份冻结源码覆盖新增登记和模块声明；匹配失败时仍保留旧记录用于 Abort。
-            local matched = match_targets(loaded.patch, self.targets, request.path)
+            local matched = match_targets(loaded.patch, self.service_registrations, request.path)
             if not matched.ok then
                 batch.error = matched
                 return

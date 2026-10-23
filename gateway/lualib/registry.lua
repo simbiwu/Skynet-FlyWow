@@ -28,8 +28,9 @@ function M.build_index(definitions)
            "gateway registry envelope_type is required")
     assert(type(definitions.commands) == "table", "gateway registry commands are required")
 
-    local by_id = {}
-    local count = 0
+    -- 校验每项定义后建立独立索引，不修改构建产物。
+    local by_id = {} -- command id 到只读协议定义的索引，供解码和路由查询。
+    local count = 0  -- 已登记 command 数量；构建结束时用于拒绝空 registry。
     for command_id, definition in pairs(definitions.commands) do
         assert_command_id(command_id)
         assert(type(definition) == "table", "gateway command definition must be a table")
@@ -55,6 +56,7 @@ function M.build_index(definitions)
         count = count + 1
     end
 
+    -- 完整索引校验通过后才交给调用者。
     assert(count > 0, "gateway registry must contain at least one command")
 
     return

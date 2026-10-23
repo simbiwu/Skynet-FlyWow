@@ -14,7 +14,8 @@ local module_state =
 ---@return any copied_graph 新建的复制结果；提供 target_graph 时返回该目标根表
 local function copy_state_graph(source_graph, target_graph)
     local copied_tables = {} -- 源表到目标表的映射，用于保留共享引用和循环引用。
-    local field_count = 0 -- 当前快照复制的字段数；达到上限时拒绝继续复制。
+    local field_count = 0    -- 当前快照复制的字段数；达到上限时拒绝继续复制。
+
     local function copy_state_value(source_value, nesting_depth)
         local value_type = type(source_value)
         if value_type ~= "table" then
@@ -69,39 +70,40 @@ function M.restore_state(source_graph, target_graph)
 end
 
 --- 原地覆盖模块导出字段；各字段引用直接安装，保留导出表身份。
----@param live table Commit/Abort 已确认身份和元表的线上表
----@param fields table 完整新字段；调用者保证与 live 隔离
-local function replace_exports(live, fields)
-    --热更路径要求模块导出表没有元表，回滚前也会检查这一点。所以在当前约束下，普通赋值和 rawset 的效果相同。
-    for key in pairs(live) do
-        rawset(live, key, nil)
+---@param module_exports table Commit/Abort 已确认身份和元表的线上表
+---@param export_fields table 完整新字段；调用者保证与 module_exports 隔离
+local function replace_exports(module_exports, export_fields)
+    -- 先移除旧版本全部字段，再安装完整候选；两个阶段都保持根导出表身份。
+    for key in pairs(module_exports) do
+        rawset(module_exports, key, nil)
     end
 
-    for key, value in pairs(fields) do
-        rawset(live, key, value)
+    for key, value in pairs(export_fields) do
+        rawset(module_exports, key, value)
     end
 end
 
-local function check_exports(exports, name)
-    assert(type(exports) == "table" and getmetatable(exports) == nil, name .. " 必须导出无元表根表")
-    local pending = {exports}
-    local seen = {[exports] = true}
+local function check_exports(module_exports, module_name)
+    assert(type(module_exports) == "table" and getmetatable(module_exports) == nil, module_name .. " 必须导出无元表根表")
+    -- 每张嵌套表只入栈一次，允许数据共享引用或形成循环。
+    local pending = {module_exports}       -- 尚未校验字段的表，作为显式工作栈。
+    local seen = {[module_exports] = true} -- 已入栈的表，避免循环引用反复入栈。
     while #pending > 0 do
         local current = table.remove(pending)
         for key, value in next, current do
-            assert(key ~= exports and value ~= exports, name .. " 导出数据不得引用模块根导出表")
-            if current == exports then
-                assert(type(key) == "string", name .. " 顶层导出字段名必须是字符串")
+            assert(key ~= module_exports and value ~= module_exports, module_name .. " 导出数据不得引用模块根导出表")
+            if current == module_exports then
+                assert(type(key) == "string", module_name .. " 顶层导出字段名必须是字符串")
             else
                 assert(type(key) == "string" or type(key) == "number" or type(key) == "boolean",
-                    name .. " 嵌套导出键必须是字符串、数字或布尔值")
+                    module_name .. " 嵌套导出键必须是字符串、数字或布尔值")
             end
 
             local value_type = type(value)
             assert(value_type == "function" or value_type == "number" or value_type == "string"
-                or value_type == "boolean" or value_type == "table", name .. " 导出值类型不受支持")
+                or value_type == "boolean" or value_type == "table", module_name .. " 导出值类型不受支持")
             if value_type == "table" and not seen[value] then
-                assert(getmetatable(value) == nil, name .. " 嵌套导出表不得带元表")
+                assert(getmetatable(value) == nil, module_name .. " 嵌套导出表不得带元表")
                 seen[value] = true
                 pending[#pending + 1] = value
             end
@@ -109,10 +111,10 @@ local function check_exports(exports, name)
     end
 
     -- 模块私有状态钩子在单个版本内成对提供；跨版本是否迁移由 Stage 决定。
-    assert((exports.export_state == nil) == (exports.import_state == nil), name .. " 状态钩子须成对")
-    if exports.export_state ~= nil then
-        assert(type(exports.export_state) == "function" and type(exports.import_state) == "function",
-            name .. " 状态钩子必须是函数")
+    assert((module_exports.export_state == nil) == (module_exports.import_state == nil), module_name .. " 状态钩子须成对")
+    if module_exports.export_state ~= nil then
+        assert(type(module_exports.export_state) == "function" and type(module_exports.import_state) == "function",
+            module_name .. " 状态钩子必须是函数")
     end
 end
 

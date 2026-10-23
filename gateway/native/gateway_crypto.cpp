@@ -21,45 +21,45 @@ namespace
 using flywow_lua_binding::LuaBinding;
 using flywow_lua_binding::LuaTable;
 constexpr const char* TYPE = "flywow.gateway.crypto";
-struct Context
+struct CryptoContext
 {
     EVP_PKEY*                    key    = nullptr; // userdata 独占，仅生成 challenge 时持有。
     std::array<unsigned char,32> secret = {};      // HMAC 密钥，握手结束擦除。
     std::array<unsigned char,32> hash   = {};      // 公开 transcript 摘要。
     bool                         active = false;   // 成功 verify 后不允许重复使用。
-    ~Context() noexcept;
+    ~CryptoContext() noexcept;
 };
 template<class T, void(*Free)(T*)> using Handle = std::unique_ptr<T, decltype(Free)>;
 
 // 检查 EVP 的显式返回；失败由当前 Lua 回调转为稳定错误结果。
-void check(bool ok, const char* code)
+void requireCryptoSuccess(bool ok, const char* code)
 {
     if (!ok) throw std::runtime_error(code);
 }
 
 // 幂等擦除 context；只影响本 userdata，无 I/O/yield，失败路径也可调用。
-void clear(Context* c)
+void clearCryptoContext(CryptoContext* crypto_context)
 {
-    EVP_PKEY_free(c->key);
-    c->key    = nullptr;
-    c->active = false;
-    OPENSSL_cleanse(c->secret.data(), c->secret.size());
-    OPENSSL_cleanse(c->hash.data(), c->hash.size());
+    EVP_PKEY_free(crypto_context->key);
+    crypto_context->key    = nullptr;
+    crypto_context->active = false;
+    OPENSSL_cleanse(crypto_context->secret.data(), crypto_context->secret.size());
+    OPENSSL_cleanse(crypto_context->hash.data(), crypto_context->hash.size());
 }
 
-Context::~Context() noexcept
+CryptoContext::~CryptoContext() noexcept
 {
-    clear(this);
+    clearCryptoContext(this);
 }
 
 // 对指定消息执行完整 HMAC-SHA256；key/message 只在调用期间借用，输出为32字节。
-void hmac(const unsigned char* key, const std::string& message, unsigned char* out)
+void computeHmac(const unsigned char* key, const std::string& message, unsigned char* output_mac)
 {
     Handle<EVP_MAC, EVP_MAC_free> algorithm(EVP_MAC_fetch(nullptr, "HMAC", nullptr), EVP_MAC_free);
-    check(bool(algorithm), "CRYPTO_PROVIDER");
+    requireCryptoSuccess(bool(algorithm), "CRYPTO_PROVIDER");
 
-    Handle<EVP_MAC_CTX, EVP_MAC_CTX_free> ctx(EVP_MAC_CTX_new(algorithm.get()), EVP_MAC_CTX_free);
-    check(bool(ctx), "CRYPTO_ALLOC");
+    Handle<EVP_MAC_CTX, EVP_MAC_CTX_free> mac_context(EVP_MAC_CTX_new(algorithm.get()), EVP_MAC_CTX_free);
+    requireCryptoSuccess(bool(mac_context), "CRYPTO_ALLOC");
 
     char digest[] = "SHA256";
     OSSL_PARAM params[] =
@@ -68,17 +68,17 @@ void hmac(const unsigned char* key, const std::string& message, unsigned char* o
         OSSL_PARAM_construct_end()
     };
     size_t size = 0;
-    check(EVP_MAC_init(ctx.get(), key, 32, params) == 1 &&
-          EVP_MAC_update(ctx.get(), reinterpret_cast<const unsigned char*>(message.data()), message.size()) == 1 &&
-          EVP_MAC_final(ctx.get(), out, &size, 32) == 1 && size == 32, "CRYPTO_HMAC");
+    requireCryptoSuccess(EVP_MAC_init(mac_context.get(), key, 32, params) == 1 &&
+          EVP_MAC_update(mac_context.get(), reinterpret_cast<const unsigned char*>(message.data()), message.size()) == 1 &&
+          EVP_MAC_final(mac_context.get(), output_mac, &size, 32) == 1 && size == 32, "CRYPTO_HMAC");
 }
 
 // 创建服务端 challenge 并派生 secret；hello 已由入口检查精确长度/版本。
 // ECDH 使用原始32字节Z，不使用各平台默认的二次散列；临时共享秘密离开函数时擦除。
-std::string challenge(Context* c, const char* hello)
+std::string buildChallenge(CryptoContext* crypto_context, const char* hello)
 {
-    Handle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> gen(EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr), EVP_PKEY_CTX_free);
-    check(bool(gen), "CRYPTO_ALLOC");
+    Handle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> keygen_context(EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr), EVP_PKEY_CTX_free);
+    requireCryptoSuccess(bool(keygen_context), "CRYPTO_ALLOC");
 
     char group[] = "prime256v1";
     OSSL_PARAM group_params[] =
@@ -86,11 +86,11 @@ std::string challenge(Context* c, const char* hello)
         OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, group, 0),
         OSSL_PARAM_construct_end()
     };
-    check(EVP_PKEY_keygen_init(gen.get()) == 1 && EVP_PKEY_CTX_set_params(gen.get(), group_params) == 1 &&
-          EVP_PKEY_generate(gen.get(), &c->key) == 1, "CRYPTO_KEYGEN");
+    requireCryptoSuccess(EVP_PKEY_keygen_init(keygen_context.get()) == 1 && EVP_PKEY_CTX_set_params(keygen_context.get(), group_params) == 1 &&
+          EVP_PKEY_generate(keygen_context.get(), &crypto_context->key) == 1, "CRYPTO_KEYGEN");
 
-    Handle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> import(EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr), EVP_PKEY_CTX_free);
-    check(bool(import), "CRYPTO_ALLOC");
+    Handle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> import_context(EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr), EVP_PKEY_CTX_free);
+    requireCryptoSuccess(bool(import_context), "CRYPTO_ALLOC");
     OSSL_PARAM peer_params[] =
     {
         OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, group, 0),
@@ -98,24 +98,24 @@ std::string challenge(Context* c, const char* hello)
         OSSL_PARAM_construct_end()
     };
     EVP_PKEY* raw_peer = nullptr;
-    const bool imported = EVP_PKEY_fromdata_init(import.get()) == 1 &&
-        EVP_PKEY_fromdata(import.get(), &raw_peer, EVP_PKEY_PUBLIC_KEY, peer_params) == 1;
+    const bool imported = EVP_PKEY_fromdata_init(import_context.get()) == 1 &&
+        EVP_PKEY_fromdata(import_context.get(), &raw_peer, EVP_PKEY_PUBLIC_KEY, peer_params) == 1;
     Handle<EVP_PKEY, EVP_PKEY_free> peer(raw_peer, EVP_PKEY_free);
-    check(imported, "INVALID_PUBLIC_KEY");
+    requireCryptoSuccess(imported, "INVALID_PUBLIC_KEY");
 
-    Handle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> verify(EVP_PKEY_CTX_new(peer.get(), nullptr), EVP_PKEY_CTX_free);
-    check(bool(verify) && EVP_PKEY_public_check(verify.get()) == 1, "INVALID_PUBLIC_KEY");
+    Handle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> public_key_check(EVP_PKEY_CTX_new(peer.get(), nullptr), EVP_PKEY_CTX_free);
+    requireCryptoSuccess(bool(public_key_check) && EVP_PKEY_public_check(public_key_check.get()) == 1, "INVALID_PUBLIC_KEY");
 
     std::string response(99, '\0');
     response[0] = 2;
     response[1] = 1;
     size_t size = 0;
-    check(EVP_PKEY_get_octet_string_param(c->key, OSSL_PKEY_PARAM_PUB_KEY,
+    requireCryptoSuccess(EVP_PKEY_get_octet_string_param(crypto_context->key, OSSL_PKEY_PARAM_PUB_KEY,
           reinterpret_cast<unsigned char*>(&response[2]), 65, &size) == 1 && size == 65, "CRYPTO_PUBLIC_KEY");
-    check(RAND_bytes(reinterpret_cast<unsigned char*>(&response[67]), 32) == 1, "CRYPTO_RANDOM");
+    requireCryptoSuccess(RAND_bytes(reinterpret_cast<unsigned char*>(&response[67]), 32) == 1, "CRYPTO_RANDOM");
 
-    Handle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> derive(EVP_PKEY_CTX_new(c->key, nullptr), EVP_PKEY_CTX_free);
-    check(bool(derive), "CRYPTO_ALLOC");
+    Handle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> derive_context(EVP_PKEY_CTX_new(crypto_context->key, nullptr), EVP_PKEY_CTX_free);
+    requireCryptoSuccess(bool(derive_context), "CRYPTO_ALLOC");
     struct Shared
     {
         unsigned char bytes[32] = {}; // 原始Z，只在当前调用存活。
@@ -124,40 +124,40 @@ std::string challenge(Context* c, const char* hello)
         {
             OPENSSL_cleanse(bytes, sizeof(bytes));
         }
-    } z;
+    } shared_secret;
 
-    size = sizeof(z.bytes);
-    check(EVP_PKEY_derive_init(derive.get()) == 1 && EVP_PKEY_derive_set_peer(derive.get(), peer.get()) == 1 &&
-          EVP_PKEY_derive(derive.get(), z.bytes, &size) == 1 && size == 32, "CRYPTO_DERIVE");
+    size = sizeof(shared_secret.bytes);
+    requireCryptoSuccess(EVP_PKEY_derive_init(derive_context.get()) == 1 && EVP_PKEY_derive_set_peer(derive_context.get(), peer.get()) == 1 &&
+          EVP_PKEY_derive(derive_context.get(), shared_secret.bytes, &size) == 1 && size == 32, "CRYPTO_DERIVE");
 
     std::string transcript(hello, 67);
     transcript += response;
     unsigned int hash_size = 0;
-    check(EVP_Digest(transcript.data(), transcript.size(), c->hash.data(), &hash_size, EVP_sha256(), nullptr) == 1 &&
+    requireCryptoSuccess(EVP_Digest(transcript.data(), transcript.size(), crypto_context->hash.data(), &hash_size, EVP_sha256(), nullptr) == 1 &&
           hash_size == 32, "CRYPTO_HASH");
 
     std::string info = "flywow/handshake/v1";
-    info.append(reinterpret_cast<const char*>(c->hash.data()), 32);
+    info.append(reinterpret_cast<const char*>(crypto_context->hash.data()), 32);
 
     Handle<EVP_KDF, EVP_KDF_free> algorithm(EVP_KDF_fetch(nullptr, "HKDF", nullptr), EVP_KDF_free);
-    check(bool(algorithm), "CRYPTO_PROVIDER");
+    requireCryptoSuccess(bool(algorithm), "CRYPTO_PROVIDER");
     Handle<EVP_KDF_CTX, EVP_KDF_CTX_free> kdf(EVP_KDF_CTX_new(algorithm.get()), EVP_KDF_CTX_free);
-    check(bool(kdf), "CRYPTO_ALLOC");
+    requireCryptoSuccess(bool(kdf), "CRYPTO_ALLOC");
 
     char digest[] = "SHA256";
     OSSL_PARAM params[] =
     {
         OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, digest, 0),
-        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, z.bytes, 32),
+        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, shared_secret.bytes, 32),
         OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT, &response[67], 32),
         OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, &info[0], info.size()),
         OSSL_PARAM_construct_end()
     };
-    check(EVP_KDF_derive(kdf.get(), c->secret.data(), 32, params) == 1, "CRYPTO_HKDF");
+    requireCryptoSuccess(EVP_KDF_derive(kdf.get(), crypto_context->secret.data(), 32, params) == 1, "CRYPTO_HKDF");
 
-    EVP_PKEY_free(c->key);
-    c->key    = nullptr;
-    c->active = true;
+    EVP_PKEY_free(crypto_context->key);
+    crypto_context->key    = nullptr;
+    crypto_context->active = true;
     return response;
 }
 
@@ -175,17 +175,17 @@ int create_crypto_context(lua_State *state)
         return lua_binding.pushError();
     }
 
-    Context *context = nullptr;
+    CryptoContext *context = nullptr;
     if (!lua_binding.newUserdata(TYPE, context)) return lua_binding.pushError();
 
     std::string response;
     try
     {
-        response = challenge(context, hello.data());
+        response = buildChallenge(context, hello.data());
     }
     catch (const std::runtime_error &error)
     {
-        clear(context);
+        clearCryptoContext(context);
         lua_binding.setError(error.what(), error.what());
         return lua_binding.pushError();
     }
@@ -197,14 +197,14 @@ int create_crypto_context(lua_State *state)
 int verify(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    Context *context = nullptr;
+    CryptoContext *context = nullptr;
     std::string bytes;
     if (!lua_binding.readUserdata(1, TYPE, context) || !lua_binding.readValue(2, bytes))
         return lua_binding.pushError();
 
     if (!context->active || bytes.size() != 33 || bytes[0] != 3)
     {
-        clear(context);
+        clearCryptoContext(context);
         lua_binding.setError("HANDSHAKE_PROOF", "invalid handshake proof");
         return lua_binding.pushError();
     }
@@ -212,23 +212,23 @@ int verify(lua_State *state)
     std::array<unsigned char,32> expected = {};
     std::string message = "client-proof";
     message.append(reinterpret_cast<const char*>(context->hash.data()), 32);
-    hmac(context->secret.data(), message, expected.data());
+    computeHmac(context->secret.data(), message, expected.data());
 
     try
     {
-        check(CRYPTO_memcmp(expected.data(), bytes.data() + 1, 32) == 0, "HANDSHAKE_PROOF");
+        requireCryptoSuccess(CRYPTO_memcmp(expected.data(), bytes.data() + 1, 32) == 0, "HANDSHAKE_PROOF");
 
         message = "server-ready";
         message.append(reinterpret_cast<const char*>(context->hash.data()), 32);
         std::string response(33, '\0');
         response[0] = 4;
-        hmac(context->secret.data(), message, reinterpret_cast<unsigned char*>(&response[1]));
-        clear(context);
+        computeHmac(context->secret.data(), message, reinterpret_cast<unsigned char*>(&response[1]));
+        clearCryptoContext(context);
         return lua_binding.returnValues(response);
     }
     catch (const std::runtime_error &error)
     {
-        clear(context);
+        clearCryptoContext(context);
         lua_binding.setError(error.what(), error.what());
         return lua_binding.pushError();
     }
@@ -238,9 +238,9 @@ int verify(lua_State *state)
 int close(lua_State *state)
 {
     LuaBinding lua_binding(state);
-    Context *context = nullptr;
+    CryptoContext *context = nullptr;
     if (!lua_binding.readUserdata(1, TYPE, context)) return lua_binding.pushError();
-    clear(context);
+    clearCryptoContext(context);
     return lua_binding.returnValues();
 }
 }
@@ -250,7 +250,7 @@ extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
 {
     LuaBinding lua_binding(state);
     LuaTable metatable;
-    if (!lua_binding.registerUserdata<Context>(TYPE, metatable)) return lua_binding.pushError();
+    if (!lua_binding.registerUserdata<CryptoContext>(TYPE, metatable)) return lua_binding.pushError();
 
     LuaTable methods = lua_binding.newTable();
     if (!methods.setFunction("verify", verify) || !methods.setFunction("close", close) ||

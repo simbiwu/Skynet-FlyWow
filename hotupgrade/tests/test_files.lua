@@ -28,7 +28,7 @@ local function register_fixture(instance, service_handle, metadata, service_name
     skynet.newservice = original_newservice
     assert(created.ok and instance.creation_handles[service_handle].service_name == service_name)
     local registered = instance:handle_command("register", metadata, service_handle)
-    assert(registered.ok and instance.targets[service_handle].service_name == service_name)
+    assert(registered.ok and instance.service_registrations[service_handle].service_name == service_name)
     return registered
 end
 assert(register_fixture(c, 10, {modules = {"lualib.test_worker_logic"},

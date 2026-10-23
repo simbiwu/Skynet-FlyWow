@@ -24,15 +24,15 @@ local M = {}
 ---@param handshake_config table 握手配置；crypto/now/max_pending/timeout_ticks 由启动阶段注入。
 ---@return HandshakeManager 只拥有 pending 握手状态；不执行 I/O 或 yield。
 function M.new(handshake_config)
-    local crypto = assert(handshake_config.crypto)
-    local now = assert(handshake_config.now)
-    local max_pending = assert(handshake_config.max_pending)
-    local timeout_ticks = assert(handshake_config.timeout_ticks)
+    local crypto = assert(handshake_config.crypto)               -- 宿主注入的 Native 密码接口，所有握手共用只读入口。
+    local read_tick = assert(handshake_config.now)               -- 宿主时钟函数；每次调用读取当前 tick，不缓存时间值。
+    local max_pending = assert(handshake_config.max_pending)     -- 当前 manager 同时持有的握手名额上限。
+    local timeout_ticks = assert(handshake_config.timeout_ticks) -- 从 accept 起算的握手总期限，单位为 10ms tick。
 
     assert(math.type(max_pending) == "integer" and max_pending > 0)
     assert(math.type(timeout_ticks) == "integer" and timeout_ticks > 0 and timeout_ticks < 0x80000000)
 
-    local pending = 0
+    local pending = 0                                            -- 当前 manager 占用的握手名额；accept 增加，close 幂等释放。
     local manager = {}
 
     --- 释放当前握手占用；幂等，清理native对象；context由Gateway独占，不执行I/O/yield。
@@ -66,10 +66,10 @@ function M.new(handshake_config)
         pending = pending + 1
         return
         {
-            phase   = "hello", -- hello/proof/confirm/ready/closed，只由本manager改变。
-            started = now(), -- 握手起点，消息不能刷新总期限。
-            held    = true, -- pending令牌，只释放一次。
-            crypto  = nil, -- native userdata；私钥/secret不进入Lua string。
+            phase   = "hello",     -- hello/proof/confirm/ready/closed，只由本manager改变。
+            started = read_tick(), -- 握手起点，消息不能刷新总期限。
+            held    = true,        -- pending令牌，只释放一次。
+            crypto  = nil,         -- native userdata；私钥/secret不进入Lua string。
         }
     end
 
@@ -78,7 +78,7 @@ function M.new(handshake_config)
     ---@return boolean 是否超过绝对握手期限。
     function manager.expired(context)
         return context and context.held and
-            (now() - context.started) % 0x100000000 >= timeout_ticks
+            (read_tick() - context.started) % 0x100000000 >= timeout_ticks
     end
 
     --- 提供当前阶段允许的精确帧长度；TCP必须在读取body前使用，不由网络长度决定分配。
@@ -99,7 +99,7 @@ function M.new(handshake_config)
     --- handshake_input.context为Gateway独占状态，handshake_input.bytes为当前帧只读字节；
     --- 处理一条完整握手消息；成功返回bytes/nil/是否待确认，失败返回nil/错误并释放context。
     --- Native错误只映射稳定码，不暴露EVP详情；不I/O/yield，不缓存提前业务包。
-    ---@param input table 包含 context 与当前完整 frame bytes；调用方拥有 bytes。
+    ---@param handshake_input table 包含 context 与当前完整 frame bytes；调用方拥有 bytes。
     ---@return string|nil, string|nil, boolean|nil 响应帧、稳定错误码、是否等待确认。
     function manager.receive(handshake_input)
         local context = handshake_input.context

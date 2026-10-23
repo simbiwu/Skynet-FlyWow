@@ -56,14 +56,14 @@ local function merge_config(base_config, config_overrides)
 end
 
 --- 把配置项校验为有界整数，避免字符串数字、小数或 NaN 进入端口和资源上限。
---- value 是候选数值，name 仅用于错误诊断，minimum/maximum 是含端点的合法范围；参数只读。
+--- config_value 是候选数值，config_name 仅用于错误诊断，min_value/max_value 是含端点的合法范围；参数只读。
 --- 返回 Lua integer；类型不符或越界时抛错。不执行 I/O、分配外部资源或 yield。
-local function require_integer(value, name, minimum, maximum)
-    assert(type(value) == "number" and math.type(value) == "integer",
-           name .. " must be an integer")
-    assert(value >= minimum and value <= maximum,
-           name .. " must be in [" .. minimum .. ", " .. maximum .. "]")
-    return value
+local function require_integer(config_value, config_name, min_value, max_value)
+    assert(type(config_value) == "number" and math.type(config_value) == "integer",
+           config_name .. " must be an integer")
+    assert(config_value >= min_value and config_value <= max_value,
+           config_name .. " must be in [" .. min_value .. ", " .. max_value .. "]")
+    return config_value
 end
 
 --- 校验并复制宿主完整传入的课程配置，避免运行期间读取可变配置 table。

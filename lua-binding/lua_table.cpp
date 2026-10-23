@@ -34,6 +34,7 @@ LuaTable &LuaTable::operator=(LuaTable &&other) noexcept
         other.binding_   = nullptr;
         other.reference_ = LUA_NOREF;
     }
+
     return *this;
 }
 
@@ -41,8 +42,7 @@ void LuaTable::reset() noexcept
 {
     if (valid())
     {
-        // 释放 registry 引用不弹栈。Lua 若还保存返回结果/字段引用，该表仍存活。
-        // luaL_unref：释放此 owner 持有的 registry 引用编号，不弹栈、不直接销毁对象；其它 Lua 引用仍可保持对象存活。
+            // luaL_unref：释放此 owner 持有的 registry 引用编号，不弹栈、不直接销毁对象；其它 Lua 引用仍可保持对象存活。
         luaL_unref(binding_->state_, LUA_REGISTRYINDEX, reference_);
     }
     binding_   = nullptr;
@@ -146,7 +146,6 @@ bool LuaTable::visitEntries(
     lua_pushnil(binding_->state_);
     // lua_next 消耗旧 key，成功时压入新 key/value；结束时不压值。
     // [S, table, nil/key] -> [S, table, key, value]，第一轮 nil 表示开始。
-    // lua_next：消耗上一轮 key；成功压入下一对 key/value，结束不压值。每轮只弹 value，保留未经转换的 key；初始 key 为 nil。
     while (lua_next(binding_->state_, table_index) != 0)
     {
         // lua_gettop：取得当前栈项数量（同时是栈顶正索引，空栈为 0）；只读取高度，不压入或移除值。
@@ -211,7 +210,6 @@ bool LuaTable::denseArrayLength(std::size_t &output) const
     // 每轮只弹 value，保留未经转换的原 key；成功/失败出口由保护器恢复 [S]。
     // lua_pushnil：压入 nil：[S] -> [S, nil]；作为错误首返回值或 table 遍历起始 key，具体用途由当前操作决定。
     lua_pushnil(binding_->state_);
-    // lua_next：消耗上一轮 key；成功压入下一对 key/value，结束不压值。每轮只弹 value，保留未经转换的 key；初始 key 为 nil。
     while (lua_next(binding_->state_, table_index) != 0)
     {
         // lua_isinteger：检查该槽是否为 Lua 整数，不接受浮点或数字字符串；不转换原值、不改变栈，返回非零表示符合。

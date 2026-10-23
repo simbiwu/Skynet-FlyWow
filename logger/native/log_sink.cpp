@@ -23,7 +23,7 @@ constexpr std::size_t kFileBufferSize = 64 * 1024;
 
 // 按路径的每一级递归创建目录。
 // 已存在且确实是目录时继续；若路径中有普通文件或权限不足，直接抛出启动错误。
-void create_directory(const std::string& path)
+void createDirectory(const std::string& path)
 {
     for (std::size_t i = 1; i <= path.size(); ++i)
     {
@@ -53,7 +53,7 @@ void create_directory(const std::string& path)
 
 // 把一条日志限制为单行，防止正文中的换行伪造后续日志头。
 // 控制字符替换为 '?'，换行和回车保留为可读转义；最多处理 8 KiB。
-std::string single_line(const std::string& text)
+std::string singleLine(const std::string& text)
 {
     const std::size_t size = std::min(text.size(), kMaxTextSize);
     std::string result;
@@ -89,7 +89,7 @@ std::string single_line(const std::string& text)
 }
 
 // 把时间转换为 YYYY-MM-DD；失败返回空字符串，调用者不应打开未知日期文件。
-std::string local_day(std::chrono::system_clock::time_point now)
+std::string localDay(std::chrono::system_clock::time_point now)
 {
     const time_t seconds = std::chrono::system_clock::to_time_t(now);
     tm local{};
@@ -116,7 +116,7 @@ LogSink::LogSink(const std::string& path, bool console) : console_(console)
         throw std::runtime_error("log_path 不能为空或超过系统路径上限");
     }
 
-    create_directory(path);
+    createDirectory(path);
 
     char resolved[PATH_MAX]{};
     if (::realpath(path.c_str(), resolved) == nullptr)
@@ -145,10 +145,10 @@ LogSink::~LogSink()
 
 // 确保当天文件已经打开。
 // 同一天直接复用句柄；跨天先关闭旧文件，再以追加方式打开 YYYY-MM-DD.log。
-// 打开失败不会立即循环重试，而是由 report_failure 限制为最多每秒一次。
+// 打开失败不会立即循环重试，而是由 reportFailure 限制为最多每秒一次。
 bool LogSink::open_day(std::chrono::system_clock::time_point now)
 {
-    const std::string date = local_day(now);
+    const std::string date = localDay(now);
     if (date.empty())
     {
         return false;
@@ -170,7 +170,7 @@ bool LogSink::open_day(std::chrono::system_clock::time_point now)
         file_ = nullptr;
         if (failed)
         {
-            report_failure();
+            reportFailure();
             return false;
         }
     }
@@ -179,7 +179,7 @@ bool LogSink::open_day(std::chrono::system_clock::time_point now)
     file_ = std::fopen(filename.c_str(), "a");
     if (file_ == nullptr)
     {
-        report_failure();
+        reportFailure();
         return false;
     }
 
@@ -191,7 +191,7 @@ bool LogSink::open_day(std::chrono::system_clock::time_point now)
 
 // 写盘失败只向 stderr 报告，并关闭失效句柄。
 // stderr 不能再经由 Logger，否则会形成“记录错误失败 -> 再记录错误”的递归。
-void LogSink::report_failure()
+void LogSink::reportFailure()
 {
     const auto now = std::chrono::steady_clock::now();
     if (now >= retry_after_)
@@ -218,7 +218,7 @@ bool LogSink::flush()
 
     if (std::fflush(file_) != 0)
     {
-        report_failure();
+        reportFailure();
         return false;
     }
 
@@ -252,8 +252,8 @@ bool LogSink::write(int level, const std::string& source, const std::string& tex
 
     const char* label = level == 0 ? "DEBUG" :
         level == 1 ? "NORMAL" : "ERROR";
-    const std::string body = single_line(text);
-    const std::string name = single_line(source);
+    const std::string body = singleLine(text);
+    const std::string name = singleLine(source);
 
     // 同一条日志只格式化一次，两个输出共用时间戳、等级、来源和转义后的正文。
     char prefix[64]{};
@@ -271,7 +271,7 @@ bool LogSink::write(int level, const std::string& source, const std::string& tex
 
     if (std::fwrite(line.data(), 1, line.size(), file_) != line.size())
     {
-        report_failure();
+        reportFailure();
         return false;
     }
 

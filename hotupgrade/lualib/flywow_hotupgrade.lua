@@ -162,17 +162,17 @@ local function merge_service_state(target_state, update_state)
 end
 
 -- 只在业务安全点已确认时执行受信同步脚本；此函数不提供安全沙箱或副作用撤销。
-local function stage_service(source)
-    if not source then
+local function stage_service(patch_source)
+    if not patch_source then
         return nil
     end
 
     -- 执行受信 Patch 构建函数并校验结果；此时尚不写入线上状态。
     local service_update = assert(module_state.registration.service_update, "Service 未提供内部更新入口")
-    local chunk = assert(load(source, "=Service Patch", "t", _G))
-    local build = chunk()
-    assert(type(build) == "function", "Service Patch 必须返回构建函数")
-    local patch = build(service_update.state)
+    local chunk = assert(load(patch_source, "=Service Patch", "t", _G))
+    local build_patch = chunk()
+    assert(type(build_patch) == "function", "Service Patch 必须返回构建函数")
+    local patch = build_patch(service_update.state)
 
     assert(type(patch) == "table" and getmetatable(patch) == nil, "Service 构建结果必须是普通表")
     assert(patch.migrate == nil or type(patch.migrate) == "function", "migrate 必须是函数")
@@ -187,8 +187,8 @@ local function stage_service(source)
         old_functions = {}, -- 本次将替换的现有函数，不处理未列出的字段。
         touched = false,    -- 首次线上写入前置 true，部分提交同样必须恢复。
     }
-    for name, fn in pairs(patch.functions or {}) do
-        assert(type(name) == "string" and type(fn) == "function"
+    for name, replacement_function in pairs(patch.functions or {}) do
+        assert(type(name) == "string" and type(replacement_function) == "function"
             and type(rawget(service_update.functions, name)) == "function", "只能直接替换现有业务函数")
         staged.old_functions[name] = rawget(service_update.functions, name)
     end
@@ -203,8 +203,8 @@ local function stage_service(source)
             staged.old_state = hotupgrade_module_patch.snapshot_state(service_update.state)
         end
 
-        local isolated = hotupgrade_module_patch.snapshot_state(staged.old_state)
-        local update_state = patch.migrate(isolated)
+        local migration_snapshot = hotupgrade_module_patch.snapshot_state(staged.old_state)
+        local update_state = patch.migrate(migration_snapshot)
         assert(type(update_state) == "table" and update_state ~= service_update.state,
             "migrate 必须返回部分状态更新表")
         update_state = hotupgrade_module_patch.snapshot_state(update_state)

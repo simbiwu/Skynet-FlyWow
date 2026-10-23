@@ -8,10 +8,10 @@ local pb = require "pb"
 local M = {}
 
 -- 读取构建产物 descriptor；文件句柄只在本函数内拥有，返回值由调用方拥有。
--- 参数 path：Server 运行目录下的 descriptor 文件路径；必须可读且内容为 FileDescriptorSet。
+-- 参数 descriptor_path：Server 运行目录下的 descriptor 文件路径；必须可读且内容为 FileDescriptorSet。
 -- 返回值：完整 descriptor bytes；失败抛出文件 I/O 异常，不 yield、不保留句柄。
-local function read_file(path)
-    local file = assert(io.open(path, "rb"))
+local function read_descriptor(descriptor_path)
+    local file = assert(io.open(descriptor_path, "rb"))
     local bytes = file:read("*a")
     file:close()
 
@@ -28,7 +28,8 @@ function M.new(codec_config)
            "gateway descriptor_path is required")
     assert(type(codec_config.registry) == "table", "gateway registry is required")
 
-    local descriptor_bytes = read_file(codec_config.descriptor_path)
+    -- descriptor 整体加载到当前 State 后，再创建共用 registry 的编解码入口。
+    local descriptor_bytes = read_descriptor(codec_config.descriptor_path)
     assert(pb.load(descriptor_bytes),
            "cannot load protobuf descriptor: " .. codec_config.descriptor_path)
 
@@ -58,6 +59,7 @@ function M.new(codec_config)
     function codec.encode_response(definition, version, response)
         assert(definition.response_type ~= nil,
                "gateway command does not define a response: " .. definition.name)
+
         local body = assert(pb.encode(definition.response_type, response))
         local envelope =
         {

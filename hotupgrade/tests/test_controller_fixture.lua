@@ -153,7 +153,7 @@ local function managed_register(instance, metadata, service_handle, service_name
     assert(instance.creation_handles[service_handle].service_name == service_name)
     local registered = instance:handle_command("register", metadata, service_handle)
     if registered.ok then
-        assert(instance.targets[service_handle].service_name == service_name)
+        assert(instance.service_registrations[service_handle].service_name == service_name)
     end
     return registered
 end

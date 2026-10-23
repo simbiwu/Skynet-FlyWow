@@ -555,14 +555,14 @@ module_state.active = module_stage
 当前完整实现如下：
 
 ```lua
-local function check_exports(exports, name)
-    assert(type(exports) == "table" and getmetatable(exports) == nil, name .. " 必须导出无元表根表")
-    local pending = {exports}
-    local seen = {[exports] = true}
+local function check_exports(module_exports, module_name)
+    assert(type(module_exports) == "table" and getmetatable(module_exports) == nil, module_name .. " 必须导出无元表根表")
+    local pending = {module_exports}
+    local seen = {[module_exports] = true}
     while #pending > 0 do
         local current = table.remove(pending)
         for key, value in next, current do
-            assert(key ~= exports and value ~= exports, name .. " 导出数据不得引用模块根导出表")
+            assert(key ~= module_exports and value ~= module_exports, module_name .. " 导出数据不得引用模块根导出表")
             if type(key) == "table" and not seen[key] then
                 seen[key] = true
                 pending[#pending + 1] = key
@@ -575,10 +575,10 @@ local function check_exports(exports, name)
     end
 
     -- 模块私有状态钩子在单个版本内成对提供；跨版本是否迁移由 Stage 决定。
-    assert((exports.export_state == nil) == (exports.import_state == nil), name .. " 状态钩子须成对")
-    if exports.export_state ~= nil then
-        assert(type(exports.export_state) == "function" and type(exports.import_state) == "function",
-            name .. " 状态钩子必须是函数")
+    assert((module_exports.export_state == nil) == (module_exports.import_state == nil), module_name .. " 状态钩子须成对")
+    if module_exports.export_state ~= nil then
+        assert(type(module_exports.export_state) == "function" and type(module_exports.import_state) == "function",
+            module_name .. " 状态钩子必须是函数")
     end
 end
 ```
@@ -717,13 +717,13 @@ end
 完整 `replace_exports()` 源码是：
 
 ```lua
-local function replace_exports(live, fields)
-    for key in pairs(live) do
-        rawset(live, key, nil)
+local function replace_exports(module_exports, export_fields)
+    for key in pairs(module_exports) do
+        rawset(module_exports, key, nil)
     end
 
-    for key, value in pairs(fields) do
-        rawset(live, key, value)
+    for key, value in pairs(export_fields) do
+        rawset(module_exports, key, value)
     end
 end
 ```

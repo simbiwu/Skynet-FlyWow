@@ -12,7 +12,10 @@ namespace
 {
 void *allocate(std::size_t size)
 {
-    if (void *memory = je_malloc(size == 0 ? 1 : size)) return memory;
+    if (void *memory = je_malloc(size == 0 ? 1 : size))
+    {
+        return memory;
+    }
 
     throw std::bad_alloc();
 }
@@ -20,11 +23,18 @@ void *allocate(std::size_t size)
 void *allocateAligned(std::size_t size, std::size_t alignment)
 {
     const std::size_t payload = size == 0 ? 1 : size;
-    if (payload > std::numeric_limits<std::size_t>::max() - alignment - sizeof(void *)) throw std::bad_alloc();
+    if (payload > std::numeric_limits<std::size_t>::max() - alignment - sizeof(void *))
+    {
+        throw std::bad_alloc();
+    }
 
     void *base = je_malloc(payload + alignment - 1 + sizeof(void *));
-    if (base == nullptr) throw std::bad_alloc();
+    if (base == nullptr)
+    {
+        throw std::bad_alloc();
+    }
 
+    // 对齐地址前保存原始分配指针；释放时从同一槽位取回，避免释放偏移地址。
     const auto start = reinterpret_cast<std::uintptr_t>(base) + sizeof(void *);
     const auto address = (start + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
     auto *result = reinterpret_cast<void *>(address);
@@ -35,36 +45,140 @@ void *allocateAligned(std::size_t size, std::size_t alignment)
 
 void deallocateAligned(void *memory) noexcept
 {
-    if (memory != nullptr) je_free(reinterpret_cast<void **>(memory)[-1]);
+    if (memory != nullptr)
+    {
+        je_free(reinterpret_cast<void **>(memory)[-1]);
+    }
 }
-}
+} // namespace
 
 #define FLYWOW_ALLOCATOR_API
-FLYWOW_ALLOCATOR_API void *operator new(std::size_t size) { return allocate(size); }
-FLYWOW_ALLOCATOR_API void *operator new[](std::size_t size) { return allocate(size); }
-FLYWOW_ALLOCATOR_API void operator delete(void *memory) noexcept { je_free(memory); }
-FLYWOW_ALLOCATOR_API void operator delete[](void *memory) noexcept { je_free(memory); }
-FLYWOW_ALLOCATOR_API void operator delete(void *memory, std::size_t) noexcept { je_free(memory); }
-FLYWOW_ALLOCATOR_API void operator delete[](void *memory, std::size_t) noexcept { je_free(memory); }
+FLYWOW_ALLOCATOR_API void *operator new(std::size_t size)
+{
+    return allocate(size);
+}
+
+FLYWOW_ALLOCATOR_API void *operator new[](std::size_t size)
+{
+    return allocate(size);
+}
+
+FLYWOW_ALLOCATOR_API void operator delete(void *memory) noexcept
+{
+    je_free(memory);
+}
+
+FLYWOW_ALLOCATOR_API void operator delete[](void *memory) noexcept
+{
+    je_free(memory);
+}
+
+FLYWOW_ALLOCATOR_API void operator delete(void *memory, std::size_t) noexcept
+{
+    je_free(memory);
+}
+
+FLYWOW_ALLOCATOR_API void operator delete[](void *memory, std::size_t) noexcept
+{
+    je_free(memory);
+}
+
 FLYWOW_ALLOCATOR_API void *operator new(std::size_t size, const std::nothrow_t &) noexcept
-{ try { return allocate(size); } catch (...) { return nullptr; } }
+{
+    try
+    {
+        return allocate(size);
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
+
 FLYWOW_ALLOCATOR_API void *operator new[](std::size_t size, const std::nothrow_t &) noexcept
-{ try { return allocate(size); } catch (...) { return nullptr; } }
-FLYWOW_ALLOCATOR_API void operator delete(void *memory, const std::nothrow_t &) noexcept { je_free(memory); }
-FLYWOW_ALLOCATOR_API void operator delete[](void *memory, const std::nothrow_t &) noexcept { je_free(memory); }
+{
+    try
+    {
+        return allocate(size);
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
+
+FLYWOW_ALLOCATOR_API void operator delete(void *memory, const std::nothrow_t &) noexcept
+{
+    je_free(memory);
+}
+
+FLYWOW_ALLOCATOR_API void operator delete[](void *memory, const std::nothrow_t &) noexcept
+{
+    je_free(memory);
+}
+
 FLYWOW_ALLOCATOR_API void *operator new(std::size_t size, std::align_val_t alignment)
-{ return allocateAligned(size, static_cast<std::size_t>(alignment)); }
+{
+    return allocateAligned(size, static_cast<std::size_t>(alignment));
+}
+
 FLYWOW_ALLOCATOR_API void *operator new[](std::size_t size, std::align_val_t alignment)
-{ return allocateAligned(size, static_cast<std::size_t>(alignment)); }
-FLYWOW_ALLOCATOR_API void operator delete(void *memory, std::align_val_t) noexcept { deallocateAligned(memory); }
-FLYWOW_ALLOCATOR_API void operator delete[](void *memory, std::align_val_t) noexcept { deallocateAligned(memory); }
-FLYWOW_ALLOCATOR_API void operator delete(void *memory, std::size_t, std::align_val_t) noexcept { deallocateAligned(memory); }
-FLYWOW_ALLOCATOR_API void operator delete[](void *memory, std::size_t, std::align_val_t) noexcept { deallocateAligned(memory); }
-FLYWOW_ALLOCATOR_API void *operator new(std::size_t size, std::align_val_t alignment, const std::nothrow_t &) noexcept
-{ try { return allocateAligned(size, static_cast<std::size_t>(alignment)); } catch (...) { return nullptr; } }
-FLYWOW_ALLOCATOR_API void *operator new[](std::size_t size, std::align_val_t alignment, const std::nothrow_t &) noexcept
-{ try { return allocateAligned(size, static_cast<std::size_t>(alignment)); } catch (...) { return nullptr; } }
+{
+    return allocateAligned(size, static_cast<std::size_t>(alignment));
+}
+
+FLYWOW_ALLOCATOR_API void operator delete(void *memory, std::align_val_t) noexcept
+{
+    deallocateAligned(memory);
+}
+
+FLYWOW_ALLOCATOR_API void operator delete[](void *memory, std::align_val_t) noexcept
+{
+    deallocateAligned(memory);
+}
+
+FLYWOW_ALLOCATOR_API void operator delete(void *memory, std::size_t, std::align_val_t) noexcept
+{
+    deallocateAligned(memory);
+}
+
+FLYWOW_ALLOCATOR_API void operator delete[](void *memory, std::size_t, std::align_val_t) noexcept
+{
+    deallocateAligned(memory);
+}
+
+FLYWOW_ALLOCATOR_API void *operator new(std::size_t size, std::align_val_t alignment,
+                                        const std::nothrow_t &) noexcept
+{
+    try
+    {
+        return allocateAligned(size, static_cast<std::size_t>(alignment));
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
+
+FLYWOW_ALLOCATOR_API void *operator new[](std::size_t size, std::align_val_t alignment,
+                                          const std::nothrow_t &) noexcept
+{
+    try
+    {
+        return allocateAligned(size, static_cast<std::size_t>(alignment));
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
+
 FLYWOW_ALLOCATOR_API void operator delete(void *memory, std::align_val_t, const std::nothrow_t &) noexcept
-{ deallocateAligned(memory); }
+{
+    deallocateAligned(memory);
+}
+
 FLYWOW_ALLOCATOR_API void operator delete[](void *memory, std::align_val_t, const std::nothrow_t &) noexcept
-{ deallocateAligned(memory); }
+{
+    deallocateAligned(memory);
+}

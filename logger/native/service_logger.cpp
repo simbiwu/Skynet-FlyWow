@@ -53,7 +53,7 @@ constexpr std::size_t kLogHeaderSize = 2;
 // 回复控制请求的调用方。
 // source 和 session 来自当前消息；session 为 0 表示单向消息，不应发送响应。
 // skynet_send 会复制传入的文本，因此局部字符串在函数返回后仍然安全。
-void reply(skynet_context* context, uint32_t source, int session, bool ok)
+void replyControlRequest(skynet_context* context, uint32_t source, int session, bool ok)
 {
     if (session == 0)
     {
@@ -67,7 +67,7 @@ void reply(skynet_context* context, uint32_t source, int session, bool ok)
 
 // 获取来源记录，并限制登记表的最大容量。
 // 表满时返回 overflow；这样临时 Service 洪水不会让 unordered_map 无限增长。
-ServiceEntry& source_entry(Logger& logger, uint32_t source)
+ServiceEntry& resolveSourceEntry(Logger& logger, uint32_t source)
 {
     const auto found = logger.services.find(source);
     if (found != logger.services.end())
@@ -85,7 +85,7 @@ ServiceEntry& source_entry(Logger& logger, uint32_t source)
 
 // 从 Skynet 的 LAUNCH 文本中提取初始 Service 名称。
 // preload 安装前可能已经产生 LAUNCH，因此这里为尚未登记的来源补充可读名称。
-void learn_launch_name(ServiceEntry& entry, const char* bytes, std::size_t size)
+void learnLaunchName(ServiceEntry& entry, const char* bytes, std::size_t size)
 {
     if (!entry.name.empty() || size <= 7 ||
         std::memcmp(bytes, "LAUNCH ", 7) != 0)
@@ -105,10 +105,10 @@ void learn_launch_name(ServiceEntry& entry, const char* bytes, std::size_t size)
 // PTYPE_TEXT 的第一个字符是 Logger 命令：
 // L=分级日志，R=登记名称，U=注销来源，F=刷新文件。
 // 消息 data 只在本次 callback 中借用；异常必须在 C callback 边界内消化。
-int callback(skynet_context* context, void* ud, int type, int session,
+int handleMessage(skynet_context* context, void* logger_data, int type, int session,
             uint32_t source, const void* data, size_t size)
 {
-    auto& logger = *static_cast<Logger*>(ud);
+    auto& logger = *static_cast<Logger*>(logger_data);
 
     try
     {
@@ -148,14 +148,14 @@ int callback(skynet_context* context, void* ud, int type, int session,
         // F 是同步刷新请求，必须使用原 session 唤醒 skynet.call。
         if (command == flywow_logger::kCommandFlush && size == 1)
         {
-            reply(context, source, session, logger.sink->flush());
+            replyControlRequest(context, source, session, logger.sink->flush());
             return 0;
         }
 
         // 控制消息不接受普通响应 session，避免调用方误把日志当响应。
         if (session != 0)
         {
-            reply(context, source, session, false);
+            replyControlRequest(context, source, session, false);
             return 0;
         }
 
@@ -166,7 +166,7 @@ int callback(skynet_context* context, void* ud, int type, int session,
             return 0;
         }
 
-        ServiceEntry& entry = source_entry(logger, source);
+        ServiceEntry& entry = resolveSourceEntry(logger, source);
 
         // R 后面的内容是 Lua Service 名称；Native Logger 保存它用于日志展示。
         // overflow 来源不保存名称，防止来源登记表继续增长。
@@ -186,7 +186,7 @@ int callback(skynet_context* context, void* ud, int type, int session,
         // preload 安装前可能已经产生 LAUNCH，因此先尝试学习标准启动日志中的名称。
         if (&entry != &logger.overflow)
         {
-            learn_launch_name(entry, bytes, size);
+            learnLaunchName(entry, bytes, size);
         }
 
         // L 消息的第二个字节是等级；没有合法等级的文本按原生日志处理。
@@ -235,7 +235,7 @@ int callback(skynet_context* context, void* ud, int type, int session,
     {
         // 异常不能穿过 Skynet C callback；控制请求收到失败，普通日志被丢弃。
         std::fprintf(stderr, "[flywow_logger] 接收失败: %s\n", exception.what());
-        reply(context, source, session, false);
+        replyControlRequest(context, source, session, false);
     }
 
     return 0;
@@ -261,7 +261,7 @@ Logger* flywow_logger_create()
 // Skynet 模块入口：解析 log_path 和等级，打开当天文件并注册 callback。
 // parm 是配置传入的日志目录；Logger 拥有复制后的路径，不借用 parm 指针。
 // 返回 0 表示 Service 已可接收日志，非 0 表示启动失败。
-int flywow_logger_init(Logger* logger, skynet_context* context, const char* parm)
+int flywow_logger_init(Logger* logger, skynet_context* context, const char* init_arguments)
 {
     if (logger == nullptr || context == nullptr)
     {
@@ -309,7 +309,7 @@ int flywow_logger_init(Logger* logger, skynet_context* context, const char* parm
             std::strcmp(configured_console, "true") == 0;
 
         // 第二阶段：创建 LogSink，并立即确认当天文件可写。
-        const char* log_path = parm == nullptr ? "" : parm;
+        const char* log_path = init_arguments == nullptr ? "" : init_arguments;
         logger->sink.reset(new flywow_logger::LogSink(log_path, console));
 
         if (!logger->sink->open_day(std::chrono::system_clock::now()))
@@ -318,7 +318,7 @@ int flywow_logger_init(Logger* logger, skynet_context* context, const char* parm
         }
 
         // 第三阶段：把 callback 交给 Skynet，并启动周期 flush。
-        skynet_callback(context, logger, callback);
+        skynet_callback(context, logger, handleMessage);
         skynet_command(context, "TIMEOUT", "100");
         return 0;
     }

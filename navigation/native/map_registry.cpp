@@ -31,7 +31,7 @@ NavResult<std::shared_ptr<const GridMap>> MapRegistry::Load(const std::string &p
     }
 
     // 完整读取和校验已在锁外完成；此处只替换当前快照。
-    const std::uint32_t         map_id = loaded.value->metadata().map_id;
+    const std::uint32_t map_id = loaded.value->metadata().map_id;
     std::lock_guard<std::mutex> lock(mutex_);
     maps_[map_id] = loaded.value;
     return loaded;
@@ -40,7 +40,7 @@ NavResult<std::shared_ptr<const GridMap>> MapRegistry::Load(const std::string &p
 NavResult<std::shared_ptr<const GridMap>> MapRegistry::Find(std::uint32_t map_id) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto                  iterator = maps_.find(map_id);
+    const auto iterator = maps_.find(map_id);
     if (iterator == maps_.end())
     {
         std::ostringstream detail;

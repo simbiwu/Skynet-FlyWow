@@ -21,21 +21,21 @@ local LOG_LEVELS =
 local MAX_SERVICE_NAME_SIZE = 128
 
 -- 保存 Skynet 原始日志入口，避免替换后适配器递归调用自身。
-local original_error = skynet.error
+local ORIGINAL_ERROR = skynet.error
 local logger = {}
-local logger_is_installed = false
+local logger_is_installed = false -- 当前 State 完成入口替换后置 true，后续 install 直接返回。
 
 --- 登记当前 Lua Service 的展示名称。
 --- 这里集中把 Service 名称转换为 Logger 的 R 消息，让 Native Logger 映射 source handle。
 ---@param service_name string 已限制长度的 Service 名称
 local function send_service_register(service_name)
-    original_error(LOGGER_COMMAND_REGISTER .. service_name)
+    ORIGINAL_ERROR(LOGGER_COMMAND_REGISTER .. service_name)
 end
 
 --- 通知 Native Logger 当前 Service 即将退出。
 --- 这里集中把退出动作转换为 Logger 的 U 消息，清理来源登记。
 local function send_service_unregister()
-    original_error(LOGGER_COMMAND_UNREGISTER)
+    ORIGINAL_ERROR(LOGGER_COMMAND_UNREGISTER)
 end
 
 --- 创建 Native Logger 的刷新请求。
@@ -69,7 +69,7 @@ local function make_adapter(min_level)
         end
 
         local body = table.concat(parts, " ")
-        original_error(LOGGER_COMMAND_LOG .. tostring(level) .. body)
+        ORIGINAL_ERROR(LOGGER_COMMAND_LOG .. tostring(level) .. body)
     end
 end
 
@@ -97,12 +97,12 @@ function logger.install()
     -- 第三阶段：替换当前 Lua State 的入口，同时保存原始退出函数。
     skynet.error = make_adapter(min_level)
 
-    local exit = skynet.exit
+    local original_exit = skynet.exit
     --- 正常退出前注销名称；不等待 Logger，名称消息与本 Service 日志保持发送顺序。
     skynet.exit = function()
         -- 注销只清理 Logger 的来源登记，不等待 Logger，也不改变 Skynet 退出流程。
         send_service_unregister()
-        return exit()
+        return original_exit()
     end
 
     logger_is_installed = true
@@ -115,6 +115,7 @@ function logger.flush()
     if skynet.getenv("logservice") ~= "flywow_logger" then
         return true
     end
+
     if not skynet._proto.text then
         skynet.register_protocol
         {
@@ -124,6 +125,7 @@ function logger.flush()
             unpack = skynet.tostring,
         }
     end
+
     -- flush 是唯一需要等待 Logger 响应的路径；普通日志仍然是异步投递。
     local result = skynet.call(".logger", "text", make_flush_request())
     assert(result == "OK", "FlyWow Logger flush failed")
