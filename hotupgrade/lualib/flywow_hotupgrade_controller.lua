@@ -22,13 +22,13 @@ local M =
     module_sequence      = nil, -- 本 Controller 内递增的许可序号，用来拒绝重复消费。
     sequence             = nil, -- 本 Controller 生命周期内递增的批次序号，用来拒绝迟到控制消息。
     -- Controller 阶段：IDLE -> WAITING_CREATIONS -> DEPLOYING -> APPLYING -> COMPLETED。
-    -- 故障恢复成功后回到 IDLE；恢复未确认时进入 FAILED_LOCKED，显式确认后回到 IDLE。
+    -- 故障恢复成功后回到 IDLE；恢复失败也回到 IDLE，报告错误并允许后续发布。
     phase                = nil, -- Controller 生命周期；APPLYING 内由 active_batch.phase 区分 Prepare 接纳与 Update 关门。
     lifecycle_waiters    = nil, -- Update 起等待创建或首次模块加载的协程，终态时统一唤醒。
     unique_services      = nil, -- 逻辑唯一 Service 名到在途结果/Service handle 的映射，仅限本 Controller。
     active_batch         = nil, -- 当前唯一活动批次；批次结束后移入 last_batch。
     last_batch           = nil, -- 最近结束批次的结果；更早批次不保留。
-    recovery_required    = nil, -- 宿主文件或目标恢复未确认时阻止后续发布。
+    recovery_required    = nil, -- 最近批次恢复失败的诊断，不阻止后续发布。
 }
 
 -- 门禁只看 Controller 阶段和批次阶段：DEPLOYING/UPDATE 关闭新操作，PREPARE 继续接纳依赖。
@@ -95,7 +95,7 @@ local function load_files(patch_base_path, selected_patch_path, patch_identity)
         end
         -- load 只编译并检查语法，不执行返回的 chunk；失败时 syntax_error 用于诊断。
         -- @路径标记错误中的文件名，t 只接受文本源码，最后的空表是 chunk 的运行环境。
-        local chunk, syntax_error = load(source, "@" .. relative, "t", {})
+        local chunk, syntax_error = load(hotupgrade_common.normalize_source(source), "@" .. relative, "t", {})
         if not chunk then
             return hotupgrade_result.failure("HU_MODULE_SYNTAX", syntax_error)
         end
@@ -200,7 +200,6 @@ end
 ---@field current_service_handle? integer status 查询时当前或最近一次处理的业务 Service handle
 ---@field results FlyWowHotUpgradeBatchTargetResult[] 各业务 Service 的处理结果
 ---@field error? FlyWowHotUpgradeResult 本批失败诊断
----@field resolved? boolean 宿主是否确认完成部署恢复
 ---@field control_started boolean 是否已向目标发送控制命令
 
 ---@class FlyWowHotUpgradeBatch
@@ -217,9 +216,8 @@ end
 ---@field waiter? thread 等待创建/登记屏障或显式恢复确认的协程
 ---@field cancelled? boolean 管理端是否请求在安全点终止本批
 ---@field error? FlyWowHotUpgradeResult 本批首个失败或恢复失败结果
----@field control_started? boolean 是否已向任一目标发送控制命令，决定恢复确认条件
+---@field control_started? boolean 是否已向任一目标发送控制命令，用于报告本批是否触及目标
 ---@field decided? boolean 是否已越过发布决定；此后 Finish 失败不回滚
----@field resolved? boolean 宿主是否已显式确认完成部署恢复
 
 ---@class FlyWowHotUpgradeControlRequest
 ---@field batch_id string Controller Service handle 与本进程递增序号组成；仅在该 Controller 生命周期有效
@@ -229,18 +227,15 @@ end
 
 ---@class FlyWowHotUpgradeManagementRequest
 ---@field path? string begin 的 Patch Root 相对目录
----@field batch_id? string status/abort/resolve_deployment 使用 begin 返回的身份
----@field confirmed? boolean 宿主明确确认恢复完成
----@field confirmation? string UNCHANGED 或 CONVERGED_CACHE_CLEARED
+---@field batch_id? string status/abort 使用 begin 返回的身份
 
 ---@class FlyWowHotUpgradeLifecycleStatus
----@field phase string IDLE/WAITING_CREATIONS/DEPLOYING/APPLYING/COMPLETED/FAILED_LOCKED
+---@field phase string IDLE/WAITING_CREATIONS/DEPLOYING/APPLYING/COMPLETED
 ---@field batch_id? string 当前或最近批次
----@field failed_locked boolean 是否因失败锁定版本门禁
 ---@field pending_creations integer 原生创建或首次登记尚未完成的记录数
 ---@field pending_module_loads integer 已授权、尚未登记或取消的模块加载数
 ---@field active_batch_id? string 当前活动批次；没有活动批次时为 nil
----@field recovery_required boolean 未确认恢复时关闭后续发布
+---@field recovery_required boolean 最近批次的恢复错误诊断，不限制后续操作
 
 ---@class FlyWowHotUpgradeControllerConfig
 ---@field patch_path string 已存在且由宿主管理的受信 Patch 根目录
@@ -425,16 +420,9 @@ end
 function M:wait_lifecycle()
     while lifecycle_closed(self) do
         local waiter = coroutine.running()
-        local waiting = {}
-        self.lifecycle_waiters[waiter] = waiting
+        self.lifecycle_waiters[waiter] = true
         skynet.wait(waiter)
         self.lifecycle_waiters[waiter] = nil
-        if waiting.blocked then
-            return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "等待期间发布失败，操作未开始")
-        end
-    end
-    if self.phase == "FAILED_LOCKED" then
-        return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "发布失败，须显式确认版本恢复一致")
     end
     return hotupgrade_result.success()
 end
@@ -724,8 +712,8 @@ function M:register(request, service_handle)
         creation = self.creation_handles[service_handle]
     end
 
-    if lifecycle_closed(self) or self.phase == "FAILED_LOCKED" then
-        return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "当前阶段不能登记新 Service")
+    if lifecycle_closed(self) then
+        return hotupgrade_result.failure("HU_LIFECYCLE_PENDING", "当前阶段不能登记新 Service")
     end
     -- 绑定真实来源并提交登记；完成后释放创建屏障。
     ---@type FlyWowHotUpgradeRegisteredService
@@ -800,12 +788,8 @@ function M:load_patch(request)
             "生命周期未完成：待创建/登记 " .. self.creation_count .. "，待模块加载/登记 " .. self.module_load_count)
     end
 
-    if self.recovery_required then
-        return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", "存在未确认恢复的目标")
-    end
-
-    if type(request.path) ~= "string" or request.selector ~= nil then
-        return hotupgrade_result.failure("HU_INVALID_PATCH", "需要相对 path；不再支持灰度 selector")
+    if type(request.path) ~= "string" then
+        return hotupgrade_result.failure("HU_INVALID_PATCH", "需要相对 path")
     end
 
     local loaded = build_patch(self.patch_path, request.path, self.service_path)
@@ -1052,8 +1036,6 @@ function M:run_batch(batch, request)
                     recovery_failure = recovery_failure or restored
                     recovery_errors[#recovery_errors + 1] = target.service_handle .. ": " .. tostring(restored.message or restored.code)
                     target.result = restored
-                elseif target.result and target.result.code == "HU_RECOVERY_REQUIRED" then
-                    target.result = hotupgrade_result.failure("HU_UPDATE_FAILED", target.result.message)
                 end
             end
         end
@@ -1064,10 +1046,9 @@ function M:run_batch(batch, request)
             batch.error.original_error = original or recovery_failure
             batch.error.recovery_error = recovery_failure
             self.recovery_required = true
-        elseif batch.error and batch.error.code == "HU_RECOVERY_REQUIRED" then
-            batch.error = hotupgrade_result.failure("HU_UPDATE_FAILED", batch.error.message)
         end
-        batch.phase = #recovery_errors > 0 and "RECOVERY_REQUIRED" or "ABORTED"
+        batch.phase = (#recovery_errors > 0 or batch.error.code == "HU_RECOVERY_REQUIRED")
+            and "RECOVERY_REQUIRED" or "ABORTED"
     else
         -- 文件和全部 Update 已确认成功；各目标 Finish 独立报告，不再执行回滚。
         batch.phase = "PUBLISH_DECIDED"
@@ -1101,15 +1082,13 @@ function M:run_batch(batch, request)
         end
     end
 
-    -- 释放目标快照；未确认恢复时保留文件快照供宿主处理。
+    -- 保留结果诊断，释放本批快照与门禁；下一批直接以当前现场为起点。
     batch.targets = nil
-    if batch.decided or not self.recovery_required then
-        batch.files = nil
-    end
+    batch.files = nil
     self.last_batch = batch
     self.active_batch = nil
-    self.phase = self.recovery_required and "FAILED_LOCKED"
-        or (batch.error and "IDLE" or batch.phase)
+    self.recovery_required = batch.phase == "RECOVERY_REQUIRED"
+    self.phase = batch.error and "IDLE" or batch.phase
     self:wake_lifecycle()
 end
 
@@ -1122,8 +1101,7 @@ function M:wake_batch()
 end
 
 function M:wake_lifecycle()
-    for waiter, waiting in pairs(self.lifecycle_waiters) do
-        waiting.blocked = waiting.blocked or self.phase == "FAILED_LOCKED"
+    for waiter in pairs(self.lifecycle_waiters) do
         skynet.wakeup(waiter)
     end
 end
@@ -1132,9 +1110,6 @@ end
 ---@param request FlyWowHotUpgradeManagementRequest path 指向发布包
 ---@return FlyWowHotUpgradeResult 成功仅表示接受请求，最终结果通过 status(batch_id) 查询
 function M:begin(request)
-    if self.phase == "FAILED_LOCKED" then
-        return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "上次发布尚未恢复")
-    end
     if self.active_batch then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "已有发布屏障")
     end
@@ -1162,46 +1137,9 @@ function M:begin(request)
     return hotupgrade_result.success({batch_id = batch.batch_id})
 end
 
---- 仅校验宿主的显式恢复确认；不发送目标 RPC，也不恢复或强制开放目标业务。
-function M:resolve_deployment(request)
-    local batch = self.active_batch or self.last_batch
-    if not batch or request.batch_id ~= batch.batch_id then
-        return hotupgrade_result.failure("HU_BATCH_MISSING", "恢复批次号不匹配")
-    end
-    if self.phase ~= "FAILED_LOCKED" and self.phase ~= "DEPLOYING" and self.phase ~= "WAITING_CREATIONS" then
-        return hotupgrade_result.failure("HU_DEPLOYMENT_PHASE", "当前阶段不能确认恢复")
-    end
-    if request.confirmed ~= true or (request.confirmation ~= "UNCHANGED"
-        and request.confirmation ~= "CONVERGED_CACHE_CLEARED") then
-        return hotupgrade_result.failure("HU_RECOVERY_CONFIRMATION_REQUIRED", "须确认文件及运行时未变更，或已完成版本收敛和必要缓存清理")
-    end
-    if request.confirmation == "UNCHANGED" and batch.control_started then
-        return hotupgrade_result.failure("HU_RECOVERY_CONFIRMATION_REQUIRED", "已向目标发送控制命令，不能声明运行时未发生变更")
-    end
-
-    -- 尚未发送目标控制命令的屏障可直接取消，并留下可查询的终态结果。
-    if self.phase == "WAITING_CREATIONS" or self.phase == "DEPLOYING" then
-        batch.phase = "ABORTED"
-        batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "宿主确认取消发布屏障")
-    end
-
-    self.active_batch = nil
-    if batch.waiter then
-        skynet.wakeup(batch.waiter)
-    end
-    self.last_batch = batch
-    batch.resolved = true
-    batch.files = nil
-    self.recovery_required = false
-    self.phase = "IDLE"
-    self:wake_lifecycle()
-    return hotupgrade_result.success()
-end
-
 ---@alias FlyWowHotUpgradeManagementCommand
 ---| "register"
 ---| "begin"
----| "resolve_deployment"
 ---| "uniqueservice"
 ---| "newservice"
 ---| "cancel_service_creation"
@@ -1229,10 +1167,6 @@ function M:handle_command(command, request, source)
         return self:begin(request)
     end
 
-    if command == "resolve_deployment" then
-        return self:resolve_deployment(request)
-    end
-
     if command == "uniqueservice" then
         return self:uniqueservice(request, source)
     end
@@ -1258,7 +1192,6 @@ function M:handle_command(command, request, source)
         {
             phase = self.phase,
             batch_id = (self.active_batch or self.last_batch) and (self.active_batch or self.last_batch).batch_id,
-            failed_locked = self.phase == "FAILED_LOCKED",
             pending_creations = self.creation_count,
             pending_module_loads = self.module_load_count,
             active_batch_id = self.active_batch and self.active_batch.batch_id,
@@ -1278,7 +1211,7 @@ function M:handle_command(command, request, source)
         {
             batch_id = batch.batch_id, phase = batch.phase, success = batch.success, failed = batch.failed,
             target_count = batch.target_count, current_service_handle = batch.current_service_handle,
-            results = batch.results, error = batch.error, resolved = batch.resolved, control_started = batch.control_started == true,
+            results = batch.results, error = batch.error, control_started = batch.control_started == true,
         }
         return hotupgrade_result.success({record = batch_status,
             lifecycle = lifecycle, recovery_required = self.recovery_required})
@@ -1287,7 +1220,14 @@ function M:handle_command(command, request, source)
     if command == "abort" then
         local batch = self.active_batch
         if batch and batch.batch_id == request.batch_id and self.phase ~= "APPLYING" then
-            return self:resolve_deployment(request)
+            batch.phase = "ABORTED"
+            batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
+            self.active_batch = nil
+            self.last_batch = batch
+            self.phase = "IDLE"
+            if batch.waiter then skynet.wakeup(batch.waiter) end
+            self:wake_lifecycle()
+            return hotupgrade_result.success()
         end
         if not batch or batch.batch_id ~= request.batch_id or batch.decided then
             return hotupgrade_result.failure("HU_ABORT_NOT_SAFE", "批次不存在或已有目标越过发布决定")

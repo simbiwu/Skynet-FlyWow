@@ -403,6 +403,23 @@ local function run_test_group()
         assert(rejected.code == "HU_MONITOR_OCCUPIED")
         assert(core.command("MONITOR") == before)
         assert(skynet.call(module_state.hotupgrade_handle, "hotupgrade", "status", {}).code == "HU_NOT_INITIALIZED")
+    elseif group == "source_headers" then
+        controller = create_controller()
+        local worker = create_worker_service()
+        local native = require "flywow_hotupgrade_native"
+        local config = require "hotupgrade_test_options"
+        for index = 1, 4 do
+            local path = "source_headers_" .. index
+            local record = wait_for_batch_phase(controller, begin_update_batch(controller, path), "COMPLETED")
+            assert(record.target_count == 1)
+            local state = read_worker_state(worker)
+            assert(state.module_value == 2 and state.level == 51 and not state.paused)
+            for _, file in ipairs({"lualib/test_worker_logic.lua", "config/headers.lua"}) do
+                assert(native.read_file(config.root_path, file) == native.read_file(config.patch_path, path .. "/" .. file))
+            end
+            assert(native.read_file(config.root_path, "service/skynet_hotupgrade_worker.patch") == false)
+        end
+        assert(read_worker_state(create_worker_service()).module_value == 2)
     elseif group == "exit_module_load" then
         controller = create_controller()
         local worker = create_worker_service()
@@ -428,20 +445,21 @@ local function run_test_group()
         local survivor = create_worker_service()
         local command = group:sub(6)
         local exiting = create_worker_service({exit_command = command, kill = group:match("^kill_") ~= nil})
-        -- 不限定 RPC 错误与退出通知次序；按已知结果恢复或保持失败锁定。
+        -- 不限定 RPC 错误与退出通知次序；按已知结果尽力恢复并报告失败。
         local expected = command == "finish" and "RECOVERY_REQUIRED" or {ABORTED = true, RECOVERY_REQUIRED = true}
         local record = wait_for_batch_phase(controller, begin_update_batch(controller, "combined"), expected)
         assert(record.failed >= 1)
         local state = read_worker_state(survivor)
         if command == "finish" then
             assert(state.module_value == 2 and not state.paused)
-            assert(lifecycle_status(controller).phase == "FAILED_LOCKED")
+            assert(lifecycle_status(controller).phase == "IDLE")
         else
             assert_original_state(survivor)
             if record.phase == "RECOVERY_REQUIRED" then
-                assert(lifecycle_status(controller).phase == "FAILED_LOCKED")
+                assert(lifecycle_status(controller).phase == "IDLE")
                 assert(record.error and record.error.code == "HU_RECOVERY_REQUIRED")
-                assert(not skynet.call(controller, "hotupgrade", "begin", {path = "module"}).ok)
+                local repaired = wait_for_batch_phase(controller, begin_update_batch(controller, "module"), "COMPLETED")
+                assert(repaired.target_count == 1)
             else
                 assert(lifecycle_status(controller).phase == "IDLE")
                 -- 退出登记已删除，下一批不能继续向旧 handle 发送事务命令。
@@ -711,12 +729,14 @@ local function run_test_group()
         local config = group == "recovery_restore" and {custom = true, restore_failure = true} or {break_module = true}
         worker_service_handle = create_worker_service(config)
         wait_for_batch_phase(controller, begin_update_batch(controller, "combined"), "RECOVERY_REQUIRED")
-        assert(read_worker_state(worker_service_handle).paused)
-        local locked = lifecycle_status(controller)
-        assert(skynet.call(controller, "hotupgrade", "resolve_deployment",
-            {batch_id = locked.batch_id, confirmed = true, confirmation = "UNCHANGED"}).code == "HU_RECOVERY_CONFIRMATION_REQUIRED")
-        local answer = skynet.call(controller, "hotupgrade", "begin", {path = "module"})
-        assert(not answer.ok and answer.code == "HU_DEPLOYMENT_BLOCKED")
+        assert(not read_worker_state(worker_service_handle).paused)
+        assert(lifecycle_status(controller).phase == "IDLE")
+        assert(skynet.call(worker_service_handle, "lua", "allow_next_upgrade", {}).ok)
+        local repaired = wait_for_batch_phase(controller, begin_update_batch(controller, "repair"), "COMPLETED")
+        assert(repaired.success == 1 and not lifecycle_status(controller).recovery_required)
+        local current = read_worker_state(worker_service_handle)
+        assert(current.module_value == 3 and current.level == 60 and current.schema_version == 3 and not current.paused)
+        assert(read_worker_state(create_worker_service()).module_value == 3)
         print("HOTUPGRADE_SKYNET_RECOVERY_REQUIRED_OK")
     else
         error("unknown HOTUPGRADE_TEST_GROUP: " .. tostring(group))

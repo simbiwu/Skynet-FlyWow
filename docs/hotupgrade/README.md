@@ -67,7 +67,7 @@ local service_handle = hotupgrade.uniqueservice("player", zone_id)
 local global_service_handle = hotupgrade.uniqueservice(true, "player", zone_id)
 ```
 
-唯一键是本 Controller 内的原始逻辑 Service 名称。首次创建先通过当前接纳门禁，再建立该名称的在途预留并复用受管理 newservice 流程；同名并发请求等待同一创建结果，原生创建返回后一起取得相同 handle。只有首次请求的启动参数生效，后续重复请求的参数不改变实例。不同名称可启动不同 Service；已有 handle 即使在发布期间也直接返回。排空和 Prepare 期间，新逻辑键可正常创建；进入 Update 后，新逻辑键等待发布结束，恢复时则等待版本确认收敛。等待门禁恢复后重查唯一名，避免并发请求各自创建。
+唯一键是本 Controller 内的原始逻辑 Service 名称。首次创建先通过当前接纳门禁，再建立该名称的在途预留并复用受管理 newservice 流程；同名并发请求等待同一创建结果，原生创建返回后一起取得相同 handle。只有首次请求的启动参数生效，后续重复请求的参数不改变实例。不同名称可启动不同 Service；已有 handle 即使在发布期间也直接返回。排空和 Prepare 期间，新逻辑键可正常创建；进入 Update 后，新逻辑键等待发布结束，本批结束后按当时现场继续处理。等待门禁恢复后重查唯一名，避免并发请求各自创建。
 
 该映射仅属于一个 Controller，不与原生 uniqueservice 的名称空间互通，不承诺跨 Controller、跨进程或跨节点唯一。全局 true 重载始终在实际启动前拒绝。snaxd 不满足受管理 Service 自行调用 register_service 的登记合同，入口返回 HU_SPECIAL_SERVICE_UNSUPPORTED，不增加 Snax 专用初始化流程；newservice 同样拒绝 snaxd。
 
@@ -113,7 +113,7 @@ hotupgrade.require(name) 仍用宿主原有 name 加载模块，通过 package.s
 
 登记前声明随初始元数据提交，由待创建记录保护。register_service 会拒绝本 State 尚在执行的首次声明（HU_LIFECYCLE_PENDING），调用方须待声明完成后登记；登记 RPC 期间的新声明等待登记结果，避免落在初始模块快照之外。
 
-已登记 Service 首次声明模块时，先向 Controller 请求 begin_module_load 许可，再执行实际 require、校验来源并建立缓存、别名、来源映射和本地声明，最后携许可 ID 调用 register_module。许可绑定真实来源及规范模块名，不能转用或重复消费；失败时回退本地新增状态，并通过 cancel_module_load 释放尚未完成的许可。begin 接受后等待已有许可完成，覆盖模块执行及登记的整个关键区间。同一 State 内并发首次声明同一规范模块会等待前一项成功或完整回退；已声明模块不重复请求许可。Controller 只更新目标已声明的模块。begin 后的 WAITING_CREATIONS 和 PREPARE 窗口继续接纳创建与首次声明，覆盖父子创建、嵌套 require 和 queue 内已有业务的正常依赖。创建计数保留到初始化、登记完成；首次声明许可保留到登记或取消。进入 UPDATE 后的新请求才挂起等待终态，此时尚不发许可、不执行模块代码，也不增加本批排空计数；失败锁定仍返回 HU_DEPLOYMENT_BLOCKED。同一规范模块的等待者继续复用本 State 的并发声明协调。
+已登记 Service 首次声明模块时，先向 Controller 请求 begin_module_load 许可，再执行实际 require、校验来源并建立缓存、别名、来源映射和本地声明，最后携许可 ID 调用 register_module。许可绑定真实来源及规范模块名，不能转用或重复消费；失败时回退本地新增状态，并通过 cancel_module_load 释放尚未完成的许可。begin 接受后等待已有许可完成，覆盖模块执行及登记的整个关键区间。同一 State 内并发首次声明同一规范模块会等待前一项成功或完整回退；已声明模块不重复请求许可。Controller 只更新目标已声明的模块。begin 后的 WAITING_CREATIONS 和 PREPARE 窗口继续接纳创建与首次声明，覆盖父子创建、嵌套 require 和 queue 内已有业务的正常依赖。创建计数保留到初始化、登记完成；首次声明许可保留到登记或取消。进入 UPDATE 后的新请求才挂起等待终态，此时尚不发许可、不执行模块代码，也不增加本批排空计数；批次结束后按当时现场继续处理请求。同一规范模块的等待者继续复用本 State 的并发声明协调。
 
 ## 业务 queue 与安全点
 
@@ -144,7 +144,7 @@ Prepare 期间继续使用旧宿主文件，允许正常创建和首次加载。
 普通模块 Stage 依赖 Controller 已完成的路径映射、语法检查、模块名去重与连续数组构建，不重复校验这些输入。Stage 在目标 Lua State 内检查线上及候选导出，准备隔离状态，并按输入顺序保存模块记录；每条记录集中持有线上根表、候选与旧字段，供 Commit 安装和 Abort 恢复。Commit/Abort 核对根表身份后，字段覆盖函数直接执行原地替换。
 
 
-Finish 释放旧快照并结束本地事务后将 hot.patching 设为 false。Abort 恢复 Service 状态及函数、普通模块导出和快照，全部确认恢复成功后才清理事务并解除 patching。Prepare 失败仍保留本地事务以便 Abort；恢复失败或无法确认时保留恢复信息和 patching=true。
+Finish 释放旧快照并结束本地事务后将 hot.patching 设为 false。Abort 尽力恢复 Service 状态、函数和普通模块导出；无论恢复结果如何，都报告结果并释放本批事务、快照和 patching。Prepare 失败仍由本批 Abort 收尾。
 
 ## Patch 布局与普通模块
 
@@ -231,7 +231,7 @@ end
 
 replace_functions 只列出需要替换的现有业务函数；未列出的函数保持原样，新函数捕获原 state。没有状态修改可省略 update_state，没有函数替换可省略 replace_functions，至少提供一项。旧 migrate / functions 字段不再接受。
 
-准备阶段保存旧状态快照和旧函数。提交前先标记 touched，再调用 update_state()，随后安装 replace_functions，最后执行 after_upgrade。部分写入抛错及后续失败沿现有 Abort 恢复；恢复失败报告 RECOVERY_REQUIRED 并保持入口关闭。迁移运行错误在 Update 提交时发现。成功 Finish 后清理快照。
+准备阶段保存旧状态快照和旧函数。提交前先标记 touched，再调用 update_state()，随后安装 replace_functions，最后执行 after_upgrade。部分写入抛错及后续失败沿现有 Abort 恢复；恢复失败报告 RECOVERY_REQUIRED，结束本批后仍释放入口。迁移运行错误在 Update 提交时发现。成功 Finish 后清理快照。
 
 默认快照支持普通数据图，保留共享和循环关系，最多 128 层、10000 个字段。这是保存恢复快照的限制，不是更新值合并限制。恢复保持线上根表身份，不承诺嵌套表身份。特殊对象由 Service 提供成对回调：
 
@@ -260,7 +260,7 @@ while true do
 end
 ~~~
 
-begin 建立批次后立即返回 batch_id，由 Controller 的原有协程继续发布。排空和 PREPARE 窗口继续接纳依赖，创建、登记和首次加载完成或取消后，由原有完成回调唤醒发布协程；完成通知只唤醒，不自动关闭门禁。协程恢复后重新检查批次、计数和新增目标，没有定时扫描或轮询排空。遗漏登记或取消会持续等待，不自动清理记录。重复 begin 返回 HU_UPGRADE_BUSY，失败锁定时返回 HU_DEPLOYMENT_BLOCKED。
+begin 建立批次后立即返回 batch_id，由 Controller 的原有协程继续发布。排空和 PREPARE 窗口继续接纳依赖，创建、登记和首次加载完成或取消后，由原有完成回调唤醒发布协程；完成通知只唤醒，不自动关闭门禁。协程恢复后重新检查批次、计数和新增目标，没有定时扫描或轮询排空。遗漏登记或取消会持续等待，不自动清理记录。重复 begin 返回 HU_UPGRADE_BUSY。
 
 正式顺序为：
 
@@ -278,31 +278,25 @@ begin 建立批次后立即返回 batch_id，由 Controller 的原有协程继�
 
 prepare/update/finish 是正常目标控制 RPC，abort 用于失败恢复。没有运行时目标时不发目标 RPC，照常部署完整文件。新目录按需建立；文件恢复删除本批新增文件，可能留下空目录。不部署非 Lua 资源，不提供文件删除清单。
 
-包检查或旧文件准备失败时，记录原始错误和 ABORTED，回到 IDLE，不向目标发送控制命令。Prepare、后续重匹配、Update 失败或发布决定前取消时，Abort 所有已参与目标，包括本轮新增并已 Prepare 的目标。Prepare 后等待在途操作时，取消会唤醒批次走 Abort；不删除仍在正常完成的创建或模块许可。文件部署或缓存清理失败时，先恢复已修改文件并清理缓存，再 Abort 目标。确认恢复成功后返回 IDLE；恢复失败或结果不明时进入 RECOVERY_REQUIRED/FAILED_LOCKED，保留 original_error/recovery_error，禁止新发布、创建和首次模块加载。
+包检查或旧文件准备失败时，记录原始错误和 ABORTED，回到 IDLE，不向目标发送控制命令。Prepare、后续重匹配、Update 失败或发布决定前取消时，Abort 所有已参与目标，包括本轮新增并已 Prepare 的目标。Prepare 后等待在途操作时，取消会唤醒批次走 Abort；不删除仍在正常完成的创建或模块许可。文件部署或缓存清理失败时，先恢复已修改文件并清理缓存，再 Abort 目标。恢复失败或结果不明时以 RECOVERY_REQUIRED 报告，保留 original_error/recovery_error。无论是否恢复成功，Controller 都结束本批并回到 IDLE，释放快照及临时门禁，不阻止后续发布、创建和首次模块加载。
 
-Finish 发生在新版文件和全部 Update 已确认成功之后。某个 Finish 失败或结果不明时，继续尝试其余目标，逐项报告并保留 FAILED_LOCKED；不回滚已经 Finish 的目标，也不撤回新版文件。批量更新不承诺严格跨 Service 原子性。
+Finish 发生在新版文件和全部 Update 已确认成功之后。某个 Finish 失败或结果不明时，继续尝试其余目标，逐项报告收尾错误并结束本批；不回滚已经 Finish 的目标，也不撤回新版文件。批量更新不承诺严格跨 Service 原子性。
 
 status 不带 batch_id 返回生命周期概览；带 batch_id 还返回当前或最近终态 record。begin 接受后的异步检查、更新和恢复错误均保存在 record.error。只保留活动及最近批次，不持久化历史。target_count 在 Prepare 期间随重新匹配更新，进入 Update 前确定最终目标数；success/failed 统计参与目标的逐项结果；整批已恢复的失败中，其他参与目标以 HU_BATCH_ABORTED 表示已尝试恢复。
 
-### 显式恢复确认
+### 失败报告与后续发布
 
-正常失败已由 HotUpgrade 确认恢复时不需要 resolve_deployment。仅在 FAILED_LOCKED 下，宿主先核实实际文件、运行时、目标 patching/本地事务和缓存，完成必要的人工恢复或版本收敛，再使用现有确认：
+本批失败后先尽力恢复，报告实际更新结果、恢复错误和未恢复项。RECOVERY_REQUIRED 与 status 的 recovery_required 只表示最近批次存在未确认恢复的错误，不是后续操作的门禁。宿主或运维决定如何处理这些错误、是否暂停业务和下一批内容。
 
-~~~lua
-local resolved = skynet.call(hotupgrade_handle, "hotupgrade", "resolve_deployment",
-{
-    batch_id = batch_id,
-    confirmed = true,
-    confirmation = "CONVERGED_CACHE_CLEARED",
-})
-assert(resolved.ok, resolved.message)
-~~~
+下一批重新读取文件并保存当前状态快照，回滚目标是本批开始时的现场，不使用上一批快照。上一批的实际代码、状态和文件变化会成为下一批起点；下一批成功只说明它自身完成，不表示未涉及的历史问题已解决。状态必须仍满足当前加载、快照和身份合同，否则继续报告具体错误。活动及最近终态查询不代替宿主保存故障报告。
 
-该命令只确认宿主声明，不执行目标恢复、Finish、文件部署或 patching 解除。成功后回到 IDLE，保留原诊断。WAITING_CREATIONS/DEPLOYING 阶段取消仍使用同一确认接口，或携相同确认字段调用 abort；文件和运行时未变化、未发目标命令时可用 UNCHANGED。APPLYING 中 abort 只在发布决定前有效。RPC 报错不代表远端已取消，不能据此声称恢复成功。
+取消使用 abort({batch_id=...})：等待创建/加载时可以取消本批，但不删除独立的生命周期记录；APPLYING 中只在发布决定前接受取消，并等待当前控制调用返回后依次 Abort。没有人工恢复确认前置条件。
 
 本模块不支持 Service 替换、跨节点原子事务、运行中 coroutine 栈更新或 Native/C 热替换。业务仍需自行验证权威数据、持久化一致性和部署权限；重新执行旧 Patch 也不能恢复过去的数据库内容。
 
 ## 文件边界与验证
+
+发布包语法检查、普通模块候选和 Service Patch 执行均按 Lua 文件加载规则跳过开头的 UTF-8 BOM 和首行 `#` 注释，保留换行以维持诊断行号。处理只作用于编译输入；冻结、部署和恢复仍保留文件原始字节。
 
 Native 提供 resolve(path[, relative_dir])、list_lua(patch_path, path) 和 Controller 内部使用的 read_file(root_path, relative_file)、replace_file(root_path, relative_file, source_or_nil)；相对目录检查与递归扫描共用路径安全校验，拒绝越界路径、链接及特殊文件。Controller 不设目标 Service、模块声明、Patch Lua 文件数或源码字节数硬上限；扫描与冻结规模由实际 Patch 和运行时可用资源决定。宿主在扫描/冻结期间保持 Patch 目录不变；扫描和读取不是抵抗并发目录替换的原子安全边界。冻结后更新和部署只使用本次源码，不重新读取发布包。正式目录应由本次 Controller 独占部署，不支持外部并发修改；文件操作沿用逐级路径检查，临时文件替换不提供跨文件磁盘原子性或断电恢复。replace_file 的 nil 内容仅用于删除本批原本不存在的新增文件；已有文件保留原权限，新文件使用 0644。
 
@@ -315,13 +309,13 @@ bash scripts/build_flywow.sh ../skynet hotupgrade
 bash hotupgrade/scripts/run_hotupgrade_tests.sh ../skynet
 ```
 
-脚本测试创建中/待登记屏障、两种登记时序、启动与业务初始化失败、创建者取消权限、模块许可匹配/消费/失败清理、并发首次声明、Update 起门禁等待，以及父子孙创建链、queue 内创建与首次声明、嵌套许可、已准备目标补模块、新目标 Prepare/Update 失败恢复、排空等待取消、冻结源码只读一次、queue 排空与 patching、完整模块增改删、私有状态迁移、Service 状态/函数组合提交、真实 handle/State/表身份保持、Update 内 Stage/Activate 与整批恢复、纯文件发布、文件部署失败恢复、新实例与首次加载版本一致，以及 Finish 故障报告和恢复门禁。Skynet 集成只启动测试专用进程，不监听业务端口；结果不替代宿主真实业务状态与数据库验证。
+脚本测试创建中/待登记屏障、两种登记时序、启动与业务初始化失败、创建者取消权限、模块许可匹配/消费/失败清理、并发首次声明、Update 起门禁等待，以及父子孙创建链、queue 内创建与首次声明、嵌套许可、已准备目标补模块、新目标 Prepare/Update 失败恢复、排空等待取消、冻结源码只读一次、queue 排空与 patching、完整模块增改删、私有状态迁移、Service 状态/函数组合提交、真实 handle/State/表身份保持、Update 内 Stage/Activate 与整批恢复、纯文件发布、文件部署失败恢复、新实例与首次加载版本一致，以及 Finish 故障报告及失败后连续发布。Skynet 集成只启动测试专用进程，不监听业务端口；结果不替代宿主真实业务状态与数据库验证。
 
 
 ### 宿主启动顺序与原生退出通知
 
 宿主启动入口必须先启动唯一的 `flywow_hotupgrade_service`，同步调用其 `lua/init` 并确认成功，然后再通过 `hotupgrade.newservice()` 或 `hotupgrade.uniqueservice()` 创建接入热更的业务 Service。业务 Service 可以在文件顶部 `require "flywow_hotupgrade"` 和调用 `hotupgrade.require()`；入口加载不执行 Controller RPC，此时根路径已由启动入口完成初始化。`register_service()` 仍在可 yield 的启动协程内执行。
 
-控制 Service 初始化时通过原生 `MONITOR` 接收 `skynet.exit()` / `skynet.kill()` 退出通知，清理登记、唯一实例与在途许可。`MONITOR` 是进程级单例，已被占用时初始化返回 `HU_MONITOR_OCCUPIED`，不会覆盖宿主监视器。发布期间退出的目标保留在批次结果内；Prepare/Update 失败恢复其余存活目标，发布决定后的退出报告收尾失败并保持恢复锁定。
+控制 Service 初始化时通过原生 `MONITOR` 接收 `skynet.exit()` / `skynet.kill()` 退出通知，清理登记、唯一实例与在途许可。`MONITOR` 是进程级单例，已被占用时初始化返回 `HU_MONITOR_OCCUPIED`，不会覆盖宿主监视器。发布期间退出的目标保留在批次结果内；Prepare/Update 失败恢复其余存活目标，发布决定后的退出报告收尾失败，结束本批后继续接纳后续发布。
 
-退出专项验证包含 Prepare、Update、Finish 中的原生 `exit` / `kill`、持有模块许可时被 kill、唯一 Service 退出后重建，以及 MONITOR 已占用时拒绝初始化且保留原监视器。退出通知清理 Controller 记录后调用 Skynet 原生 `term(handle)`，解除控制 State 对退出目标的挂起 RPC。Controller 不等待或补偿退出通知与 RPC 错误的到达次序；按处理时已知结果继续推进，失败则进入现有失败与恢复流程，必要时保持 FAILED_LOCKED。
+退出专项验证包含 Prepare、Update、Finish 中的原生 `exit` / `kill`、持有模块许可时被 kill、唯一 Service 退出后重建，以及 MONITOR 已占用时拒绝初始化且保留原监视器。退出通知清理 Controller 记录后调用 Skynet 原生 `term(handle)`，解除控制 State 对退出目标的挂起 RPC。Controller 不等待或补偿退出通知与 RPC 错误的到达次序；按处理时已知结果继续推进，失败则进入现有失败与恢复流程，错误只作本批诊断，不形成后续批次门禁。

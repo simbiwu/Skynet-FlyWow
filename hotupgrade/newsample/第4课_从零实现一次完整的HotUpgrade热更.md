@@ -823,7 +823,7 @@ HotUpgrade 之后会在原 PlayerService 的 Lua State 内执行这个函数，�
 
 replace_functions 只列出需要替换的现有业务函数；未列出的函数保持原样，新函数捕获原 state。没有状态修改可省略 update_state，没有函数替换可省略 replace_functions，至少提供一项。旧 migrate / functions 字段不再接受。
 
-准备阶段保存旧状态快照和旧函数。提交前先标记 touched，再调用 update_state()，随后安装 replace_functions，最后执行 after_upgrade。部分写入抛错及后续失败沿现有 Abort 恢复；恢复失败报告 RECOVERY_REQUIRED 并保持入口关闭。迁移运行错误在 Update 提交时发现。成功 Finish 后清理快照。
+准备阶段保存旧状态快照和旧函数。提交前先标记 touched，再调用 update_state()，随后安装 replace_functions，最后执行 after_upgrade。部分写入抛错及后续失败沿现有 Abort 恢复；恢复失败报告 RECOVERY_REQUIRED，结束本批后仍释放入口。迁移运行错误在 Update 提交时发现。成功 Finish 后清理快照。
 
 默认快照支持普通数据图，保留共享和循环关系，最多 128 层、10000 个字段。这是保存恢复快照的限制，不是更新值合并限制。恢复保持线上根表身份，不承诺嵌套表身份。特殊对象由 Service 提供成对回调：
 
@@ -1090,9 +1090,6 @@ local begun = skynet.call(hotupgrade_handle, "hotupgrade", "begin",
 
 ```lua
 function M:begin(request)
-    if self.phase == "FAILED_LOCKED" then
-        return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "上次发布尚未恢复")
-    end
     if self.active_batch then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "已有发布屏障")
     end
@@ -1277,11 +1274,14 @@ local loaded = self:load_patch(request)
 对每份源码，`load_files()` 用：
 
 ```lua
-local chunk, syntax_error = load(source, "@" .. relative, "t", {})
+local chunk, syntax_error = load(hotupgrade_common.normalize_source(source), "@" .. relative, "t", {})
 if not chunk then
     return hotupgrade_result.failure("HU_MODULE_SYNTAX", syntax_error)
 end
 ```
+
+`hotupgrade_common.normalize_source()` 定义于 `hotupgrade/lualib/flywow_hotupgrade_common.lua`，按 Lua 文件加载规则跳过 UTF-8 BOM 和首行 `#` 注释并保留换行。这里只转换编译输入；冻结、部署和恢复使用原始源码字节。
+
 
 这段位于 `flywow_hotupgrade_controller.lua` 的 `load_files()` 中，由 `build_patch()` 调用。
 
@@ -1658,11 +1658,26 @@ module_state.registration = registration
 skynet.dispatch("hotupgrade", function(session, source, command, request)
     local ok, answer = pcall(handle_upgrade, command, request, source)
     if not ok then
-        -- 未预期异常可能发生在写入后；保留本地事务与 patching，不能伪称恢复成功。
-        if module_state.active_transaction then
-            module_state.active_transaction.phase = "RECOVERY_REQUIRED"
+        -- 异常也必须结束本批；Finish 已越过发布决定，只释放快照而不回滚。
+        local original = hotupgrade_result.failure("HU_CONTROL_FAILED", tostring(answer))
+        local txn = module_state.active_transaction
+        if txn and command ~= "finish" then
+            answer = abort(txn)
+            if answer.ok then
+                answer = original
+            else
+                answer.original_error = original
+            end
+        else
+            if txn then
+                if txn.modules then hotupgrade_module_patch.finish(txn.modules) end
+                module_state.completed_sequence = txn.sequence
+                module_state.last_batch_id = txn.batch_id
+                module_state.active_transaction = nil
+            end
+            M.patching = false
+            answer = original
         end
-        answer = hotupgrade_result.failure("HU_RECOVERY_REQUIRED", tostring(answer))
     end
 
     if session ~= 0 then
@@ -1935,7 +1950,7 @@ local function stage_service(patch_source)
 
     -- 执行受信 Patch 构建函数并校验结果；此时尚不写入线上状态。
     local service_update = assert(module_state.registration.service_update, "Service 未提供内部更新入口")
-    local chunk = assert(load(patch_source, "=Service Patch", "t", _G))
+    local chunk = assert(load(hotupgrade_common.normalize_source(patch_source), "=Service Patch", "t", _G))
     local build_patch = chunk()
     assert(type(build_patch) == "function", "Service Patch 必须返回构建函数")
     ---@type FlyWowHotUpgradeServicePatch
@@ -1987,7 +2002,7 @@ end
 现有 Update 先提交普通模块，再同步更新 Service：
 
 ```lua
-        -- Activate 同步提交；任一步失败先组合恢复，再由 Controller 整批 Abort。
+        -- Activate 同步提交；失败先报告，再由 Controller 串行 Abort 整批目标。
         local installed = hotupgrade_module_patch.commit(txn.modules)
         local ok, message = pcall(function()
             assert(installed.ok, installed.message)
@@ -2010,8 +2025,7 @@ end
         end)
 
         if not ok then
-            local restored = abort(txn)
-            return restored.ok and hotupgrade_result.failure("HU_ACTIVATE_FAILED", tostring(message)) or restored
+            return hotupgrade_result.failure("HU_ACTIVATE_FAILED", tostring(message))
         end
 ```
 
@@ -2048,11 +2062,11 @@ local function restore_service(txn)
 end
 ```
 
-默认 restore_state 将旧快照原地恢复到线上根表，移除更新新增字段，并重建旧数据关系。特殊对象采用成对 snapshot / restore，自定义 commit 已删除。恢复失败仍保持入口关闭。更新和恢复必须同步，不得执行无法撤销的消息、数据库等外部操作。
+默认 restore_state 将旧快照原地恢复到线上根表，移除更新新增字段，并重建旧数据关系。特殊对象采用成对 snapshot / restore，自定义 commit 已删除。恢复失败仍报告错误，但结束本批后释放入口。更新和恢复必须同步，不得执行无法撤销的消息、数据库等外部操作。
 
 #### 第五次状态快照：Activate 完成
 
-state 已修改，business.load 已替换为捕获原 state 的新闭包，普通模块也已安装 V2。旧快照和旧函数仍保留到 Finish，后续失败可由 Abort 恢复；成功 Finish 才清理恢复数据并开放业务。
+state 已修改，business.load 已替换为捕获原 state 的新闭包，普通模块也已安装 V2。旧快照和旧函数仍保留到 Finish，后续失败可由 Abort 恢复；Finish 或 Abort 结束时清理本批数据并开放业务。
 
 ### 8. Controller 怎样部署正式 Lua 文件？
 
@@ -2224,16 +2238,11 @@ PlayerService 收到后，仍然进入：
 -- finish 确认提交后才清理旧快照并重新开放业务入口。
 if command == "finish" and txn.phase == "ACTIVATED" then
     local finished = hotupgrade_module_patch.finish(txn.modules)
-    if not finished.ok then
-        txn.phase = "RECOVERY_REQUIRED"
-        return finished
-    end
-
     module_state.completed_sequence = txn.sequence
     module_state.last_batch_id = txn.batch_id
     module_state.active_transaction = nil
     M.patching = false
-    return hotupgrade_result.success()
+    return finished
 end
 ```
 
@@ -2283,8 +2292,7 @@ Controller 收齐结果后，在 `M:run_batch()` 的结尾保存最终批次记�
 ```lua
 self.last_batch = batch
 self.active_batch = nil
-self.phase = self.recovery_required and "FAILED_LOCKED"
-    or (batch.error and "IDLE" or batch.phase)
+self.phase = batch.error and "IDLE" or batch.phase
 self:wake_lifecycle()
 ```
 
@@ -2570,7 +2578,7 @@ Controller 会记录：
 
 并使生命周期进入：
 
-`FAILED_LOCKED`
+`RECOVERY_REQUIRED`
 
 这意味着系统无法确认版本已经收敛，后续新的发布及受管理创建会被门禁阻止，需要宿主核实和处理。
 
@@ -2582,9 +2590,9 @@ Controller 会记录：
 
 这时候再强行整批回滚是不安全的。
 
-所以 Controller 会继续尝试其他目标的 Finish，并报告失败，将生命周期锁定，而不会撤回新版文件或对已经 Finish 的目标执行整体回滚。
+所以 Controller 会继续尝试其他目标的 Finish 并报告失败，结束本批后允许继续发布，不撤回新版文件或对已经 Finish 的目标执行整体回滚。
 
-`resolve_deployment()` 也不是一键恢复函数。它只是让宿主在核实并完成必要的人工恢复或版本收敛后，显式确认可以解除 Controller 的发布锁定。
+失败不要求人工确认解锁；宿主或运维根据报告决定下一批内容，下一批以当时现场重新保存快照和执行。
 
 这就是本课需要掌握的恢复边界。
 

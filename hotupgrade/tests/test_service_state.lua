@@ -242,7 +242,7 @@ if scenario.expected_failure then
     if scenario.expected_failure == "HU_SERVICE_STAGE_FAILED" then
         assert(after_calls == 0 and hotupgrade.patching)
     else
-        assert(after_calls == (scenario.expected_after_calls or 1) and not hotupgrade.patching)
+        assert(after_calls == (scenario.expected_after_calls or 1) and hotupgrade.patching)
     end
     assert(command("abort").ok)
     assert(live_module.version == 1)

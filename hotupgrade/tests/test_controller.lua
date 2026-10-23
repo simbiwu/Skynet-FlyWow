@@ -79,12 +79,9 @@ scenarios['lifecycle'] = function()
     local begun_exit = lifecycle:handle_command("begin", {path = "module"}, 1)
     assert(begun_exit.ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(lifecycle.phase == "FAILED_LOCKED" and lifecycle.last_batch.phase == "RECOVERY_REQUIRED")
+    assert(lifecycle.phase == "IDLE" and lifecycle.last_batch.phase == "RECOVERY_REQUIRED")
     lifecycle:on_service_exit(62)
-    assert(lifecycle.phase == "FAILED_LOCKED" and lifecycle.service_registrations[62] == nil)
-    assert(lifecycle:handle_command("resolve_deployment", {
-        batch_id = begun_exit.batch_id, confirmed = true, confirmation = "CONVERGED_CACHE_CLEARED",
-    }, 1).ok)
+    assert(lifecycle.phase == "IDLE" and lifecycle.service_registrations[62] == nil)
     module_state.control_hook = nil
     module_state.injected_control_failure = nil
 
@@ -246,7 +243,6 @@ scenarios['matching'] = function()
     assert(not register_module(c, "extra", 30).ok)
     local module_patch = c:load_patch({path = "module"})
     assert(module_patch.ok and #module_patch.targets == 2)
-    assert(not c:load_patch({path = "module", selector = {percent = 0.5}}).ok)
     -- 未登记模块只部署；一次性 Service .patch 仍须匹配。
     local unmatched = c:load_patch({path = "unmatched_module"})
     assert(unmatched.ok and #unmatched.targets == 2 and #unmatched.patch.files == 2)
@@ -300,17 +296,11 @@ scenarios['matching'] = function()
     assert(not c:handle_command("history", {}, 1).ok)
     -- 持有容量和只保留最近终态的合同，不能靠清空查询记录绕过恢复门禁。
     assert(c:handle_command("status", {batch_id = "99:1"}, 1).code == "HU_BATCH_MISSING")
-    -- 恢复命令只接受管理者明确确认，不发送目标状态 RPC 或替代实际恢复。
-    assert(c.phase == "FAILED_LOCKED")
-    assert(c:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 1).code == "HU_DEPLOYMENT_BLOCKED")
-    assert(c:handle_command("begin_module_load", {name = "late"}, 10).code == "HU_DEPLOYMENT_BLOCKED")
-    assert(c:handle_command("begin", {}, 1).code == "HU_DEPLOYMENT_BLOCKED")
-    assert(c:handle_command("resolve_deployment", {batch_id = c.last_batch.batch_id, confirmed = true,
-        confirmation = "UNCHANGED"}, 1).code == "HU_RECOVERY_CONFIRMATION_REQUIRED")
-    module_state.last_control_command_by_service_handle = {}
-    assert(c:handle_command("resolve_deployment", {batch_id = c.last_batch.batch_id, confirmed = true,
-        confirmation = "CONVERGED_CACHE_CLEARED"}, 1).ok)
-    assert(c.phase == "IDLE" and next(module_state.last_control_command_by_service_handle) == nil)
+    -- 恢复失败仅报告，不再阻止创建、声明和下一批发布。
+    assert(c.phase == "IDLE")
+    local allowed_after_failure = c:handle_command("begin_module_load", {name = "late"}, 10)
+    assert(allowed_after_failure.ok)
+    assert(c:handle_command("cancel_module_load", {name = "late", permit_id = allowed_after_failure.permit_id}, 10).ok)
     module_state.injected_control_failure = nil
 
     local waiting = c
@@ -321,9 +311,8 @@ scenarios['matching'] = function()
     assert(waiting:handle_command("begin", {path = "module"}, 1).code == "HU_UPGRADE_BUSY")
     assert(waiting:handle_command("unknown_command", {}, 1).code == "HU_UNKNOWN_COMMAND")
     assert(waiting:handle_command("register", metadata, 84).ok and waiting.phase == "WAITING_CREATIONS")
-    assert(waiting:handle_command("resolve_deployment", {batch_id = "stale"}, 1).code == "HU_BATCH_MISSING")
-    assert(waiting:handle_command("resolve_deployment", {batch_id = begun.batch_id}, 1).code == "HU_RECOVERY_CONFIRMATION_REQUIRED")
-    assert(waiting:handle_command("resolve_deployment", {batch_id = begun.batch_id, confirmed = true, confirmation = "UNCHANGED"}, 1).ok)
+    assert(waiting:handle_command("abort", {batch_id = "stale"}, 1).code == "HU_ABORT_NOT_SAFE")
+    assert(waiting:handle_command("abort", {batch_id = begun.batch_id}, 1).ok)
     assert(waiting.last_batch.phase == "ABORTED"
         and waiting.last_batch.error.code == "HU_ABORT_REQUESTED")
     -- 已取消的异步协程即使稍后被调度，也不能开始更新。
@@ -337,8 +326,7 @@ scenarios['matching'] = function()
     assert(pending_creation.ok)
     local pending_batch = waiting:handle_command("begin", {path = "module"}, 1)
     assert(pending_batch.ok and waiting.phase == "WAITING_CREATIONS")
-    assert(waiting:handle_command("resolve_deployment", {batch_id = pending_batch.batch_id,
-        confirmed = true, confirmation = "UNCHANGED"}, 1).ok)
+    assert(waiting:handle_command("abort", {batch_id = pending_batch.batch_id}, 1).ok)
     assert(waiting.last_batch.phase == "ABORTED"
         and waiting.last_batch.error.code == "HU_ABORT_REQUESTED")
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
@@ -498,7 +486,7 @@ scenarios['unique'] = function()
     end
     assert(publish(unique, {path = "module"}).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(unique.phase == "FAILED_LOCKED" and unique.last_batch.error.recovery_error.code == "HU_FIXTURE_FAILED")
+    assert(unique.phase == "IDLE" and unique.last_batch.error.recovery_error.code == "HU_FIXTURE_FAILED")
     module_state.control_hook = nil
     module_state.injected_control_failure = nil
     print("HOTUPGRADE_CONTROLLER_LOCAL_UNIQUE_OK")
@@ -582,8 +570,6 @@ scenarios['drain_abort'] = function()
     local id = begin_deployment(c, "module")
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(c.active_batch.phase == "PREPARE" and c.active_batch.waiter and c.creation_count == 1)
-    assert(c:handle_command("resolve_deployment", {batch_id = id, confirmed = true,
-        confirmation = "CONVERGED_CACHE_CLEARED"}, 1).code == "HU_DEPLOYMENT_PHASE")
     assert(c:handle_command("abort", {batch_id = id}, 1).ok)
     assert(c.last_batch.phase == "ABORTED" and c.last_batch.error.code == "HU_ABORT_REQUESTED")
     assert(table.concat(module_state.operations, ",") == "10:prepare,10:abort")
@@ -659,13 +645,11 @@ scenarios['resources'] = function()
         module_state.injected_control_failure = {service_handle = 102, command = "finish", unknown = unknown}
         assert(publish(ordered, {path = "module"}).ok)
         module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-        assert(ordered.phase == "FAILED_LOCKED" and ordered.last_batch.success == 2 and ordered.last_batch.failed == 1)
+        assert(ordered.phase == "IDLE" and ordered.last_batch.success == 2 and ordered.last_batch.failed == 1)
         assert(table.concat(module_state.operations, ",") ==
             "101:prepare,102:prepare,103:prepare,101:update,102:update,103:update,file:lualib/test_worker_logic.lua,cache,101:finish,102:finish,103:finish")
         assert(module_state.file_contents["lualib/test_worker_logic.lua"])
         module_state.injected_control_failure = nil
-        assert(ordered:handle_command("resolve_deployment", {batch_id = ordered.last_batch.batch_id, confirmed = true,
-            confirmation = "CONVERGED_CACHE_CLEARED"}, 1).ok)
     end
 
     local deployment = ordered
@@ -699,7 +683,7 @@ scenarios['resources'] = function()
     module_state.injected_restore_failure = true
     assert(publish(deployment, {path = "deploy_failure"}).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(deployment.phase == "FAILED_LOCKED" and deployment.recovery_required)
+    assert(deployment.phase == "IDLE" and deployment.recovery_required)
     assert(deployment.last_batch.error.original_error.code == "HU_FILE_DEPLOY_FAILED")
     assert(deployment.last_batch.error.recovery_error.code == "HU_FILE_DEPLOY_FAILED")
     module_state.injected_restore_failure = false

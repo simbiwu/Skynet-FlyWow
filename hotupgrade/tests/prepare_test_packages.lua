@@ -125,6 +125,22 @@ local cases =
     duplicate_custom_service = {["actors/zone"] = {["battle.worker.patch"] = service,
         ["battle/worker.patch"] = service}},
 }
+local header_prefixes = {"", "\239\187\191", "#!/usr/bin/env lua\n", "\239\187\191#!/usr/bin/env lua\r\n"}
+for index, prefix in ipairs(header_prefixes) do
+    cases["source_headers_" .. index] = {
+        lualib = {["test_worker_logic.lua"] = prefix .. module_v2},
+        service = {["skynet_hotupgrade_worker.patch"] = prefix .. [[return function(state)
+            return {update_state = function() state.level = 51 end}
+        end]]},
+        config = {["headers.lua"] = prefix .. "return {ready = true}"},
+    }
+end
+cases.repair = {
+    lualib = {["test_worker_logic.lua"] = module_v2:gsub("function M.value%(%) return 2 end", "function M.value() return 3 end")},
+    service = {["skynet_hotupgrade_worker.patch"] = [[return function(state)
+        return {update_state = function() state.equip = "枪"; state.level = 60; state.schema_version = 3 end}
+    end]]},
+}
 for name, directories in pairs(cases) do
     for directory, entries in pairs(directories) do
         assert(os.execute("mkdir -p " .. root .. name .. "/" .. directory))

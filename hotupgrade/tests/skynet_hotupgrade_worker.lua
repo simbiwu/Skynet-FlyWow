@@ -262,6 +262,13 @@ skynet.start(function()
             assert(package.loaded["lualib.hotupgrade_extra"] == nil and package.loaded.hotupgrade_extra == nil)
             assert(skynet.call(skynet.uniqueservice("flywow_hotupgrade_service"), "hotupgrade", "status", {}).lifecycle.pending_module_loads == 0)
             answer = true
+        elseif command == "allow_next_upgrade" then
+            -- 测试宿主修正注入的根表缓存故障，并提交下一批针对现场的修复包。
+            worker_test_config.custom = false
+            worker_test_config.restore_failure = false
+            worker_test_config.break_module = false
+            package.loaded["lualib.test_worker_logic"] = logic
+            answer = {ok = true}
         elseif command == "cancel_creation" then
             answer = hotupgrade.cancel_service_creation(request.service_handle)
         elseif command == "declare_slow" then

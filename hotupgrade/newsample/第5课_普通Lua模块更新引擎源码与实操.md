@@ -20,7 +20,7 @@
 
 1. **Stage（暂存）**：读取已经冻结的 V2 源码，在当前 Lua State 内创建候选模块，并保存旧导出字段；不立即修改正在使用的模块表。这里的 Stage 是更新引擎的暂存操作；Controller 状态机阶段使用 `phase` 表示。
 2. **Commit**：把候选模块的完整导出字段安装到旧模块根表上，根表身份保持不变。
-3. **Abort**：如果整次事务在发布决定前失败，尝试恢复旧导出字段，并在恢复成功后释放阶段数据。
+3. **Abort**：如果整次事务在发布决定前失败，尝试恢复旧导出字段，无论恢复是否成功都释放本批阶段数据。
 4. **Finish**：正式文件已经成功部署、发布决定已经作出后，释放旧字段快照，不再提供本批次的普通模块撤销能力。
 
 除此之外，我们还必须弄清一个容易误解的问题：**模块导出表与模块闭包的 upvalue 不是同一层状态**。原地更新 `logic.version`，并不意味着旧闭包的 upvalue 自动迁移。需要迁移的模块私有状态，要靠 `export_state()` 和 `import_state()` 显式传递。
@@ -318,13 +318,13 @@ function M.stage(module_patches, module_loaders)
             end
 
             -- 使用 Lua 原生 require；新加载的依赖不属于本次模块回滚。
-            local chunk = assert(load(module_patch.source, "@" .. module_patch.name, "t"))
+            local chunk = assert(load(hotupgrade_common.normalize_source(module_patch.source), "@" .. module_patch.name, "t"))
             local loader = module_loaders and module_loaders[module_patch.name]
             module_stage.entries[#module_stage.entries + 1] =
             {
                 name        = module_patch.name,                           -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
                 live        = live,                                        -- 原模块根表；提交与恢复始终原地修改它的字段。
-                old         = fields,                                      -- 旧导出字段及原引用；保留至 Finish 或恢复成功。
+                old         = fields,                                      -- 旧导出字段及原引用；保留至本批 Finish/Abort 结束。
                 chunk       = chunk,                                       -- 第一轮编译的源码；第二轮执行后释放。
                 loader_name = loader and loader.name or module_patch.name, -- 首次 require 名称，不用规范登记名替代。
                 loader_path = loader and loader.path,                      -- 首次加载路径，与普通 Lua 文件加载参数一致。
@@ -356,6 +356,9 @@ function M.stage(module_patches, module_loaders)
     return hotupgrade_result.success({stage = module_stage})
 end
 ```
+
+`hotupgrade_common.normalize_source()` 定义于 `hotupgrade/lualib/flywow_hotupgrade_common.lua`，按 Lua 文件加载规则跳过 UTF-8 BOM 和首行 `#` 注释并保留换行。这里只转换编译输入；冻结、部署和恢复使用原始源码字节。
+
 
 看起来较长，但它的流程很明确：**第一个循环先处理全部模块的旧导出字段与源码编译，第二个循环再执行候选模块并完成验证和私有状态迁移。** 我们只有一个 `lualib.player_logic`，所以每个循环仅迭代一次。以后一个批次有多个模块时，这个执行顺序仍然成立。
 
@@ -411,13 +414,13 @@ module_stage.entries[1].old.next_count ──→ 原 V1 闭包
 再往下，源码用 Lua 的 load() 编译候选模块，不额外创建环境表：
 
 ```lua
-local chunk = assert(load(module_patch.source, "@" .. module_patch.name, "t"))
+local chunk = assert(load(hotupgrade_common.normalize_source(module_patch.source), "@" .. module_patch.name, "t"))
             local loader = module_loaders and module_loaders[module_patch.name]
 module_stage.entries[#module_stage.entries + 1] =
 {
     name      = module_patch.name, -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
     live      = live,      -- 原模块根表；提交与恢复始终原地修改它的字段。
-    old       = fields,    -- 旧导出字段及原引用；保留至 Finish 或恢复成功。
+    old       = fields,    -- 旧导出字段及原引用；保留至本批 Finish/Abort 结束。
     chunk     = chunk,     -- 第一轮编译的源码；第二轮执行后释放。
     candidate = nil,       -- 第二轮准备的新导出；Commit 时整体安装其字段。
 }
@@ -867,12 +870,13 @@ function M.abort(module_stage)
         end
     end
 
-    -- 只有所有旧导出都确认恢复后才释放 Stage 和旧快照。
+    -- 所有恢复项都已尝试；失败仍报告，但本批快照不阻塞下一次 Stage。
+    local finished = M.finish(module_stage)
     if #errors > 0 then
         return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
     end
 
-    return M.finish(module_stage)
+    return finished
 end
 ```
 
@@ -903,7 +907,7 @@ logic.new_tag                         nil
 
 `abort()` 把每个模块的恢复操作放在独立 `pcall()` 中，是为了一个模块出现恢复错误后，仍继续尝试恢复其他模块，并收集全部失败信息。只要存在任意失败，它就返回 `HU_RECOVERY_REQUIRED`，保留 `module_state.active_module_stage` 及旧快照，不能声称整个模块更新已经撤销成功。
 
-当前实验只有一个普通模块，没有外部干扰，所以应当成功。`M.abort()` 随后调用 `M.finish(module_stage)` 释放本次 Stage 的记录。它并不是“撤销失败后仍强行释放”，而是**确认所有模块的导出字段都恢复成功后**才释放。
+当前实验只有一个普通模块，没有外部干扰，所以应当成功。`M.abort()` 随后调用 `M.finish(module_stage)` 释放本次 Stage 的记录。恢复失败也会释放本批快照并报告错误，不阻止下一次 Stage。
 
 ### Abort 会恢复闭包私有 upvalue 吗？
 
@@ -1079,7 +1083,7 @@ if command == "update" then
     txn.service = service
     txn.phase = "STAGED"
 
-    -- Activate 同步提交；任一步失败先组合恢复，再由 Controller 整批 Abort。
+    -- Activate 同步提交；失败先报告，再由 Controller 串行 Abort 整批目标。
     local installed = hotupgrade_module_patch.commit(txn.modules)
     local ok, message = pcall(function()
         assert(installed.ok, installed.message)
@@ -1102,8 +1106,7 @@ if command == "update" then
     end)
 
     if not ok then
-        local restored = abort(txn)
-        return restored.ok and hotupgrade_result.failure("HU_ACTIVATE_FAILED", tostring(message)) or restored
+        return hotupgrade_result.failure("HU_ACTIVATE_FAILED", tostring(message))
     end
 
     txn.phase = "ACTIVATED"
@@ -1155,23 +1158,21 @@ local function abort(txn)
         end
     end
 
-    -- 任何恢复项失败都保留关闭状态；只有全部恢复成功才释放事务。
-    if #errors > 0 then
-        txn.phase = "RECOVERY_REQUIRED"
-        return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
-    end
-
+    -- 本批尽力恢复后释放事务与临时门禁；错误只通过结果报告。
     module_state.completed_sequence = txn.sequence
     module_state.last_batch_id = txn.batch_id
     module_state.active_transaction = nil
     M.patching = false
+    if #errors > 0 then
+        return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
+    end
     return hotupgrade_result.success()
 end
 ```
 
 它来自 `hotupgrade/lualib/flywow_hotupgrade.lua`，由本地 `handle_upgrade("abort")` 调用，也会被 Activate 失败路径调用。
 
-`restore_service(txn)` 先负责恢复登记的 Service 私有状态和被改写的业务函数字段；`hotupgrade_module_patch.abort(txn.modules)` 再恢复普通模块导出。任一项失败都保留恢复信息和 `patching=true`，只有确认全部成功才清理本地活动事务并重新开放业务。
+`restore_service(txn)` 先负责恢复登记的 Service 私有状态和被改写的业务函数字段；`hotupgrade_module_patch.abort(txn.modules)` 再恢复普通模块导出。任一项失败均如实报告；本批结束后仍释放快照、活动事务和 `patching`，下一批以当时现场为基准。
 
 这正好对应我们在独立实验里看到的区别：单独的 `module_patch.abort()` 不知道外部的 `state.equip`，而完整的 `abort(txn)` 才持有并恢复 Service 部分的旧状态。
 
@@ -1182,16 +1183,11 @@ end
 ```lua
 if command == "finish" and txn.phase == "ACTIVATED" then
     local finished = hotupgrade_module_patch.finish(txn.modules)
-    if not finished.ok then
-        txn.phase = "RECOVERY_REQUIRED"
-        return finished
-    end
-
     module_state.completed_sequence = txn.sequence
     module_state.last_batch_id = txn.batch_id
     module_state.active_transaction = nil
     M.patching = false
-    return hotupgrade_result.success()
+    return finished
 end
 ```
 

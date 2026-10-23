@@ -148,13 +148,13 @@ function M.stage(module_patches, module_loaders)
             end
 
             -- 使用 Lua 原生 require；新加载的依赖不属于本次模块回滚。
-            local chunk = assert(load(module_patch.source, "@" .. module_patch.name, "t"))
+            local chunk = assert(load(hotupgrade_common.normalize_source(module_patch.source), "@" .. module_patch.name, "t"))
             local loader = module_loaders and module_loaders[module_patch.name]
             module_stage.entries[#module_stage.entries + 1] =
             {
                 name        = module_patch.name,                           -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
                 live        = live,                                        -- 原模块根表；提交与恢复始终原地修改它的字段。
-                old         = fields,                                      -- 旧导出字段及原引用；保留至 Finish 或恢复成功。
+                old         = fields,                                      -- 旧导出字段及原引用；保留至本批 Finish/Abort 结束。
                 chunk       = chunk,                                       -- 第一轮编译的源码；第二轮执行后释放。
                 loader_name = loader and loader.name or module_patch.name, -- 首次 require 名称，不用规范登记名替代。
                 loader_path = loader and loader.path,                      -- 首次加载路径，与普通 Lua 文件加载参数一致。
@@ -208,7 +208,7 @@ function M.commit(module_stage)
     return ok and hotupgrade_result.success() or hotupgrade_result.failure("HU_MODULE_COMMIT_FAILED", tostring(message))
 end
 
---- 尽量恢复所有旧表；任一身份变化均报告故障并保留 Stage，以便人工核对。
+--- 尽量恢复所有旧表；任一身份变化均报告故障，结束时释放本批 Stage。
 function M.abort(module_stage)
     if module_state.active_module_stage ~= module_stage then
         return hotupgrade_result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
@@ -229,12 +229,13 @@ function M.abort(module_stage)
         end
     end
 
-    -- 只有所有旧导出都确认恢复后才释放 Stage 和旧快照。
+    -- 所有恢复项都已尝试；失败仍报告，但本批快照不阻塞下一次 Stage。
+    local finished = M.finish(module_stage)
     if #errors > 0 then
         return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
     end
 
-    return M.finish(module_stage)
+    return finished
 end
 
 --- 确认本地模块更新结束并释放旧快照；不负责开放业务入口。

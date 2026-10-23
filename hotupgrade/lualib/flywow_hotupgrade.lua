@@ -7,7 +7,7 @@ local hotupgrade_native = require "flywow_hotupgrade_native"
 local hotupgrade_module_patch = require "flywow_hotupgrade_module_patch"
 local M =
 {
-    patching = false, -- prepare 起禁止新业务进入，finish 或确认恢复后解除。
+    patching = false, -- prepare 起禁止新业务进入，本批 finish/abort 结束后解除。
 }
 local module_state =
 {
@@ -36,7 +36,7 @@ end
 -- 与 Controller Service 使用同一原生消息协议；不建立独立协议/RPC 模块。
 skynet.register_protocol({name = "hotupgrade", id = hotupgrade_common.PROTOCOL_ID, pack = skynet.pack, unpack = skynet.unpack})
 
---- 创建受管理 Service；排空和 Prepare 期间正常接纳，Update 起等待发布终态；恢复未确认则拒绝。
+--- 创建受管理 Service；排空和 Prepare 期间正常接纳，Update 起等待本批发布终态，失败不阻止后续操作。
 --- 会 yield，成功直接返回原生 handle，不等待调用方后续业务 init。
 --- 启动参数遵循 skynet.newservice 的原有约束；失败抛出含 HU_ 错误码的异常。
 ---@param service_name string 原生 Skynet Service 入口名
@@ -124,16 +124,14 @@ local function abort(txn)
         end
     end
 
-    -- 任何恢复项失败都保留关闭状态；只有全部恢复成功才释放事务。
-    if #errors > 0 then
-        txn.phase = "RECOVERY_REQUIRED"
-        return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
-    end
-
+    -- 本批尽力恢复后释放事务与临时门禁；错误只通过结果报告。
     module_state.completed_sequence = txn.sequence
     module_state.last_batch_id = txn.batch_id
     module_state.active_transaction = nil
     M.patching = false
+    if #errors > 0 then
+        return hotupgrade_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
+    end
     return hotupgrade_result.success()
 end
 
@@ -151,7 +149,7 @@ local function stage_service(patch_source)
 
     -- 执行受信 Patch 构建函数并校验结果；此时尚不写入线上状态。
     local service_update = assert(module_state.registration.service_update, "Service 未提供内部更新入口")
-    local chunk = assert(load(patch_source, "=Service Patch", "t", _G))
+    local chunk = assert(load(hotupgrade_common.normalize_source(patch_source), "=Service Patch", "t", _G))
     local build_patch = chunk()
     assert(type(build_patch) == "function", "Service Patch 必须返回构建函数")
     ---@type FlyWowHotUpgradeServicePatch
@@ -202,7 +200,7 @@ end
 ---@param command FlyWowHotUpgradeServiceCommand Controller Service 分发的稳定控制命令
 ---@param request table batch_id、sequence；update 另含 modules 和可选 service_source
 ---@param source integer 由 Skynet 提供的真实调用来源
----@return FlyWowHotUpgradeResult 恢复不确定时保持 patching=true
+---@return FlyWowHotUpgradeResult 更新或恢复错误如实报告；Abort/Finish 结束本批临时门禁
 local function handle_upgrade(command, request, source)
     -- 先核验 Controller 来源；批次身份由 Controller 生成，再与本地事务记录比对。
     if source ~= module_state.hotupgrade_handle then
@@ -270,7 +268,7 @@ local function handle_upgrade(command, request, source)
         txn.service = service
         txn.phase = "STAGED"
 
-        -- Activate 同步提交；任一步失败先组合恢复，再由 Controller 整批 Abort。
+        -- Activate 同步提交；失败先报告，再由 Controller 串行 Abort 整批目标。
         local installed = hotupgrade_module_patch.commit(txn.modules)
         local ok, message = pcall(function()
             assert(installed.ok, installed.message)
@@ -293,8 +291,8 @@ local function handle_upgrade(command, request, source)
         end)
 
         if not ok then
-            local restored = abort(txn)
-            return restored.ok and hotupgrade_result.failure("HU_ACTIVATE_FAILED", tostring(message)) or restored
+            -- Controller 串行发出一次 Abort，报告更新错误与独立恢复结果。
+            return hotupgrade_result.failure("HU_ACTIVATE_FAILED", tostring(message))
         end
 
         txn.phase = "ACTIVATED"
@@ -304,16 +302,11 @@ local function handle_upgrade(command, request, source)
     -- finish 确认提交后才清理旧快照并重新开放业务入口。
     if command == "finish" and txn.phase == "ACTIVATED" then
         local finished = hotupgrade_module_patch.finish(txn.modules)
-        if not finished.ok then
-            txn.phase = "RECOVERY_REQUIRED"
-            return finished
-        end
-
         module_state.completed_sequence = txn.sequence
         module_state.last_batch_id = txn.batch_id
         module_state.active_transaction = nil
         M.patching = false
-        return hotupgrade_result.success()
+        return finished
     end
 
     return hotupgrade_result.failure("HU_PHASE_INVALID", "当前阶段不能执行 " .. tostring(command))
@@ -323,7 +316,7 @@ end
 ---@field state table 现存 Service 私有状态表；更新只改其字段，不替换该表。
 ---@field functions table Service 原有业务函数表；Patch 只替换本次列出的现有函数字段。
 ---@field snapshot? fun(state:table):table 更新前生成与线上对象隔离的恢复快照；与 restore 成对提供。
----@field restore? fun(state:table, old_state:table) 提交失败时同步恢复快照；返回 false 或抛错会保持 patching=true。
+---@field restore? fun(state:table, old_state:table) 提交失败时同步恢复快照；返回 false 或抛错报告恢复失败，仍结束本批事务。
 
 ---@class FlyWowHotUpgradeRegistration
 ---@field service_update? FlyWowHotUpgradeServiceUpdate 可选 Service 内部状态/函数更新入口
@@ -383,11 +376,26 @@ function M.register_service(registration)
     skynet.dispatch("hotupgrade", function(session, source, command, request)
         local ok, answer = pcall(handle_upgrade, command, request, source)
         if not ok then
-            -- 未预期异常可能发生在写入后；保留本地事务与 patching，不能伪称恢复成功。
-            if module_state.active_transaction then
-                module_state.active_transaction.phase = "RECOVERY_REQUIRED"
+            -- 异常也必须结束本批；Finish 已越过发布决定，只释放快照而不回滚。
+            local original = hotupgrade_result.failure("HU_CONTROL_FAILED", tostring(answer))
+            local txn = module_state.active_transaction
+            if txn and command ~= "finish" then
+                answer = abort(txn)
+                if answer.ok then
+                    answer = original
+                else
+                    answer.original_error = original
+                end
+            else
+                if txn then
+                    if txn.modules then hotupgrade_module_patch.finish(txn.modules) end
+                    module_state.completed_sequence = txn.sequence
+                    module_state.last_batch_id = txn.batch_id
+                    module_state.active_transaction = nil
+                end
+                M.patching = false
+                answer = original
             end
-            answer = hotupgrade_result.failure("HU_RECOVERY_REQUIRED", tostring(answer))
         end
 
         if session ~= 0 then

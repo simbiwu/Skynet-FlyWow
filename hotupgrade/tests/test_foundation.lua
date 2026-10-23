@@ -1,5 +1,14 @@
 --- 普通 Lua 状态图、模块身份、状态迁移与安全点失败合同。
 local patch = require "flywow_hotupgrade_module_patch"
+local common = require "flywow_hotupgrade_common"
+for _, prefix in ipairs({"", "\239\187\191", "#!/usr/bin/env lua\n", "\239\187\191#!/usr/bin/env lua\r\n"}) do
+    assert(assert(load(common.normalize_source(prefix .. "return 42"), "@header.lua", "t"))() == 42)
+    local _, message = load(common.normalize_source(prefix .. "\nlocal ="), "@header.lua", "t")
+    local expected_line = prefix:find("\n", 1, true) and 3 or 2
+    assert(message and message:find("header.lua:" .. expected_line .. ":", 1, true), message)
+end
+assert(load(common.normalize_source("\239\187\191#only comment"), "@header.lua", "t"))
+assert(not load(common.normalize_source("\239\187xreturn {}"), "@header.lua", "t"))
 local graph = {nested = {count = 7}}
 graph.self = graph
 graph.shared = graph.nested
@@ -67,7 +76,7 @@ assert(staged.ok and patch.commit(staged.stage).ok)
 package.loaded.logic = {}
 assert(patch.abort(staged.stage).code == "HU_RECOVERY_REQUIRED")
 package.loaded.logic = live
-assert(patch.abort(staged.stage).ok)
+assert(patch.abort(staged.stage).code == "HU_PHASE_INVALID")
 -- 无状态模块不需要钩子；多模块中一个 Stage 失败不能提前安装其他模块。
 local simple = {value = function() return 1 end}
 package.loaded.a = simple
@@ -322,9 +331,9 @@ assert(target_control("abort", 3).ok and not hotupgrade.patching)
 registration.before_upgrade = function() return true end
 assert(target_control("prepare", 5).ok and target_control("update", 5).ok)
 local original_finish = patch.finish
-patch.finish = function() return {ok = false, code = "HU_FIXTURE_FINISH_FAILED"} end
-assert(target_control("finish", 5).code == "HU_FIXTURE_FINISH_FAILED" and hotupgrade.patching)
-assert(target_control("update", 5).code == "HU_PHASE_INVALID")
+patch.finish = function(stage) original_finish(stage); return {ok = false, code = "HU_FIXTURE_FINISH_FAILED"} end
+assert(target_control("finish", 5).code == "HU_FIXTURE_FINISH_FAILED" and not hotupgrade.patching)
+assert(target_control("update", 5).code == "HU_STALE_TRANSACTION")
 patch.finish = original_finish
 assert(target_control("abort", 5).ok and not hotupgrade.patching)
 assert(target_control("stage", 6).code == "HU_UNKNOWN_COMMAND")

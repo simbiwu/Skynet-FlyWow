@@ -629,16 +629,11 @@ Finish 成功       hot.patching = false
 ```lua
 if command == "finish" and txn.phase == "ACTIVATED" then
     local finished = hotupgrade_module_patch.finish(txn.modules)
-    if not finished.ok then
-        txn.phase = "RECOVERY_REQUIRED"
-        return finished
-    end
-
     module_state.completed_sequence = txn.sequence
     module_state.last_batch_id = txn.batch_id
     module_state.active_transaction = nil
     M.patching = false
-    return hotupgrade_result.success()
+    return finished
 end
 ```
 
@@ -780,7 +775,7 @@ LESSON6_OK
 | C 没有被拒绝 | `spend` 的 `if hot.patching` 是否在 `business_queue()` 之前 |
 | B 观察到 V2 而非 V1 | 是否误把 B 的请求放在 Prepare 之后，或替换了本课约定的执行顺序 |
 | 最终 version 没变 V2 | `patches/v2/lualib/player_logic.lua` 是否在正确位置；当前模块是否经 `hot.require` 登记 |
-| `FAILED_LOCKED` / 恢复失败 | 留给第 7 课沿真实错误和目标阶段分析，不要在本课添加任意等待来“解决” |
+| `RECOVERY_REQUIRED` / 恢复失败 | 留给第 7 课沿真实错误和目标阶段分析，不要在本课添加任意等待来“解决” |
 
 前四课学习成果应使你能解释 Controller、业务 Service 和内存对象分别由谁持有；第 5 课应使你能解释 V2 模块字段如何原地安装；**本课则补上关键条件：为什么安装 V2 之前，旧版本中那些已经开始执行、又可能 yield 的业务必须先走完。**
 
@@ -795,4 +790,4 @@ LESSON6_OK
 
 能沿**同一份 PlayerService 的 A → B → Prepare → C → release → Finish** 重述这六个问题，才是真正掌握了当前 FlyWow 的“安全热更”机制，而不是记住 `hot.patching` 这个布尔值。
 
-**下一课：第 7 课《失败处理、恢复与回滚边界》**。届时仍使用真实事务，但深入 Prepare / Update / 文件部署失败、RPC 不确定结果、多 Service 恢复与 `FAILED_LOCKED` 等分支，不在本课提前扩张这些逻辑。
+**下一课：第 7 课《失败处理、恢复与回滚边界》**。届时仍使用真实事务，但深入 Prepare / Update / 文件部署失败、RPC 不确定结果、多 Service 恢复与 `RECOVERY_REQUIRED` 等分支，不在本课提前扩张这些逻辑。

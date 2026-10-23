@@ -13,6 +13,9 @@ rm -rf build/hotupgrade-tests/patches build/hotupgrade-tests/host build/hotupgra
 mkdir -p build/hotupgrade-tests/patches
 "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/prepare_test_packages.lua
 "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_foundation.lua
+for scenario in controller module service cancel diagnostic; do
+    "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_failure_continuation.lua "$scenario"
+done
 # 每个业务接收器场景拥有独立 Lua State，不为测试向生产模块增加 reset 接口。
 for scenario in shared custom nested_shared cycles old_alias types empty direct_fields expansion depth depth_boundary field_boundary snapshot_size abort recovery recovery_retry custom_recovery partial_throw legacy legacy_functions bad_state_callback; do
     "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_service_state.lua "$scenario"
@@ -28,16 +31,16 @@ cp -a build/hotupgrade-tests/host build/hotupgrade-tests/host-original
 cd "$FRAMEWORK_DIR/../.."
 LOG="$FRAMEWORK_DIR/build/hotupgrade-tests/skynet.log"
 : > "$LOG"
-for group in kill_prepare kill_update kill_finish monitor_occupied exit_module_load exit_prepare exit_update exit_finish drain_creation drain_queue drain_modules drain_late_module drain_new_failure drain_update_failure deployment deploy_failure service_file lifecycle preload host_paths custom_paths patch_match identity_queue registration_missing prepare_false prepare_error optional_service state_shared state_shared_failure declaration bad_functions stage_failure activation_after_failure activation_custom_failure activation_custom_success activation_custom_success_failure multiple_targets partial abort recovery_restore recovery_module; do
+for group in source_headers kill_prepare kill_update kill_finish monitor_occupied exit_module_load exit_prepare exit_update exit_finish drain_creation drain_queue drain_modules drain_late_module drain_new_failure drain_update_failure deployment deploy_failure service_file lifecycle preload host_paths custom_paths patch_match identity_queue registration_missing prepare_false prepare_error optional_service state_shared state_shared_failure declaration bad_functions stage_failure activation_after_failure activation_custom_failure activation_custom_success activation_custom_success_failure multiple_targets partial abort recovery_restore recovery_module; do
     rm -rf -- "$FRAMEWORK_DIR/build/hotupgrade-tests/host"
     cp -a "$FRAMEWORK_DIR/build/hotupgrade-tests/host-original" "$FRAMEWORK_DIR/build/hotupgrade-tests/host"
     HOTUPGRADE_TEST_GROUP="$group" timeout 45 "$SKYNET_ROOT/skynet" \
         ./third_party/skynet-flywow/hotupgrade/tests/skynet_config.lua \
         2>&1 | tee -a "$LOG"
 done
-test "$(grep -c HOTUPGRADE_SKYNET_GROUP_OK "$LOG")" -eq 41
+test "$(grep -c HOTUPGRADE_SKYNET_GROUP_OK "$LOG")" -eq 42
 # 每个真实 Skynet 进程都应执行 Native 文件扫描与路径测试。
-test "$(grep -c HOTUPGRADE_FILES_OK "$LOG")" -eq 41
+test "$(grep -c HOTUPGRADE_FILES_OK "$LOG")" -eq 42
 if grep -q HOTUPGRADE_SKYNET_FAILED "$LOG"; then
     exit 1
 fi
