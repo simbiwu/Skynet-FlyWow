@@ -28,7 +28,7 @@ local module_state =
 -- 与 Controller Service 使用同一原生消息协议；不建立独立协议/RPC 模块。
 skynet.register_protocol({name = "hotupgrade", id = hotupgrade_common.PROTOCOL_ID, pack = skynet.pack, unpack = skynet.unpack})
 
---- 创建受管理 Service；发布期间等待成功终态，失败锁定则抛出 HU_DEPLOYMENT_BLOCKED。
+--- 创建受管理 Service；排空和 Prepare 期间正常接纳，Update 起等待发布终态；恢复未确认则拒绝。
 --- 会 yield，成功直接返回原生 handle，不等待调用方后续业务 init。
 --- 启动参数遵循 skynet.newservice 的原有约束；失败抛出含 HU_ 错误码的异常。
 ---@param service_name string 原生 Skynet Service 入口名
@@ -44,7 +44,7 @@ function M.newservice(service_name, ...)
     return answer.service_handle
 end
 
---- 仅本 Controller 内的本地唯一服务；可能等待发布或在途唯一创建。
+--- 仅本 Controller 内的本地唯一服务；Update 起可能等待发布，也可能等待同名在途创建。
 --- true 重载明确抛出 HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED，不启动 Service。
 ---@param name_or_global string|boolean 逻辑名，或 true 表示后续首参为全局逻辑名
 ---@param ... any 完整启动参数；首次请求的参数生效
@@ -129,31 +129,35 @@ local function abort(txn)
     return hotupgrade_result.success()
 end
 
--- 只把 Patch 提供的字段合入候选状态；遗漏字段保留，nil 不表达删除。
+-- 按路径合并部分更新：旧字段保留，Patch 的共享表在不同分支分别应用。
 local function merge_service_state(target_state, update_state)
-    local update_targets = {} -- 更新表到候选表的映射，用于终止循环并保持 Patch 的共享引用。
-    local function merge_table(target_table, source_table, nesting_depth)
-        local mapped_target = update_targets[source_table]
-        if mapped_target then
-            return mapped_target
-        end
+    local ancestors   = {} -- 只记录当前递归路径；遇到 Patch 循环时连回本路径的目标祖先。
+    local field_count = 0  -- 本次合并实际展开的字段数，防止共享数据沿多条路径展开后失控。
 
+    local function merge_table(target_table, source_table, nesting_depth)
         assert(nesting_depth <= hotupgrade_common.MAX_STATE_DEPTH, "Service 状态更新嵌套超过限制")
-        update_targets[source_table] = target_table
+        ancestors[source_table] = target_table
         for key, update_value in pairs(source_table) do
-            local current_value = rawget(target_table, key)
-            if type(update_value) == "table" then
-                if type(current_value) == "table" then
-                    rawset(target_table, key, merge_table(current_value, update_value, nesting_depth + 1))
-                else
-                    rawset(target_table, key, merge_table({}, update_value, nesting_depth + 1))
-                end
-            else
+            field_count = field_count + 1
+            assert(field_count <= hotupgrade_common.MAX_STATE_FIELDS, "Service 状态更新展开超过字段限制")
+            if type(update_value) ~= "table" then
                 rawset(target_table, key, update_value)
+            elseif ancestors[update_value] then
+                -- 循环引用在本分支闭合；不会复用已经完成的兄弟分支。
+                rawset(target_table, key, ancestors[update_value])
+            else
+                local target_child = rawget(target_table, key)
+                if type(target_child) ~= "table" then
+                    target_child = {}
+                end
+                merge_table(target_child, update_value, nesting_depth + 1)
+                rawset(target_table, key, target_child)
             end
         end
-        return target_table
+
+        ancestors[source_table] = nil
     end
+
     merge_table(target_state, update_state, 1)
 end
 
@@ -382,13 +386,14 @@ function M.register_service(registration)
     end
 
     local service_update = registration.service_update
-    if service_update then
+    if service_update ~= nil then
         if type(service_update) ~= "table" or type(service_update.state) ~= "table"
             or type(service_update.functions) ~= "table" or getmetatable(service_update.functions) ~= nil then
             return hotupgrade_result.failure("HU_INVALID_OPTIONS", "Service 更新入口需要私有 state 与现有函数表")
         end
 
-        local custom = service_update.snapshot or service_update.commit or service_update.restore
+        local custom = service_update.snapshot ~= nil or service_update.commit ~= nil
+            or service_update.restore ~= nil
         if custom and (type(service_update.snapshot) ~= "function" or type(service_update.commit) ~= "function"
             or type(service_update.restore) ~= "function") then
             return hotupgrade_result.failure("HU_INVALID_OPTIONS", "自定义快照、提交、恢复必须成组提供")

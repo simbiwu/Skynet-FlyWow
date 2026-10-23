@@ -2,13 +2,13 @@
 
 源码仓库：`https://github.com/simbiwu/Skynet-FlyWow`
 
-本课核对的 `main` 提交：`7fa806e64448930f82fce02abc3f5c65dc1cc56a`
+本课源码片段以当前工作区为准；状态快照限制与 `flywow_hotupgrade_common.lua` 同步。
 
-主要源码：[`hotupgrade/lualib/flywow_hotupgrade_module_patch.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/7fa806e64448930f82fce02abc3f5c65dc1cc56a/hotupgrade/lualib/flywow_hotupgrade_module_patch.lua)
+主要源码：[`hotupgrade/lualib/flywow_hotupgrade_module_patch.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/main/hotupgrade/lualib/flywow_hotupgrade_module_patch.lua)
 
-配合阅读：[`hotupgrade/lualib/flywow_hotupgrade.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/7fa806e64448930f82fce02abc3f5c65dc1cc56a/hotupgrade/lualib/flywow_hotupgrade.lua)、[`hotupgrade/lualib/flywow_hotupgrade_controller.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/7fa806e64448930f82fce02abc3f5c65dc1cc56a/hotupgrade/lualib/flywow_hotupgrade_controller.lua)
+配合阅读：[`hotupgrade/lualib/flywow_hotupgrade.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/main/hotupgrade/lualib/flywow_hotupgrade.lua)、[`hotupgrade/lualib/flywow_hotupgrade_controller.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/main/hotupgrade/lualib/flywow_hotupgrade_controller.lua)
 
-> **阅读约定**：本课新写的教学实验放在 `hotupgrade/lesson5/`，代码是我们为学习编写的，不是仓库已有 Sample；带有仓库源码路径、函数名和对应调用关系的代码才是实际框架源码。所有函数名与字段名均按上述最新提交核对。该版本 Controller 使用 `run_batch()`、`load_patch()`，业务 Lua State 使用 `handle_upgrade()`。不要沿用第 4 课旧提交里的 `run()`、`load()` 和 `control()` 来定位这些内部函数。
+> **阅读约定**：本课新写的教学实验放在 `hotupgrade/lesson5/`，代码是我们为学习编写的，不是仓库已有 Sample；带有仓库源码路径、函数名和对应调用关系的代码才是实际框架源码。源码片段中的函数名、字段名和常量以当前工作区为准。该版本 Controller 使用 `run_batch()`、`load_patch()`，业务 Lua State 使用 `handle_upgrade()`。不要沿用第 4 课旧提交里的 `run()`、`load()` 和 `control()` 来定位这些内部函数。
 >
 > **前置条件**：已经完成第 4 课，知道 `hotupgrade.require()`、Prepare、Update、Finish 与 Service Patch 的作用。本课不重新讲 Controller 如何启动或怎样发布完整 Service 文件，而是接着第 4 课进入 **Update 内部的普通模块更新引擎**。示例仍沿用“刀 → 剑”，但本课会专门观察模块导出表、函数引用、闭包私有状态和旧快照。
 
@@ -624,7 +624,7 @@ local function copy_state_graph(source_graph, target_graph)
             return copied_tables[source_value]
         end
 
-        assert(nesting_depth <= 64, "状态快照嵌套超过 64 层")
+        assert(nesting_depth <= hotupgrade_common.MAX_STATE_DEPTH, "状态快照嵌套超过限制")
         local target_table = {}
         if nesting_depth == 1 and target_graph then
             target_table = target_graph
@@ -637,7 +637,7 @@ local function copy_state_graph(source_graph, target_graph)
         copied_tables[source_value] = target_table
         for key, child_source in pairs(source_value) do
             field_count = field_count + 1
-            assert(field_count <= 10000, "状态快照超过 10000 个字段")
+            assert(field_count <= hotupgrade_common.MAX_STATE_FIELDS, "状态快照超过字段限制")
             assert(type(key) == "string" or type(key) == "number" or type(key) == "boolean",
                 "状态字段必须使用标量键")
             target_table[key] = copy_state_value(child_source, nesting_depth + 1)
@@ -669,7 +669,7 @@ end
 
 这与普通模块导出表更新是两件事。**普通模块根表由后面讲到的 `replace_exports()` 更新。**
 
-内部映射 `copied_tables` 保存源 table 到目标 table 的对应关系，保留嵌套表之间的共享和循环。`nesting_depth` 限制嵌套深度为 64，`field_count` 限制本次复制遍历的字段数量为 10000。键只允许字符串、数字或布尔值，值只允许普通数据及符合合同的嵌套表。
+内部映射 `copied_tables` 保存源 table 到目标 table 的对应关系，保留嵌套表之间的共享和循环。`nesting_depth` 使用 `flywow_hotupgrade_common.MAX_STATE_DEPTH`，当前为 128；`field_count` 使用同模块的 `MAX_STATE_FIELDS`，当前为 10000。本课源码文件已在顶部加载该公共模块。键只允许字符串、数字或布尔值，值只允许普通数据及符合合同的嵌套表。
 
 本例只有 `{count=2}`，因此 `snapshot_state()` 新建一张普通表，把数字 2 复制过去。V2 `import_state(snapshot)` 拿到独立的 table，而不是对 V1 私有 upvalue 的直接引用。
 
@@ -1036,7 +1036,7 @@ V2 count                      → 由已安装的 V2 闭包持有，当前为 2
 
 到这里，我们已经独立走通了引擎的四个函数，接下来必须确认：生产环境到底是谁调用它们？各自在哪个 Service、哪个 Lua State 中执行？何时可以修改线上表？
 
-沿第 4 课的调用链，管理端 `begin({path="v2"})` 之后，Controller Service 的 `flywow_hotupgrade_controller.lua` 使用 `M:run_batch()` 调度发布批次。它通过 `M:step()` 给目标 `PlayerService` 发送 `"hotupgrade"` 协议的 `"update"` 请求。
+沿第 4 课的调用链，管理端 `begin({path="v2"})` 之后，Controller Service 的 `flywow_hotupgrade_controller.lua` 使用 `M:run_batch()` 调度发布批次。在 Prepare 期间继续接纳创建和首次加载、重匹配新增目标及模块声明，并在全部准备完成后关闭门禁。随后它通过 `M:step()` 给最终目标清单中的 `PlayerService` 发送 `"hotupgrade"` 协议的 `"update"` 请求。
 
 最新源码中，`M:step()` 构造 Update 请求时使用的真实片段是：
 
@@ -1056,7 +1056,7 @@ local ok, answer = pcall(skynet.call, target.service_handle, "hotupgrade", comma
 
 `hotupgrade/lualib/flywow_hotupgrade.lua` 的 `handle_upgrade("update", request, source)`。
 
-此时 Prepare 必须已完成，本地 `txn.phase` 为 `QUIESCED`，`hot.patching=true`，业务 queue 已通过安全点。下面是最新源码中 Update 的**完整分支**。我们之前讲的引擎 Stage 和 Commit，就在这里调用：
+此时全部匹配目标的 Prepare 与在途操作都已完成，Controller 已进入 UPDATE 并关闭创建和首次加载门禁；目标本地事务保存本批 batch_id/sequence，`hot.patching=true`，业务 queue 已通过安全点。下面是最新源码中 Update 的**完整分支**。我们之前讲的引擎 Stage 和 Commit，就在这里调用：
 
 ```lua
 if command == "update" then

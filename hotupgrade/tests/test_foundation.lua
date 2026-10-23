@@ -88,6 +88,17 @@ assert(not patch.stage({{name = "a", source = [[return {
     export_state = function() return {} end,
     import_state = function() error("import failed") end,
 }]]}}).ok)
+local before_corrupt_import = package.loaded.a
+local corrupt_candidate = patch.stage({{name = "a", source = [[
+local M = {config = {}}
+M.export_state = function() return {} end
+M.import_state = function()
+    M.config.root = M
+end
+return M
+]]}})
+assert(not corrupt_candidate.ok and corrupt_candidate.message:find("根导出表", 1, true))
+assert(package.loaded.a == before_corrupt_import)
 local retried = patch.stage({{name = "a", source = [[return {
     value = function() return 2 end,
     export_state = function() return {} end,
@@ -244,6 +255,10 @@ local registration = {}
 local missing_before_upgrade = hotupgrade.register_service(registration)
 assert(not missing_before_upgrade.ok and missing_before_upgrade.code == "HU_INVALID_OPTIONS")
 registration.before_upgrade = function() return true end
+registration.service_update = false
+local invalid_service_update = hotupgrade.register_service(registration)
+assert(not invalid_service_update.ok and invalid_service_update.code == "HU_INVALID_OPTIONS")
+registration.service_update = nil
 assert(hotupgrade.register_service(registration).ok)
 local function target_control(command, sequence)
     control_dispatch(1, 99, command, {batch_id = "fixture:" .. sequence, sequence = sequence, modules = {}})

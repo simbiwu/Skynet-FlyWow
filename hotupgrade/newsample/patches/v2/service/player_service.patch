@@ -1,0 +1,23 @@
+return function(state)
+    return
+    {
+        migrate = function(old_state)
+            return
+            {
+                equip = "剑",
+                schema_version = 2,
+            }
+        end,
+
+        functions =
+        {
+            load = function(base_attack)
+                if state.equip == "剑" then
+                    return base_attack + 20 + 1
+                end
+
+                return base_attack
+            end,
+        },
+    }
+end

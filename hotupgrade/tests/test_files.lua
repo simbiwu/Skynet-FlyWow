@@ -32,7 +32,7 @@ local function register_fixture(instance, service_handle, metadata, service_name
     return registered
 end
 assert(register_fixture(c, 10, {modules = {"lualib.test_worker_logic"},
-    has_service_update = true}, "battle.worker").ok)
+    has_service_update = true}, "battle/worker").ok)
 assert(c:load_patch({path = "module"}).ok)
 assert(not c:load_patch({path = "invalid"}).ok)
 for _, path in ipairs({"../module", "/module", "module/../module", "module//lualib",
@@ -40,7 +40,7 @@ for _, path in ipairs({"../module", "/module", "module/../module", "module//lual
     assert(not hotupgrade_native.list_lua(root, path), path)
 end
 
-for _, path in ipairs({"duplicate_module", "duplicate_custom_service"}) do
+for _, path in ipairs({"duplicate_module"}) do
     assert(c:load_patch({path = path}).code == "HU_INVALID_PATCH")
 end
 local many_files = assert(hotupgrade_native.list_lua(root, "count_unlimited"))

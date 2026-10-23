@@ -73,7 +73,7 @@ skynet.start(function()
     print("模块缓存别名保持:", after.player.module_alias_same)
     print("业务函数已替换:", after.player.load_changed)
     print("旧闭包的攻击力:", after.player.initial_attack)
-    print("原 Service patching:", after.player_service.patching)
+    print("原 Service patching:", after.player.patching)
 
     -- 创建第二个 PlayerService，直接运行 V2。
     local second_service_handle = hot.newservice("player_service")

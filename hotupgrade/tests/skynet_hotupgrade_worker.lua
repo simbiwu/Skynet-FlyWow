@@ -22,6 +22,7 @@ local service_nested = {count = 7, retained = 23}
 local service_state =
 {
     equip = "刀", level = 50, schema_version = 1, obsolete = true,
+    a = {keep_a = 1}, b = {keep_b = 2},
     nested = service_nested, nested_alias = service_nested, ranks = {1, 2, 3}, mode = "legacy", replaced = {old = true},
 }
 service_state.self = service_state
@@ -159,6 +160,9 @@ skynet.start(function()
                 nested_identity = service_state.nested == nested_identity,
                 nested_alias_identity = service_state.nested_alias == service_state.nested,
                 root_cycle = service_state.self == service_state,
+                merge_distinct = service_state.a ~= service_state.b,
+                a_changed = service_state.a.changed, a_keep_a = service_state.a.keep_a, a_keep_b = service_state.a.keep_b,
+                b_changed = service_state.b.changed, b_keep_a = service_state.b.keep_a, b_keep_b = service_state.b.keep_b,
                 obsolete = service_state.obsolete,
                 rank_2 = service_state.ranks[2],
                 rank_3 = service_state.ranks[3],

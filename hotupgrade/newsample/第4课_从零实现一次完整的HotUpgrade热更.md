@@ -1032,7 +1032,7 @@ skynet.start(function()
     print("模块缓存别名保持:", after.player.module_alias_same)
     print("业务函数已替换:", after.player.load_changed)
     print("旧闭包的攻击力:", after.player.initial_attack)
-    print("原 Service patching:", after.player_service.patching)
+    print("原 Service patching:", after.player.patching)
 
     -- 创建第二个 PlayerService，直接运行 V2。
     local second_service_handle = hot.newservice("player_service")
@@ -1183,7 +1183,7 @@ Controller
 
 此时还没有向 PlayerService 发送任何更新命令。
 
-### 2. 为什么 `run()` 不直接加载 Patch，而要先等待生命周期屏障？
+### 2. 为什么 `run_batch()` 先等待创建和模块登记？
 
 接下来执行权来到 Controller 新协程。
 
@@ -1193,7 +1193,7 @@ Controller
 
 调用者是刚才 `M:begin()` 创建的 `skynet.fork()` 协程。
 
-先看 `run()` 的开头，这是一段连续真实源码：
+先看 `run_batch()` 的开头，这是一段连续真实源码：
 
 ```lua
 function M:run_batch(batch, request)
@@ -1206,7 +1206,9 @@ function M:run_batch(batch, request)
     if self.active_batch ~= batch then
         return
     end
-    self:advance_deployment()
+    -- 扫描和文件快照阶段同步执行；Prepare 开始后重新开放接纳窗口。
+    self.phase = "DEPLOYING"
+    batch.phase = "DEPLOYING"
     local ok, message = pcall(function()
         local loaded = self:load_patch(request)
         if not loaded.ok then
@@ -1235,11 +1237,11 @@ function M:run_batch(batch, request)
 
 `module_load_count` 记录尚未完成或取消的首次模块加载许可。
 
-只要任一计数不为零，`run()` 就通过 `skynet.wait()` 等待。
+只要任一计数不为零，`run_batch()` 就通过 `skynet.wait()` 等待。此时创建和首次加载仍允许进入，因此父初始化需要创建子 Service、模块加载需要继续加载依赖，都可以正常完成。新增操作继续计数，不能漏过排空。
 
-当这些操作完成时，相应的登记或取消函数会更新计数，并调用 `advance_deployment()`。当两个计数都归零时，它会设置阶段并唤醒等待中的发布协程。
+当这些操作完成时，相应的登记或取消函数会更新计数，并调用 `wake_batch()`。两个计数都归零时，它只唤醒正在等待的发布协程，不推进阶段。最后关闭门禁的决定要等 Prepare 和新增目标全部收口。
 
-`skynet.wakeup()` 只是让协程有机会恢复，`run()` 恢复后仍然重新检查计数以及当前 `batch` 的身份。
+`skynet.wakeup()` 只是让协程有机会恢复，`run_batch()` 恢复后仍然重新检查计数以及当前 `batch` 的身份。
 
 在我们这次 Sample 中，第一次 PlayerService 的 `init` RPC 已经成功返回，创建和模块登记都已完成，因此两个计数都是零，不需要实际等待。
 
@@ -1253,7 +1255,7 @@ function M:run_batch(batch, request)
 
 ### 3. Controller 怎样读取发布包并确定目标？
 
-生命周期屏障通过后，`run()` 进入：
+当前在途操作完成后，`run_batch()` 进入：
 
 ```lua
 local loaded = self:load_patch(request)
@@ -1302,44 +1304,63 @@ end
 
 因为它是用于升级现存 PlayerService 的一次性脚本，而不是以后 Skynet 创建 Service 时要加载的入口文件。
 
-分类之后，`M:load_patch()` 再根据 Controller 已保存的 `targets` 登记表确定真正需要发送控制 RPC 的目标。
+分类之后，`M:load_patch()` 调用内部 `match_targets()`，根据 Controller 已保存的 `targets` 登记表确定初始目标。Prepare 期间新增登记或模块声明后，仍调用这个匹配函数，但复用已经冻结的 Patch，不重新读文件。
 
-真实源码的目标匹配部分位于 `M:load_patch()`：
+真实源码的目标匹配函数位于同一个 Controller 文件，由 `M:load_patch()` 和 Prepare 收口过程共同调用：
 
 ```lua
-local targets = {} -- 本批需要执行原有更新协议的真实 Service。
-local matched = {} -- 当前登记快照已覆盖的 Service .patch 文件。
-for _, record in pairs(self.targets) do
-    local modules = {}
-    for _, entry in ipairs(loaded.patch.modules) do
-        if record.modules[entry.name] then
-            modules[#modules + 1] = entry
+-- 对同一份冻结 Patch 匹配当前登记信息；Prepare 后重用，不重新读取或执行源码。
+---@param registered_services table<integer, FlyWowHotUpgradeRegisteredService> Controller 当前已登记的 Service
+---@param selected_patch_path string 发布包相对路径，仅用于匹配失败诊断
+local function match_targets(patch, registered_services, selected_patch_path)
+    -- 从当前登记信息选出运行时接收者；只有一次性 Service .patch 强制要求目标存在。
+    ---@type FlyWowHotUpgradeBatchTarget[]
+    local targets = {} -- 本批需要执行原有更新协议的真实 Service。
+    local matched = {} -- 当前登记快照已覆盖的 Service .patch 文件。
+    for _, record in pairs(registered_services) do
+        local modules = {}
+        for _, entry in ipairs(patch.modules) do
+            if record.modules[entry.name] then
+                modules[#modules + 1] = entry
+            end
+        end
+
+        local service = patch.service_patches[record.service_name]
+        if service and not record.has_service_update then
+            return hotupgrade_result.failure("HU_SERVICE_PATCH_UNSUPPORTED", selected_patch_path .. "/" .. service.entry_file
+                .. ": 目标 " .. record.service_handle .. " 未提供 Service 内部更新入口")
+        end
+
+        if service then
+            matched[service.entry_file] = true
+        end
+
+        if #modules > 0 or service then
+            targets[#targets + 1] =
+            {
+                service_handle = record.service_handle,
+                modules = modules,
+                service_source = service and service.source,
+                service_entry_file = service and service.entry_file,
+            }
+        end
+    end
+    -- 完整 .lua 无运行时接收者时只部署；一次性 .patch 必须匹配现存目标。
+    for service_name, entry in pairs(patch.service_patches) do
+        if not matched[entry.entry_file] then
+            return hotupgrade_result.failure("HU_TARGET_MISSING", selected_patch_path .. "/" .. entry.entry_file
+                .. ": 没有已登记目标匹配 Service 名称 " .. service_name)
         end
     end
 
-    local service = loaded.patch.services[record.service_name]
-    if service and not record.has_service_update then
-        return hotupgrade_result.failure("HU_SERVICE_PATCH_UNSUPPORTED", request.path .. "/" .. service.entry_file
-            .. ": 目标 " .. record.service_handle .. " 未提供 Service 内部更新入口")
-    end
-
-    if service then
-        matched[service.entry_file] = true
-    end
-
-    if #modules > 0 or service then
-        targets[#targets + 1] =
-        {
-            service_handle = record.service_handle,
-            modules = modules,
-            service_source = service and service.source,
-            service_entry_file = service and service.entry_file,
-        }
-    end
+    table.sort(targets, function(left, right)
+        return left.service_handle < right.service_handle
+    end)
+    return hotupgrade_result.success({targets = targets})
 end
 ```
 
-这是 `M:load_patch()` 中的连续代码，没有重新编写算法。
+其中 `patch` 是同一份冻结源码，`registered_services` 是 Controller 当前的登记表，`selected_patch_path` 只用于错误诊断。首次匹配失败仍在任何目标控制 RPC 之前退出；Prepare 后重匹配失败则撤销已经参与的目标。
 
 Controller 从 `self.targets` 取出此前登记的 `first_service_handle`。
 
@@ -1388,11 +1409,11 @@ Controller 只知道应该把哪些源码发送给哪个 Service。
 
 `loaded.patch`：本次完整发布包的冻结内容。
 
-`loaded.targets`：本次要执行运行时更新的目标列表。
+`loaded.targets`：首次匹配到的运行时更新目标，Prepare 期间还可能补入新目标。
 
-接下来，`run()` 先读取正式宿主目录中每份将被部署的 `.lua` 文件的旧内容，保存为 `file.old_source`，供发布决定前失败时恢复。
+接下来，`run_batch()` 先读取正式宿主目录中每份将被部署的 `.lua` 文件的旧内容，保存为 `file.old_source`，供发布决定前失败时恢复。
 
-然后固定：
+然后保存冻结文件和初始目标：
 
 ```lua
 batch.files = loaded.patch.files
@@ -1413,7 +1434,7 @@ service/player_service.lua
 
 到这里，Controller 终于可以开始联系 PlayerService。
 
-#### 第二次状态快照：目标和文件已经固定
+#### 第二次状态快照：文件已冻结，初始目标已匹配
 
 ```text
 Controller
@@ -1455,24 +1476,69 @@ batch.targets = loaded.targets
 batch.target_count = #loaded.targets
 self.phase = "APPLYING"
 
--- 逐个调用 before_upgrade；全部目标成功后才进入 Update。
-batch.phase = "PREPARE"
+-- Prepare 期间仍用旧宿主文件；保留每个目标的参与记录，新目标补做一次 Prepare。
+local targets_by_handle = {} -- 本批记录的临时索引；重匹配时保留 participated 和恢复信息。
 for _, target in ipairs(batch.targets) do
+    targets_by_handle[target.service_handle] = target
+end
+
+batch.phase = "PREPARE"
+while true do
+    for _, target in ipairs(batch.targets) do
+        if batch.cancelled then
+            batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
+            return
+        end
+        if not target.participated then
+            batch.current_service_handle = target.service_handle
+            target.participated = true
+            local answer = self:step(batch, target, "prepare")
+            if not answer.ok then
+                target.result = answer
+                batch.error = answer
+                return
+            end
+        end
+    end
+
+    -- 回调可能等待创建或首次加载；允许这些依赖完成，完成通知或取消会唤醒本批。
+    while not batch.cancelled and (self.creation_count > 0 or self.module_load_count > 0) do
+        batch.waiter = coroutine.running()
+        skynet.wait(batch.waiter)
+        batch.waiter = nil
+    end
     if batch.cancelled then
         batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
         return
     end
-    batch.current_service_handle = target.service_handle
-    target.participated = true
-    local answer = self:step(batch, target, "prepare")
-    if not answer.ok then
-        target.result = answer
-        batch.error = answer
+
+    -- 同一份冻结源码覆盖新增登记和模块声明；匹配失败时仍保留旧记录用于 Abort。
+    local matched = match_targets(loaded.patch, self.targets, request.path)
+    if not matched.ok then
+        batch.error = matched
         return
+    end
+
+    local needs_prepare = false
+    for index, current in ipairs(matched.targets) do
+        local target = targets_by_handle[current.service_handle]
+        if target then
+            target.modules = current.modules
+        else
+            target = current
+            targets_by_handle[target.service_handle] = target
+            needs_prepare = true
+        end
+        matched.targets[index] = target
+    end
+    batch.targets = matched.targets
+    batch.target_count = #batch.targets
+    if not needs_prepare then
+        break
     end
 end
 
--- Prepare 已确认全部业务排空，现在逐个更新现存目标。
+-- 最终匹配、计数检查到进入 Update 之间不 yield；此刻一次性关闭创建和加载门禁。
 batch.phase = "UPDATE"
 for _, target in ipairs(batch.targets) do
     if batch.cancelled then
@@ -1498,7 +1564,13 @@ end
 
 `hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:run_batch()`。
 
-这里将 Prepare 和 Update 写成两个顺序执行的循环。Controller 先等待全部 Prepare 成功返回，再开始 Update。
+这里的外层 `while true` 只覆盖 Prepare 收口。它依次做三件事：给尚未参与的目标发 Prepare；等待回调期间产生的创建和首次加载完成；用冻结 Patch 重新匹配当前登记信息。
+
+`targets_by_handle` 是本批记录的临时索引，让重匹配复用同一个目标记录。已经成功 Prepare 的目标保留 `participated=true`，下一轮不会重复调用回调；它新增的受影响模块写入 `target.modules`。新增目标则在下一轮执行一次 Prepare。
+
+举例：A 正在排空的业务创建 B，B 初始化又创建 C。此时 B、C 都可正常启动、加载旧文件并登记；Controller 将匹配本批 Patch 的 B、C 纳入目标，再让它们各做一次 Prepare。没有匹配的 Service 不做 Prepare，但其创建和登记仍计数。
+
+最终一轮确认创建和加载计数为零、没有待 Prepare 的新目标后，退出循环并立即设置 `batch.phase="UPDATE"`。这几步之间没有 yield，因此不会夹入一项已经获准却未被计入最终清单的操作。从这时起，新创建和首次加载才等待发布终态；业务代码不需要处理发布重试。
 
 假设将来有多个 PlayerService 需要更新，那么执行顺序是：
 
@@ -1690,7 +1762,7 @@ end
 
 Controller 中先前 yield 的 `M:step()` 恢复，接着返回 `M:run_batch()`。
 
-**到这里，Prepare 才真正完成。**
+**到这里，当前 PlayerService 的 Prepare RPC 已完成。** Controller 还要等待这期间产生的创建、首次加载并重匹配；所有匹配目标都准备好后，才统一进入 Update。Sample 没有新增操作，因此最终仍只有原 PlayerService。
 
 我们这次没有模拟耗时业务，因此在实际运行中，这个等待通常会很快完成。不过它所建立的安全条件，是后面原地修改 Lua 对象的前提。
 
@@ -1727,7 +1799,7 @@ Controller
 
 ### 6. Update：真正修改运行中的 Lua 对象
 
-现在 `M:run_batch()` 已经完成所有目标的 Prepare。
+现在 `M:run_batch()` 已完成所有匹配目标的 Prepare、在途操作排空和最终匹配。它连续设置 `batch.phase="UPDATE"`，关闭创建和首次加载门禁，然后开始 Update。
 
 Controller 将 `batch.phase` 设为 `"UPDATE"`，并进入独立的 Update 循环。
 
@@ -1870,34 +1942,38 @@ local ok, service = pcall(stage_service, request.service_source)
 
 完整实现：
 
-文件顶部已加载 flywow_hotupgrade_common；这里使用 MAX_STATE_DEPTH，与状态快照复制共享同一嵌套层数上限。
+文件顶部已加载 flywow_hotupgrade_common；这里使用 MAX_STATE_DEPTH、MAX_STATE_FIELDS，与状态快照复制统一维护嵌套与字段限制。
 
 ```lua
--- 只把 Patch 提供的字段合入候选状态；遗漏字段保留，nil 不表达删除。
+-- 按路径合并部分更新：旧字段保留，Patch 的共享表在不同分支分别应用。
 local function merge_service_state(target_state, update_state)
-    local update_targets = {}
-    local function merge_table(target_table, source_table, nesting_depth)
-        local mapped_target = update_targets[source_table]
-        if mapped_target then
-            return mapped_target
-        end
+    local ancestors   = {} -- 只记录当前递归路径；遇到 Patch 循环时连回本路径的目标祖先。
+    local field_count = 0  -- 本次合并实际展开的字段数，防止共享数据沿多条路径展开后失控。
 
+    local function merge_table(target_table, source_table, nesting_depth)
         assert(nesting_depth <= hotupgrade_common.MAX_STATE_DEPTH, "Service 状态更新嵌套超过限制")
-        update_targets[source_table] = target_table
+        ancestors[source_table] = target_table
         for key, update_value in pairs(source_table) do
-            local current_value = rawget(target_table, key)
-            if type(update_value) == "table" then
-                if type(current_value) == "table" then
-                    rawset(target_table, key, merge_table(current_value, update_value, nesting_depth + 1))
-                else
-                    rawset(target_table, key, merge_table({}, update_value, nesting_depth + 1))
-                end
-            else
+            field_count = field_count + 1
+            assert(field_count <= hotupgrade_common.MAX_STATE_FIELDS, "Service 状态更新展开超过字段限制")
+            if type(update_value) ~= "table" then
                 rawset(target_table, key, update_value)
+            elseif ancestors[update_value] then
+                -- 循环引用在本分支闭合；不会复用已经完成的兄弟分支。
+                rawset(target_table, key, ancestors[update_value])
+            else
+                local target_child = rawget(target_table, key)
+                if type(target_child) ~= "table" then
+                    target_child = {}
+                end
+                merge_table(target_child, update_value, nesting_depth + 1)
+                rawset(target_table, key, target_child)
             end
         end
-        return target_table
+
+        ancestors[source_table] = nil
     end
+
     merge_table(target_state, update_state, 1)
 end
 
@@ -1959,6 +2035,43 @@ end
 ```
 
 这里的 `merge_service_state()` 负责递归合并部分更新；`stage_service()` 保存旧快照、运行迁移并生成完整候选状态。两者都只处理隔离数据，不在 Stage 阶段写线上状态。
+
+Patch 中同一张表被多个路径引用时，各路径分别与自己的旧值合并，不据此建立新的线上共享关系。例如旧状态和完整 Service Patch 如下：
+
+```lua
+-- Service 原有状态
+local state = {
+    a = {keep_a = 1},
+    b = {keep_b = 2},
+}
+```
+
+```lua
+return function(state)
+    return {
+        migrate = function(old_state)
+            local shared = {changed = 3}
+            return {a = shared, b = shared}
+        end,
+    }
+end
+```
+
+提交后结果是：
+
+```lua
+print(state.a == state.b) -- false
+print(state.a.changed)    -- 3
+print(state.a.keep_a)     -- 1
+print(state.a.keep_b)     -- nil
+print(state.b.changed)    -- 3
+print(state.b.keep_a)     -- nil
+print(state.b.keep_b)     -- 2
+```
+
+旧状态原有的共享引用仍随快照保留；向同一张旧表的不同路径提供冲突字段，属于 Patch 自身的冲突，不由框架裁决。Patch 中的循环引用只连接当前合并路径上的目标祖先；同一张循环表被不同分支复用时，各分支分别闭合循环。状态根表身份保持不变，不保证嵌套表身份。合并展开最多处理 10000 个字段，嵌套深度最多 128 层；候选状态仍须通过完整快照检查，任何准备失败均不写线上状态。
+
+实现中的 `ancestors` 只记录当前尚未返回的递归路径，用于处理循环引用；一个分支处理完后就移除记录。同一张 Patch 表随后出现在兄弟分支时，会重新合入该分支自己的旧表，因此不会串联两个旧状态分支。
 
 我们沿执行顺序看。
 
@@ -2908,14 +3021,16 @@ bash hotupgrade/lesson4/run.sh ../skynet
 ```text
 主 Service：begin({path="v2"})
     ↓ RPC
-Controller：建立 batch / skynet.fork(run)
+Controller：建立 batch / skynet.fork(run_batch)
     ↓
-生命周期屏障：等待创建和首次加载完成
+初始排空：继续接纳创建和首次加载，等待在途操作完成
     ↓
-加载发布包：冻结源码 / 确定目标 / 保存旧文件
+加载发布包：冻结源码 / 初次匹配目标 / 保存旧文件
     ↓ RPC
-PlayerService Prepare：patching=true / 等待 queue 排空
-    ↓ RPC
+PlayerService Prepare：patching=true / 等待 queue 排空，仍允许完成创建和首次加载
+    ↓
+Controller：等待新增操作完成 / 用冻结 Patch 重匹配 / 新目标补做 Prepare
+    ↓ 无待准备目标、在途计数为零，连续关门
 PlayerService Update / Stage：准备候选与旧快照
     ↓
 PlayerService Update / Activate：原地更新模块、状态和业务函数

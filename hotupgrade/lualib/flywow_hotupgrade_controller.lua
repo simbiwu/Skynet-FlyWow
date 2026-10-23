@@ -15,20 +15,26 @@ local M =
     pending_creations    = nil, -- 尚未完成创建或首次登记的记录；完成后由 finish_creation 移除。
     creation_handles     = nil, -- 原生返回的真实 Service handle 到创建记录的索引，用于关联早到登记。
     registration_waiters = nil, -- 等待原生 Service handle 建立映射的登记协程；映射完成后唤醒。
-    creation_count       = nil, -- 尚未完成原生创建或首次登记的数量；决定何时解除部署等待。
+    creation_count       = nil, -- 尚未完成创建和首次登记的数量；归零后批次可重匹配并完成 Prepare 收口。
     module_loads         = nil, -- 许可 ID 到来源 Service/模块名的映射；登记或取消时移除。
-    module_load_count    = nil, -- 正在执行首次加载与登记的许可数；决定何时解除部署等待。
+    module_load_count    = nil, -- 正在执行首次加载与登记的许可数；全部完成后才能关闭 Update 门禁。
     module_sequence      = nil, -- 本 Controller 内递增的许可序号，用来拒绝重复消费。
     sequence             = nil, -- 本 Controller 生命周期内递增的批次序号，用来拒绝迟到控制消息。
     -- Controller 阶段：IDLE -> WAITING_CREATIONS -> DEPLOYING -> APPLYING -> COMPLETED。
     -- 故障恢复成功后回到 IDLE；恢复未确认时进入 FAILED_LOCKED，显式确认后回到 IDLE。
-    phase                = nil, -- Controller 生命周期/发布门禁；批次进度与结果另存于 active_batch.phase。
-    lifecycle_waiters    = nil, -- 发布屏障期间等待创建或首次模块加载的协程，终态时统一唤醒。
+    phase                = nil, -- Controller 生命周期；APPLYING 内由 active_batch.phase 区分 Prepare 接纳与 Update 关门。
+    lifecycle_waiters    = nil, -- Update 起等待创建或首次模块加载的协程，终态时统一唤醒。
     unique_services      = nil, -- 逻辑唯一 Service 名到在途结果/Service handle 的映射，仅限本 Controller。
     active_batch         = nil, -- 当前唯一活动批次；批次结束后移入 last_batch。
     last_batch           = nil, -- 最近结束批次的结果；更早批次不保留。
     recovery_required    = nil, -- 宿主文件或目标恢复未确认时阻止后续发布。
 }
+
+-- 排空和 Prepare 期间允许完成依赖；进入 Update 后，后续请求才等待发布终态。
+local function lifecycle_closed(controller)
+    return controller.phase == "DEPLOYING"
+        or (controller.phase == "APPLYING" and controller.active_batch.phase ~= "PREPARE")
+end
 
 -- Native 失败时以第二返回值返回带 code 字段的错误对象。
 local function native_code(native_error)
@@ -39,7 +45,21 @@ local function native_code(native_error)
     return "HU_NATIVE_ERROR"
 end
 
--- 宿主根目录相对 Lua 路径对应 Controller 使用的唯一模块登记名。
+-- 校验 Skynet Service 入口名；斜杠分隔的名称直接对应嵌套 Service 文件路径。
+local function valid_service_name(service_name)
+    if type(service_name) ~= "string" or service_name == "" or service_name:find("\\", 1, true)
+        or service_name:sub(1, 1) == "/" or service_name:sub(-1) == "/" or service_name:find("//", 1, true) then
+        return false
+    end
+
+    for segment in service_name:gmatch("[^/]+") do
+        if segment == "." or segment == ".." or not segment:match("^[%w_.%-]+$") then
+            return false
+        end
+    end
+    return true
+end
+
 local function module_name(relative_path)
     if relative_path:sub(-4) ~= ".lua" or relative_path:find("\\", 1, true) then
         return nil
@@ -105,8 +125,8 @@ local function build_patch(patch_base_path, selected_patch_path, service_path)
         end
 
         if is_patch then
-            local name = entry.file:sub(#service_prefix + 1, -7):gsub("/", ".")
-            if name == "" or not name:match("^[%w_.%-]+$") or service_patches[name] then
+            local name = entry.file:sub(#service_prefix + 1, -7)
+            if not valid_service_name(name) or service_patches[name] then
                 return hotupgrade_result.failure("HU_INVALID_PATCH", "Service 路径映射重复或无效: " .. entry.file)
             end
             service_patches[name] = {name = name, entry_file = entry.file, source = entry.source}
@@ -173,7 +193,7 @@ end
 ---@field phase string 本批最终或当前阶段
 ---@field success integer 成功目标数
 ---@field failed integer 失败目标数
----@field target_count integer 本批目标数
+---@field target_count integer 当前匹配目标数；Prepare 期间可增长，Update 前确定最终数量
 ---@field current_service_handle? integer status 查询时当前或最近一次处理的业务 Service handle
 ---@field results FlyWowHotUpgradeBatchTargetResult[] 各业务 Service 的处理结果
 ---@field error? FlyWowHotUpgradeResult 本批失败诊断
@@ -185,11 +205,11 @@ end
 ---@field sequence integer Controller 生命周期内递增的本批序号
 ---@field phase string 本批当前阶段及终态
 ---@field results FlyWowHotUpgradeBatchTargetResult[] 按目标记录的本批结果
----@field targets FlyWowHotUpgradeBatchTarget[] 当前批次冻结的目标快照
+---@field targets FlyWowHotUpgradeBatchTarget[] Prepare 期间补齐的目标；进入 Update 前固定，保留各目标参与记录
 ---@field files? table[] 本批冻结的宿主文件及恢复快照
 ---@field success integer 成功目标数
 ---@field failed integer 失败目标数
----@field target_count integer 本批目标数
+---@field target_count integer 当前匹配目标数；Prepare 期间可增长，Update 前确定最终数量
 ---@field current_service_handle? integer 当前或最近一次处理的业务 Service handle；status 对外返回此值
 ---@field waiter? thread 等待创建/登记屏障或显式恢复确认的协程
 ---@field cancelled? boolean 管理端是否请求在安全点终止本批
@@ -302,7 +322,7 @@ function M:finish_creation(creation)
             self.creation_handles[creation.service_handle] = nil
         end
         self.creation_count = self.creation_count - 1
-        self:advance_deployment()
+        self:wake_batch()
         self:wake_registration()
     end
 end
@@ -319,10 +339,10 @@ end
 ---@field arguments table 带 n 的启动参数数组；按原生 newservice 约束传递
 ---@field global? boolean true 明确拒绝；不支持跨节点全局唯一
 
---- 等待发布门禁；只有成功终态或显式恢复确认后重新检查接纳条件。
---- 等待中的请求不计入在途创建/许可，避免阻塞当前批次排空。
+--- Prepare 前后的排空窗口继续接纳依赖；Update 起等待发布终态。
+--- 关门后的等待请求尚未开始，不计入当前批次的在途操作。
 function M:wait_lifecycle()
-    while self.phase == "WAITING_CREATIONS" or self.phase == "DEPLOYING" or self.phase == "APPLYING" do
+    while lifecycle_closed(self) do
         local waiter = coroutine.running()
         local waiting = {}
         self.lifecycle_waiters[waiter] = waiting
@@ -339,23 +359,18 @@ function M:wait_lifecycle()
 end
 
 local function valid_service_creation_request(request, source)
-    return math.type(source) == "integer" and source > 0 and type(request.service_name) == "string"
-        and request.service_name:match("^[%w_.%-]+$") and type(request.arguments) == "table"
+    return math.type(source) == "integer" and source > 0 and valid_service_name(request.service_name)
+        and type(request.arguments) == "table"
         and math.type(request.arguments.n) == "integer" and request.arguments.n >= 0
         and (request.global == nil or type(request.global) == "boolean")
 end
 
---- 已校验请求的共同创建过程；原生调用可能 yield，返回 handle 后仍持有登记屏障。
+--- 已通过门禁和参数检查的共同创建过程；原生调用可能 yield，计数保留至登记完成。
 ---@param request FlyWowHotUpgradeServiceCreationRequest 已校验的创建请求
 ---@param source integer 已校验的真实创建者来源
 ---@param unique_name? string 仅本地唯一入口在内部传入的逻辑预留名
 ---@return FlyWowHotUpgradeResult 成功时包含 service_handle
 local function start_service(self, request, source, unique_name)
-    local admitted = self:wait_lifecycle()
-    if not admitted.ok then
-        return admitted
-    end
-
     local creation =
     {
         owner           = source,                -- 原创建者拥有返回后未登记 Service 的取消权。
@@ -404,12 +419,18 @@ function M:uniqueservice(request, source)
     end
 
     local unique = self.unique_services[request.service_name]
+    if not (unique and unique.service_handle) then
+        local admitted = self:wait_lifecycle()
+        if not admitted.ok then
+            return admitted
+        end
+        -- 等待门禁会 yield；恢复后重查唯一名，再决定等待、复用或预留。
+        unique = self.unique_services[request.service_name]
+    end
+
     if unique then
         if unique.service_handle then
             return hotupgrade_result.success({service_handle = unique.service_handle})
-        end
-        if self.phase == "FAILED_LOCKED" then
-            return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "发布失败，唯一创建请求未开始")
         end
         local waiter = coroutine.running()
         unique.waiters[waiter] = true
@@ -451,6 +472,10 @@ function M:newservice(request, source, unique_name)
         return hotupgrade_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "snaxd 不满足受管理 Service 自行调用 register_service 的登记合同")
     end
 
+    local admitted = self:wait_lifecycle()
+    if not admitted.ok then
+        return admitted
+    end
     return start_service(self, request, source, unique_name)
 end
 
@@ -552,7 +577,7 @@ function M:complete_module_load(request, source, cancel)
     self.module_loads[request.permit_id] = nil
     target.loading_modules[request.name] = nil
     self.module_load_count = self.module_load_count - 1
-    self:advance_deployment()
+    self:wake_batch()
     return hotupgrade_result.success()
 end
 
@@ -613,7 +638,7 @@ function M:register(request, service_handle)
         creation = self.creation_handles[service_handle]
     end
 
-    if self.phase == "DEPLOYING" or self.phase == "APPLYING" or self.phase == "FAILED_LOCKED" then
+    if lifecycle_closed(self) or self.phase == "FAILED_LOCKED" then
         return hotupgrade_result.failure("HU_DEPLOYMENT_BLOCKED", "当前阶段不能登记新 Service")
     end
     -- 绑定真实来源并提交登记；完成后释放创建屏障。
@@ -631,7 +656,57 @@ function M:register(request, service_handle)
     return hotupgrade_result.success()
 end
 
---- 冻结文件并生成目标快照；不执行 Patch 代码、不读其他 Service Lua State。
+-- 对同一份冻结 Patch 匹配当前登记信息；Prepare 后重用，不重新读取或执行源码。
+---@param registered_services table<integer, FlyWowHotUpgradeRegisteredService> Controller 当前已登记的 Service
+---@param selected_patch_path string 发布包相对路径，仅用于匹配失败诊断
+local function match_targets(patch, registered_services, selected_patch_path)
+    -- 从当前登记信息选出运行时接收者；只有一次性 Service .patch 强制要求目标存在。
+    ---@type FlyWowHotUpgradeBatchTarget[]
+    local targets = {} -- 本批需要执行原有更新协议的真实 Service。
+    local matched = {} -- 当前登记快照已覆盖的 Service .patch 文件。
+    for _, record in pairs(registered_services) do
+        local modules = {}
+        for _, entry in ipairs(patch.modules) do
+            if record.modules[entry.name] then
+                modules[#modules + 1] = entry
+            end
+        end
+
+        local service = patch.service_patches[record.service_name]
+        if service and not record.has_service_update then
+            return hotupgrade_result.failure("HU_SERVICE_PATCH_UNSUPPORTED", selected_patch_path .. "/" .. service.entry_file
+                .. ": 目标 " .. record.service_handle .. " 未提供 Service 内部更新入口")
+        end
+
+        if service then
+            matched[service.entry_file] = true
+        end
+
+        if #modules > 0 or service then
+            targets[#targets + 1] =
+            {
+                service_handle = record.service_handle,
+                modules = modules,
+                service_source = service and service.source,
+                service_entry_file = service and service.entry_file,
+            }
+        end
+    end
+    -- 完整 .lua 无运行时接收者时只部署；一次性 .patch 必须匹配现存目标。
+    for service_name, entry in pairs(patch.service_patches) do
+        if not matched[entry.entry_file] then
+            return hotupgrade_result.failure("HU_TARGET_MISSING", selected_patch_path .. "/" .. entry.entry_file
+                .. ": 没有已登记目标匹配 Service 名称 " .. service_name)
+        end
+    end
+
+    table.sort(targets, function(left, right)
+        return left.service_handle < right.service_handle
+    end)
+    return hotupgrade_result.success({targets = targets})
+end
+
+--- 冻结文件并初次匹配目标；Prepare 后复用冻结源码重新匹配，不执行 Patch 代码。
 function M:load_patch(request)
     -- 先确认生命周期与路径请求有效，再从冻结 Patch 构造目标快照；此阶段不发送事务 RPC。
     if self.creation_count > 0 or self.module_load_count > 0 then
@@ -652,52 +727,11 @@ function M:load_patch(request)
         return loaded
     end
 
-    -- 固定运行时接收者；只有一次性 Service .patch 强制要求目标存在。
-    ---@type FlyWowHotUpgradeBatchTarget[]
-    local targets = {} -- 本批需要执行原有更新协议的真实 Service。
-    local matched = {} -- 当前登记快照已覆盖的 Service .patch 文件。
-    ---@type table<integer, FlyWowHotUpgradeRegisteredService>
-    local registered_services = self.targets
-    for _, record in pairs(registered_services) do
-        local modules = {}
-        for _, entry in ipairs(loaded.patch.modules) do
-            if record.modules[entry.name] then
-                modules[#modules + 1] = entry
-            end
-        end
-
-        local service = loaded.patch.service_patches[record.service_name]
-        if service and not record.has_service_update then
-            return hotupgrade_result.failure("HU_SERVICE_PATCH_UNSUPPORTED", request.path .. "/" .. service.entry_file
-                .. ": 目标 " .. record.service_handle .. " 未提供 Service 内部更新入口")
-        end
-
-        if service then
-            matched[service.entry_file] = true
-        end
-
-        if #modules > 0 or service then
-            targets[#targets + 1] =
-            {
-                service_handle = record.service_handle,
-                modules = modules,
-                service_source = service and service.source,
-                service_entry_file = service and service.entry_file,
-            }
-        end
+    local matched = match_targets(loaded.patch, self.targets, request.path)
+    if not matched.ok then
+        return matched
     end
-    -- 完整 .lua 无运行时接收者时只部署；一次性 .patch 必须匹配现存目标。
-    for service_name, entry in pairs(loaded.patch.service_patches) do
-        if not matched[entry.entry_file] then
-            return hotupgrade_result.failure("HU_TARGET_MISSING", request.path .. "/" .. entry.entry_file
-                .. ": 没有已登记目标匹配 Service 名称 " .. service_name)
-        end
-    end
-
-    table.sort(targets, function(left, right)
-        return left.service_handle < right.service_handle
-    end)
-    return hotupgrade_result.success({patch = loaded.patch, targets = targets})
+    return hotupgrade_result.success({patch = loaded.patch, targets = matched.targets})
 end
 
 --- 直接使用 Skynet 原生 call；失败不代表远端操作取消，协调方仍须明确恢复。
@@ -741,8 +775,9 @@ function M:run_batch(batch, request)
     if self.active_batch ~= batch then
         return
     end
-    -- 初始计数为零时不会触发完成回调，由此处推进到 DEPLOYING。
-    self:advance_deployment()
+    -- 扫描和文件快照阶段同步执行；Prepare 开始后重新开放接纳窗口。
+    self.phase = "DEPLOYING"
+    batch.phase = "DEPLOYING"
     -- 屏障排空后加载并匹配发布包，再准备可恢复的宿主文件快照。
     local ok, message = pcall(function()
         local loaded = self:load_patch(request)
@@ -759,30 +794,75 @@ function M:run_batch(batch, request)
             end
             file.old_source = old_source
         end
-        -- 固定 Patch 文件和匹配目标快照，后续提交只使用这份批次数据。
+        -- 固定 Patch 文件和初始目标；Prepare 期间补齐登记信息，源码和旧文件快照不再读取。
         batch.files = loaded.patch.files
         batch.targets = loaded.targets
         batch.target_count = #loaded.targets
         self.phase = "APPLYING"
 
-        -- 逐个调用 before_upgrade；全部目标成功后才进入 Update。
-        batch.phase = "PREPARE"
+        -- Prepare 期间仍用旧宿主文件；保留每个目标的参与记录，新目标补做一次 Prepare。
+        local targets_by_handle = {} -- 本批记录的临时索引；重匹配时保留 participated 和恢复信息。
         for _, target in ipairs(batch.targets) do
+            targets_by_handle[target.service_handle] = target
+        end
+
+        batch.phase = "PREPARE"
+        while true do
+            for _, target in ipairs(batch.targets) do
+                if batch.cancelled then
+                    batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
+                    return
+                end
+                if not target.participated then
+                    batch.current_service_handle = target.service_handle
+                    target.participated = true
+                    local answer = self:step(batch, target, "prepare")
+                    if not answer.ok then
+                        target.result = answer
+                        batch.error = answer
+                        return
+                    end
+                end
+            end
+
+            -- 回调可能等待创建或首次加载；允许这些依赖完成，完成通知或取消会唤醒本批。
+            while not batch.cancelled and (self.creation_count > 0 or self.module_load_count > 0) do
+                batch.waiter = coroutine.running()
+                skynet.wait(batch.waiter)
+                batch.waiter = nil
+            end
             if batch.cancelled then
                 batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
                 return
             end
-            batch.current_service_handle = target.service_handle
-            target.participated = true
-            local answer = self:step(batch, target, "prepare")
-            if not answer.ok then
-                target.result = answer
-                batch.error = answer
+
+            -- 同一份冻结源码覆盖新增登记和模块声明；匹配失败时仍保留旧记录用于 Abort。
+            local matched = match_targets(loaded.patch, self.targets, request.path)
+            if not matched.ok then
+                batch.error = matched
                 return
+            end
+
+            local needs_prepare = false
+            for index, current in ipairs(matched.targets) do
+                local target = targets_by_handle[current.service_handle]
+                if target then
+                    target.modules = current.modules
+                else
+                    target = current
+                    targets_by_handle[target.service_handle] = target
+                    needs_prepare = true
+                end
+                matched.targets[index] = target
+            end
+            batch.targets = matched.targets
+            batch.target_count = #batch.targets
+            if not needs_prepare then
+                break
             end
         end
 
-        -- Prepare 已确认全部业务排空，现在逐个更新现存目标。
+        -- 最终匹配、计数检查到进入 Update 之间不 yield；此刻一次性关闭创建和加载门禁。
         batch.phase = "UPDATE"
         for _, target in ipairs(batch.targets) do
             if batch.cancelled then
@@ -919,14 +999,11 @@ function M:run_batch(batch, request)
     self:wake_lifecycle()
 end
 
--- 完成回调推进等待阶段，不轮询或超时删除创建记录。
-function M:advance_deployment()
-    if self.phase == "WAITING_CREATIONS" and self.creation_count == 0 and self.module_load_count == 0 then
-        self.phase = "DEPLOYING"
-        self.active_batch.phase = "DEPLOYING"
-        if self.active_batch.waiter then
-            skynet.wakeup(self.active_batch.waiter)
-        end
+-- 在途操作全部完成后只通知批次；最终关门由 run_batch 在 Prepare 收口后决定。
+function M:wake_batch()
+    local batch = self.active_batch
+    if batch and batch.waiter and self.creation_count == 0 and self.module_load_count == 0 then
+        skynet.wakeup(batch.waiter)
     end
 end
 
@@ -937,7 +1014,7 @@ function M:wake_lifecycle()
     end
 end
 
---- 接受发布并立即返回批次；协程等待已有创建/许可后读取发布包并完成更新。
+--- 接受发布并立即返回批次；Prepare 期间继续接纳依赖，最终排空后关闭门禁并更新。
 ---@param request FlyWowHotUpgradeManagementRequest path 指向发布包
 ---@return FlyWowHotUpgradeResult 成功仅表示接受请求，最终结果通过 status(batch_id) 查询
 function M:begin(request)
@@ -986,6 +1063,12 @@ function M:resolve_deployment(request)
     end
     if request.confirmation == "UNCHANGED" and batch.control_started then
         return hotupgrade_result.failure("HU_RECOVERY_CONFIRMATION_REQUIRED", "已向目标发送控制命令，不能声明运行时未发生变更")
+    end
+
+    -- 尚未发送目标控制命令的屏障可直接取消，并留下可查询的终态结果。
+    if self.phase == "WAITING_CREATIONS" or self.phase == "DEPLOYING" then
+        batch.phase = "ABORTED"
+        batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "宿主确认取消发布屏障")
     end
 
     self.active_batch = nil
@@ -1097,6 +1180,9 @@ function M:handle_command(command, request, source)
         end
 
         batch.cancelled = true
+        if batch.waiter then
+            skynet.wakeup(batch.waiter)
+        end
         return hotupgrade_result.success()
     end
 

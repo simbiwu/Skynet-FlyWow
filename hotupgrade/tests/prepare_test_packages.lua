@@ -49,6 +49,12 @@ end
 local cases =
 {
     module = {lualib = {["test_worker_logic.lua"] = module_v2}},
+    draining = {lualib = {["test_worker_logic.lua"] = module_v2,
+        ["hotupgrade_extra.lua"] = "return {value = function() return 2 end}"}},
+    drain_service = {lualib = {["test_worker_logic.lua"] = module_v2,
+        ["hotupgrade_extra.lua"] = "return {value = function() return 2 end}",
+        ["battle/state_sync/runtime.lua"] = "return {value = function() return 2 end}"},
+        service = {["skynet_hotupgrade_drain.patch"] = service}},
     combined = {lualib = {["test_worker_logic.lua"] = module_v2}, service = {["skynet_hotupgrade_worker.patch"] = service}},
     service = {service = {["skynet_hotupgrade_worker.patch"] = service}},
     stage_failure = {lualib = {["test_worker_logic.lua"] = module_v2}, service = {["skynet_hotupgrade_worker.patch"] = [[return function(state)
@@ -77,6 +83,13 @@ local cases =
             }
             updates.obsolete = nil
             return updates
+        end}
+    end]]}},
+    state_shared = {service = {["skynet_hotupgrade_worker.patch"] = [[return function()
+        return {migrate = function(old_state)
+            old_state.a.keep_a = 999
+            local shared = {changed = 3}
+            return {a = shared, b = shared}
         end}
     end]]}},
     bad_functions = {service = {["skynet_hotupgrade_worker.patch"] = [[return function()

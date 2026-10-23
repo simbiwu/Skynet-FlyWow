@@ -48,12 +48,19 @@ end
 scenarios['lifecycle'] = function()
     local lifecycle = initialize_controller()
     local launches_before_invalid_names = #module_state.launches
-    for _, command in ipairs({"newservice", "uniqueservice"}) do
-        local rejected = lifecycle:handle_command(command,
-            {service_name = "fixture/name", arguments = {n = 0}}, 1)
-        assert(rejected.code == "HU_INVALID_REQUEST")
+    for _, service_name in ipairs({"../fixture", "fixture//worker", "fixture/../worker", "/fixture"}) do
+        for _, command in ipairs({"newservice", "uniqueservice"}) do
+            local rejected = lifecycle:handle_command(command,
+                {service_name = service_name, arguments = {n = 0}}, 1)
+            assert(rejected.code == "HU_INVALID_REQUEST")
+        end
     end
     assert(#module_state.launches == launches_before_invalid_names)
+    module_state.launch_service_handle = 68
+    local nested_creation = lifecycle:handle_command("newservice",
+        {service_name = "battle/worker", arguments = {n = 0}}, 1)
+    assert(nested_creation.ok and module_state.launches[#module_state.launches].name == "battle/worker")
+    assert(lifecycle:handle_command("cancel_service_creation", {service_handle = 68}, 1).ok)
 
     local function blocked(instance)
         for _, command in ipairs({"unknown_command", "validate", "apply"}) do
@@ -148,6 +155,12 @@ scenarios['lifecycle'] = function()
     assert(lifecycle:handle_command("begin_module_load", {name = "extra"}, 90).code == "HU_SERVICE_NOT_REGISTERED")
     local started_lifecycle = publish(lifecycle, {path = "module"})
     assert(started_lifecycle.ok)
+    -- 只有 Update 起关闭门禁；在真实 Update 调用中挂起，验证后来的请求等待且不计数。
+    module_state.control_hook = function(service_handle, command)
+        if service_handle == 70 and command == "update" then coroutine.yield() end
+    end
+    module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+    assert(lifecycle.active_batch.phase == "UPDATE")
     local queued_result
     local queued = coroutine.create(function()
         queued_result = lifecycle:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 1)
@@ -163,6 +176,7 @@ scenarios['lifecycle'] = function()
     assert(coroutine.resume(module_waiter) and queued_module == nil)
     local view = lifecycle:handle_command("status", {}, 1).lifecycle
     assert(view.pending_creations == 0 and view.pending_module_loads == 0 and view.active_batch_id == started_lifecycle.batch_id)
+    module_state.control_hook = nil
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(queued_module.ok and lifecycle.module_load_count == 1)
     assert(lifecycle:handle_command("register_module", {name = "late", permit_id = queued_module.permit_id}, 70).ok)
@@ -265,13 +279,29 @@ scenarios['matching'] = function()
     assert(begun.ok and waiting.phase == "WAITING_CREATIONS")
     assert(waiting:handle_command("begin", {path = "module"}, 1).code == "HU_UPGRADE_BUSY")
     assert(waiting:handle_command("unknown_command", {}, 1).code == "HU_UNKNOWN_COMMAND")
-    assert(waiting:handle_command("register", metadata, 84).ok and waiting.phase == "DEPLOYING")
+    assert(waiting:handle_command("register", metadata, 84).ok and waiting.phase == "WAITING_CREATIONS")
     assert(waiting:handle_command("resolve_deployment", {batch_id = "stale"}, 1).code == "HU_BATCH_MISSING")
     assert(waiting:handle_command("resolve_deployment", {batch_id = begun.batch_id}, 1).code == "HU_RECOVERY_CONFIRMATION_REQUIRED")
     assert(waiting:handle_command("resolve_deployment", {batch_id = begun.batch_id, confirmed = true, confirmation = "UNCHANGED"}, 1).ok)
+    assert(waiting.last_batch.phase == "ABORTED"
+        and waiting.last_batch.error.code == "HU_ABORT_REQUESTED")
     -- 已取消的异步协程即使稍后被调度，也不能开始更新。
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(waiting.phase == "IDLE")
+
+    -- WAITING_CREATIONS 可在创建仍未完成时取消；随后清理原创建记录。
+    module_state.launch_service_handle = 86
+    local pending_creation = waiting:handle_command("newservice",
+        {service_name = "fixture", arguments = {n = 0}}, 1)
+    assert(pending_creation.ok)
+    local pending_batch = waiting:handle_command("begin", {path = "module"}, 1)
+    assert(pending_batch.ok and waiting.phase == "WAITING_CREATIONS")
+    assert(waiting:handle_command("resolve_deployment", {batch_id = pending_batch.batch_id,
+        confirmed = true, confirmation = "UNCHANGED"}, 1).ok)
+    assert(waiting.last_batch.phase == "ABORTED"
+        and waiting.last_batch.error.code == "HU_ABORT_REQUESTED")
+    module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+    assert(waiting:handle_command("cancel_service_creation", {service_handle = 86}, 1).ok)
 
     local allowed = waiting:handle_command("begin_module_load", {name = "later"}, 84)
     assert(allowed.ok)
@@ -282,19 +312,17 @@ scenarios['matching'] = function()
     assert(waiting:handle_command("register_module", {name = "later", permit_id = allowed.permit_id}, 84).ok)
     assert(waiting.phase == "COMPLETED")
 
-    -- begin 已接受后检查失败，status 保留诊断并唤醒排队创建。
+    -- begin 后仍接纳创建；完成登记后才能进行整包检查，失败前没有目标控制命令。
     local failed_batch = begin_deployment(waiting, "unmatched_service")
-    local queued_creation
     module_state.launch_service_handle = 85
-    local queued_waiter = coroutine.create(function()
-        queued_creation = waiting:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 1)
-    end)
-    assert(coroutine.resume(queued_waiter) and queued_creation == nil)
+    local admitted_creation = waiting:handle_command("newservice",
+        {service_name = "fixture", arguments = {n = 0}}, 1)
+    assert(admitted_creation.service_handle == 85 and waiting.creation_count == 1)
+    assert(waiting:handle_command("register", metadata, 85).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     local failed = waiting:handle_command("status", {batch_id = failed_batch}, 1)
     assert(failed.record.error.code == "HU_TARGET_MISSING" and not failed.record.control_started)
-    assert(waiting.phase == "IDLE" and queued_creation.service_handle == 85)
-    assert(waiting:handle_command("cancel_service_creation", {service_handle = 85}, 1).ok)
+    assert(waiting.phase == "IDLE" and waiting.targets[85])
 
     -- preload 由原生启动处理；Controller 不拒绝、不改写目标名或启动参数。
     module_state.shared_environment.preload = "fixture_preload.lua"
@@ -326,7 +354,7 @@ scenarios['paths'] = function()
     local paths = initialize_controller()
     assert(managed_register(paths,
         {modules = {"config.settings", "lualib.battle.state_sync.runtime", "lualib.packages.demo.init"},
-            has_service_update = true}, 50, "battle.worker").ok)
+            has_service_update = true}, 50, "battle/worker").ok)
     local loaded = paths:load_patch({path = "host_paths"})
     assert(loaded.ok and #loaded.patch.modules == 3)
     assert(loaded.patch.modules[1].entry_file == "config/settings.lua")
@@ -341,7 +369,7 @@ end
 scenarios['custom_paths'] = function()
     local changed = initialize_controller("actors")
     assert(managed_register(changed,
-        {modules = {}, has_service_update = true}, 60, "zone.player").ok)
+        {modules = {}, has_service_update = true}, 60, "zone/player").ok)
     assert(changed:load_patch({path = "custom_named_service"}).ok)
 end
 
@@ -397,12 +425,13 @@ scenarios['unique'] = function()
         new_unique = unique:handle_command("uniqueservice", {service_name = "fixture_other", arguments = {n = 0}}, 2)
     end)
     launch_count = #module_state.launches
-    assert(coroutine.resume(unique_waiter) and new_unique == nil and #module_state.launches == launch_count)
     module_state.launch_service_handle = 92
+    assert(coroutine.resume(unique_waiter) and new_unique.service_handle == 92)
+    assert(#module_state.launches == launch_count + 1 and unique.creation_count == 1)
+    assert(unique:handle_command("cancel_service_creation", {service_handle = 92}, 2).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(unique:handle_command("status", {batch_id = unique_batch}, 1).record.error.code == "HU_PATCH_EMPTY")
-    assert(unique.phase == "IDLE" and new_unique.service_handle == 92 and unique.creation_count == 1)
-    assert(unique:handle_command("cancel_service_creation", {service_handle = 92}, 2).ok)
+    assert(unique.phase == "IDLE" and unique.creation_count == 0)
 
     launch_count = #module_state.launches
     assert(unique:handle_command("uniqueservice", {global = true}, 1).code == "HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED")
@@ -432,6 +461,123 @@ scenarios['unique'] = function()
     module_state.control_hook = nil
     module_state.injected_control_failure = nil
     print("HOTUPGRADE_CONTROLLER_LOCAL_UNIQUE_OK")
+end
+
+-- 逐轮补齐创建链和模块声明；源码只冻结一次，旧目标的 Prepare 不重复。
+scenarios['draining'] = function()
+    local c = initialize_controller()
+    assert(managed_register(c, metadata, 10).ok)
+    assert(managed_register(c, {modules = {}, has_service_update = false}, 20).ok)
+    local native = require "flywow_hotupgrade_native"
+    local original_list = native.list_lua
+    local scans = 0
+    native.list_lua = function(...)
+        scans = scans + 1
+        return original_list(...)
+    end
+    local queued_unique = {}
+    local queued_permit
+    local launches_at_update
+    module_state.control_hook = function(service_handle, command, request)
+        if command == "prepare" and service_handle == 10 then
+            assert(c.active_batch.phase == "PREPARE")
+            assert(managed_register(c, metadata, 30).ok)
+            assert(managed_register(c, {modules = {}, has_service_update = false}, 31, "unaffected").ok)
+            assert(register_module(c, "lualib.hotupgrade_extra", 10).ok)
+            assert(register_module(c, "lualib.hotupgrade_extra", 20).ok)
+        elseif command == "prepare" and service_handle == 30 then
+            module_state.launch_service_handle = 40
+            assert(c:handle_command("uniqueservice",
+                {service_name = "child", arguments = {n = 0}}, 30).service_handle == 40)
+            assert(c:handle_command("register", metadata, 40).ok)
+        elseif command == "update" and service_handle == 10 then
+            assert(#request.modules == 2 and c.creation_count == 0 and c.module_load_count == 0)
+            launches_at_update = #module_state.launches
+            for index = 1, 2 do
+                local waiter = coroutine.create(function()
+                    queued_unique[index] = c:handle_command("uniqueservice",
+                        {service_name = "late", arguments = {n = 0}}, 10)
+                end)
+                assert(coroutine.resume(waiter) and not queued_unique[index])
+            end
+            local waiter = coroutine.create(function()
+                queued_permit = c:handle_command("begin_module_load", {name = "late"}, 10)
+            end)
+            assert(coroutine.resume(waiter) and queued_permit == nil)
+            assert(c.unique_services.late == nil and #module_state.launches == launches_at_update)
+            module_state.launch_service_handle = 50
+        end
+    end
+    local id = begin_deployment(c, "draining")
+    module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+    assert(c.last_batch.batch_id == id and c.last_batch.phase == "COMPLETED")
+    assert(c.last_batch.target_count == 4 and c.last_batch.success == 4 and scans == 1)
+    local prepares = {}
+    for _, operation in ipairs(module_state.operations) do
+        local service_handle = operation:match("^(%d+):prepare$")
+        if service_handle then prepares[service_handle] = (prepares[service_handle] or 0) + 1 end
+    end
+    for _, service_handle in ipairs({10, 20, 30, 40}) do
+        assert(prepares[tostring(service_handle)] == 1)
+    end
+    assert(not prepares["31"] and queued_unique[1].service_handle == 50
+        and queued_unique[2].service_handle == 50)
+    assert(#module_state.launches == launches_at_update + 1 and queued_permit.ok)
+    assert(c:handle_command("register_module",
+        {name = "late", permit_id = queued_permit.permit_id}, 10).ok)
+    assert(c:handle_command("cancel_service_creation", {service_handle = 50}, 10).ok)
+    assert(c.creation_count == 0 and c.module_load_count == 0 and next(c.lifecycle_waiters) == nil)
+end
+
+scenarios['drain_abort'] = function()
+    local c = initialize_controller()
+    assert(managed_register(c, metadata, 10).ok)
+    module_state.control_hook = function(service_handle, command)
+        if service_handle == 10 and command == "prepare" then
+            module_state.launch_service_handle = 30
+            assert(c:handle_command("newservice", {service_name = "child", arguments = {n = 0}}, 10).ok)
+        end
+    end
+    local id = begin_deployment(c, "module")
+    module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+    assert(c.active_batch.phase == "PREPARE" and c.active_batch.waiter and c.creation_count == 1)
+    assert(c:handle_command("resolve_deployment", {batch_id = id, confirmed = true,
+        confirmation = "CONVERGED_CACHE_CLEARED"}, 1).code == "HU_DEPLOYMENT_PHASE")
+    assert(c:handle_command("abort", {batch_id = id}, 1).ok)
+    assert(c.last_batch.phase == "ABORTED" and c.last_batch.error.code == "HU_ABORT_REQUESTED")
+    assert(table.concat(module_state.operations, ",") == "10:prepare,10:abort")
+    assert(c:handle_command("cancel_service_creation", {service_handle = 30}, 10).ok)
+    assert(c.phase == "IDLE" and c.creation_count == 0)
+end
+
+scenarios['drain_unsupported'] = function()
+    local c = initialize_controller()
+    assert(managed_register(c, {modules = metadata.modules, has_service_update = true}, 10).ok)
+    module_state.control_hook = function(service_handle, command)
+        if service_handle == 10 and command == "prepare" then
+            assert(managed_register(c, metadata, 30).ok)
+        end
+    end
+    local id = begin_deployment(c, "combined")
+    module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+    assert(c.last_batch.batch_id == id and c.last_batch.error.code == "HU_SERVICE_PATCH_UNSUPPORTED")
+    assert(c.last_batch.phase == "ABORTED" and c.phase == "IDLE")
+    assert(table.concat(module_state.operations, ",") == "10:prepare,10:abort")
+end
+
+scenarios['drain_new_failure'] = function()
+    local c = initialize_controller()
+    assert(managed_register(c, metadata, 10).ok)
+    module_state.control_hook = function(service_handle, command)
+        if service_handle == 10 and command == "prepare" then
+            assert(managed_register(c, metadata, 30).ok)
+            module_state.injected_control_failure = {service_handle = 30, command = "prepare"}
+        end
+    end
+    begin_deployment(c, "module")
+    module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+    assert(c.last_batch.phase == "ABORTED" and c.last_batch.failed == 2)
+    assert(table.concat(module_state.operations, ",") == "10:prepare,30:prepare,30:abort,10:abort")
 end
 
 scenarios['resources'] = function()

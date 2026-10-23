@@ -41,7 +41,7 @@ local function copy_state_graph(source_graph, target_graph)
         copied_tables[source_value] = target_table
         for key, child_source in pairs(source_value) do
             field_count = field_count + 1
-            assert(field_count <= 10000, "状态快照超过 10000 个字段")
+            assert(field_count <= hotupgrade_common.MAX_STATE_FIELDS, "状态快照超过字段限制")
             assert(type(key) == "string" or type(key) == "number" or type(key) == "boolean",
                 "状态字段必须使用标量键")
             target_table[key] = copy_state_value(child_source, nesting_depth + 1)
@@ -168,6 +168,8 @@ function M.stage(entries)
                 local snapshot = M.snapshot_state(entry.live.export_state())
                 assert(candidate.import_state(snapshot) ~= false, "模块拒绝状态导入")
             end
+            -- import_state 属于受信钩子，但可能改变候选导出图；提交前重新验证最终图。
+            check_exports(candidate, entry.name)
             entry.candidate = candidate
             entry.chunk = nil
         end

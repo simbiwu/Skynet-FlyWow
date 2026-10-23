@@ -53,7 +53,7 @@ package.loaded.skynet =
         module_state.operations[#module_state.operations + 1] = service_handle .. ":" .. command
         module_state.last_control_command_by_service_handle[service_handle] = command
         if module_state.control_hook then
-            module_state.control_hook(service_handle, command)
+            module_state.control_hook(service_handle, command, request)
         end
         if module_state.injected_control_failure and module_state.injected_control_failure.service_handle == service_handle and module_state.injected_control_failure.command == command then
             if module_state.injected_control_failure.unknown then
@@ -102,6 +102,7 @@ package.loaded.flywow_hotupgrade_native =
         local files =
         {
             module = {"lualib/test_worker_logic.lua"},
+            draining = {"lualib/test_worker_logic.lua", "lualib/hotupgrade_extra.lua"},
             service_file = {"service/new_service.lua"},
             deploy_failure = {"lualib/a_added.lua", "lualib/test_worker_logic.lua", "service/z_blocked.lua"},
             combined = {"lualib/test_worker_logic.lua", "service/skynet_hotupgrade_worker.patch"},
@@ -112,7 +113,7 @@ package.loaded.flywow_hotupgrade_native =
             nested_named_service = {"service/battle/worker.patch"},
             custom_named_service = {"actors/zone/player.patch"},
             duplicate_module = {"lualib/battle.worker.lua", "lualib/battle/worker.lua"},
-            duplicate_service = {"service/battle.worker.patch", "service/battle/worker.patch"},
+            duplicate_service = {"service/battle/worker.patch", "service/battle/worker.patch"},
         }
         return files[path], {code = "HU_PATCH_EMPTY"}
     end,
