@@ -89,6 +89,17 @@ end
 
 local function creation_lifecycle_tests()
     local hotupgrade_handle = create_controller()
+    -- 原生 kill 不经包装，退出通知必须释放尚未登记的创建记录。
+    local killed = module_state.hotupgrade_api.newservice("skynet_hotupgrade_worker")
+    assert(lifecycle_status(hotupgrade_handle).pending_creations == 1)
+    skynet.kill(killed)
+    for _ = 1, 1000 do
+        if lifecycle_status(hotupgrade_handle).pending_creations == 0 then
+            break
+        end
+        skynet.sleep(1)
+    end
+    assert(lifecycle_status(hotupgrade_handle).pending_creations == 0)
     local pending = module_state.hotupgrade_api.newservice("skynet_hotupgrade_worker")
     assert(lifecycle_status(hotupgrade_handle).pending_creations == 1)
     lifecycle_blocked(hotupgrade_handle)
@@ -246,6 +257,16 @@ local function unique_lifecycle_tests()
     wait_for_batch_phase(hotupgrade_handle, begun.batch_id, "COMPLETED")
     assert(read_worker_state(admitted).module_value == 2 and read_worker_state(second).module_value == 2)
     assert(module_state.hotupgrade_api.cancel_service_creation(admitted).code == "HU_SERVICE_ALREADY_REGISTERED")
+    skynet.kill(first)
+    local replacement = first
+    for _ = 1, 1000 do
+        skynet.sleep(1)
+        replacement = module_state.hotupgrade_api.uniqueservice("skynet_hotupgrade_unique_a", "auto", "original_tail")
+        if replacement ~= first then break end
+    end
+    assert(replacement ~= first)
+    assert(read_worker_state(replacement).module_value == 2)
+    assert(module_state.hotupgrade_api.uniqueservice("skynet_hotupgrade_unique_a") == replacement)
     print("HOTUPGRADE_SKYNET_UNIQUE_LIFECYCLE_OK")
 end
 
@@ -372,7 +393,56 @@ local function run_test_group()
     local group = assert(os.getenv("HOTUPGRADE_TEST_GROUP"), "HOTUPGRADE_TEST_GROUP is required")
     local controller = nil
     local worker_service_handle = nil
-    if group:match("^drain_") then
+    if group == "monitor_occupied" then
+        local core = require "skynet.core"
+        core.command("MONITOR", skynet.address(skynet.self()))
+        local before = core.command("MONITOR")
+        local config = require "hotupgrade_test_options"
+        local rejected = skynet.call(module_state.hotupgrade_handle, "lua", "init",
+            {patch_path = config.patch_path, root_path = config.root_path, service_path = config.service_path})
+        assert(rejected.code == "HU_MONITOR_OCCUPIED")
+        assert(core.command("MONITOR") == before)
+        assert(skynet.call(module_state.hotupgrade_handle, "hotupgrade", "status", {}).code == "HU_NOT_INITIALIZED")
+    elseif group == "exit_module_load" then
+        controller = create_controller()
+        local worker = create_worker_service()
+        skynet.fork(function()
+            -- kill 不承诺替正在执行的业务 RPC 返回结果；这里只验证 Controller 自有许可。
+            pcall(skynet.call, worker, "lua", "declare_slow", {})
+        end)
+        for _ = 1, 1000 do
+            if lifecycle_status(controller).pending_module_loads == 1 then break end
+            skynet.sleep(1)
+        end
+        assert(lifecycle_status(controller).pending_module_loads == 1)
+        skynet.kill(worker)
+        for _ = 1, 1000 do
+            if lifecycle_status(controller).pending_module_loads == 0 then break end
+            skynet.sleep(1)
+        end
+        assert(lifecycle_status(controller).pending_module_loads == 0)
+        local record = wait_for_batch_phase(controller, begin_update_batch(controller, "module"), "COMPLETED")
+        assert(record.target_count == 0)
+    elseif group:match("^exit_") or group:match("^kill_") then
+        controller = create_controller()
+        local survivor = create_worker_service()
+        local command = group:sub(6)
+        local exiting = create_worker_service({exit_command = command, kill = group:match("^kill_") ~= nil})
+        local expected = command == "finish" and "RECOVERY_REQUIRED" or "ABORTED"
+        local record = wait_for_batch_phase(controller, begin_update_batch(controller, "combined"), expected)
+        assert(record.failed >= 1)
+        local state = read_worker_state(survivor)
+        if command == "finish" then
+            assert(state.module_value == 2 and not state.paused)
+            assert(lifecycle_status(controller).phase == "FAILED_LOCKED")
+        else
+            assert_original_state(survivor)
+            assert(lifecycle_status(controller).phase == "IDLE")
+            -- 退出登记已删除，下一批不能继续向旧 handle 发送事务命令。
+            local next_record = wait_for_batch_phase(controller, begin_update_batch(controller, "module"), "COMPLETED")
+            assert(next_record.target_count == 1)
+        end
+    elseif group:match("^drain_") then
         drain_lifecycle_tests(group)
     elseif group == "service_file" then
         controller = create_controller()

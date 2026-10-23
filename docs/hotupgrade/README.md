@@ -316,3 +316,12 @@ bash hotupgrade/scripts/run_hotupgrade_tests.sh ../skynet
 ```
 
 脚本测试创建中/待登记屏障、两种登记时序、启动与业务初始化失败、创建者取消权限、模块许可匹配/消费/失败清理、并发首次声明、Update 起门禁等待，以及父子孙创建链、queue 内创建与首次声明、嵌套许可、已准备目标补模块、新目标 Prepare/Update 失败恢复、排空等待取消、冻结源码只读一次、queue 排空与 patching、完整模块增改删、私有状态迁移、Service 状态/函数组合提交、真实 handle/State/表身份保持、Update 内 Stage/Activate 与整批恢复、纯文件发布、文件部署失败恢复、新实例与首次加载版本一致，以及 Finish 故障报告和恢复门禁。Skynet 集成只启动测试专用进程，不监听业务端口；结果不替代宿主真实业务状态与数据库验证。
+
+
+### 宿主启动顺序与原生退出通知
+
+宿主启动入口必须先启动唯一的 `flywow_hotupgrade_service`，同步调用其 `lua/init` 并确认成功，然后再通过 `hotupgrade.newservice()` 或 `hotupgrade.uniqueservice()` 创建接入热更的业务 Service。业务 Service 可以在文件顶部 `require "flywow_hotupgrade"` 和调用 `hotupgrade.require()`；入口加载不执行 Controller RPC，此时根路径已由启动入口完成初始化。`register_service()` 仍在可 yield 的启动协程内执行。
+
+控制 Service 初始化时通过原生 `MONITOR` 接收 `skynet.exit()` / `skynet.kill()` 退出通知，清理登记、唯一实例与在途许可。`MONITOR` 是进程级单例，已被占用时初始化返回 `HU_MONITOR_OCCUPIED`，不会覆盖宿主监视器。发布期间退出的目标保留在批次结果内；Prepare/Update 失败恢复其余存活目标，发布决定后的退出报告收尾失败并保持恢复锁定。
+
+退出专项验证包含 Prepare、Update、Finish 中的原生 `exit` / `kill`、持有模块许可时被 kill、唯一 Service 退出后重建，以及 MONITOR 已占用时拒绝初始化且保留原监视器。退出通知清理 Controller 记录后调用 Skynet 原生 `term(handle)`，解除控制 State 对退出目标的挂起 RPC；RPC 错误先到时让出一次调度，使原生退出通知参与恢复判断。

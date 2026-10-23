@@ -14,6 +14,7 @@ local M =
     service_registrations = nil, -- 按真实 Service handle 保存登记记录；供许可校验、Patch 匹配和批次快照读取。
     pending_creations    = nil, -- 尚未完成创建或首次登记的记录；完成后由 finish_creation 移除。
     creation_handles     = nil, -- 原生返回的真实 Service handle 到创建记录的索引，用于关联早到登记。
+    early_exits          = nil, -- 原生创建尚未返回时收到的退出 handle；创建调用收敛后立即清空。
     registration_waiters = nil, -- 等待原生 Service handle 建立映射的登记协程；映射完成后唤醒。
     creation_count       = nil, -- 尚未完成创建和首次登记的数量；归零后批次可重匹配并完成 Prepare 收口。
     module_loads         = nil, -- 许可 ID 到来源 Service/模块名的映射；登记或取消时移除。
@@ -181,6 +182,7 @@ end
 ---@field modules table[] 本批匹配到的完整模块 Patch
 ---@field service_source? string 本批 Service Patch 的冻结源码
 ---@field service_entry_file? string 本批 Service Patch 的相对路径，用于错误诊断
+---@field exited? boolean 原生 MONITOR 已确认目标退出；保留结果快照，停止对其发送控制消息
 ---@field participated? boolean 是否已进入本批控制流程，决定失败时是否发送 Abort
 ---@field result? FlyWowHotUpgradeResult 该目标最近一次 Prepare/Update/Finish/Abort 结果
 
@@ -288,6 +290,7 @@ function M.initialize(controller_config)
         service_registrations = {},
         pending_creations    = {},
         creation_handles     = {},
+        early_exits          = {},
         registration_waiters = {},
         creation_count       = 0,
         module_loads         = {},
@@ -324,7 +327,84 @@ function M:finish_creation(creation)
         self.creation_count = self.creation_count - 1
         self:wake_batch()
         self:wake_registration()
+
+        local native_pending = false
+        for _, pending in pairs(self.pending_creations) do
+            if not pending.returned then
+                native_pending = true
+                break
+            end
+        end
+        if not native_pending then
+            self.early_exits = {}
+        end
     end
+end
+
+-- 原生退出通知只处理已跟踪 handle；重复通知不能再次减少在途计数。
+function M:on_service_exit(service_handle)
+    if math.type(service_handle) ~= "integer" or service_handle <= 0 then
+        return
+    end
+
+    local service_registration = self.service_registrations[service_handle]
+    local creation = self.creation_handles[service_handle]
+    local tracked = service_registration ~= nil or creation ~= nil
+    if service_registration then
+        self.service_registrations[service_handle] = nil
+    end
+
+    for name, unique in pairs(self.unique_services) do
+        if unique.service_handle == service_handle then
+            self.unique_services[name] = nil
+            tracked = true
+        end
+    end
+
+    if creation then
+        self:finish_creation(creation)
+    end
+
+    for permit_id, permit in pairs(self.module_loads) do
+        if permit.source == service_handle then
+            self.module_loads[permit_id] = nil
+            self.module_load_count = self.module_load_count - 1
+            if service_registration then
+                service_registration.loading_modules[permit.name] = nil
+            end
+            tracked = true
+        end
+    end
+
+    local batch = self.active_batch
+    if batch and batch.targets then
+        for _, target in ipairs(batch.targets) do
+            if target.service_handle == service_handle and not target.exited then
+                target.exited = true
+                target.result = hotupgrade_result.failure("HU_SERVICE_EXITED",
+                    "Service " .. service_handle .. " 在发布期间退出")
+                if batch.phase == "PREPARE" or batch.phase == "UPDATE" then
+                    batch.error = batch.error or target.result
+                elseif batch.phase == "PUBLISH_DECIDED" then
+                    batch.error = batch.error or hotupgrade_result.failure("HU_RECOVERY_REQUIRED",
+                        target.result.message, "finish")
+                    self.recovery_required = true
+                end
+                tracked = true
+            end
+        end
+    end
+
+    if not tracked then
+        for _, pending in pairs(self.pending_creations) do
+            if not pending.returned then
+                self.early_exits[service_handle] = true
+                break
+            end
+        end
+    end
+    self:wake_batch()
+    self:wake_registration()
 end
 
 -- 映射和计数先更新，再唤醒登记协程；唤醒不代表已匹配成功。
@@ -395,6 +475,11 @@ local function start_service(self, request, source, unique_name)
     creation.service_handle = service_handle
     self.creation_handles[service_handle] = creation
     creation.returned = true
+    if self.early_exits[service_handle] then
+        self.early_exits[service_handle] = nil
+        self:finish_creation(creation)
+        return hotupgrade_result.failure("HU_SERVICE_EXITED", "Service 在原生创建返回前退出")
+    end
     self:wake_registration()
     return hotupgrade_result.success({service_handle = service_handle})
 end
@@ -750,8 +835,18 @@ function M:step(batch, target, command)
         request.service_source = target.service_source
     end
 
+    if target.exited then
+        return target.result
+    end
     batch.control_started = true
     local ok, answer = pcall(skynet.call, target.service_handle, "hotupgrade", command, request)
+    if not ok then
+        -- 原生 RPC 错误与 MONITOR 分属不同协议；让已经到达的退出通知先完成清理。
+        skynet.sleep(0)
+    end
+    if target.exited then
+        return target.result
+    end
     if not ok or type(answer) ~= "table" or type(answer.ok) ~= "boolean" then
         return hotupgrade_result.failure("HU_RPC_FAILED", tostring(answer), command)
     end
@@ -817,6 +912,9 @@ function M:run_batch(batch, request)
                     batch.current_service_handle = target.service_handle
                     target.participated = true
                     local answer = self:step(batch, target, "prepare")
+                    if batch.error then
+                        return
+                    end
                     if not answer.ok then
                         target.result = answer
                         batch.error = answer
@@ -830,6 +928,9 @@ function M:run_batch(batch, request)
                 batch.waiter = coroutine.running()
                 skynet.wait(batch.waiter)
                 batch.waiter = nil
+            end
+            if batch.error then
+                return
             end
             if batch.cancelled then
                 batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
@@ -871,6 +972,9 @@ function M:run_batch(batch, request)
             end
             batch.current_service_handle = target.service_handle
             local answer = self:step(batch, target, "update")
+            if batch.error then
+                return
+            end
             if not answer.ok then
                 target.result = answer
                 batch.error = answer
@@ -878,6 +982,9 @@ function M:run_batch(batch, request)
             end
         end
 
+        if batch.error then
+            return
+        end
         if batch.cancelled then
             batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
             return
@@ -934,9 +1041,9 @@ function M:run_batch(batch, request)
 
         for index = #batch.targets, 1, -1 do
             local target = batch.targets[index]
-            if target.participated then
+            if target.participated and not target.exited then
                 local restored = self:step(batch, target, "abort")
-                if not restored.ok then
+                if not restored.ok and not target.exited then
                     recovery_failure = recovery_failure or restored
                     recovery_errors[#recovery_errors + 1] = target.service_handle .. ": " .. tostring(restored.message or restored.code)
                     target.result = restored
@@ -962,7 +1069,9 @@ function M:run_batch(batch, request)
         batch.decided = true
         for _, target in ipairs(batch.targets) do
             batch.current_service_handle = target.service_handle
-            target.result = self:step(batch, target, "finish")
+            if not target.exited then
+                target.result = self:step(batch, target, "finish")
+            end
             if not target.result.ok then
                 batch.error = hotupgrade_result.failure("HU_RECOVERY_REQUIRED",
                     target.result.message or target.result.code, "finish")

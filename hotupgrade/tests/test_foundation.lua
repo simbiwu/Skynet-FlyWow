@@ -236,8 +236,9 @@ package.loaded.skynet =
 package.loaded["skynet.require"] = {require = original_require}
 package.loaded.flywow_hotupgrade_native = {resolve = function(path) return path end}
 local hotupgrade = require "flywow_hotupgrade"
-assert(unique_calls == 1)
+assert(unique_calls == 0, "文件顶部加载公开入口不能查询 Controller")
 assert(hotupgrade.newservice("fixture_service", "first", nil, "last") == 101)
+assert(unique_calls == 1)
 assert(forwarded.newservice.service_name == "fixture_service")
 assert(forwarded.newservice.arguments.n == 3 and forwarded.newservice.arguments[1] == "first"
     and forwarded.newservice.arguments[2] == nil and forwarded.newservice.arguments[3] == "last")
@@ -259,7 +260,8 @@ registration.service_update = false
 local invalid_service_update = hotupgrade.register_service(registration)
 assert(not invalid_service_update.ok and invalid_service_update.code == "HU_INVALID_OPTIONS")
 registration.service_update = nil
-assert(hotupgrade.register_service(registration).ok)
+local registered = hotupgrade.register_service(registration)
+assert(registered.ok, tostring(registered.code) .. ": " .. tostring(registered.message))
 local function target_control(command, sequence)
     control_dispatch(1, 99, command, {batch_id = "fixture:" .. sequence, sequence = sequence, modules = {}})
     return control_answer
@@ -331,7 +333,7 @@ end
 -- 登记失败后新增的来源记录也必须撤销；不能把留下的表当成合法既有缓存。
 package.loaded.hotupgrade_extra = last_loaded_value
 local loaded_ok, load_error = pcall(hotupgrade.require, "hotupgrade_extra")
-assert(not loaded_ok and tostring(load_error):find("HU_INVALID_PATH", 1, true))
+assert(not loaded_ok and tostring(load_error):find("HU_INVALID_PATH", 1, true), tostring(loaded_ok) .. ": " .. tostring(load_error))
 assert(package.loaded.hotupgrade_extra == last_loaded_value and next(permits) == nil)
 package.loaded.hotupgrade_extra = nil
 fail_registration = false

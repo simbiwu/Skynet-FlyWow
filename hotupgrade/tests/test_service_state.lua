@@ -178,6 +178,7 @@ local receiver -- register_service 安装的真实协议接收器。
 local answer   -- retpack 捕获的控制命令返回值。
 package.loaded.skynet = {
     uniqueservice = function() return 99 end,
+    getenv = function() return "/fixture/host" end,
     register_protocol = function() end,
     dispatch = function(protocol, callback) assert(protocol == "hotupgrade"); receiver = callback end,
     call = function(_, _, command) assert(command == "register"); return {ok = true} end,

@@ -28,16 +28,16 @@ cp -a build/hotupgrade-tests/host build/hotupgrade-tests/host-original
 cd "$FRAMEWORK_DIR/../.."
 LOG="$FRAMEWORK_DIR/build/hotupgrade-tests/skynet.log"
 : > "$LOG"
-for group in drain_creation drain_queue drain_modules drain_late_module drain_new_failure drain_update_failure deployment deploy_failure service_file lifecycle preload host_paths custom_paths patch_match identity_queue registration_missing prepare_false prepare_error optional_service state_shared state_shared_failure declaration bad_functions stage_failure activation_after_failure activation_custom_failure activation_custom_success activation_custom_success_failure multiple_targets partial abort recovery_restore recovery_module; do
+for group in kill_prepare kill_update kill_finish monitor_occupied exit_module_load exit_prepare exit_update exit_finish drain_creation drain_queue drain_modules drain_late_module drain_new_failure drain_update_failure deployment deploy_failure service_file lifecycle preload host_paths custom_paths patch_match identity_queue registration_missing prepare_false prepare_error optional_service state_shared state_shared_failure declaration bad_functions stage_failure activation_after_failure activation_custom_failure activation_custom_success activation_custom_success_failure multiple_targets partial abort recovery_restore recovery_module; do
     rm -rf -- "$FRAMEWORK_DIR/build/hotupgrade-tests/host"
     cp -a "$FRAMEWORK_DIR/build/hotupgrade-tests/host-original" "$FRAMEWORK_DIR/build/hotupgrade-tests/host"
     HOTUPGRADE_TEST_GROUP="$group" timeout 45 "$SKYNET_ROOT/skynet" \
         ./third_party/skynet-flywow/hotupgrade/tests/skynet_config.lua \
         2>&1 | tee -a "$LOG"
 done
-test "$(grep -c HOTUPGRADE_SKYNET_GROUP_OK "$LOG")" -eq 33
+test "$(grep -c HOTUPGRADE_SKYNET_GROUP_OK "$LOG")" -eq 41
 # 每个真实 Skynet 进程都应执行 Native 文件扫描与路径测试。
-test "$(grep -c HOTUPGRADE_FILES_OK "$LOG")" -eq 33
+test "$(grep -c HOTUPGRADE_FILES_OK "$LOG")" -eq 41
 if grep -q HOTUPGRADE_SKYNET_FAILED "$LOG"; then
     exit 1
 fi

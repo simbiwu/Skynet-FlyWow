@@ -38,6 +38,7 @@ package.loaded.skynet =
         end
         return module_state.launch_service_handle
     end,
+    sleep = function(ticks) assert(ticks == 0) end, -- 单元场景无原生消息队列；真实调度交错由 Skynet 集成测试覆盖。
     wait = function() coroutine.yield() end,
     wakeup = function(co) assert(coroutine.resume(co)) end,
     kill = function(service_handle) module_state.killed[service_handle] = true end,

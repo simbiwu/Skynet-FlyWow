@@ -47,6 +47,30 @@ end
 
 scenarios['lifecycle'] = function()
     local lifecycle = initialize_controller()
+    -- 原生退出通知移除登记与加载许可，重复通知不重复减计数。
+    assert(managed_register(lifecycle, metadata, 61).ok)
+    local permit = lifecycle:handle_command("begin_module_load", {name = "lualib.exit_pending"}, 61)
+    assert(permit.ok and lifecycle.module_load_count == 1)
+    lifecycle:on_service_exit(61)
+    assert(lifecycle.service_registrations[61] == nil)
+    assert(lifecycle.module_load_count == 0 and next(lifecycle.module_loads) == nil)
+    lifecycle:on_service_exit(61)
+    lifecycle:on_service_exit(999)
+    assert(lifecycle.module_load_count == 0 and lifecycle.creation_count == 0)
+
+    -- 退出只删除匹配 handle 的唯一实例；保留批次快照并记录失败。
+    assert(managed_register(lifecycle, metadata, 62).ok)
+    lifecycle.unique_services.fixture = {service_handle = 62}
+    lifecycle.unique_services.other = {service_handle = 63}
+    local exited_target = {service_handle = 62}
+    lifecycle.active_batch = {phase = "PREPARE", targets = {exited_target}}
+    lifecycle:on_service_exit(62)
+    assert(lifecycle.unique_services.fixture == nil and lifecycle.unique_services.other.service_handle == 63)
+    assert(lifecycle.active_batch.targets[1] == exited_target and exited_target.exited)
+    assert(lifecycle.active_batch.error.code == "HU_SERVICE_EXITED")
+    lifecycle.active_batch = nil
+    lifecycle.unique_services.other = nil
+
     local launches_before_invalid_names = #module_state.launches
     for _, service_name in ipairs({"../fixture", "fixture//worker", "fixture/../worker", "/fixture"}) do
         for _, command in ipairs({"newservice", "uniqueservice"}) do

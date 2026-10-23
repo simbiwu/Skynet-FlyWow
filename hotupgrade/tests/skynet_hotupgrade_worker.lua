@@ -9,10 +9,11 @@ elseif not startup_mode then
     assert(startup_arguments.n == 0)
 end
 local skynet = require "skynet"
+require "skynet.manager"
 local business_queue = require "skynet.queue"()
 local holding = false -- 仅测试观察 queue 中可 yield 业务是否仍未退出。
-local hotupgrade
-local logic
+local hotupgrade = require "flywow_hotupgrade"
+local logic = hotupgrade.require("test_worker_logic")
 local runtime
 local package_logic
 local settings
@@ -71,6 +72,26 @@ local function initialize(request)
             value.nested.count = next_state.nested.count
         end
     end
+    -- 在接收真实事务消息时退出，验证 Controller 对原生退出与 RPC 失败交错的处理。
+    if worker_test_config.exit_command then
+        local dispatch = skynet.dispatch
+        skynet.dispatch = function(protocol, callback)
+            if protocol == "hotupgrade" then
+                dispatch(protocol, function(session, source, command, request)
+                    if command == worker_test_config.exit_command then
+                        if worker_test_config.kill then
+                            skynet.kill(skynet.self())
+                            skynet.wait(coroutine.running())
+                        end
+                        skynet.exit()
+                    end
+                    callback(session, source, command, request)
+                end)
+            else
+                dispatch(protocol, callback)
+            end
+        end
+    end
     return hotupgrade.register_service(
     {
         service_update = service_update,
@@ -99,8 +120,6 @@ local function initialize(request)
 end
 
 skynet.start(function()
-    hotupgrade = require "flywow_hotupgrade"
-    logic = hotupgrade.require("test_worker_logic")
     runtime = hotupgrade.require("battle.state_sync.runtime")
     package_logic = hotupgrade.require("packages.demo")
     settings = hotupgrade.require("config.settings")
