@@ -54,7 +54,7 @@ local function wait_for_batch_phase(hotupgrade_handle, batch_id, expected_phase)
         local batch_record = batch_status.record
         if batch_record.phase == "COMPLETED"
             or batch_record.phase == "ABORTED" or batch_record.phase == "PARTIAL" or batch_record.phase == "RECOVERY_REQUIRED" then
-            assert(batch_record.phase == expected_phase, batch_record.phase .. ":" ..
+            assert(batch_record.phase == expected_phase or (type(expected_phase) == "table" and expected_phase[batch_record.phase]), batch_record.phase .. ":" ..
                 tostring(batch_record.error and batch_record.error.message))
             return batch_record
         end
@@ -428,7 +428,8 @@ local function run_test_group()
         local survivor = create_worker_service()
         local command = group:sub(6)
         local exiting = create_worker_service({exit_command = command, kill = group:match("^kill_") ~= nil})
-        local expected = command == "finish" and "RECOVERY_REQUIRED" or "ABORTED"
+        -- 不限定 RPC 错误与退出通知次序；按已知结果恢复或保持失败锁定。
+        local expected = command == "finish" and "RECOVERY_REQUIRED" or {ABORTED = true, RECOVERY_REQUIRED = true}
         local record = wait_for_batch_phase(controller, begin_update_batch(controller, "combined"), expected)
         assert(record.failed >= 1)
         local state = read_worker_state(survivor)
@@ -437,10 +438,16 @@ local function run_test_group()
             assert(lifecycle_status(controller).phase == "FAILED_LOCKED")
         else
             assert_original_state(survivor)
-            assert(lifecycle_status(controller).phase == "IDLE")
-            -- 退出登记已删除，下一批不能继续向旧 handle 发送事务命令。
-            local next_record = wait_for_batch_phase(controller, begin_update_batch(controller, "module"), "COMPLETED")
-            assert(next_record.target_count == 1)
+            if record.phase == "RECOVERY_REQUIRED" then
+                assert(lifecycle_status(controller).phase == "FAILED_LOCKED")
+                assert(record.error and record.error.code == "HU_RECOVERY_REQUIRED")
+                assert(not skynet.call(controller, "hotupgrade", "begin", {path = "module"}).ok)
+            else
+                assert(lifecycle_status(controller).phase == "IDLE")
+                -- 退出登记已删除，下一批不能继续向旧 handle 发送事务命令。
+                local next_record = wait_for_batch_phase(controller, begin_update_batch(controller, "module"), "COMPLETED")
+                assert(next_record.target_count == 1)
+            end
         end
     elseif group:match("^drain_") then
         drain_lifecycle_tests(group)
@@ -464,7 +471,7 @@ local function run_test_group()
         local root = require("hotupgrade_test_options").root_path
         local old = assert(native.read_file(root, "lualib/test_worker_logic.lua"))
         assert_original_state(worker_service_handle)
-        assert(assert(load(old))().value() == 1)
+        assert(assert(load(old))("test_worker_logic", root .. "/lualib/test_worker_logic.lua").value() == 1)
         assert(native.read_file(root, "lualib/new/dependency.lua") == false)
         wait_for_batch_phase(controller, begin_update_batch(controller, "deployment"), "COMPLETED")
         assert(read_worker_state(worker_service_handle).module_value == 2 and read_worker_state(worker_service_handle).equip == "剑")

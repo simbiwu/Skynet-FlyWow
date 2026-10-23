@@ -357,6 +357,21 @@ local extra = hotupgrade.require("hotupgrade_extra")
 assert(extra.value() == 1 and begin_count == declarations_before + 1 and next(permits) == nil)
 assert(hotupgrade.require("hotupgrade_extra") == extra and begin_count == declarations_before + 1)
 assert(package.loaded["lualib.hotupgrade_extra"] == extra)
+local original_value = extra.value
+assert(target_control("prepare", 7).ok)
+control_dispatch(1, 99, "update", {
+    batch_id = "fixture:7", sequence = 7,
+    modules = {{name = "lualib.hotupgrade_extra", source = [[
+        local name, path = ...
+        assert(name == "hotupgrade_extra")
+        assert(path == "build/hotupgrade-tests/host/lualib/hotupgrade_extra.lua")
+        return {value = function() return 2 end}
+    ]]}},
+})
+assert(control_answer.ok, control_answer.message)
+assert(extra.value() == 2 and package.loaded.hotupgrade_extra == extra)
+assert(package.loaded["lualib.hotupgrade_extra"] == extra)
+assert(target_control("abort", 7).ok and extra.value == original_value)
 package.path = original_path
 print("HOTUPGRADE_FOUNDATION_LIFECYCLE_OK")
 print("HOTUPGRADE_FOUNDATION_OK")

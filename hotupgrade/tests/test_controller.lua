@@ -71,6 +71,23 @@ scenarios['lifecycle'] = function()
     lifecycle.active_batch = nil
     lifecycle.unique_services.other = nil
 
+    assert(managed_register(lifecycle, metadata, 62).ok)
+    module_state.injected_control_failure = {service_handle = 62, command = "prepare", unknown = true}
+    module_state.control_hook = function(_, command)
+        if command == "abort" then error("target already exited") end
+    end
+    local begun_exit = lifecycle:handle_command("begin", {path = "module"}, 1)
+    assert(begun_exit.ok)
+    module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+    assert(lifecycle.phase == "FAILED_LOCKED" and lifecycle.last_batch.phase == "RECOVERY_REQUIRED")
+    lifecycle:on_service_exit(62)
+    assert(lifecycle.phase == "FAILED_LOCKED" and lifecycle.service_registrations[62] == nil)
+    assert(lifecycle:handle_command("resolve_deployment", {
+        batch_id = begun_exit.batch_id, confirmed = true, confirmation = "CONVERGED_CACHE_CLEARED",
+    }, 1).ok)
+    module_state.control_hook = nil
+    module_state.injected_control_failure = nil
+
     local launches_before_invalid_names = #module_state.launches
     for _, service_name in ipairs({"../fixture", "fixture//worker", "fixture/../worker", "/fixture"}) do
         for _, command in ipairs({"newservice", "uniqueservice"}) do

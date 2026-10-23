@@ -123,8 +123,9 @@ end
 
 --- 编译全部源码后加载候选和迁移模块私有状态；受信顶层及钩子必须同步且无外部副作用。
 ---@param module_patches table[] 待暂存模块项；每项包含规范模块名 name 和冻结源码 source。
+---@param module_loaders? table<string, {name:string, path:string}> 本 State 首次声明的加载名和路径；独立调用省略时使用规范名，路径为 nil。
 ---@return FlyWowHotUpgradeResult 成功含 stage；失败不安装线上导出。
-function M.stage(module_patches)
+function M.stage(module_patches, module_loaders)
     if module_state.active_module_stage then
         return hotupgrade_result.failure("HU_UPGRADE_BUSY", "模块 Stage 尚未结束")
     end
@@ -148,19 +149,22 @@ function M.stage(module_patches)
 
             -- 使用 Lua 原生 require；新加载的依赖不属于本次模块回滚。
             local chunk = assert(load(module_patch.source, "@" .. module_patch.name, "t"))
+            local loader = module_loaders and module_loaders[module_patch.name]
             module_stage.entries[#module_stage.entries + 1] =
             {
-                name      = module_patch.name, -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
-                live      = live,      -- 原模块根表；提交与恢复始终原地修改它的字段。
-                old       = fields,    -- 旧导出字段及原引用；保留至 Finish 或恢复成功。
-                chunk     = chunk,     -- 第一轮编译的源码；第二轮执行后释放。
-                candidate = nil,       -- 第二轮准备的新导出；Commit 时整体安装其字段。
+                name        = module_patch.name,                           -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
+                live        = live,                                        -- 原模块根表；提交与恢复始终原地修改它的字段。
+                old         = fields,                                      -- 旧导出字段及原引用；保留至 Finish 或恢复成功。
+                chunk       = chunk,                                       -- 第一轮编译的源码；第二轮执行后释放。
+                loader_name = loader and loader.name or module_patch.name, -- 首次 require 名称，不用规范登记名替代。
+                loader_path = loader and loader.path,                      -- 首次加载路径，与普通 Lua 文件加载参数一致。
+                candidate   = nil,                                         -- 第二轮准备的新导出；Commit 时整体安装其字段。
             }
         end
 
         -- 再执行候选模块，检查导出并迁移隔离的私有状态。
         for _, entry in ipairs(module_stage.entries) do
-            local candidate = entry.chunk()
+            local candidate = entry.chunk(entry.loader_name, entry.loader_path)
             check_exports(candidate, entry.name)
             assert(candidate ~= entry.live, "候选须返回新的导出表")
             -- 只有旧版提供快照且新版提供导入钩子时才迁移；缺少任一方就使用新版初始化状态。

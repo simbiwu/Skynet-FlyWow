@@ -1843,7 +1843,7 @@ if command == "update" then
         return hotupgrade_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
     -- Controller 已按本 State 的登记模块筛选 Patch；Stage 准备候选和快照，不写线上状态。
-    local staged = hotupgrade_module_patch.stage(request.modules or {})
+    local staged = hotupgrade_module_patch.stage(request.modules, module_state.declared_modules)
     if not staged.ok then
         return staged
     end
@@ -1897,7 +1897,7 @@ Controller 之前使用 `load()`，只检查发布包的语法，没有执行模
 ```lua
 -- 再执行候选模块，检查导出并迁移隔离的私有状态。
 for _, entry in ipairs(module_stage.entries) do
-    local candidate = entry.chunk()
+    local candidate = entry.chunk(entry.loader_name, entry.loader_path)
     check_exports(candidate, entry.name)
     assert(candidate ~= entry.live, "候选须返回新的导出表")
 

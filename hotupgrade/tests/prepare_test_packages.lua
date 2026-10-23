@@ -16,6 +16,9 @@ write(host_root .. "lualib/battle/state_sync/runtime.lua", "return {value = func
 write(host_root .. "lualib/packages/demo/init.lua", "return {value = function() return 1 end}")
 write(host_root .. "config/settings.lua", "return {max_level = 100}")
 local module_v2 = [[
+local loader_name, loader_path = ...
+assert(loader_name == "test_worker_logic")
+assert(type(loader_path) == "string" and loader_path:sub(-#"/lualib/test_worker_logic.lua") == "/lualib/test_worker_logic.lua")
 local count = 0
 local M = {}
 function M.value() return 2 end

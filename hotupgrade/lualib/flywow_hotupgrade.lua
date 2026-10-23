@@ -19,7 +19,7 @@ local module_state =
     active_transaction    = nil,                              -- 当前事务的撤销数据保留至 finish/abort 确认完成。
     completed_sequence    = 0,                                -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
     last_batch_id         = nil,                              -- 最近完成的批次，用于 finish/abort 幂等响应。
-    declared_modules      = {},                               -- hotupgrade.require 已登记的模块集合。
+    declared_modules      = {},                               -- 规范名到首次加载名/路径的记录；声明与候选执行共用。
     module_loads          = {},                               -- 同一规范模块的首次声明串行完成，等待者不能观察半完成的本地状态。
     module_sources        = setmetatable({}, {__mode = "k"}), -- 仅保存本入口确认的模块表与文件路径；弱键不延长模块生命周期。
 }
@@ -256,7 +256,7 @@ local function handle_upgrade(command, request, source)
             return hotupgrade_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
         end
         -- Controller 已按本 State 的登记模块筛选 Patch；Stage 准备候选和快照，不写线上状态。
-        local staged = hotupgrade_module_patch.stage(request.modules)
+        local staged = hotupgrade_module_patch.stage(request.modules, module_state.declared_modules)
         if not staged.ok then
             return staged
         end
@@ -464,13 +464,14 @@ function M.require(name)
     loading = {owner = coroutine.running(), waiters = {}}
     module_state.module_loads[canonical_name] = loading
     -- 建立本次加载的回滚边界；许可、缓存别名和声明必须整体完成或恢复。
-    local permit_id                 -- 仅已登记 Service 的首次声明持有，完成登记或失败取消后释放。
-    local cached_value              -- 许可恢复后读取的原名缓存，失败时原样恢复。
-    local previous_alias            -- 许可恢复后读取的规范别名，不清除合法既有缓存。
-    local value                     -- 本次加载或复用的模块根表。
-    local snapshot_taken = false    -- 许可失败时尚未触碰本地缓存，无需回退。
-    local added_source = false      -- 只撤销本次新建的来源映射。
-    local added_declaration = false -- 只回退本次新增的本地模块声明。
+    local loading_path = source_path -- 首次加载器的路径参数；Skynet 不返回路径时沿用 searchpath 结果。
+    local permit_id                  -- 仅已登记 Service 的首次声明持有，完成登记或失败取消后释放。
+    local cached_value               -- 许可恢复后读取的原名缓存，失败时原样恢复。
+    local previous_alias             -- 许可恢复后读取的规范别名，不清除合法既有缓存。
+    local value                      -- 本次加载或复用的模块根表。
+    local snapshot_taken = false     -- 许可失败时尚未触碰本地缓存，无需回退。
+    local added_source = false       -- 只撤销本次新建的来源映射。
+    local added_declaration = false  -- 只回退本次新增的本地模块声明。
     local ok, message = pcall(function()
         if module_state.registration and not module_state.declared_modules[canonical_name] then
             local answer = skynet.call(get_hotupgrade_handle(), "hotupgrade",
@@ -514,6 +515,7 @@ function M.require(name)
                 "HU_DUPLICATE_MODULE: 模块名称已被 package.preload 占用: " .. canonical_name)
             assert(package.loaded[canonical_name] == nil or rawequal(package.loaded[canonical_name], value),
                 "HU_DUPLICATE_MODULE: 模块路径登记名已被其他模块占用: " .. canonical_name)
+            loading_path = loader_path or source_path
             if module_state.module_sources[value] == nil then
                 module_state.module_sources[value] = resolved_path
                 added_source = true
@@ -523,7 +525,7 @@ function M.require(name)
         -- 登记 RPC 前建立全部本地状态；许可阻止 Controller 在此关键区间启动批次。
         package.loaded[canonical_name] = value
         if not module_state.declared_modules[canonical_name] then
-            module_state.declared_modules[canonical_name] = true
+            module_state.declared_modules[canonical_name] = {name = name, path = loading_path}
             added_declaration = true
         end
         if permit_id then
