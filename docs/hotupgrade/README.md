@@ -11,7 +11,7 @@ HotUpgrade 在现存 Skynet Service、现存 Lua State 内更新受信 Lua 代�
 ```lua
 skynet.start(function()
     local hotupgrade_handle = skynet.uniqueservice("flywow_hotupgrade_service")
-    local hotupgrade = require "flywow_hotupgrade" -- 必须在协程内加载；模块顶部的唯一服务查询会 yield。
+    local hotupgrade = require "flywow_hotupgrade"
     local initialized = skynet.call(hotupgrade_handle, "lua", "init",
     {
         patch_path = "./config/hotupgrade",
@@ -29,7 +29,7 @@ end)
 - lua_path：./third_party/skynet-flywow/hotupgrade/lualib/?.lua
 - lua_cpath：./third_party/skynet-flywow/build/native/?.so
 
-公开入口是 hotupgrade/lualib/flywow_hotupgrade.lua；控制 Service 入口是 hotupgrade/service/flywow_hotupgrade_service.lua。Controller 加载 flywow_hotupgrade_native 时，Lua 从 Native 搜索路径定位统一构建入口产出的 build/native/flywow_hotupgrade_native.so。每个加载公开入口的 State 会在模块加载时调用一次原生 skynet.uniqueservice("flywow_hotupgrade_service")，并缓存 handle。该调用会 yield，因此须从 Skynet 协程内（例如 skynet.start 回调）首次 require 公开入口。宿主仍负责在启动受管理业务 Service 前初始化 Controller。管理 State 无需登记为业务目标。
+公开入口是 hotupgrade/lualib/flywow_hotupgrade.lua；控制 Service 入口是 hotupgrade/service/flywow_hotupgrade_service.lua。Controller 加载 flywow_hotupgrade_native 时，Lua 从 Native 搜索路径定位统一构建入口产出的 build/native/flywow_hotupgrade_native.so。宿主先在 composition root 初始化 Controller 并确认成功，再创建受管理业务 Service。业务 Service 可以在文件顶部 require 公开入口并调用 hotupgrade.require()；这两步不会获取 Controller handle 或执行 RPC。Controller handle 仅在首次实际需要 RPC 时通过原生 skynet.uniqueservice() 获取并缓存。register_service() 会发送登记 RPC，必须在可 yield 的 Skynet 协程内调用。管理 State 无需登记为业务目标。
 
 patch_path 必须存在且可读取。root_path 是已存在的宿主项目根目录，service_path 是它下面已存在的相对 Service 目录；拒绝绝对路径、空路径段、.、..、反斜杠和符号链接目录。目录允许多级，例如 service/battle。
 
@@ -71,9 +71,9 @@ local global_service_handle = hotupgrade.uniqueservice(true, "player", zone_id)
 
 该映射仅属于一个 Controller，不与原生 uniqueservice 的名称空间互通，不承诺跨 Controller、跨进程或跨节点唯一。全局 true 重载始终在实际启动前拒绝。snaxd 不满足受管理 Service 自行调用 register_service 的登记合同，入口返回 HU_SPECIAL_SERVICE_UNSUPPORTED，不增加 Snax 专用初始化流程；newservice 同样拒绝 snaxd。
 
-首次创建失败时释放创建记录和唯一名预留，唤醒同一次创建的等待者返回错误，后续请求可重试。原创建者合法取消尚未登记的 Service 时，在原生终止成功后释放该唯一名。成功登记后不能取消创建。本地唯一入口不进行死亡监控或自动重建；已登记 Service 的受控终止和替换须由宿主管理。FlyWow 仅使用现有 Skynet 公开接口，不要求修改、复制、覆盖或生成任何 Skynet 框架源码。
+首次创建失败时释放创建记录和唯一名预留，唤醒同一次创建的等待者返回错误，后续请求可重试。原创建者合法取消尚未登记的 Service 时，在原生终止成功后释放该唯一名。成功登记后不能取消创建。Controller 使用 Skynet 原生 MONITOR 清理退出 Service 的登记和本地唯一映射；同名 hotupgrade.uniqueservice() 后续调用会重新创建实例。MONITOR 是进程级单例；若初始化时已被占用，Controller 返回 HU_MONITOR_OCCUPIED，不覆盖现有监视器。FlyWow 仅使用现有 Skynet 接口，不修改 Skynet 框架源码。
 
-在受管理业务 Service 自己的 Lua State 登记。由于公开模块首次加载会调用可 yield 的原生 `skynet.uniqueservice()`，以下初始化应放在 Skynet 协程内：
+在受管理业务 Service 自己的 Lua State 登记。公开模块和业务模块可在文件顶部加载；`register_service()` 会执行登记 RPC，因此放在 Skynet 可 yield 的启动协程内：
 
 ```lua
 skynet.start(function()

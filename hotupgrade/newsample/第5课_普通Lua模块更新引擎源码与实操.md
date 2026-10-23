@@ -8,7 +8,7 @@
 
 配合阅读：[`hotupgrade/lualib/flywow_hotupgrade.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/main/hotupgrade/lualib/flywow_hotupgrade.lua)、[`hotupgrade/lualib/flywow_hotupgrade_controller.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/main/hotupgrade/lualib/flywow_hotupgrade_controller.lua)
 
-> **阅读约定**：本课新写的教学实验放在 `hotupgrade/lesson5/`，代码是我们为学习编写的，不是仓库已有 Sample；带有仓库源码路径、函数名和对应调用关系的代码才是实际框架源码。源码片段中的函数名、字段名和常量以当前工作区为准。该版本 Controller 使用 `run_batch()`、`load_patch()`，业务 Lua State 使用 `handle_upgrade()`。不要沿用第 4 课旧提交里的 `run()`、`load()` 和 `control()` 来定位这些内部函数。
+> **阅读约定**：本课新写的教学实验放在 `hotupgrade/lesson5/`，代码是我们为学习编写的，不是仓库已有 Sample；带有仓库源码路径、函数名和对应调用关系的代码才是实际框架源码。源码片段中的函数名、字段名和常量以当前工作区为准。当前 Controller 模块使用 `run_batch()`、`load_patch()`，业务 Lua State 的公开入口内部使用 `handle_upgrade()`。不要沿用旧提交里的 `run()`、`load()` 和 `control()` 定位这些函数。
 >
 > **前置条件**：已经完成第 4 课，知道 `hotupgrade.require()`、Prepare、Update、Finish 与 Service Patch 的作用。本课不重新讲 Controller 如何启动或怎样发布完整 Service 文件，而是接着第 4 课进入 **Update 内部的普通模块更新引擎**。示例仍沿用“刀 → 剑”，但本课会专门观察模块导出表、函数引用、闭包私有状态和旧快照。
 
@@ -18,7 +18,7 @@
 
 这不是 Lua 自动完成的，而是 `flywow_hotupgrade_module_patch.lua` 里的更新引擎有意实现的。它要解决四件事：
 
-1. **Stage**：读取已经冻结的 V2 源码，在当前 Lua State 内创建候选模块，并保存旧导出字段；不立即修改正在使用的模块表。
+1. **Stage（暂存）**：读取已经冻结的 V2 源码，在当前 Lua State 内创建候选模块，并保存旧导出字段；不立即修改正在使用的模块表。这里的 Stage 是更新引擎的暂存操作；Controller 状态机阶段使用 `phase` 表示。
 2. **Commit**：把候选模块的完整导出字段安装到旧模块根表上，根表身份保持不变。
 3. **Abort**：如果整次事务在发布决定前失败，尝试恢复旧导出字段，并在恢复成功后释放阶段数据。
 4. **Finish**：正式文件已经成功部署、发布决定已经作出后，释放旧字段快照，不再提供本批次的普通模块撤销能力。
@@ -339,6 +339,8 @@ function M.stage(entries)
                 local snapshot = M.snapshot_state(entry.live.export_state())
                 assert(candidate.import_state(snapshot) ~= false, "模块拒绝状态导入")
             end
+            -- 导入钩子也属于候选准备过程；提交前再次检查最终导出图。
+            check_exports(candidate, entry.name)
             entry.candidate = candidate
             entry.chunk = nil
         end
@@ -1036,7 +1038,7 @@ V2 count                      → 由已安装的 V2 闭包持有，当前为 2
 
 到这里，我们已经独立走通了引擎的四个函数，接下来必须确认：生产环境到底是谁调用它们？各自在哪个 Service、哪个 Lua State 中执行？何时可以修改线上表？
 
-沿第 4 课的调用链，管理端 `begin({path="v2"})` 之后，Controller Service 的 `flywow_hotupgrade_controller.lua` 使用 `M:run_batch()` 调度发布批次。在 Prepare 期间继续接纳创建和首次加载、重匹配新增目标及模块声明，并在全部准备完成后关闭门禁。随后它通过 `M:step()` 给最终目标清单中的 `PlayerService` 发送 `"hotupgrade"` 协议的 `"update"` 请求。
+沿第 4 课的调用链，管理端 `begin({path="v2"})` 之后，HotUpgrade Service 的 `flywow_hotupgrade_controller.lua` 使用 `M:run_batch()` 调度发布批次。在 Prepare 期间继续接纳创建和首次加载、重匹配新增目标及模块声明，并在全部准备完成后关闭门禁。随后它通过 `M:step()` 给最终目标清单中的 `PlayerService` 发送 `"hotupgrade"` 协议的 `"update"` 请求。
 
 最新源码中，`M:step()` 构造 Update 请求时使用的真实片段是：
 
@@ -1050,7 +1052,7 @@ batch.control_started = true
 local ok, answer = pcall(skynet.call, target.service_handle, "hotupgrade", command, request)
 ```
 
-来源：`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:step()`，调用者是同文件的 `M:run_batch()`。此时执行在 **Controller Service** 中，`target.service_handle` 来自本次已登记目标快照。这个 RPC 发送之后，Controller 协程 yield，直到目标回复。
+来源：`hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:step()`，调用者是同文件的 `M:run_batch()`。此时执行在 **HotUpgrade Service** 中，`target.service_handle` 来自本次已登记目标快照。这个 RPC 发送之后，Controller 协程 yield，直到目标回复。
 
 目标 `PlayerService` 此前已经执行 `hotupgrade.register_service()`，因此本地注册了 `"hotupgrade"` 协议的 dispatch。接收到 Update 以后，进入它自己 Lua State 中：
 
@@ -1199,7 +1201,7 @@ end
 你现在可以把三个名字相近、但生命周期和职责不同的对象分开：
 
 ```text
-Controller Service
+HotUpgrade Service
     active_batch          整批发布的状态和结果
 
 PlayerService / flywow_hotupgrade.lua
@@ -1296,7 +1298,7 @@ Finish:             v2   121   100
 
 这份表只是把刚才已经看到的对象变化压缩到一起，方便验收；它不是替代前面源码讲解的另一套流程。
 
-本课已使用本地 Lua 5.4 动态库，运行由上文摘录的引擎函数和完整教学脚本组成的隔离实验，以上各项输出与实际执行一致。**这不等于已经在 GitHub 仓库的原生构建、Skynet Service 或完整发布事务中执行测试。** 在实际仓库中操作时，应以自己的 checkout 版本和执行结果为准；本课阅读的源码提交已经在开头固定。
+上述输出是根据本课给出的 V1/V2 文件和当前引擎执行路径推导的预期结果。本课实验文件由学习者按前文创建；仓库不包含 `hotupgrade/lesson5/` 的预制实验目录，因此这里不声称这些命令已在当前工作区实际运行。它也不替代原生构建、真实 Skynet Service 或完整发布事务的测试。学习时应在当前 checkout 中对照引擎源码；若源码字段或行为与摘录不同，以实际源码为准并先更新对应讲解。
 
 ## 十一、读完第 5 课，应该建立怎样的执行模型？
 

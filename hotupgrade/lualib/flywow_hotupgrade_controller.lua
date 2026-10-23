@@ -31,7 +31,8 @@ local M =
     recovery_required    = nil, -- 宿主文件或目标恢复未确认时阻止后续发布。
 }
 
--- 排空和 Prepare 期间允许完成依赖；进入 Update 后，后续请求才等待发布终态。
+-- 门禁只看 Controller 阶段和批次阶段：DEPLOYING/UPDATE 关闭新操作，PREPARE 继续接纳依赖。
+-- WAITING_CREATIONS 与 PREPARE 中已接纳的创建/首次加载必须完成，才有资格进入 UPDATE。
 local function lifecycle_closed(controller)
     return controller.phase == "DEPLOYING"
         or (controller.phase == "APPLYING" and controller.active_batch.phase ~= "PREPARE")
@@ -840,10 +841,6 @@ function M:step(batch, target, command)
     end
     batch.control_started = true
     local ok, answer = pcall(skynet.call, target.service_handle, "hotupgrade", command, request)
-    if not ok then
-        -- 原生 RPC 错误与 MONITOR 分属不同协议；让已经到达的退出通知先完成清理。
-        skynet.sleep(0)
-    end
     if target.exited then
         return target.result
     end
@@ -861,7 +858,8 @@ end
 ---@param batch FlyWowHotUpgradeBatch 当前唯一活动批次
 ---@param request FlyWowHotUpgradeManagementRequest 批次开始时冻结的管理请求
 function M:run_batch(batch, request)
-    -- 登记 waiter 到 wait 之间不 yield；完成回调会唤醒同一批次，恢复后重验身份和计数。
+    -- WAITING_CREATIONS：先等待批次开始前已接纳的创建和首次加载收敛。
+    -- waiter 在检查计数后、yield 前登记，避免完成通知落在检查与等待之间。
     while self.active_batch == batch and (self.creation_count > 0 or self.module_load_count > 0) do
         batch.waiter = coroutine.running()
         skynet.wait(batch.waiter)
@@ -870,7 +868,8 @@ function M:run_batch(batch, request)
     if self.active_batch ~= batch then
         return
     end
-    -- 扫描和文件快照阶段同步执行；Prepare 开始后重新开放接纳窗口。
+    -- DEPLOYING：暂时关闭新创建和首次加载，固定 Patch 与旧文件快照。
+    -- 后面切到 APPLYING/PREPARE 后才重新开放依赖入口。
     self.phase = "DEPLOYING"
     batch.phase = "DEPLOYING"
     -- 屏障排空后加载并匹配发布包，再准备可恢复的宿主文件快照。
@@ -893,9 +892,11 @@ function M:run_batch(batch, request)
         batch.files = loaded.patch.files
         batch.targets = loaded.targets
         batch.target_count = #loaded.targets
+        -- APPLYING/PREPARE：Controller 门禁重新接纳创建和首次加载，业务文件仍保持旧版本。
+        -- 退出 Prepare 窗口后再一次性进入 UPDATE，避免父回调等待的子 Service 被门禁挡住。
         self.phase = "APPLYING"
 
-        -- Prepare 期间仍用旧宿主文件；保留每个目标的参与记录，新目标补做一次 Prepare。
+        -- 保留目标参与记录；每轮重匹配发现的新目标都必须先执行 Prepare。
         local targets_by_handle = {} -- 本批记录的临时索引；重匹配时保留 participated 和恢复信息。
         for _, target in ipairs(batch.targets) do
             targets_by_handle[target.service_handle] = target
@@ -937,7 +938,8 @@ function M:run_batch(batch, request)
                 return
             end
 
-            -- 同一份冻结源码覆盖新增登记和模块声明；匹配失败时仍保留旧记录用于 Abort。
+            -- 本轮依赖已排空；用冻结源码重新匹配期间不 yield，纳入刚完成登记的 Service。
+            -- 匹配失败仍保留已参与目标，供下面 Abort 恢复。
             local matched = match_targets(loaded.patch, self.service_registrations, request.path)
             if not matched.ok then
                 batch.error = matched
@@ -963,8 +965,11 @@ function M:run_batch(batch, request)
             end
         end
 
-        -- 最终匹配、计数检查到进入 Update 之间不 yield；此刻一次性关闭创建和加载门禁。
+        -- UPDATE 关门点：上一轮已确认两个在途计数归零，重匹配也没有 yield。
+        -- 以下阶段赋值连续执行；Controller 不会在两者之间处理新请求。
+        -- 因此 UPDATE 开始时没有已接纳的创建/首次加载，新到请求会在 wait_lifecycle 挂起至批次终态。
         batch.phase = "UPDATE"
+        -- UPDATE：各目标同步提交状态与代码；新生命周期请求保持挂起，不属于本批目标。
         for _, target in ipairs(batch.targets) do
             if batch.cancelled then
                 batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
