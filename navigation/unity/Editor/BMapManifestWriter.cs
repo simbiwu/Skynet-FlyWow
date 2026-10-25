@@ -1,4 +1,4 @@
-// 职责：为一次 BMAP 导出生成便于人和 CI 审查的 JSON 摘要。
+// 职责：为一次 BMAP 导出生成便于人工 审查的 JSON 摘要。
 // 边界：Unity Editor Review Artifact；发布工具与 Server 加载边界校验 Manifest。
 // 输入/输出：Snapshot + BMAP 校验信息 -> JSON 文件。
 // 不负责：不影响 BMAP 合法性，不作为 Runtime 数据源。
@@ -8,7 +8,7 @@ using UnityEngine;
 
 namespace FlyWow.Navigation.Editor
 {
-    /// <summary>生成供人和 CI Review 的 JSON 摘要；Server Runtime 不读取它。</summary>
+    /// <summary>生成供人工 Review 的 JSON 摘要；Server Runtime 不读取它。</summary>
     public static class BMapManifestWriter
     {
         [Serializable]

@@ -41,7 +41,7 @@ Server 启动时调用 load_navigation_profiles 加载导航专用配置，并�
 ```bash
 bash third_party/skynet-flywow/scripts/build_flywow.sh third_party/skynet
 python3 -m unittest discover -s third_party/skynet-flywow/navigation/tests -p 'test_navigation_tools.py'
-python3 third_party/skynet-flywow/scripts/ci/check_repository.py
+python3 third_party/skynet-flywow/scripts/quality/check_repository.py
 ```
 
 Unity 工程在 manifest 的 `testables` 中加入 `com.flywow.navigation`，在 Test Runner 执行 `FlyWow.Navigation.EditorTests`。测试应在隔离工程运行，避免加载其它 Scene 的 NavMesh。

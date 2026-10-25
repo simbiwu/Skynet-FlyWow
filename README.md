@@ -45,7 +45,7 @@ navigation/
 └── unity/
 ```
 
-根目录的 `scripts/ci/` 是仓库级质量门禁；它不承载 Gateway 或 Navigation 运行时代码。根目录不再直接放 `lualib/`、`native/`、`service/`、`unity/`、`clients/`、`tools/` 或模块测试目录。
+根目录的 `scripts/quality/` 是本地仓库自检工具；它不承载 Gateway 或 Navigation 运行时代码。根目录不再直接放 `lualib/`、`native/`、`service/`、`unity/`、`clients/`、`tools/` 或模块测试目录。
 
 ## 预期模块方向
 
@@ -101,8 +101,8 @@ side-view 2D：重力、跳跃和平台层，属于不同运动模型
 ```bash
 python3 -m unittest discover -s gateway/tests -p 'test_*.py'
 python3 -m unittest discover -s navigation/tests -p 'test_*.py'
-python3 -m unittest discover -s scripts/ci -p 'test_*.py'
-python3 scripts/ci/check_repository.py
+python3 -m unittest discover -s scripts/quality -p 'test_*.py'
+python3 scripts/quality/check_repository.py
 ```
 
 ## Lua Binding

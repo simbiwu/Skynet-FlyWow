@@ -1,8 +1,8 @@
 # 职责：锁定仓库自检工具对合法文本和典型破坏的判断，防止质量门禁静默失效。
 # 边界：Build/Test Tooling；只测试纯检查函数，不启动 Skynet、不连接网络。
 # 输入/输出：内存字节与临时 Markdown -> unittest 断言和进程退出状态。
-# 生命周期：本地提交前及 GitHub CI 中按次运行；临时目录由 unittest 生命周期回收。
-# 不负责：不验证未来业务模块、编译器、性能、安全或 GitHub Runner 行为。
+# 生命周期：由开发者按需本地运行；临时目录由 unittest 生命周期回收。
+# 不负责：不验证未来业务模块、编译器、性能、安全或安全策略。
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 
-# 测试通过文件路径加载工具，避免为了一个 CI 脚本提前建立 Python package 层级。
+# 测试通过文件路径加载工具，避免为了一个 仓库自检脚本提前建立 Python package 层级。
 CHECKER_PATH = Path(__file__).resolve().parent / "check_repository.py"
 SPEC = importlib.util.spec_from_file_location("check_repository", CHECKER_PATH)
 if SPEC is None or SPEC.loader is None:
