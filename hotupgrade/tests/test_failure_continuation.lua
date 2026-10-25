@@ -38,7 +38,7 @@ elseif scenario == "diagnostic" then
     assert(controller:handle_command("begin", {path = "module"}, 1).ok)
     state.pending_control_coroutines[#state.pending_control_coroutines]()
     assert(controller.last_batch.phase == "COMPLETED")
-elseif scenario == "cancel" then
+elseif scenario == "management_abort" then
     local fixture = require "test_controller_fixture"
     local state = fixture.module_state
     local controller = fixture.initialize_controller()
@@ -46,11 +46,13 @@ elseif scenario == "cancel" then
     assert(controller:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 1).ok)
     local begun = controller:handle_command("begin", {path = "module"}, 1)
     assert(begun.ok and controller.creation_count == 1)
-    assert(controller:handle_command("abort", {batch_id = begun.batch_id}, 1).ok)
-    assert(controller.last_batch.phase == "ABORTED" and controller.phase == "IDLE")
-    assert(controller.creation_count == 1)
     state.pending_control_coroutines[#state.pending_control_coroutines]()
+    assert(controller.active_batch.waiter)
+    assert(controller:handle_command("abort", {batch_id = begun.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
+    assert(controller.active_batch.batch_id == begun.batch_id and controller.creation_count == 1)
     assert(controller:handle_command("cancel_service_creation", {service_handle = 10}, 1).ok)
+    assert(controller.last_batch.phase == "COMPLETED" and controller.active_batch == nil)
+    assert(controller.creation_count == 0)
 elseif scenario == "module" then
     local patch = require "flywow_hotupgrade_module_patch"
     local live = {value = 1}

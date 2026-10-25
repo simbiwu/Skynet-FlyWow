@@ -1,4 +1,5 @@
 --- 本 Lua State 的完整模块更新；保留导出表身份，候选私有状态与旧版本隔离。
+--- 只替换导出字段，不重绑定函数 upvalue；旧函数引用和候选根表引用均保留原 Lua 语义。
 local hotupgrade_result = require "flywow_hotupgrade_error"
 local hotupgrade_common = require "flywow_hotupgrade_common"
 local M = {}

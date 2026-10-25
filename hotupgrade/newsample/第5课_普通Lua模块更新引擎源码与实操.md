@@ -1242,6 +1242,24 @@ cached_next()
 
 在设计普通模块时，如果没有需要跨版本继承的私有状态，**不用为了符合形式而增加这两个钩子**。我们本课放入 `count`，只是为了亲眼验证当前引擎的迁移流程。
 
+### 候选函数中的 M 与调用时的 self
+
+候选脚本执行 `local M = {}` 时会创建新表；Commit 仅将它的字段安装到原来的线上表，不改写函数 upvalue。下面是边界反例，不是受支持的线上根表身份判断方式：
+
+```lua
+local M = {version = 2}
+function M:is_same_table()
+    return self == M
+end
+return M
+```
+
+更新后 `logic:is_same_table()` 等价于 `logic.is_same_table(logic)`。self 接收原来的线上表，函数中捕获的 M 仍是候选表，所以结果为 false；package.loaded 与 logic 的线上根表身份依然保持不变。引擎不扫描或重绑定函数捕获的根表引用。
+
+方法需要操作线上导出字段时，通过 self 访问并使用冒号调用，例如 `function M:read_version() return self.version end`。需要迁移的私有 count 继续保存在局部变量中，通过本课已有的 export_state/import_state 迁移，不依赖候选根表就是线上根表。
+
+缓存的 V1 函数继续访问 V1 的 count，新安装的 V2 函数访问迁移后的 V2 count。两者初始值可以相同，之后独立变化；这属于允许的新旧函数引用并存，不是迁移失败。独立回归测试 `hotupgrade/tests/test_module_reference_contract.lua` 固定根表身份、自引用反例、self 访问、私有状态迁移和旧闭包继续工作的结果。
+
 ## 十、运行与逐项验收
 
 前面我们创建了三个完整文件，都是普通 Lua 文件。本实验不启动 Skynet，也不调用 Native。需要使用项目固定兼容的 Lua 5.4，原因包括源码中使用了 `math.type()` 等 Lua 5.4 API。

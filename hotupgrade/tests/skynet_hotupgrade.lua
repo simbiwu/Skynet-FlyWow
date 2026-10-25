@@ -713,17 +713,19 @@ local function run_test_group()
         local new_handle = module_state.hotupgrade_api.newservice("skynet_hotupgrade_worker")
         assert(module_state.hotupgrade_api.cancel_service_creation(new_handle).ok)
         print("HOTUPGRADE_SKYNET_PARTIAL_OK")
-    elseif group == "abort" then
+    elseif group == "management_abort" then
         controller = create_controller()
         worker_service_handle = create_worker_service()
         skynet.fork(function() assert(skynet.call(worker_service_handle, "lua", "hold", {ticks = 15}).ok) end)
         while skynet.call(worker_service_handle, "lua", "holding", {}) == false do skynet.sleep(1) end
         local id = begin_update_batch(controller, "combined")
         while not read_worker_state(worker_service_handle).paused do skynet.sleep(1) end
-        assert(skynet.call(controller, "hotupgrade", "abort", {batch_id = id}).ok)
-        wait_for_batch_phase(controller, id, "ABORTED")
-        assert_original_state(worker_service_handle)
-        print("HOTUPGRADE_SKYNET_ABORT_OK")
+        local rejected = skynet.call(controller, "hotupgrade", "abort", {batch_id = id})
+        assert(not rejected.ok and rejected.code == "HU_UNKNOWN_COMMAND")
+        wait_for_batch_phase(controller, id, "COMPLETED")
+        local after = read_worker_state(worker_service_handle)
+        assert(after.module_value == 2 and after.equip == "剑" and not after.paused)
+        print("HOTUPGRADE_SKYNET_MANAGEMENT_ABORT_REJECTED_OK")
     elseif group == "recovery_restore" or group == "recovery_module" then
         controller = create_controller()
         local config = group == "recovery_restore" and {custom = true, restore_failure = true} or {break_module = true}

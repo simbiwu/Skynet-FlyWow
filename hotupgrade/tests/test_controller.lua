@@ -283,18 +283,25 @@ scenarios['matching'] = function()
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(c.phase == "APPLYING" and #module_state.operations == 1)
     assert(module_state.operations[1] == "10:prepare")
-    assert(c:handle_command("abort", {batch_id = started.batch_id}, 1).ok)
-    assert(#module_state.operations == 1, "取消等待当前 Prepare 返回，不能并发发送 Abort")
-    module_state.control_hook = nil
+    local active_before_abort = c.active_batch
+    assert(c:handle_command("abort", {batch_id = started.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
+    assert(c.active_batch == active_before_abort and #module_state.operations == 1)
+    module_state.control_hook = function(_handle, command)
+        assert(command == "prepare" or command == "update" or command == "finish")
+        assert(c:handle_command("abort", {batch_id = started.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
+        assert(c.active_batch == active_before_abort)
+    end
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(c:handle_command("status", {batch_id = started.batch_id}, 1).record.phase == "ABORTED")
-    assert(table.concat(module_state.operations, ",") == "10:prepare,10:abort")
+    assert(c:handle_command("status", {batch_id = started.batch_id}, 1).record.phase == "COMPLETED")
+    assert(table.concat(module_state.operations, ",") == "10:prepare,20:prepare,10:update,20:update,file:lualib/test_worker_logic.lua,cache,10:finish,20:finish")
+    assert(c:handle_command("abort", {batch_id = started.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
+    module_state.control_hook = nil
     module_state.injected_control_failure = {service_handle = 10, command = "finish"}
     status = publish_and_complete_module_batch()
     assert(status.recovery_required and status.record.phase == "RECOVERY_REQUIRED")
     assert(not c:handle_command("apply", {path = "module"}, 1).ok)
     assert(not c:handle_command("history", {}, 1).ok)
-    -- 持有容量和只保留最近终态的合同，不能靠清空查询记录绕过恢复门禁。
+    -- 仅保留活动批次和最近终态；更早批次不能继续查询。
     assert(c:handle_command("status", {batch_id = "99:1"}, 1).code == "HU_BATCH_MISSING")
     -- 恢复失败仅报告，不再阻止创建、声明和下一批发布。
     assert(c.phase == "IDLE")
@@ -311,26 +318,25 @@ scenarios['matching'] = function()
     assert(waiting:handle_command("begin", {path = "module"}, 1).code == "HU_UPGRADE_BUSY")
     assert(waiting:handle_command("unknown_command", {}, 1).code == "HU_UNKNOWN_COMMAND")
     assert(waiting:handle_command("register", metadata, 84).ok and waiting.phase == "WAITING_CREATIONS")
-    assert(waiting:handle_command("abort", {batch_id = "stale"}, 1).code == "HU_ABORT_NOT_SAFE")
-    assert(waiting:handle_command("abort", {batch_id = begun.batch_id}, 1).ok)
-    assert(waiting.last_batch.phase == "ABORTED"
-        and waiting.last_batch.error.code == "HU_ABORT_REQUESTED")
-    -- 已取消的异步协程即使稍后被调度，也不能开始更新。
+    assert(waiting:handle_command("abort", {batch_id = "stale"}, 1).code == "HU_UNKNOWN_COMMAND")
+    assert(waiting:handle_command("abort", {batch_id = begun.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
+    assert(waiting.active_batch.batch_id == begun.batch_id)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(waiting.phase == "IDLE")
+    assert(waiting.last_batch.phase == "COMPLETED")
 
-    -- WAITING_CREATIONS 可在创建仍未完成时取消；随后清理原创建记录。
+    -- 管理端不能取消批次；创建者仍可取消未登记 Service，使排空自然完成。
     module_state.launch_service_handle = 86
     local pending_creation = waiting:handle_command("newservice",
         {service_name = "fixture", arguments = {n = 0}}, 1)
     assert(pending_creation.ok)
     local pending_batch = waiting:handle_command("begin", {path = "module"}, 1)
     assert(pending_batch.ok and waiting.phase == "WAITING_CREATIONS")
-    assert(waiting:handle_command("abort", {batch_id = pending_batch.batch_id}, 1).ok)
-    assert(waiting.last_batch.phase == "ABORTED"
-        and waiting.last_batch.error.code == "HU_ABORT_REQUESTED")
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+    assert(waiting.active_batch.waiter)
+    assert(waiting:handle_command("abort", {batch_id = pending_batch.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
+    assert(waiting.active_batch.batch_id == pending_batch.batch_id and waiting.creation_count == 1)
     assert(waiting:handle_command("cancel_service_creation", {service_handle = 86}, 1).ok)
+    assert(waiting.last_batch.phase == "COMPLETED" and waiting.creation_count == 0)
 
     local allowed = waiting:handle_command("begin_module_load", {name = "later"}, 84)
     assert(allowed.ok)
@@ -558,7 +564,7 @@ scenarios['draining'] = function()
     assert(c.creation_count == 0 and c.module_load_count == 0 and next(c.lifecycle_waiters) == nil)
 end
 
-scenarios['drain_abort'] = function()
+scenarios['drain_abort_rejected'] = function()
     local c = initialize_controller()
     assert(managed_register(c, metadata, 10).ok)
     module_state.control_hook = function(service_handle, command)
@@ -570,11 +576,13 @@ scenarios['drain_abort'] = function()
     local id = begin_deployment(c, "module")
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(c.active_batch.phase == "PREPARE" and c.active_batch.waiter and c.creation_count == 1)
-    assert(c:handle_command("abort", {batch_id = id}, 1).ok)
-    assert(c.last_batch.phase == "ABORTED" and c.last_batch.error.code == "HU_ABORT_REQUESTED")
-    assert(table.concat(module_state.operations, ",") == "10:prepare,10:abort")
+    local active_before_abort = c.active_batch
+    assert(c:handle_command("abort", {batch_id = id}, 1).code == "HU_UNKNOWN_COMMAND")
+    assert(c.active_batch == active_before_abort and c.creation_count == 1)
+    assert(table.concat(module_state.operations, ",") == "10:prepare")
     assert(c:handle_command("cancel_service_creation", {service_handle = 30}, 10).ok)
-    assert(c.phase == "IDLE" and c.creation_count == 0)
+    assert(c.last_batch.phase == "COMPLETED" and c.creation_count == 0)
+    assert(table.concat(module_state.operations, ",") == "10:prepare,10:update,file:lualib/test_worker_logic.lua,cache,10:finish")
 end
 
 scenarios['drain_unsupported'] = function()

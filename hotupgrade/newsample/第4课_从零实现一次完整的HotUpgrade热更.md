@@ -1486,10 +1486,6 @@ end
 batch.phase = "PREPARE"
 while true do
     for _, target in ipairs(batch.targets) do
-        if batch.cancelled then
-            batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
-            return
-        end
         if not target.participated then
             batch.current_service_handle = target.service_handle
             target.participated = true
@@ -1502,15 +1498,11 @@ while true do
         end
     end
 
-    -- 回调可能等待创建或首次加载；允许这些依赖完成，完成通知或取消会唤醒本批。
-    while not batch.cancelled and (self.creation_count > 0 or self.module_load_count > 0) do
+    -- 回调可能等待创建或首次加载；允许这些依赖完成，完成通知会唤醒本批。
+    while self.creation_count > 0 or self.module_load_count > 0 do
         batch.waiter = coroutine.running()
         skynet.wait(batch.waiter)
         batch.waiter = nil
-    end
-    if batch.cancelled then
-        batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
-        return
     end
 
     -- 同一份冻结源码覆盖新增登记和模块声明；匹配失败时仍保留旧记录用于 Abort。
@@ -1542,10 +1534,6 @@ end
 -- 最终匹配、计数检查到进入 Update 之间不 yield；此刻一次性关闭创建和加载门禁。
 batch.phase = "UPDATE"
 for _, target in ipairs(batch.targets) do
-    if batch.cancelled then
-        batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
-        return
-    end
     batch.current_service_handle = target.service_handle
     local answer = self:step(batch, target, "update")
     if not answer.ok then
@@ -1555,15 +1543,13 @@ for _, target in ipairs(batch.targets) do
     end
 end
 
-if batch.cancelled then
-    batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
-    return
-end
 ```
 
 这段代码来自：
 
 `hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:run_batch()`。
+
+begin 接受后不提供管理端主动取消；Controller 的管理命令 abort 返回 HU_UNKNOWN_COMMAND。下面的内部 Abort 只在批次失败后恢复目标，不是管理端取消入口。
 
 这里的外层 `while true` 只覆盖 Prepare 收口。它依次做三件事：给尚未参与的目标发 Prepare；等待回调期间产生的创建和首次加载完成；用冻结 Patch 重新匹配当前登记信息。
 
@@ -2197,7 +2183,6 @@ Skynet
 ```lua
 -- 文件和全部 Update 已确认成功；各目标 Finish 独立报告，不再执行回滚。
 batch.phase = "PUBLISH_DECIDED"
-batch.decided = true
 for _, target in ipairs(batch.targets) do
     batch.current_service_handle = target.service_handle
     target.result = self:step(batch, target, "finish")
@@ -2215,10 +2200,6 @@ batch.phase = batch.error and "RECOVERY_REQUIRED" or "COMPLETED"
 首先把批次阶段设置为：
 
 `PUBLISH_DECIDED`
-
-并设置：
-
-`batch.decided = true`
 
 这表示 Controller 已经确认本批次的所有运行时 Update 和正式文件部署都成功了。
 

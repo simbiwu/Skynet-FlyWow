@@ -213,11 +213,9 @@ end
 ---@field failed integer 失败目标数
 ---@field target_count integer 当前匹配目标数；Prepare 期间可增长，Update 前确定最终数量
 ---@field current_service_handle? integer 当前或最近一次处理的业务 Service handle；status 对外返回此值
----@field waiter? thread 等待创建/登记屏障或显式恢复确认的协程
----@field cancelled? boolean 管理端是否请求在安全点终止本批
+---@field waiter? thread 等待创建/登记或首次模块加载完成的批次协程
 ---@field error? FlyWowHotUpgradeResult 本批首个失败或恢复失败结果
 ---@field control_started? boolean 是否已向任一目标发送控制命令，用于报告本批是否触及目标
----@field decided? boolean 是否已越过发布决定；此后 Finish 失败不回滚
 
 ---@class FlyWowHotUpgradeControlRequest
 ---@field batch_id string Controller Service handle 与本进程递增序号组成；仅在该 Controller 生命周期有效
@@ -227,7 +225,7 @@ end
 
 ---@class FlyWowHotUpgradeManagementRequest
 ---@field path? string begin 的 Patch Root 相对目录
----@field batch_id? string status/abort 使用 begin 返回的身份
+---@field batch_id? string status 使用 begin 返回的身份
 
 ---@class FlyWowHotUpgradeLifecycleStatus
 ---@field phase string IDLE/WAITING_CREATIONS/DEPLOYING/APPLYING/COMPLETED
@@ -889,10 +887,6 @@ function M:run_batch(batch, request)
         batch.phase = "PREPARE"
         while true do
             for _, target in ipairs(batch.targets) do
-                if batch.cancelled then
-                    batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
-                    return
-                end
                 if not target.participated then
                     batch.current_service_handle = target.service_handle
                     target.participated = true
@@ -908,17 +902,13 @@ function M:run_batch(batch, request)
                 end
             end
 
-            -- 回调可能等待创建或首次加载；允许这些依赖完成，完成通知或取消会唤醒本批。
-            while not batch.cancelled and (self.creation_count > 0 or self.module_load_count > 0) do
+            -- 回调可能等待创建或首次加载；允许这些依赖完成，完成通知会唤醒本批。
+            while self.creation_count > 0 or self.module_load_count > 0 do
                 batch.waiter = coroutine.running()
                 skynet.wait(batch.waiter)
                 batch.waiter = nil
             end
             if batch.error then
-                return
-            end
-            if batch.cancelled then
-                batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
                 return
             end
 
@@ -955,10 +945,6 @@ function M:run_batch(batch, request)
         batch.phase = "UPDATE"
         -- UPDATE：各目标同步提交状态与代码；新生命周期请求保持挂起，不属于本批目标。
         for _, target in ipairs(batch.targets) do
-            if batch.cancelled then
-                batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
-                return
-            end
             batch.current_service_handle = target.service_handle
             local answer = self:step(batch, target, "update")
             if batch.error then
@@ -972,10 +958,6 @@ function M:run_batch(batch, request)
         end
 
         if batch.error then
-            return
-        end
-        if batch.cancelled then
-            batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
             return
         end
 
@@ -1052,7 +1034,6 @@ function M:run_batch(batch, request)
     else
         -- 文件和全部 Update 已确认成功；各目标 Finish 独立报告，不再执行回滚。
         batch.phase = "PUBLISH_DECIDED"
-        batch.decided = true
         for _, target in ipairs(batch.targets) do
             batch.current_service_handle = target.service_handle
             if not target.exited then
@@ -1147,7 +1128,6 @@ end
 ---| "register_module"
 ---| "cancel_module_load"
 ---| "status"
----| "abort"
 
 --- 管理命令不做远程认证；宿主掌握 Controller handle，登记来源由消息头确定。
 ---@param command FlyWowHotUpgradeManagementCommand Controller Service 分发的稳定管理命令
@@ -1215,29 +1195,6 @@ function M:handle_command(command, request, source)
         }
         return hotupgrade_result.success({record = batch_status,
             lifecycle = lifecycle, recovery_required = self.recovery_required})
-    end
-
-    if command == "abort" then
-        local batch = self.active_batch
-        if batch and batch.batch_id == request.batch_id and self.phase ~= "APPLYING" then
-            batch.phase = "ABORTED"
-            batch.error = hotupgrade_result.failure("HU_ABORT_REQUESTED", "管理端终止发布")
-            self.active_batch = nil
-            self.last_batch = batch
-            self.phase = "IDLE"
-            if batch.waiter then skynet.wakeup(batch.waiter) end
-            self:wake_lifecycle()
-            return hotupgrade_result.success()
-        end
-        if not batch or batch.batch_id ~= request.batch_id or batch.decided then
-            return hotupgrade_result.failure("HU_ABORT_NOT_SAFE", "批次不存在或已有目标越过发布决定")
-        end
-
-        batch.cancelled = true
-        if batch.waiter then
-            skynet.wakeup(batch.waiter)
-        end
-        return hotupgrade_result.success()
     end
 
     return hotupgrade_result.failure("HU_UNKNOWN_COMMAND", tostring(command))

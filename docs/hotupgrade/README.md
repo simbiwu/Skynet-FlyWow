@@ -135,7 +135,7 @@ end
 
 业务返回值和异常由业务自己定义。HotUpgrade 不管理 queue、不包装业务返回值，也不计数业务协程。queue 内的业务可以正常 yield；脱离该 queue 的协程不在排空保证范围内。
 
-register_service 必须提供 before_upgrade 函数；缺失或非函数会在登记时以 HU_INVALID_OPTIONS 拒绝。每次 Prepare 建立本地事务并设置 hot.patching=true 后都会调用该回调。回调允许 yield，必须通过上述同一个 queue 等待此前已进入的业务全部退出，例如 return business_queue(function() return true end)。Prepare 不维护额外阶段状态或比较回调前后的事务表身份；目标控制 RPC 由 Controller 串行等待，管理端取消只设置批次取消标志，待当前调用返回后才发送 Abort。只有 true 或 {ok=true} 确认业务安全点；回调失败、拒绝或异常均使 Prepare 失败，不能进入 Update。框架不轮询或超时放行业务。
+register_service 必须提供 before_upgrade 函数；缺失或非函数会在登记时以 HU_INVALID_OPTIONS 拒绝。每次 Prepare 建立本地事务并设置 hot.patching=true 后都会调用该回调。回调允许 yield，必须通过上述同一个 queue 等待此前已进入的业务全部退出，例如 return business_queue(function() return true end)。Prepare 不维护额外阶段状态或比较回调前后的事务表身份；目标控制 RPC 由 Controller 串行等待；begin 接受后不允许管理端主动取消，失败时由 Controller 执行内部 Abort。只有 true 或 {ok=true} 确认业务安全点；回调失败、拒绝或异常均使 Prepare 失败，不能进入 Update。框架不轮询或超时放行业务。
 
 业务 Service 的 hot.patching 与 Controller 创建/加载门禁职责不同：Prepare 设置 hot.patching 后，业务入口按现有接入方式停止新业务；此前已进入 queue 的业务仍可调用创建和首次加载 API，Controller 在 PREPARE 窗口正常处理这些依赖。
 
@@ -169,7 +169,40 @@ Finish 释放旧快照并结束本地事务后将 hot.patching 设为 false。Ab
 
 模块根导出必须是无元表 table，且候选必须是新根表。顶层导出字段名必须是字符串；导出值可为函数、数字、字符串、布尔值或普通嵌套表。嵌套表不得带元表，键只能是字符串、数字或布尔值，值可使用上述类型并继续嵌套；共享引用和循环引用允许，但数据图不得直接或间接引用模块根表，否则提交后会指向候选根表。引擎不限制新旧版本同名字段的类型。提交按候选根表完整替换字段，嵌套对象不递归合并、不保证身份；缓存的旧嵌套引用仍指向旧对象，回滚恢复旧字段及其原引用。可变私有状态放在模块闭包或由 Service 持有。候选源码接收首次 hotupgrade.require 使用的原始模块名和加载路径作为两个可变参数；该记录留在本 Lua State，不使用 Controller 的规范登记名替代。候选源码中的 require 使用 Lua 原生实现，可以按普通 Lua 规则加载当前 State 尚未加载的依赖。成功加载的依赖会留在 package.loaded；即使 Stage 或后续发布步骤失败，模块更新引擎也不清理这些新依赖、不回滚它们的模块初始化状态。本次事务只回滚明确纳入更新的模块导出和状态。候选模块顶层及状态钩子仍须受信、同步，不得 yield、I/O、写全局、修改线上状态或启动任务。
 
-调用方通过 logic.load(...) 读取当前函数。缓存的旧函数仍是旧函数，不会自动更新；不要对外暴露候选导出表或在业务中改写模块导出。
+### 函数引用与候选根表
+
+保留模块根表身份，只保证通过该表重新读取字段能看到已安装版本。已经缓存的旧函数和旧嵌套对象继续保留原引用，这是允许的 Lua 行为；框架不会扫描业务变量、定时器或回调并替换其中的函数。
+
+```lua
+local logic = hotupgrade.require("player_logic")
+local saved_attack = logic.attack -- 更新前保存的函数。
+-- 完成热更后：
+logic.attack(player)              -- 从稳定根表读取新版 attack。
+saved_attack(player)             -- 继续执行保存的旧函数。
+```
+
+候选代码创建的根表与线上根表是两张表。提交只把候选字段安装到线上表，不修改函数捕获的 upvalue。下面是不能依赖的根表身份假设，用于说明边界：
+
+```lua
+local M = {version = 2}
+function M:is_same_table()
+    return self == M
+end
+return M
+```
+
+提交后调用 `logic:is_same_table()`，self 是原有线上表，闭包中的 M 仍是候选表，因此返回 false。导出检查不扫描函数 upvalue，也不自动重绑定这个 M。模块函数不能把捕获的候选根表当作提交后的线上根表；需要访问线上导出字段的方法通过 self 访问，并使用冒号调用：
+
+```lua
+local M = {version = 2}
+function M:read_version()
+    return self.version
+end
+return M
+-- 更新后，logic:read_version() 从原有线上根表读取 version，得到 2。
+```
+
+可迁移的私有状态放在局部变量中，沿用下节的 export_state/import_state。不要对外暴露候选根表或在业务中改写模块导出。
 
 ### 模块私有状态
 
@@ -196,7 +229,7 @@ end
 return M
 ```
 
-每个版本内的 export_state 与 import_state 须成对提供。只有旧版提供 export_state 且候选版提供 import_state 时，旧状态快照才会复制并传给候选版；缺少任一方时跳过迁移，由候选版使用自己的初始化状态。状态复制或钩子报错、import_state 返回 false，都会拒绝 Stage。更新前闭包在 Stage 中不变，Abort 恢复原函数字段后继续使用更新前状态；不使用 debug.upvaluejoin 搬运 upvalue。
+每个版本内的 export_state 与 import_state 须成对提供。只有旧版提供 export_state 且候选版提供 import_state 时，旧状态快照才会复制并传给候选版；缺少任一方时跳过迁移，由候选版使用自己的初始化状态。状态复制或钩子报错、import_state 返回 false，都会拒绝 Stage。更新前闭包在 Stage 中不变，Abort 恢复原函数字段后继续使用更新前状态；不使用 debug.upvaluejoin 搬运 upvalue。 Finish 后，业务仍持有的旧函数继续访问旧版私有状态；新版函数访问迁移后自己的私有状态，两者不是同一个 upvalue，后续修改不会自动互相同步。
 
 钩子必须同步、无外部副作用，不得改其他模块。默认快照只接受 nil、布尔、数值、字符串和无元表普通表，键是字符串/数值/布尔；图内共享和循环会保留，最多 128 层、10000 个字段。超限或不可复制值使 Stage 失败。
 
@@ -278,7 +311,7 @@ begin 建立批次后立即返回 batch_id，由 Controller 的原有协程继�
 
 prepare/update/finish 是正常目标控制 RPC，abort 用于失败恢复。没有运行时目标时不发目标 RPC，照常部署完整文件。新目录按需建立；文件恢复删除本批新增文件，可能留下空目录。不部署非 Lua 资源，不提供文件删除清单。
 
-包检查或旧文件准备失败时，记录原始错误和 ABORTED，回到 IDLE，不向目标发送控制命令。Prepare、后续重匹配、Update 失败或发布决定前取消时，Abort 所有已参与目标，包括本轮新增并已 Prepare 的目标。Prepare 后等待在途操作时，取消会唤醒批次走 Abort；不删除仍在正常完成的创建或模块许可。文件部署或缓存清理失败时，先恢复已修改文件并清理缓存，再 Abort 目标。恢复失败或结果不明时以 RECOVERY_REQUIRED 报告，保留 original_error/recovery_error。无论是否恢复成功，Controller 都结束本批并回到 IDLE，释放快照及临时门禁，不阻止后续发布、创建和首次模块加载。
+包检查或旧文件准备失败时，记录原始错误和 ABORTED，回到 IDLE，不向目标发送控制命令。Prepare、后续重匹配或 Update 失败时，Abort 所有已参与目标，包括本轮新增并已 Prepare 的目标。文件部署或缓存清理失败时，先恢复已修改文件并清理缓存，再 Abort 目标。恢复失败或结果不明时以 RECOVERY_REQUIRED 报告，保留 original_error/recovery_error。无论是否恢复成功，Controller 都结束本批并回到 IDLE，释放快照及临时门禁，不阻止后续发布、创建和首次模块加载。
 
 Finish 发生在新版文件和全部 Update 已确认成功之后。某个 Finish 失败或结果不明时，继续尝试其余目标，逐项报告收尾错误并结束本批；不回滚已经 Finish 的目标，也不撤回新版文件。批量更新不承诺严格跨 Service 原子性。
 
@@ -290,7 +323,7 @@ status 不带 batch_id 返回生命周期概览；带 batch_id 还返回当前�
 
 下一批重新读取文件并保存当前状态快照，回滚目标是本批开始时的现场，不使用上一批快照。上一批的实际代码、状态和文件变化会成为下一批起点；下一批成功只说明它自身完成，不表示未涉及的历史问题已解决。状态必须仍满足当前加载、快照和身份合同，否则继续报告具体错误。活动及最近终态查询不代替宿主保存故障报告。
 
-取消使用 abort({batch_id=...})：等待创建/加载时可以取消本批，但不删除独立的生命周期记录；APPLYING 中只在发布决定前接受取消，并等待当前控制调用返回后依次 Abort。没有人工恢复确认前置条件。
+begin 成功后不提供管理端主动取消。向 Controller 发送 abort 返回 HU_UNKNOWN_COMMAND，不改变活动批次；管理端使用 status 等待最终结果。内部目标控制协议的 abort 仍用于失败恢复。创建失败后的 cancel_service_creation 和首次加载失败后的 cancel_module_load 继续用于结束各自的生命周期记录，不是取消热更批次。
 
 本模块不支持 Service 替换、跨节点原子事务、运行中 coroutine 栈更新或 Native/C 热替换。业务仍需自行验证权威数据、持久化一致性和部署权限；重新执行旧 Patch 也不能恢复过去的数据库内容。
 
@@ -309,7 +342,7 @@ bash scripts/build_flywow.sh ../skynet hotupgrade
 bash hotupgrade/scripts/run_hotupgrade_tests.sh ../skynet
 ```
 
-脚本测试创建中/待登记屏障、两种登记时序、启动与业务初始化失败、创建者取消权限、模块许可匹配/消费/失败清理、并发首次声明、Update 起门禁等待，以及父子孙创建链、queue 内创建与首次声明、嵌套许可、已准备目标补模块、新目标 Prepare/Update 失败恢复、排空等待取消、冻结源码只读一次、queue 排空与 patching、完整模块增改删、私有状态迁移、Service 状态/函数组合提交、真实 handle/State/表身份保持、Update 内 Stage/Activate 与整批恢复、纯文件发布、文件部署失败恢复、新实例与首次加载版本一致，以及 Finish 故障报告及失败后连续发布。Skynet 集成只启动测试专用进程，不监听业务端口；结果不替代宿主真实业务状态与数据库验证。
+脚本测试创建中/待登记屏障、两种登记时序、启动与业务初始化失败、创建者取消权限、模块许可匹配/消费/失败清理、并发首次声明、Update 起门禁等待，以及父子孙创建链、queue 内创建与首次声明、嵌套许可、已准备目标补模块、新目标 Prepare/Update 失败恢复、排空及控制 RPC 期间拒绝管理端 abort、冻结源码只读一次、queue 排空与 patching、完整模块增改删、候选根表与 self 的身份边界、缓存旧函数和新旧闭包状态隔离、私有状态迁移、Service 状态/函数组合提交、真实 handle/State/表身份保持、Update 内 Stage/Activate 与整批恢复、纯文件发布、文件部署失败恢复、新实例与首次加载版本一致，以及 Finish 故障报告及失败后连续发布。Skynet 集成只启动测试专用进程，不监听业务端口；结果不替代宿主真实业务状态与数据库验证。
 
 
 ### 宿主启动顺序与原生退出通知
