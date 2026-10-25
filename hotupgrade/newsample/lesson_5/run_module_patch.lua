@@ -1,6 +1,6 @@
 -- 从 FlyWow 仓库根目录执行；直接使用仓库的 Module Patch Engine。
 package.path = "./hotupgrade/lualib/?.lua;"
-    .. "./hotupgrade/lesson5/v1/?.lua;"
+    .. "./hotupgrade/newsample/lesson_5/v1/?.lua;"
     .. package.path
 
 local module_patch = require "flywow_hotupgrade_module_patch"
@@ -22,7 +22,7 @@ logic.next_count()
 print("V1:", logic.version(), old_load(100), logic.export_state().count)
 
 -- 从文件读取完整 V2 源码，作为引擎 stage() 的输入。
-local file = assert(io.open("hotupgrade/lesson5/v2/player_logic.lua", "rb"))
+local file = assert(io.open("hotupgrade/newsample/lesson_5/v2/player_logic.lua", "rb"))
 local v2_source = file:read("*a")
 file:close()
 

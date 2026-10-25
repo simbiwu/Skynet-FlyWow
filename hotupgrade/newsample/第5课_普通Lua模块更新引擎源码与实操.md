@@ -8,7 +8,7 @@
 
 配合阅读：[`hotupgrade/lualib/flywow_hotupgrade.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/main/hotupgrade/lualib/flywow_hotupgrade.lua)、[`hotupgrade/lualib/flywow_hotupgrade_controller.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/main/hotupgrade/lualib/flywow_hotupgrade_controller.lua)
 
-> **阅读约定**：本课新写的教学实验放在 `hotupgrade/lesson5/`，代码是我们为学习编写的，不是仓库已有 Sample；带有仓库源码路径、函数名和对应调用关系的代码才是实际框架源码。源码片段中的函数名、字段名和常量以当前工作区为准。当前 Controller 模块使用 `run_batch()`、`load_patch()`，业务 Lua State 的公开入口内部使用 `handle_upgrade()`。不要沿用旧提交里的 `run()`、`load()` 和 `control()` 定位这些函数。
+> **阅读约定**：本课新写的教学实验放在 `hotupgrade/newsample/lesson_5/`，代码是我们为学习编写的，不是仓库已有 Sample；带有仓库源码路径、函数名和对应调用关系的代码才是实际框架源码。源码片段中的函数名、字段名和常量以当前工作区为准。当前 Controller 模块使用 `run_batch()`、`load_patch()`，业务 Lua State 的公开入口内部使用 `handle_upgrade()`。不要沿用旧提交里的 `run()`、`load()` 和 `control()` 定位这些函数。
 >
 > **前置条件**：已经完成第 4 课，知道 `hotupgrade.require()`、Prepare、Update、Finish 与 Service Patch 的作用。本课不重新讲 Controller 如何启动或怎样发布完整 Service 文件，而是接着第 4 课进入 **Update 内部的普通模块更新引擎**。示例仍沿用“刀 → 剑”，但本课会专门观察模块导出表、函数引用、闭包私有状态和旧快照。
 
@@ -47,7 +47,7 @@ module_state.active_module_stage   当前 Lua State 唯一未完成的模块暂�
 在 FlyWow 仓库根目录下，新建：
 
 ```text
-hotupgrade/lesson5/
+hotupgrade/newsample/lesson_5/
 ├── v1/
 │   └── player_logic.lua
 ├── v2/
@@ -59,7 +59,7 @@ hotupgrade/lesson5/
 
 ### 先编写 V1 模块
 
-文件：`hotupgrade/lesson5/v1/player_logic.lua`。下面是我们新编写的**完整文件**。
+文件：`hotupgrade/newsample/lesson_5/v1/player_logic.lua`。下面是我们新编写的**完整文件**。
 
 ```lua
 local count = 0
@@ -105,7 +105,7 @@ return M
 
 ### 再编写 V2 完整模块
 
-文件：`hotupgrade/lesson5/v2/player_logic.lua`。下面也是**完整文件**：
+文件：`hotupgrade/newsample/lesson_5/v2/player_logic.lua`。下面也是**完整文件**：
 
 ```lua
 local count = 0
@@ -150,12 +150,12 @@ return M
 
 ### 编写实验入口
 
-文件：`hotupgrade/lesson5/run_module_patch.lua`。这是本课自己编写的**完整执行入口**，不包含 Skynet、Controller，也没有把输出封装成测试框架：
+文件：`hotupgrade/newsample/lesson_5/run_module_patch.lua`。这是本课自己编写的**完整执行入口**，不包含 Skynet、Controller，也没有把输出封装成测试框架：
 
 ```lua
 -- 从 FlyWow 仓库根目录执行；直接使用仓库的 Module Patch Engine。
 package.path = "./hotupgrade/lualib/?.lua;"
-    .. "./hotupgrade/lesson5/v1/?.lua;"
+    .. "./hotupgrade/newsample/lesson_5/v1/?.lua;"
     .. package.path
 
 local module_patch = require "flywow_hotupgrade_module_patch"
@@ -177,7 +177,7 @@ logic.next_count()
 print("V1:", logic.version(), old_load(100), logic.export_state().count)
 
 -- 从文件读取完整 V2 源码，作为引擎 stage() 的输入。
-local file = assert(io.open("hotupgrade/lesson5/v2/player_logic.lua", "rb"))
+local file = assert(io.open("hotupgrade/newsample/lesson_5/v2/player_logic.lua", "rb"))
 local v2_source = file:read("*a")
 file:close()
 
@@ -415,14 +415,16 @@ module_stage.entries[1].old.next_count ──→ 原 V1 闭包
 
 ```lua
 local chunk = assert(load(hotupgrade_common.normalize_source(module_patch.source), "@" .. module_patch.name, "t"))
-            local loader = module_loaders and module_loaders[module_patch.name]
+local loader = module_loaders and module_loaders[module_patch.name]
 module_stage.entries[#module_stage.entries + 1] =
 {
-    name      = module_patch.name, -- package.loaded 的规范名；提交与恢复时核对线上根表身份。
-    live      = live,      -- 原模块根表；提交与恢复始终原地修改它的字段。
-    old       = fields,    -- 旧导出字段及原引用；保留至本批 Finish/Abort 结束。
-    chunk     = chunk,     -- 第一轮编译的源码；第二轮执行后释放。
-    candidate = nil,       -- 第二轮准备的新导出；Commit 时整体安装其字段。
+    name        = module_patch.name,                           -- package.loaded 的规范名；提交与恢复始终核对线上根表身份。
+    live        = live,                                        -- 原模块根表；提交与恢复始终原地修改它的字段。
+    old         = fields,                                      -- 旧导出字段及原引用；保留至本批 Finish/Abort 结束。
+    chunk       = chunk,                                       -- 第一轮编译的源码；第二轮执行后释放。
+    loader_name = loader and loader.name or module_patch.name, -- 首次 require 名称。
+    loader_path = loader and loader.path,                      -- 首次加载路径。
+    candidate   = nil,                                         -- 第二轮准备的新导出；Commit 时整体安装其字段。
 }
 ```
 
@@ -472,7 +474,7 @@ local M =
 }
 ```
 
-这段代码来自我们自己编写的 `hotupgrade/lesson5/v2/player_logic.lua` 的文件顶部。它会创建**新的候选导出表**以及**新的 V2 私有 count**，与旧模块不是同一张表，也不是同一份 upvalue。
+这段代码来自我们自己编写的 `hotupgrade/newsample/lesson_5/v2/player_logic.lua` 的文件顶部。它会创建**新的候选导出表**以及**新的 V2 私有 count**，与旧模块不是同一张表，也不是同一份 upvalue。
 
 随后 `check_exports(candidate, entry.name)` 验证候选导出；`candidate ~= entry.live` 明确禁止候选返回正在使用的旧导出根表。引擎不限制新版与旧版同名字段的 Lua 类型，提交时由候选表完整决定导出字段；业务方按自己的模块更新方案处理调用方兼容性。
 
@@ -782,7 +784,7 @@ state.equip = "剑"
 print("Commit:", logic.version(), logic.make_load(state)(100), old_load(100))
 ```
 
-来源：我们编写的 `hotupgrade/lesson5/run_module_patch.lua`。这不是框架替我们修改 Service 状态；这里的 `state.equip` 只是单 Lua State 实验对 Service 状态迁移的模拟。
+来源：我们编写的 `hotupgrade/newsample/lesson_5/run_module_patch.lua`。这不是框架替我们修改 Service 状态；这里的 `state.equip` 只是单 Lua State 实验对 Service 状态迁移的模拟。
 
 `logic.make_load(state)` 当前是 V2 的导出函数，返回一个捕获 `state` 的 V2 闭包，所以攻击力是 `100+21=121`。
 
@@ -1068,18 +1070,26 @@ if command == "update" then
     if txn.phase ~= nil then
         return hotupgrade_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
-    -- Controller 已按本 State 的登记模块筛选 Patch；Stage 准备候选和快照，不写线上状态。
-    local staged = hotupgrade_module_patch.stage(request.modules, module_state.declared_modules)
+    -- 先加载 Service Patch 声明的新模块；它们留给下一批普通模块 Stage。
+    local service, service_failure = stage_service_and_new_modules(txn, request.service_source)
+    if service_failure then
+        return service_failure
+    end
+
+    -- 新模块清单上下文覆盖普通候选 Stage；漏列的首次依赖立即失败。
+    local stage_ok, staged = pcall(hotupgrade_module_patch.stage,
+        request.modules, module_state.declared_modules)
+    txn.new_module_context = nil
+    if not stage_ok then
+        local cause = type(staged) == "table" and staged.ok == false and staged or nil
+        return hotupgrade_result.failure("HU_MODULE_STAGE_FAILED",
+            cause and cause.message or tostring(staged), nil, cause and cause.code)
+    end
     if not staged.ok then
         return staged
     end
 
     txn.modules = staged.stage
-    local ok, service = pcall(stage_service, request.service_source)
-    if not ok then
-        return hotupgrade_result.failure("HU_SERVICE_STAGE_FAILED", tostring(service))
-    end
-
     txn.service = service
     txn.phase = "STAGED"
 
@@ -1267,13 +1277,13 @@ return M
 在 FlyWow 仓库根目录执行：
 
 ```bash
-lua5.4 hotupgrade/lesson5/run_module_patch.lua
+lua5.4 hotupgrade/newsample/lesson_5/run_module_patch.lua
 ```
 
 如果本机 Lua 5.4 可执行程序名是 `lua`，则用：
 
 ```bash
-lua hotupgrade/lesson5/run_module_patch.lua
+lua hotupgrade/newsample/lesson_5/run_module_patch.lua
 ```
 
 本课代码依赖的 `flywow_hotupgrade_module_patch.lua`、`flywow_hotupgrade_error.lua` 和 `flywow_hotupgrade_common.lua` 都通过脚本设置的 `package.path` 从仓库现有目录加载，不需要复制核心源码文件。
@@ -1311,7 +1321,7 @@ Finish:             v2   121   100
 
 这份表只是把刚才已经看到的对象变化压缩到一起，方便验收；它不是替代前面源码讲解的另一套流程。
 
-上述输出是根据本课给出的 V1/V2 文件和当前引擎执行路径推导的预期结果。本课实验文件由学习者按前文创建；仓库不包含 `hotupgrade/lesson5/` 的预制实验目录，因此这里不声称这些命令已在当前工作区实际运行。它也不替代原生构建、真实 Skynet Service 或完整发布事务的测试。学习时应在当前 checkout 中对照引擎源码；若源码字段或行为与摘录不同，以实际源码为准并先更新对应讲解。
+上述输出是根据本课给出的 V1/V2 文件和当前引擎执行路径推导的预期结果。本课实验文件预置在 `hotupgrade/newsample/lesson_5/`；文中的路径均对应当前仓库文件。预期输出不替代原生构建、真实 Skynet Service 或完整发布事务的测试。学习时应在当前 checkout 中对照引擎源码；若源码字段或行为与摘录不同，以实际源码为准并先更新对应讲解。
 
 ## 十一、读完第 5 课，应该建立怎样的执行模型？
 

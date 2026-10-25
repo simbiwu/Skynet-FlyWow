@@ -679,7 +679,7 @@ scenarios['resources'] = function()
     assert(module_state.file_contents["lualib/a_added.lua"] == nil)
     assert(module_state.last_control_command_by_service_handle[104] == "abort")
     module_state.injected_file_failure = nil
-    -- 文件准备和缓存清理失败均保留具体诊断；恢复失败才锁定。
+    -- 文件准备和缓存清理失败均保留具体诊断；恢复失败只报告错误，不阻止后续发布。
     module_state.injected_read_failure = "lualib/test_worker_logic.lua"
     module_state.operations = {}
     local rejected_file = publish(deployment, {path = "module"})
@@ -689,11 +689,16 @@ scenarios['resources'] = function()
     assert(#module_state.operations == 0 and not deployment.last_batch.control_started)
     module_state.injected_read_failure = nil
     module_state.file_contents = {["lualib/test_worker_logic.lua"] = "old"}
+    module_state.operations = {}
     module_state.cache_failures = 1
     assert(publish(deployment, {path = "module"}).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(deployment.phase == "IDLE" and deployment.last_batch.error.code == "HU_CACHE_CLEAR_FAILED")
+    assert(deployment.phase == "IDLE" and deployment.last_batch.phase == "ABORTED")
+    assert(deployment.last_batch.error.code == "HU_CACHE_CLEAR_FAILED" and not deployment.recovery_required)
     assert(module_state.file_contents["lualib/test_worker_logic.lua"] == "old")
+    assert(table.concat(module_state.operations, ",") ==
+        "101:prepare,102:prepare,103:prepare,104:prepare,file:lualib/test_worker_logic.lua,cache,"
+        .. "file:lualib/test_worker_logic.lua,cache,104:abort,103:abort,102:abort,101:abort")
 
     module_state.injected_file_failure = "service/z_blocked.lua"
     module_state.injected_restore_failure = true
