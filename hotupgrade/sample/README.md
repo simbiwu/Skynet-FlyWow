@@ -22,11 +22,11 @@
 
 - flywow_hotupgrade_sample.lua：按顺序执行初始化、创建实例、发布、等待完成和读取结果。
 - host_v1/：初始 PlayerService 和 V1 普通模块。
-- patches/v2/：完整 V2 模块、部署后的 Service 文件，以及更新现存实例的一次性 player_service.patch。
+- patches/v2/：完整 V2 模块、新增的 combat_rules 模块、部署后的 Service 文件，以及更新现存实例的一次性 player_service.patch。
 - skynet_config.lua：本示例使用的 Skynet、FlyWow 和宿主代码搜索路径。
 
 PlayerService 的 skynet.queue() 是更新安全点的一部分：更新前停止新业务，再等待正在执行的业务结束。V1 攻击值是 105；发布后原实例的装备状态迁移为“剑”，业务函数更新为 V2，攻击值变成 120。新实例从已部署的 V2 文件启动，也得到 120。
 
 Prepare 排空期间，队列中已进入的业务仍可正常创建 Service 或首次加载模块。Controller 会等待这些操作完成，并让新增的匹配目标也执行一次 Prepare；全部准备好后才在 Update 前关闭创建和加载门禁，后续请求由框架等待到发布结束。
 
-Service Patch 的 update_state() 在 Update 中直接修改现存 state；未修改字段保留，嵌套赋值和赋 nil 删除遵循 Lua 语义。replace_functions 指定要替换的现有函数；旧快照仅用于恢复。
+Service Patch 用 new_modules 声明本 Service 首次使用的 combat_rules。Controller 先部署全部 Lua 文件，目标再加载并登记该模块，然后 Stage player_logic；因此 V2 候选中的 hotupgrade.require("combat_rules") 能命中已登记模块，不会在 UPDATE 等普通首次加载许可。新模块不加入当前批次的模块 Stage，下一批才可作为普通模块更新。Service Patch 的 update_state() 在 Update 中直接修改现存 state；未修改字段保留，嵌套赋值和赋 nil 删除遵循 Lua 语义。replace_functions 指定要替换的现有函数；旧快照仅用于恢复。

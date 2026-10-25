@@ -199,6 +199,13 @@ scenarios['lifecycle'] = function()
     end
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(lifecycle.active_batch.phase == "UPDATE")
+    local new_module_request = {batch_id = started_lifecycle.batch_id, name = "lualib.new_rules"}
+    assert(lifecycle:handle_command("register_new_module", new_module_request, 71).code == "HU_NEW_MODULE_NOT_ALLOWED")
+    assert(lifecycle:handle_command("register_new_module", {batch_id = "stale", name = new_module_request.name}, 70).code
+        == "HU_NEW_MODULE_NOT_ALLOWED")
+    assert(lifecycle:handle_command("register_new_module", new_module_request, 70).ok)
+    assert(lifecycle:handle_command("register_new_module", new_module_request, 70).ok)
+    assert(lifecycle.service_registrations[70].modules[new_module_request.name])
     local queued_result
     local queued = coroutine.create(function()
         queued_result = lifecycle:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 1)
@@ -220,6 +227,7 @@ scenarios['lifecycle'] = function()
     assert(lifecycle:handle_command("register_module", {name = "late", permit_id = queued_module.permit_id}, 70).ok)
     assert(queued_result.ok and queued_result.service_handle == 83)
     assert(lifecycle:handle_command("cancel_service_creation", {service_handle = 83}, 1).ok)
+    assert(lifecycle:handle_command("register_new_module", new_module_request, 70).code == "HU_NEW_MODULE_NOT_ALLOWED")
     assert(lifecycle:handle_command("status", {batch_id = "unknown"}, 1).code == "HU_BATCH_MISSING")
     print("HOTUPGRADE_CONTROLLER_LIFECYCLE_OK")
 end
@@ -293,7 +301,7 @@ scenarios['matching'] = function()
     end
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(c:handle_command("status", {batch_id = started.batch_id}, 1).record.phase == "COMPLETED")
-    assert(table.concat(module_state.operations, ",") == "10:prepare,20:prepare,10:update,20:update,file:lualib/test_worker_logic.lua,cache,10:finish,20:finish")
+    assert(table.concat(module_state.operations, ",") == "10:prepare,20:prepare,file:lualib/test_worker_logic.lua,cache,10:update,20:update,10:finish,20:finish")
     assert(c:handle_command("abort", {batch_id = started.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
     module_state.control_hook = nil
     module_state.injected_control_failure = {service_handle = 10, command = "finish"}
@@ -582,7 +590,7 @@ scenarios['drain_abort_rejected'] = function()
     assert(table.concat(module_state.operations, ",") == "10:prepare")
     assert(c:handle_command("cancel_service_creation", {service_handle = 30}, 10).ok)
     assert(c.last_batch.phase == "COMPLETED" and c.creation_count == 0)
-    assert(table.concat(module_state.operations, ",") == "10:prepare,10:update,file:lualib/test_worker_logic.lua,cache,10:finish")
+    assert(table.concat(module_state.operations, ",") == "10:prepare,file:lualib/test_worker_logic.lua,cache,10:update,10:finish")
 end
 
 scenarios['drain_unsupported'] = function()
@@ -637,14 +645,14 @@ scenarios['resources'] = function()
     assert(publish(ordered, {path = "module"}).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(table.concat(module_state.operations, ",") ==
-        "101:prepare,102:prepare,103:prepare,101:update,102:update,103:update,file:lualib/test_worker_logic.lua,cache,101:finish,102:finish,103:finish")
+        "101:prepare,102:prepare,103:prepare,file:lualib/test_worker_logic.lua,cache,101:update,102:update,103:update,101:finish,102:finish,103:finish")
     module_state.operations = {}
     local before_failure = module_state.file_contents["lualib/test_worker_logic.lua"]
     module_state.injected_control_failure = {service_handle = 103, command = "update"}
     assert(publish(ordered, {path = "module"}).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(table.concat(module_state.operations, ",") ==
-        "101:prepare,102:prepare,103:prepare,101:update,102:update,103:update,103:abort,102:abort,101:abort")
+        "101:prepare,102:prepare,103:prepare,file:lualib/test_worker_logic.lua,cache,101:update,102:update,103:update,file:lualib/test_worker_logic.lua,cache,103:abort,102:abort,101:abort")
     assert(module_state.file_contents["lualib/test_worker_logic.lua"] == before_failure)
     assert(ordered.last_batch.phase == "ABORTED" and ordered.phase == "IDLE")
     module_state.injected_control_failure = nil
@@ -655,7 +663,7 @@ scenarios['resources'] = function()
         module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
         assert(ordered.phase == "IDLE" and ordered.last_batch.success == 2 and ordered.last_batch.failed == 1)
         assert(table.concat(module_state.operations, ",") ==
-            "101:prepare,102:prepare,103:prepare,101:update,102:update,103:update,file:lualib/test_worker_logic.lua,cache,101:finish,102:finish,103:finish")
+            "101:prepare,102:prepare,103:prepare,file:lualib/test_worker_logic.lua,cache,101:update,102:update,103:update,101:finish,102:finish,103:finish")
         assert(module_state.file_contents["lualib/test_worker_logic.lua"])
         module_state.injected_control_failure = nil
     end

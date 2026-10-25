@@ -36,7 +36,7 @@
 玩家状态版本：2
 基础攻击力：100
 装备加成：21
-最终攻击力：121
+最终攻击力：120
 ```
 
 热更完成后，还要验证两件事：
@@ -207,7 +207,7 @@ local function initialize()
             return logic.version() == "v2"
                 and state.equip == "剑"
                 and state.schema_version == 2
-                and business.load(100) == 121
+                and business.load(100) == 120
         end,
     })
 end
@@ -719,13 +719,26 @@ attack: 105
 ```text
 hotupgrade/lesson4/patches/v2/
 ├── lualib/
+│   ├── combat_rules.lua
 │   └── player_logic.lua
 └── service/
     ├── player_service.lua
     └── player_service.patch
 ```
 
-注意这三个文件的作用不同，不能互相替代。
+注意这三个文件的作用不同，不能互相替代。本次还新增普通模块 combat_rules.lua，由 Service Patch 的 new_modules 显式声明。Controller 先部署完整 Lua 文件并清理缓存，再向目标发送 Update；目标在 Update 中通过 hotupgrade.require() 首次加载并登记该模块。该清单中的模块不属于本批冻结的普通模块 Stage 集合，不能在同批首次登记后又被更新；后续批次可以再更新它。如果某个清单模块同时被门禁期间的普通首次加载协程占有，Update 会以 `HU_MODULE_LOADING` 快速失败并走现有恢复流程，不会互相等待。
+
+新增文件：hotupgrade/lesson4/patches/v2/lualib/combat_rules.lua
+
+```lua
+local M = {}
+
+function M.attack_bonus(equip)
+    return equip == "剑" and 20 or 0
+end
+
+return M
+```
 
 ### 编写 V2 普通模块
 
@@ -734,6 +747,8 @@ hotupgrade/lesson4/patches/v2/
 完整代码：
 
 ```lua
+local hotupgrade = require "flywow_hotupgrade"
+local combat_rules = hotupgrade.require("combat_rules")
 local M = {}
 
 function M.version()
@@ -742,11 +757,7 @@ end
 
 function M.make_load(state)
     return function(base_attack)
-        if state.equip == "剑" then
-            return base_attack + 20 + 1
-        end
-
-        return base_attack
+        return base_attack + combat_rules.attack_bonus(state.equip)
     end
 end
 
@@ -757,7 +768,7 @@ return M
 
 V1 判断 `"刀"`，加 5。
 
-V2 判断 `"剑"`，加 21。
+V2 将装备规则放在 combat_rules.lua 中；装备为“剑”时加 20。
 
 但我们没有只写一个新的 `make_load()`，而是提供了整个模块的完整 V2。
 
@@ -792,6 +803,7 @@ V2 判断 `"剑"`，加 21。
 return function(state)
     return
     {
+        new_modules = {"combat_rules"},
         update_state = function()
             assert(state.schema_version == 1, "PlayerService 需要 schema 1")
             state.equip = "剑"
@@ -801,7 +813,7 @@ return function(state)
         {
             load = function(base_attack)
                 if state.equip == "剑" then
-                    return base_attack + 20 + 1
+                    return base_attack + 20
                 end
 
                 return base_attack
@@ -819,9 +831,9 @@ HotUpgrade 之后会在原 PlayerService 的 Lua State 内执行这个函数，�
 
 构建函数返回两部分内容：
 
-构建函数接收现存 state，只准备闭包，不修改线上状态。update_state() 不接收参数、不返回候选状态，在 Update 同步提交阶段直接修改现存 state。嵌套赋值、共享引用、循环引用和赋 nil 删除字段均遵循普通 Lua 语义；未修改字段自然保留，不生成候选状态、不递归合并。
+构建函数接收现存 state，只准备闭包，不修改线上状态。new_modules 列出本次 Update 首次登记的模块名；加载时仍需首次登记的依赖也须列入清单，已登记依赖可直接复用。update_state() 不接收参数、不返回候选状态，在 Update 同步提交阶段直接修改现存 state。嵌套赋值、共享引用、循环引用和赋 nil 删除字段均遵循普通 Lua 语义；未修改字段自然保留，不生成候选状态、不递归合并。
 
-replace_functions 只列出需要替换的现有业务函数；未列出的函数保持原样，新函数捕获原 state。没有状态修改可省略 update_state，没有函数替换可省略 replace_functions，至少提供一项。旧 migrate / functions 字段不再接受。
+replace_functions 只列出需要替换的现有业务函数；未列出的函数保持原样，新函数捕获原 state。update_state、非空 replace_functions、非空 new_modules 至少提供一项。旧 migrate / functions 字段不再接受。
 
 准备阶段保存旧状态快照和旧函数。提交前先标记 touched，再调用 update_state()，随后安装 replace_functions，最后执行 after_upgrade。部分写入抛错及后续失败沿现有 Abort 恢复；恢复失败报告 RECOVERY_REQUIRED，结束本批后仍释放入口。迁移运行错误在 Update 提交时发现。成功 Finish 后清理快照。
 
@@ -897,7 +909,7 @@ local function initialize()
             return logic.version() == "v2"
                 and state.equip == "剑"
                 and state.schema_version == 2
-                and business.load(100) == 121
+                and business.load(100) == 120
         end,
     })
 end
@@ -1424,10 +1436,11 @@ batch.target_count = #loaded.targets
 
 这些语句位于 `flywow_hotupgrade_controller.lua` 的 `M:run_batch()`，在 `self:load_patch(request)` 返回之后执行。
 
-本次 `batch.files` 包含两份完整 `.lua` 文件：
+本次 `batch.files` 包含三份完整 `.lua` 文件：
 
 ```text
 lualib/player_logic.lua
+lualib/combat_rules.lua
 service/player_service.lua
 ```
 
@@ -1836,25 +1849,33 @@ PlayerService 收到消息后，经本地 `skynet.dispatch("hotupgrade", ...)` �
 
 `flywow_hotupgrade.lua` 的 `handle_upgrade("update")`。
 
-现在先看真实代码的 Stage 部分：
+目标 Update 先在该 PlayerService 的 Lua State 中构建 Service Patch，并加载、登记它声明的 new_modules；同一临时清单上下文持续到普通候选模块完成 Stage。候选代码漏列一个尚未登记的新依赖时会立即失败，不会在 UPDATE 中等待普通首次加载许可。Stage 返回的 `cause_code` 只对应实际逃逸的错误；若候选代码用 `pcall` 捕获该错误，后续其它失败不会沿用它。以下是省略周边校验后的关键顺序：
 
 ```lua
 if command == "update" then
     if txn.phase ~= nil then
         return hotupgrade_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
-    -- Controller 已按本 State 的登记模块筛选 Patch；Stage 准备候选和快照，不写线上状态。
-    local staged = hotupgrade_module_patch.stage(request.modules, module_state.declared_modules)
+    -- 先构建 Service Patch 并登记 new_modules；新模块不在本批冻结的普通模块集合中。
+    local service, service_failure = stage_service_and_new_modules(txn, request.service_source)
+    if service_failure then
+        return service_failure
+    end
+
+    -- Controller 传入的本批普通模块清单已冻结，不包含刚登记的新模块。
+    local stage_ok, staged = pcall(hotupgrade_module_patch.stage,
+        request.modules, module_state.declared_modules)
+    txn.new_module_context = nil
+    if not stage_ok then
+        local cause = type(staged) == "table" and staged.ok == false and staged or nil
+        return hotupgrade_result.failure("HU_MODULE_STAGE_FAILED",
+            cause and cause.message or tostring(staged), nil, cause and cause.code)
+    end
     if not staged.ok then
         return staged
     end
 
     txn.modules = staged.stage
-    local ok, service = pcall(stage_service, request.service_source)
-    if not ok then
-        return hotupgrade_result.failure("HU_SERVICE_STAGE_FAILED", tostring(service))
-    end
-
     txn.service = service
     txn.phase = "STAGED"
 ```
@@ -1947,7 +1968,21 @@ local function stage_service(patch_source)
     assert(patch.update_state == nil or type(patch.update_state) == "function", "update_state 必须是函数")
     assert(patch.replace_functions == nil or (type(patch.replace_functions) == "table"
         and getmetatable(patch.replace_functions) == nil), "replace_functions 必须是普通表")
-    assert(patch.update_state or (patch.replace_functions and next(patch.replace_functions)), "Service Patch 没有更新内容")
+    if patch.new_modules ~= nil then
+        assert(type(patch.new_modules) == "table" and getmetatable(patch.new_modules) == nil,
+            "new_modules 必须是普通数组")
+        local item_count = 0
+        local last_index = 0
+        for index, module_name in pairs(patch.new_modules) do
+            assert(math.type(index) == "integer" and index > 0 and type(module_name) == "string"
+                and module_name ~= "", "new_modules 必须是非空模块名组成的连续数组")
+            item_count = item_count + 1
+            last_index = math.max(last_index, index)
+        end
+        assert(item_count == last_index, "new_modules 必须是连续数组")
+    end
+    assert(patch.update_state or (patch.replace_functions and next(patch.replace_functions))
+        or (patch.new_modules and next(patch.new_modules)), "Service Patch 没有更新内容")
 
     -- 保存本次可能替换的旧函数，Activate 失败时逐字段恢复。
     local staged =
@@ -2060,12 +2095,12 @@ state 已修改，business.load 已替换为捕获原 state 的新闭包，普�
 
 `hotupgrade/lualib/flywow_hotupgrade_controller.lua` 的 `M:run_batch()`。
 
-前面的 Prepare 和 Update 都已经成功返回，Controller 可以继续执行后面的文件部署代码。
+Prepare 和目标集合收口后，Controller 先部署并清理正式文件缓存，再向任何目标发送 Update RPC。这样 Patch 构建和 new_modules 首次加载使用的是本批已冻结并部署的 Lua 源码。
 
 真实源码：
 
 ```lua
--- 仅使用已冻结的完整文件，不能在 Update 后重新读取发布包。
+-- 仅使用已冻结的完整文件；在目标 Update 前部署，不重新读取发布包。
 for _, file in ipairs(batch.files) do
     local written, failure = hotupgrade_native.replace_file(self.root_path, file.entry_file, file.source)
     if not written then
@@ -2078,11 +2113,12 @@ if #batch.files > 0 then
     local cleared, failure = pcall(skynet.cache.clear)
     if not cleared then
         batch.error = hotupgrade_result.failure("HU_CACHE_CLEAR_FAILED", tostring(failure))
+        return
     end
 end
 ```
 
-这段代码位于 `M:run_batch()` 的 Update 成功之后。
+这段代码位于 `M:run_batch()` 进入 UPDATE 阶段后、向目标发送 Update RPC 之前。
 
 `batch.files` 是之前由 `M:load_patch()` 冻结的正式 `.lua` 文件集合。
 
@@ -2090,6 +2126,7 @@ end
 
 ```text
 lualib/player_logic.lua
+lualib/combat_rules.lua
 service/player_service.lua
 ```
 
@@ -2135,15 +2172,9 @@ Controller 逐个调用 Native `replace_file()`，将冻结的 V2 源码部署�
 
 **Lua `package.loaded`** 保存的是某个 Lua State 已经加载过的模块。
 
-`skynet.cache.clear()` 不负责把原 PlayerService 中的 `logic` 表变成 V2；那件事早已在 Update 中由 Module Patch Engine 完成。
+`skynet.cache.clear()` 不负责把原 PlayerService 中的 `logic` 表变成 V2；运行中的模块根表会在随后每个目标的 Update 中由 Module Patch Engine 原地更新。
 
-现在我们终于同时拥有了：
-
-- 原 PlayerService 内存中的 V2 模块、V2 状态和 V2 业务函数。
-- 正式磁盘上的 V2 完整 Lua 文件。
-- 已经清理的 Skynet 代码缓存。
-
-但这仍然不是最后一步。
+此时正式磁盘上的完整 Lua 文件已更新，Skynet 代码缓存已清理；Controller 接下来才向目标发送 Update RPC。目标 Update 成功返回后，运行中的 PlayerService 才同时拥有 V2 模块、V2 状态和 V2 业务函数。之后仍需执行 Finish。
 
 #### 第六次状态快照：正式文件部署完成
 
@@ -2151,18 +2182,13 @@ Controller 逐个调用 Native `replace_file()`，将冻结的 V2 源码部署�
 Controller
     phase = APPLYING
     batch.phase = UPDATE
-    batch.files 中两份正式文件已部署
-    尚未执行 Finish
+    三份正式 Lua 文件已部署，Skynet 代码缓存已清理
+    尚未向目标发送 Update RPC
 
 原 PlayerService
     hot.patching = true
-    txn.phase = ACTIVATED
-
-    state = V2
-    logic = V2 导出内容
-    business.load = V2 闭包
-
-    旧快照：仍保留
+    仍处于 Prepare 安全点
+    尚未加载 new_modules 或执行普通模块 Stage
 
 正式磁盘
     player_logic.lua = V2
@@ -2256,15 +2282,13 @@ M.patching = false
 
 这时新业务就可以重新进入 PlayerService 自己的 queue，正常使用 V2 状态和函数。
 
-为什么旧快照不能在 Update 成功后立即释放？
+为什么目标 Update 成功后不能立即释放旧快照？
 
-因为 Update 成功只说明内存更新成功。如果接下来的正式文件部署失败，Controller 还需要让 PlayerService 恢复 V1。
-
-一旦提前释放旧快照，就失去了正常恢复的依据。
+因为后续目标的 Update 仍可能失败，Controller 需要向已经完成 Update 的目标发送 Abort。它们必须保留旧快照，供当前批次失败恢复。
 
 所以当前顺序是：
 
-**Update 保留恢复能力 → 部署正式文件 → 发布决定 → Finish 释放恢复数据并开放业务。**
+**部署正式文件并清缓存 → 逐个目标 Update，保留恢复数据 → 所有目标成功后作出发布决定 → Finish 释放恢复数据并开放业务。**
 
 Finish 成功后，它通过 RPC 返回 Controller。
 
@@ -2313,7 +2337,7 @@ Controller
     logic.version() = "v2"
     模块导出根表身份不变
 
-    business.load(100) = 121
+    business.load(100) = 120
     initial_load(100) = 100
 
     旧模块快照：已释放
@@ -2383,7 +2407,7 @@ Controller 完成批次之后，我们最初编写的 `lesson4_main.lua` 正在�
 | `version` | `v2` |
 | `equip` | 剑 |
 | `schema_version` | `2` |
-| `attack` | `121` |
+| `attack` | `120` |
 | `initial_attack` | `100` |
 | `load_changed` | `true` |
 | `state_same` | `true` |
@@ -2449,8 +2473,8 @@ second_service_handle
     state = {equip="剑", schema_version=2}
     business.load = 新创建的 V2 闭包
 
-    business.load(100) = 121
-    initial_load(100) = 121
+    business.load(100) = 120
+    initial_load(100) = 120
     hot.patching = false
 ```
 
@@ -2529,9 +2553,9 @@ Controller.phase = IDLE
 
 ### 文件部署失败
 
-再假设所有目标 Update 都已经成功，原 PlayerService 现在运行 V2，但在部署正式 Lua 文件时失败了。
+假设正式文件部署期间第二个文件写入失败。此时目标 Update RPC 还没有开始，运行中的 PlayerService 仍保持旧版本；但第一个正式文件可能已经写入，所以 Controller 仍需恢复已写文件并清理 Skynet 缓存，然后 Abort 已 Prepare 的目标。
 
-此时 Controller 不能直接放开 PlayerService，否则运行时和正式文件可能处于不同版本。
+部署失败发生在目标 Update 前，因此这批没有修改 Service 内存；恢复文件及缓存后，通过 Abort 释放已经 Prepare 的目标。
 
 所以 `M:run_batch()` 的恢复分支会先尝试恢复已经改动的正式文件，并在需要时重新清理 Skynet 代码缓存。
 
@@ -2543,7 +2567,7 @@ Controller.phase = IDLE
 
 这样一旦原 PlayerService 恢复并重新接收业务，正式文件也已被恢复到与旧版本一致的状态。
 
-如果文件或运行时无法确认恢复成功，Controller 不能宣称已经恢复，而是进入恢复要求状态。
+文件或目标恢复失败时，Controller 在本批结果中报告 RECOVERY_REQUIRED、原始错误和恢复错误；结束本批并开放生命周期入口。这个报告供宿主或运维判断后续动作，不阻止后续发布、Service 创建或模块首次加载。
 
 ### 恢复失败与 Finish 失败
 
@@ -2553,15 +2577,7 @@ Controller.phase = IDLE
 
 例如，某个 PlayerService 无法恢复旧状态，或者已经修改的正式文件无法恢复。
 
-Controller 会记录：
-
-`RECOVERY_REQUIRED`
-
-并使生命周期进入：
-
-`RECOVERY_REQUIRED`
-
-这意味着系统无法确认版本已经收敛，后续新的发布及受管理创建会被门禁阻止，需要宿主核实和处理。
+Controller 会在该批次的 `phase` 中记录 `RECOVERY_REQUIRED`，随后将生命周期入口恢复为 `IDLE`，不会因此阻止下一批。这表示 Controller 无法确认恢复已完成。它会如实报告错误并结束本批；RECOVERY_REQUIRED 是诊断结果，不会给后续发布或受管理创建设置门禁。宿主或运维根据报告决定下一步。
 
 第二种是**Finish 阶段失败**。
 
@@ -2596,7 +2612,7 @@ bash hotupgrade/lesson4/run.sh ../skynet
 
 发布批次: <batch_id>
 
-发布后: v2 剑 2 121
+发布后: v2 剑 2 120
 原 Service handle 保持: true
 原状态根表保持: true
 原模块根表保持: true
@@ -2605,7 +2621,7 @@ bash hotupgrade/lesson4/run.sh ../skynet
 旧闭包的攻击力: 100
 原 Service patching: false
 
-新 PlayerService: v2 剑 2 121
+新 PlayerService: v2 剑 2 120
 两个 Service 的 handle 不同: true
 ```
 
@@ -2628,12 +2644,14 @@ PlayerService Prepare：patching=true / 等待 queue 排空，仍允许完成创
     ↓
 Controller：等待新增操作完成 / 用冻结 Patch 重匹配 / 新目标补做 Prepare
     ↓ 无待准备目标、在途计数为零，连续关门
-PlayerService Update / Stage：准备候选与旧快照
+Controller：部署正式 Lua 文件 / skynet.cache.clear()
+    ↓ RPC
+PlayerService Update：执行 Patch 并登记 new_modules
+    ↓
+PlayerService Update / Stage：准备普通模块候选与恢复快照
     ↓
 PlayerService Update / Activate：原地更新模块、状态和业务函数
     ↓ RPC 返回
-Controller：正式文件部署 / skynet.cache.clear()
-    ↓ RPC
 PlayerService Finish：释放快照 / patching=false
     ↓ RPC 返回
 Controller：batch.phase=COMPLETED

@@ -33,6 +33,27 @@ local function get_hotupgrade_handle()
     return module_state.hotupgrade_handle
 end
 
+-- 普通 require 与本批新模块声明共用同一路径身份，避免别名绕过批次清单。
+local function resolve_module_identity(name)
+    assert(type(name) == "string" and name ~= "", "模块名无效")
+    local root_path = assert(skynet.getenv(hotupgrade_common.ROOT_PATH_ENV),
+        "HU_NOT_INITIALIZED: 须先初始化 Controller，再声明可更新模块")
+    local source_path = assert(package.searchpath(name, package.path),
+        "HU_INVALID_PATH: 可更新模块必须能通过 package.path 定位 Lua 文件: " .. name)
+    assert(package.preload[name] == nil, "HU_INVALID_PATH: 可更新模块不支持 package.preload: " .. name)
+    local resolved_path = assert(hotupgrade_native.resolve(source_path),
+        "HU_INVALID_PATH: 无法解析模块文件路径: " .. source_path)
+    local root_prefix = root_path == "/" and "/" or root_path .. "/"
+    assert(resolved_path:sub(1, #root_prefix) == root_prefix,
+        "HU_INVALID_PATH: 模块文件不在 root_path 内: " .. resolved_path)
+    local relative_path = resolved_path:sub(#root_prefix + 1)
+    assert(relative_path:sub(-4) == ".lua" and not relative_path:find("\\", 1, true),
+        "HU_INVALID_PATH: 模块必须对应宿主目录中的 Lua 文件: " .. relative_path)
+    local canonical_name = relative_path:sub(1, -5):gsub("/", ".")
+    assert(canonical_name ~= "", "HU_INVALID_PATH: 模块文件路径无效")
+    return {source_path = source_path, resolved_path = resolved_path, canonical_name = canonical_name}
+end
+
 -- 与 Controller Service 使用同一原生消息协议；不建立独立协议/RPC 模块。
 skynet.register_protocol({name = "hotupgrade", id = hotupgrade_common.PROTOCOL_ID, pack = skynet.pack, unpack = skynet.unpack})
 
@@ -136,6 +157,7 @@ local function abort(txn)
 end
 
 ---@class FlyWowHotUpgradeServicePatch
+---@field new_modules? string[] 本 Service 本批首次加载的模块名；未登记的依赖也须列入，登记仅对后续批次生效。
 ---@field update_state? fun() 在 Update 提交时直接修改构建函数捕获的现存 state；不得 yield 或产生外部副作用。
 ---@field replace_functions? table<string, function> 本次要替换的现有业务函数；未列出的字段保持原样。
 
@@ -160,7 +182,21 @@ local function stage_service(patch_source)
     assert(patch.update_state == nil or type(patch.update_state) == "function", "update_state 必须是函数")
     assert(patch.replace_functions == nil or (type(patch.replace_functions) == "table"
         and getmetatable(patch.replace_functions) == nil), "replace_functions 必须是普通表")
-    assert(patch.update_state or (patch.replace_functions and next(patch.replace_functions)), "Service Patch 没有更新内容")
+    if patch.new_modules ~= nil then
+        assert(type(patch.new_modules) == "table" and getmetatable(patch.new_modules) == nil,
+            "new_modules 必须是普通数组")
+        local item_count = 0
+        local last_index = 0
+        for index, module_name in pairs(patch.new_modules) do
+            assert(math.type(index) == "integer" and index > 0 and type(module_name) == "string"
+                and module_name ~= "", "new_modules 必须是非空模块名组成的连续数组")
+            item_count = item_count + 1
+            last_index = math.max(last_index, index)
+        end
+        assert(item_count == last_index, "new_modules 必须是连续数组")
+    end
+    assert(patch.update_state or (patch.replace_functions and next(patch.replace_functions))
+        or (patch.new_modules and next(patch.new_modules)), "Service Patch 没有更新内容")
 
     -- 保存本次可能替换的旧函数，Activate 失败时逐字段恢复。
     local staged =
@@ -187,6 +223,42 @@ local function stage_service(patch_source)
     end
 
     return staged
+end
+
+-- Update 临时上下文仅允许清单中的首次声明，并覆盖随后普通候选 Stage。
+local function stage_service_and_new_modules(transaction, patch_source)
+    local context = {owner = coroutine.running(), batch_id = transaction.batch_id, names = {}}
+    transaction.new_module_context = context
+    local phase = "service"
+    local ok, staged_service = pcall(function()
+        if not patch_source then
+            return nil
+        end
+
+        local staged = stage_service(patch_source)
+        local new_modules = staged.patch.new_modules or {}
+        local names = {}
+        for _, name in ipairs(new_modules) do
+            local identity = resolve_module_identity(name)
+            assert(not names[identity.canonical_name],
+                "HU_DUPLICATE_MODULE: new_modules 重复指向同一文件: " .. identity.canonical_name)
+            names[identity.canonical_name] = true
+        end
+
+        context.names = names
+        phase = "new_modules"
+        for _, name in ipairs(new_modules) do
+            M.require(name)
+        end
+        return staged
+    end)
+    if not ok then
+        local cause = type(staged_service) == "table" and staged_service.ok == false and staged_service or nil
+        transaction.new_module_context = nil
+        return nil, hotupgrade_result.failure(phase == "service" and "HU_SERVICE_STAGE_FAILED" or "HU_NEW_MODULE_FAILED",
+            cause and cause.message or tostring(staged_service), nil, cause and cause.code)
+    end
+    return staged_service
 end
 
 ---@alias FlyWowHotUpgradeServiceCommand
@@ -225,7 +297,12 @@ local function handle_upgrade(command, request, source)
             return hotupgrade_result.failure("HU_UPGRADE_BUSY", "当前批次已在处理中")
         end
 
-        module_state.active_transaction = {batch_id = request.batch_id, sequence = request.sequence}
+        module_state.active_transaction =
+        {
+            batch_id = request.batch_id,
+            sequence = request.sequence,
+            new_module_context = nil, -- Update 临时上下文覆盖 Patch 构建、新模块加载和候选 Stage，owner 限定当前控制协程。
+        }
         M.patching = true
 
         local ok, answer = pcall(module_state.registration.before_upgrade)
@@ -253,18 +330,26 @@ local function handle_upgrade(command, request, source)
         if txn.phase ~= nil then
             return hotupgrade_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
         end
-        -- Controller 已按本 State 的登记模块筛选 Patch；Stage 准备候选和快照，不写线上状态。
-        local staged = hotupgrade_module_patch.stage(request.modules, module_state.declared_modules)
+        -- 先从已部署文件登记 Patch 声明的新模块；它们留给下一批普通 Stage。
+        local service, service_failure = stage_service_and_new_modules(txn, request.service_source)
+        if service_failure then
+            return service_failure
+        end
+
+        -- 保留同一声明上下文直到候选模块执行结束，漏列的新依赖须立即失败，不能在 UPDATE 等许可。
+        local stage_ok, staged = pcall(hotupgrade_module_patch.stage,
+            request.modules, module_state.declared_modules)
+        txn.new_module_context = nil
+        if not stage_ok then
+            local cause = type(staged) == "table" and staged.ok == false and staged or nil
+            return hotupgrade_result.failure("HU_MODULE_STAGE_FAILED",
+                cause and cause.message or tostring(staged), nil, cause and cause.code)
+        end
         if not staged.ok then
             return staged
         end
 
         txn.modules = staged.stage
-        local ok, service = pcall(stage_service, request.service_source)
-        if not ok then
-            return hotupgrade_result.failure("HU_SERVICE_STAGE_FAILED", tostring(service))
-        end
-
         txn.service = service
         txn.phase = "STAGED"
 
@@ -431,23 +516,19 @@ end
 ---@param name string 宿主原有 require 名；Controller 使用实际文件的根目录相对路径登记
 ---@return table 当前 State 的稳定模块导出表
 function M.require(name)
-    -- 先解析原始 require 名对应的宿主文件身份，后续缓存和登记都以该路径核对。
-    assert(type(name) == "string" and name ~= "", "模块名无效")
-    local root_path = assert(skynet.getenv(hotupgrade_common.ROOT_PATH_ENV),
-        "HU_NOT_INITIALIZED: 须先初始化 Controller，再声明可更新模块")
-    local source_path = assert(package.searchpath(name, package.path),
-        "HU_INVALID_PATH: 可更新模块必须能通过 package.path 定位 Lua 文件: " .. name)
-    assert(package.preload[name] == nil, "HU_INVALID_PATH: 可更新模块不支持 package.preload: " .. name)
-    local resolved_path = assert(hotupgrade_native.resolve(source_path),
-        "HU_INVALID_PATH: 无法解析模块文件路径: " .. source_path)
-    local root_prefix = root_path == "/" and "/" or root_path .. "/"
-    assert(resolved_path:sub(1, #root_prefix) == root_prefix,
-        "HU_INVALID_PATH: 模块文件不在 root_path 内: " .. resolved_path)
-    local relative_path = resolved_path:sub(#root_prefix + 1)
-    assert(relative_path:sub(-4) == ".lua" and not relative_path:find("\\", 1, true),
-        "HU_INVALID_PATH: 模块必须对应宿主目录中的 Lua 文件: " .. relative_path)
-    local canonical_name = relative_path:sub(1, -5):gsub("/", ".")
-    assert(canonical_name ~= "", "HU_INVALID_PATH: 模块文件路径无效")
+    -- 原始 require 名、来源路径和 Controller 登记名必须指向同一文件。
+    local module_identity = resolve_module_identity(name)
+    local source_path = module_identity.source_path
+    local resolved_path = module_identity.resolved_path
+    local canonical_name = module_identity.canonical_name
+    local transaction = module_state.active_transaction
+    local new_module_context = transaction and transaction.new_module_context
+    local in_new_module_context = new_module_context and new_module_context.owner == coroutine.running()
+    local register_new_module = in_new_module_context and new_module_context.names[canonical_name] == true
+    if in_new_module_context and not module_state.declared_modules[canonical_name] and not register_new_module then
+        error(hotupgrade_result.failure("HU_NEW_MODULE_NOT_DECLARED",
+            "新模块依赖未列入 new_modules: " .. canonical_name .. "\n" .. debug.traceback("", 2)), 0)
+    end
 
     -- 当前 State 已进入首次登记时先等待 Controller 结果，避免声明越过登记快照。
     if module_state.registration and not module_state.registered then
@@ -463,6 +544,11 @@ function M.require(name)
     local loading = module_state.module_loads[canonical_name]
     if loading then
         local thread = coroutine.running()
+        -- Update 不等待门禁中的普通加载协程，避免双方互相等待。
+        if register_new_module and loading.owner ~= thread then
+            error(hotupgrade_result.failure("HU_MODULE_LOADING",
+                "新模块正由其他协程加载: " .. canonical_name .. "\n" .. debug.traceback("", 2)), 0)
+        end
         assert(loading.owner ~= thread, "HU_MODULE_LOADING: 不支持循环声明 " .. canonical_name)
         loading.waiters[#loading.waiters + 1] = thread
         skynet.wait(thread)
@@ -481,7 +567,7 @@ function M.require(name)
     local added_source = false       -- 只撤销本次新建的来源映射。
     local added_declaration = false  -- 只回退本次新增的本地模块声明。
     local ok, message = pcall(function()
-        if module_state.registration and not module_state.declared_modules[canonical_name] then
+        if module_state.registration and not module_state.declared_modules[canonical_name] and not register_new_module then
             local answer = skynet.call(get_hotupgrade_handle(), "hotupgrade",
                 "begin_module_load", {name = canonical_name})
             assert(type(answer) == "table" and answer.ok and type(answer.permit_id) == "string",
@@ -541,6 +627,11 @@ function M.require(name)
                 "register_module", {name = canonical_name, permit_id = permit_id})
             assert(type(answer) == "table" and answer.ok,
                 "模块登记失败: " .. tostring(type(answer) == "table" and answer.message or answer))
+        elseif register_new_module and added_declaration then
+            local answer = skynet.call(get_hotupgrade_handle(), "hotupgrade", "register_new_module",
+                {batch_id = new_module_context.batch_id, name = canonical_name})
+            assert(type(answer) == "table" and answer.ok,
+                "新模块登记失败: " .. tostring(type(answer) == "table" and answer.message or answer))
         end
     end)
     -- 任一步失败都恢复原名缓存、规范别名和本次新增的本地声明。

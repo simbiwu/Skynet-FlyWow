@@ -113,7 +113,11 @@ hotupgrade.require(name) 仍用宿主原有 name 加载模块，通过 package.s
 
 登记前声明随初始元数据提交，由待创建记录保护。register_service 会拒绝本 State 尚在执行的首次声明（HU_LIFECYCLE_PENDING），调用方须待声明完成后登记；登记 RPC 期间的新声明等待登记结果，避免落在初始模块快照之外。
 
-已登记 Service 首次声明模块时，先向 Controller 请求 begin_module_load 许可，再执行实际 require、校验来源并建立缓存、别名、来源映射和本地声明，最后携许可 ID 调用 register_module。许可绑定真实来源及规范模块名，不能转用或重复消费；失败时回退本地新增状态，并通过 cancel_module_load 释放尚未完成的许可。begin 接受后等待已有许可完成，覆盖模块执行及登记的整个关键区间。同一 State 内并发首次声明同一规范模块会等待前一项成功或完整回退；已声明模块不重复请求许可。Controller 只更新目标已声明的模块。begin 后的 WAITING_CREATIONS 和 PREPARE 窗口继续接纳创建与首次声明，覆盖父子创建、嵌套 require 和 queue 内已有业务的正常依赖。创建计数保留到初始化、登记完成；首次声明许可保留到登记或取消。进入 UPDATE 后的新请求才挂起等待终态，此时尚不发许可、不执行模块代码，也不增加本批排空计数；批次结束后按当时现场继续处理请求。同一规范模块的等待者继续复用本 State 的并发声明协调。
+已登记 Service 首次声明普通模块时，先向 Controller 请求 begin_module_load 许可，再执行实际 require、校验来源并建立缓存、别名、来源映射和本地声明，最后携许可 ID 调用 register_module。许可绑定真实来源及规范模块名，不能转用或重复消费；失败时回退本地新增状态，并通过 cancel_module_load 释放尚未完成的许可。begin 接受后等待已有许可完成，覆盖模块执行及登记的整个关键区间。同一 State 内并发首次声明同一规范模块会等待前一项成功或完整回退；已声明模块不重复请求许可。Controller 只更新目标已声明的模块。begin 后的 WAITING_CREATIONS 和 PREPARE 窗口继续接纳创建与首次声明，覆盖父子创建、嵌套 require 和 queue 内已有业务的正常依赖。进入 UPDATE 后，普通新请求挂起到批次终态，不申请许可、不执行模块代码，也不增加本批排空计数。
+
+Service Patch 可通过 `new_modules` 声明本 Service 在本批首次使用的模块，例如 `{new_modules = {"combat_rules", "skill_rules"}}`。Controller 先部署本批完整 `.lua` 并清理缓存，再把 `.patch` 交给目标。目标先构建 Service Patch、读取该列表，再用内部登记命令加载清单内模块；这个命令只接受当前批次 UPDATE 阶段正在处理的目标。它不走普通首次加载许可，因此目标等待 Controller 登记时不会与批次互等。清单内模块在该 State 尚未登记的依赖也必须列入；已登记依赖可直接复用。清单以外的未登记依赖会立即失败，不进入生命周期等待。Service Patch 构建函数需要先返回清单，不能在构建函数内首次 require 这批新模块。
+
+新模块在当前 Lua State 登记后加入 Controller 的模块清单，但不加入已冻结的本批普通模块更新清单；后续批次重新匹配时才会正常 Stage/Commit。同一临时清单上下文保持到普通候选模块完成 Stage，因此候选代码遗漏的未登记依赖也会快速失败，不会申请普通首次加载许可后与当前 UPDATE 相互等待。若清单新模块与门禁期间等待普通首次加载的协程冲突，Update 快速以 `HU_MODULE_LOADING` 失败并走现有恢复流程，不等待或接管该协程。仅含非空 `new_modules` 的 Service Patch 有效。内部登记 RPC 可能 yield；候选模块执行、状态钩子及 Service 更新回调仍须遵守各自同步合同。普通并发首次声明仍由本 State 的加载协调处理。
 
 ## 业务 queue 与安全点
 
@@ -139,7 +143,7 @@ register_service 必须提供 before_upgrade 函数；缺失或非函数会在�
 
 业务 Service 的 hot.patching 与 Controller 创建/加载门禁职责不同：Prepare 设置 hot.patching 后，业务入口按现有接入方式停止新业务；此前已进入 queue 的业务仍可调用创建和首次加载 API，Controller 在 PREPARE 窗口正常处理这些依赖。
 
-Prepare 期间继续使用旧宿主文件，允许正常创建和首次加载。每轮回调结束后，Controller 等在途操作完成，再用同一份冻结 Patch 重新匹配登记信息：新匹配的 Service 补做一次 Prepare；已准备目标新增受影响模块，只补模块清单，不重复 before_upgrade。不匹配本批 Patch 的新 Service 不做 Prepare，但仍须完成初始化和登记。只有所有匹配目标已准备、创建和加载计数为零，才在不 yield 的连续步骤中固定最终清单并进入 UPDATE、关闭接纳门禁。Update 中 Stage 只构建候选和保存快照，Activate 同步提交模块、Service 状态和函数，再执行 after_upgrade。after_upgrade 只检查已提交状态，不得 yield 或产生外部副作用；false 或异常触发组合恢复。
+Prepare 期间继续使用旧宿主文件，允许正常创建和首次加载。每轮回调结束后，Controller 等在途操作完成，再用同一份冻结 Patch 重新匹配登记信息：新匹配的 Service 补做一次 Prepare；已准备目标新增受影响模块，只补模块清单，不重复 before_upgrade。不匹配本批 Patch 的新 Service 不做 Prepare，但仍须完成初始化和登记。所有匹配目标准备完成后，在不 yield 的连续步骤中固定最终清单并进入 UPDATE、关闭普通创建和首次加载门禁。Controller 随后先部署完整 `.lua` 并清理缓存，再向目标发送 Update。目标先准备 Service Patch 并处理 `new_modules`，再 Stage 本批冻结的普通模块，之后 Activate 同步提交模块、Service 状态和函数，最后执行 after_upgrade。after_upgrade 只检查已提交状态，不得 yield 或产生外部副作用；false 或异常触发组合恢复。
 
 普通模块 Stage 依赖 Controller 已完成的路径映射、语法检查、模块名去重与连续数组构建，不重复校验这些输入。Stage 在目标 Lua State 内检查线上及候选导出，准备隔离状态，并按输入顺序保存模块记录；每条记录集中持有线上根表、候选与旧字段，供 Commit 安装和 Abort 恢复。Commit/Abort 核对根表身份后，字段覆盖函数直接执行原地替换。
 
@@ -164,6 +168,10 @@ Finish 释放旧快照并结束本地事务后将 hot.patching 设为 false。Ab
 发布包内部路径对应宿主 root_path 下的实际路径。递归扫描全部 .lua 和 .patch，并先冻结内容、检查语法。配置 service_path 中的 .lua 是完整新版 Service，只部署；该目录中的 .patch 是一次性 Service 更新脚本，只更新现存实例、不部署。其他目录中的 .lua 是完整普通模块：已登记时同时更新运行时和部署文件，未登记时仅部署。.patch 不能出现在 service_path 之外。
 
 .lua 与 .patch 无须成对出现；允许仅 Service 源码、仅 Service Patch、仅普通模块，以及没有任何运行时目标的纯文件发布。Service .patch 必须匹配至少一个已登记且支持内部更新的目标；未匹配返回 HU_TARGET_MISSING，不支持则返回 HU_SERVICE_PATCH_UNSUPPORTED。普通模块名称仍按实际路径登记，例如 config.settings、lualib.player_logic。不同路径映射到同一普通模块名或同一 Service Patch 名时拒绝整包；其他普通文件忽略，符号链接和特殊文件拒绝。
+
+Service Patch 返回表中的 `new_modules` 是普通 require 名称数组。框架按实际路径解析模块身份、拒绝重复文件项，并在目标 Update 内通过 `hotupgrade.require` 加载。清单中的模块可以递归依赖清单内的其他新模块；已经登记的模块可直接复用，循环声明沿用现有拒绝行为。清单外首次依赖若未被业务捕获，会使当前阶段失败：外层 `code` 保留阶段错误（如 `HU_MODULE_STAGE_FAILED`），`cause_code` 随实际传播的错误记录（如 `HU_NEW_MODULE_NOT_DECLARED`）；调用方不需要解析 `message`。业务捕获该错误后，它不会污染后续失败的 `cause_code`。Patch 构建函数只能声明清单，不能在返回前首次加载清单内模块。仅声明非空 `new_modules` 的 Patch 不需要伪造 `update_state` 或 `replace_functions`。
+
+成功登记的新模块不参与本批冻结的普通模块 Stage/Commit，从下一批开始可更新。如果本批后续模块 Stage、Activate 或其他目标失败，已经加载并登记的新模块留在该 Lua State， Controller 尝试恢复部署文件后也不撤销该登记；status 报告失败，后续批次按当时内存和登记现场继续。
 
 两类均可单独存在。每份普通模块文件必须是完整模块新版本。只改一个函数也必须保留新版仍需要的全部导出字段。提交会更新所有新字段，并删除新版已去掉的字段，原导出表和两种 package.loaded 名称的身份保持不变。
 
@@ -262,7 +270,7 @@ end
 
 构建函数接收现存 state，只准备闭包，不修改线上状态。update_state() 不接收参数、不返回候选状态，在 Update 同步提交阶段直接修改现存 state。嵌套赋值、共享引用、循环引用和赋 nil 删除字段均遵循普通 Lua 语义；未修改字段自然保留，不生成候选状态、不递归合并。
 
-replace_functions 只列出需要替换的现有业务函数；未列出的函数保持原样，新函数捕获原 state。没有状态修改可省略 update_state，没有函数替换可省略 replace_functions，至少提供一项。旧 migrate / functions 字段不再接受。
+replace_functions 只列出需要替换的现有业务函数；未列出的函数保持原样，新函数捕获原 state。update_state、非空 replace_functions、非空 new_modules 至少提供一项。旧 migrate / functions 字段不再接受。
 
 准备阶段保存旧状态快照和旧函数。提交前先标记 touched，再调用 update_state()，随后安装 replace_functions，最后执行 after_upgrade。部分写入抛错及后续失败沿现有 Abort 恢复；恢复失败报告 RECOVERY_REQUIRED，结束本批后仍释放入口。迁移运行错误在 Update 提交时发现。成功 Finish 后清理快照。
 
@@ -298,14 +306,14 @@ begin 建立批次后立即返回 batch_id，由 Controller 的原有协程继�
 正式顺序为：
 
 1. WAITING_CREATIONS：继续接纳创建和首次加载，等待在途操作完成。
-2. 同步读取、语法检查并冻结完整发布包，完成初次整包匹配；为正式 .lua 保存旧内容或“不存在”标记。文件准备阶段显示 DEPLOYING。
-3. APPLYING/PREPARE：逐个目标禁止新业务并通过各自 queue 确认安全点，期间仍接纳创建和首次加载，宿主文件仍为旧版。
+2. 同步读取、语法检查并冻结完整发布包，完成初次整包匹配；为正式 `.lua` 保存旧内容或“不存在”标记。
+3. APPLYING/PREPARE：逐个目标禁止新业务并通过各自 queue 确认安全点，期间仍接纳创建和首次加载；宿主文件保持旧版。
 4. 等待本轮产生的创建和加载完成，复用冻结 Patch 重匹配；新目标补做 Prepare，旧目标只补新增模块清单。必要时重复此步，每个目标只 Prepare 一次。
-5. 计数为零且全部匹配目标已准备后，在同一次不 yield 的执行中完成最终匹配并进入 UPDATE；此刻关闭创建和首次加载门禁。
-6. 逐个目标 Update；在目标自己的同一次 RPC 内执行 Stage → Activate → after_upgrade。
-7. 部署冻结的完整 .lua，再调用 skynet.cache.clear()；.patch 不进入部署集合。
-8. 记录 PUBLISH_DECIDED，逐个目标 Finish，清理快照并开放业务。
-9. 保存 COMPLETED 或具体失败记录，唤醒门禁等待者；后来的创建和首次加载使用已部署的新文件，或确认恢复后的旧文件。
+5. 计数为零且全部匹配目标已准备后，在同一次不 yield 的执行中完成最终匹配并进入 UPDATE；普通创建和首次加载门禁关闭。
+6. Controller 部署冻结的完整 `.lua` 并调用 `skynet.cache.clear()`；`.patch` 不进入部署集合。部署失败时恢复已写文件并 Abort 已 Prepare 的目标。
+7. 逐个目标 Update。目标先构建 Service Patch、加载并登记 `new_modules`，再对冻结的普通模块执行 Stage → Activate → after_upgrade。
+8. 所有目标 Update 成功后记录 PUBLISH_DECIDED，逐个目标 Finish，清理快照并开放业务。
+9. 保存 COMPLETED 或具体失败记录，唤醒门禁等待者；之后的创建和首次加载使用已部署文件，恢复成功时则使用恢复后的文件。
 
 正常门禁等待由框架内部完成，业务调用方无需为发布窗口捕获错误或重试。排空期间的新增依赖可能延长 Prepare；最终关门的依据是操作完成和目标准备完成，而不是等待固定时长。
 
@@ -319,7 +327,7 @@ status 不带 batch_id 返回生命周期概览；带 batch_id 还返回当前�
 
 ### 失败报告与后续发布
 
-本批失败后先尽力恢复，报告实际更新结果、恢复错误和未恢复项。RECOVERY_REQUIRED 与 status 的 recovery_required 只表示最近批次存在未确认恢复的错误，不是后续操作的门禁。宿主或运维决定如何处理这些错误、是否暂停业务和下一批内容。
+本批失败后先尽力恢复，报告实际更新结果、恢复错误和未恢复项。已成功加载并登记的新模块不会随普通模块/Service 回滚撤销；若随后发生失败，文件恢复可能使磁盘版本与当前 Lua State 中的新模块不同，status 和失败结果如实报告本批失败，下一批按当时内存、登记及文件现场继续。RECOVERY_REQUIRED 与 status 的 recovery_required 只表示最近批次存在未确认恢复的错误，不是后续操作的门禁。宿主或运维决定如何处理这些错误、是否暂停业务和下一批内容。
 
 下一批重新读取文件并保存当前状态快照，回滚目标是本批开始时的现场，不使用上一批快照。上一批的实际代码、状态和文件变化会成为下一批起点；下一批成功只说明它自身完成，不表示未涉及的历史问题已解决。状态必须仍满足当前加载、快照和身份合同，否则继续报告具体错误。活动及最近终态查询不代替宿主保存故障报告。
 
@@ -342,7 +350,7 @@ bash scripts/build_flywow.sh ../skynet hotupgrade
 bash hotupgrade/scripts/run_hotupgrade_tests.sh ../skynet
 ```
 
-脚本测试创建中/待登记屏障、两种登记时序、启动与业务初始化失败、创建者取消权限、模块许可匹配/消费/失败清理、并发首次声明、Update 起门禁等待，以及父子孙创建链、queue 内创建与首次声明、嵌套许可、已准备目标补模块、新目标 Prepare/Update 失败恢复、排空及控制 RPC 期间拒绝管理端 abort、冻结源码只读一次、queue 排空与 patching、完整模块增改删、候选根表与 self 的身份边界、缓存旧函数和新旧闭包状态隔离、私有状态迁移、Service 状态/函数组合提交、真实 handle/State/表身份保持、Update 内 Stage/Activate 与整批恢复、纯文件发布、文件部署失败恢复、新实例与首次加载版本一致，以及 Finish 故障报告及失败后连续发布。Skynet 集成只启动测试专用进程，不监听业务端口；结果不替代宿主真实业务状态与数据库验证。
+脚本测试创建中/待登记屏障、两种登记时序、启动与业务初始化失败、创建者取消权限、模块许可匹配/消费/失败清理、并发首次声明、Update 起门禁等待，以及父子孙创建链、queue 内创建与首次声明、嵌套许可、已准备目标补模块、新目标 Prepare/Update 失败恢复、排空及控制 RPC 期间拒绝管理端 abort、冻结源码只读一次、queue 排空与 patching、完整模块增改删、候选根表与 self 的身份边界、缓存旧函数和新旧闭包状态隔离、私有状态迁移、Service 状态/函数组合提交、真实 handle/State/表身份保持、Update 内 Stage/Activate 与整批恢复、纯文件发布、文件部署失败恢复、新实例与首次加载版本一致，以及 Finish 故障报告及失败后连续发布。新模块场景验证了文件先部署、递归登记依赖、当前批次不重复 Stage、Service Patch 与普通候选中漏列的新依赖快速失败、并发首次加载冲突时 Update 失败后解除等待、捕获依赖错误不污染后续根因，以及失败后下一批继续更新。Skynet 集成只启动测试专用进程，不监听业务端口；结果不替代宿主真实业务状态与数据库验证。
 
 
 ### 宿主启动顺序与原生退出通知

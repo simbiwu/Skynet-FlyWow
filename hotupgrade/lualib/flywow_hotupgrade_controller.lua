@@ -653,6 +653,34 @@ function M:complete_module_load(request, source, cancel)
     return hotupgrade_result.success()
 end
 
+---@class FlyWowHotUpgradeNewModuleRequest
+---@field batch_id string 当前正在更新的批次身份
+---@field name string 已登记 Service 首次加载的新模块规范名
+
+--- UPDATE 期间由当前目标登记 .patch 声明的新模块，不申请常规生命周期许可。
+---@param request FlyWowHotUpgradeNewModuleRequest
+---@param source integer 正在执行 Update 的真实目标 Service handle
+---@return FlyWowHotUpgradeResult
+function M:register_new_module(request, source)
+    if type(request.batch_id) ~= "string" or type(request.name) ~= "string" or request.name == "" then
+        return hotupgrade_result.failure("HU_INVALID_REQUEST", "需要批次身份和模块名")
+    end
+
+    local batch = self.active_batch
+    if not batch or batch.batch_id ~= request.batch_id or batch.phase ~= "UPDATE"
+        or batch.current_service_handle ~= source then
+        return hotupgrade_result.failure("HU_NEW_MODULE_NOT_ALLOWED", "仅当前批次正在更新的目标可登记新模块")
+    end
+
+    local service_registration = self.service_registrations[source]
+    if not service_registration then
+        return hotupgrade_result.failure("HU_SERVICE_NOT_REGISTERED", "模块声明者未登记")
+    end
+
+    service_registration.modules[request.name] = true
+    return hotupgrade_result.success()
+end
+
 --- 早到登记会 yield，直至原生返回的 handle 与消息 source 精确匹配或全部原生创建结束。
 ---@param request FlyWowHotUpgradeTargetMetadata
 ---@param service_handle integer Skynet 消息头中的真实业务 Service handle；由受管理创建结果确认
@@ -943,25 +971,7 @@ function M:run_batch(batch, request)
         -- 以下阶段赋值连续执行；Controller 不会在两者之间处理新请求。
         -- 因此 UPDATE 开始时没有已接纳的创建/首次加载，新到请求会在 wait_lifecycle 挂起至批次终态。
         batch.phase = "UPDATE"
-        -- UPDATE：各目标同步提交状态与代码；新生命周期请求保持挂起，不属于本批目标。
-        for _, target in ipairs(batch.targets) do
-            batch.current_service_handle = target.service_handle
-            local answer = self:step(batch, target, "update")
-            if batch.error then
-                return
-            end
-            if not answer.ok then
-                target.result = answer
-                batch.error = answer
-                return
-            end
-        end
-
-        if batch.error then
-            return
-        end
-
-        -- 仅使用已冻结的完整文件，不能在 Update 后重新读取发布包。
+        -- 先发布完整 Lua 文件；目标 Update 内首次加载的新模块必须读取本批文件。
         for _, file in ipairs(batch.files) do
             local written, failure = hotupgrade_native.replace_file(self.root_path, file.entry_file, file.source)
             if not written then
@@ -974,6 +984,21 @@ function M:run_batch(batch, request)
             local cleared, failure = pcall(skynet.cache.clear)
             if not cleared then
                 batch.error = hotupgrade_result.failure("HU_CACHE_CLEAR_FAILED", tostring(failure))
+                return
+            end
+        end
+
+        -- UPDATE：各目标提交状态与代码；新生命周期请求保持挂起，不属于本批目标。
+        for _, target in ipairs(batch.targets) do
+            batch.current_service_handle = target.service_handle
+            local answer = self:step(batch, target, "update")
+            if batch.error then
+                return
+            end
+            if not answer.ok then
+                target.result = answer
+                batch.error = answer
+                return
             end
         end
     end)
@@ -1126,6 +1151,7 @@ end
 ---| "cancel_service_creation"
 ---| "begin_module_load"
 ---| "register_module"
+---| "register_new_module"
 ---| "cancel_module_load"
 ---| "status"
 
@@ -1165,6 +1191,10 @@ function M:handle_command(command, request, source)
 
     if command == "register_module" or command == "cancel_module_load" then
         return self:complete_module_load(request, source, command == "cancel_module_load")
+    end
+
+    if command == "register_new_module" then
+        return self:register_new_module(request, source)
     end
 
     if command == "status" then

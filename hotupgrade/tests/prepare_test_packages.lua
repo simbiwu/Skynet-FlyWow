@@ -34,6 +34,42 @@ end
 M.added = true
 return M
 ]]
+local module_new_modules_v2 = [[
+local loader_name, loader_path = ...
+assert(loader_name == "test_worker_logic")
+assert(type(loader_path) == "string" and loader_path:sub(-#"/lualib/test_worker_logic.lua") == "/lualib/test_worker_logic.lua")
+local hotupgrade = require "flywow_hotupgrade"
+local rules = hotupgrade.require("hotupgrade_new_rules")
+local count = 0
+local M = {}
+function M.value() return rules.value() end
+function M.bump()
+    count = count + 1
+    return count
+end
+function M.export_state() return {count = count} end
+function M.import_state(state)
+    count = state.count
+    return true
+end
+M.added = true
+return M
+]]
+local new_dependency_v2 = [[return {value = function() return 50 end}]]
+local new_rules_v2 = [[
+local hotupgrade = require "flywow_hotupgrade"
+local dependency = hotupgrade.require("hotupgrade_new_dependency")
+return {value = function() return dependency.value() + 2 end}
+]]
+local new_modules_service = [[return function()
+    return {new_modules = {"hotupgrade_new_rules", "hotupgrade_new_dependency"}}
+end]]
+local concurrent_new_modules_service = [[return function()
+    return {new_modules = {"hotupgrade_new_dependency", "hotupgrade_new_rules"}}
+end]]
+local undeclared_modules_service = [[return function()
+    return {new_modules = {"hotupgrade_bad_new_parent"}}
+end]]
 local service = [[
 return function(state)
     return {
@@ -60,6 +96,41 @@ local cases =
         ["battle/state_sync/runtime.lua"] = "return {value = function() return 2 end}"},
         service = {["skynet_hotupgrade_drain.patch"] = service}},
     combined = {lualib = {["test_worker_logic.lua"] = module_v2}, service = {["skynet_hotupgrade_worker.patch"] = service}},
+    new_modules = {lualib = {["test_worker_logic.lua"] = module_new_modules_v2,
+        ["hotupgrade_new_dependency.lua"] = "return {value = function() return 40 end}",
+        ["hotupgrade_new_rules.lua"] = [[local hotupgrade = require "flywow_hotupgrade"
+            local dependency = hotupgrade.require("hotupgrade_new_dependency")
+            return {value = function() return dependency.value() + 2 end}]]},
+        service = {["skynet_hotupgrade_worker.patch"] = new_modules_service}},
+    new_modules_concurrent = {lualib = {["test_worker_logic.lua"] = module_new_modules_v2,
+        ["hotupgrade_new_dependency.lua"] = "return {value = function() return 40 end}",
+        ["hotupgrade_new_rules.lua"] = [[local hotupgrade = require "flywow_hotupgrade"
+            local dependency = hotupgrade.require("hotupgrade_new_dependency")
+            return {value = function() return dependency.value() + 2 end}]]},
+        service = {["skynet_hotupgrade_worker.patch"] = concurrent_new_modules_service}},
+    new_modules_failure = {lualib = {["test_worker_logic.lua"] = "error('injected candidate failure')",
+        ["hotupgrade_new_dependency.lua"] = "return {value = function() return 40 end}",
+        ["hotupgrade_new_rules.lua"] = [[local hotupgrade = require "flywow_hotupgrade"
+            local dependency = hotupgrade.require("hotupgrade_new_dependency")
+            return {value = function() return dependency.value() + 2 end}]]},
+        service = {["skynet_hotupgrade_worker.patch"] = new_modules_service}},
+    new_modules_followup = {lualib = {["test_worker_logic.lua"] = module_new_modules_v2,
+        ["hotupgrade_new_dependency.lua"] = new_dependency_v2,
+        ["hotupgrade_new_rules.lua"] = new_rules_v2}},
+    new_modules_undeclared = {lualib = {["hotupgrade_bad_new_parent.lua"] = [[
+        local hotupgrade = require "flywow_hotupgrade"
+        return hotupgrade.require("hotupgrade_unlisted_dependency")
+    ]], ["hotupgrade_unlisted_dependency.lua"] = "return {value = 2}"},
+        service = {["skynet_hotupgrade_worker.patch"] = undeclared_modules_service}},
+    new_modules_candidate_undeclared = {lualib = {["test_worker_logic.lua"] = module_new_modules_v2,
+        ["hotupgrade_new_dependency.lua"] = "return {value = function() return 40 end}",
+        ["hotupgrade_new_rules.lua"] = new_rules_v2}},
+    new_modules_candidate_caught_error = {lualib = {["test_worker_logic.lua"] = [[
+        local hotupgrade = require "flywow_hotupgrade"
+        local loaded = pcall(hotupgrade.require, "hotupgrade_unlisted_dependency")
+        assert(not loaded)
+        error("injected unrelated candidate failure")
+    ]], ["hotupgrade_unlisted_dependency.lua"] = "return {value = 1}"}},
     service = {service = {["skynet_hotupgrade_worker.patch"] = service}},
     stage_failure = {lualib = {["test_worker_logic.lua"] = module_v2}, service = {["skynet_hotupgrade_worker.patch"] = [[return function(state)
         return {update_state = function()

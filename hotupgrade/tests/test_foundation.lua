@@ -203,6 +203,8 @@ local begin_count = 0
 local fail_registration = false
 local unique_calls = 0
 local last_loaded_value
+local new_module_registrations = {}
+local active_new_module_batch
 local forwarded = {}
 local control_dispatch
 local control_answer
@@ -249,6 +251,10 @@ package.loaded.skynet =
             end
             permits[request.permit_id] = nil
             return {ok = true}
+        elseif command == "register_new_module" then
+            assert(request.batch_id == active_new_module_batch)
+            new_module_registrations[#new_module_registrations + 1] = request.name
+            return {ok = true}
         elseif command == "cancel_module_load" then
             assert(permits[request.permit_id] == request.name)
             permits[request.permit_id] = nil
@@ -286,8 +292,12 @@ assert(not invalid_service_update.ok and invalid_service_update.code == "HU_INVA
 registration.service_update = nil
 local registered = hotupgrade.register_service(registration)
 assert(registered.ok, tostring(registered.code) .. ": " .. tostring(registered.message))
-local function target_control(command, sequence)
-    control_dispatch(1, 99, command, {batch_id = "fixture:" .. sequence, sequence = sequence, modules = {}})
+local function target_control(command, sequence, extra)
+    local request = {batch_id = "fixture:" .. sequence, sequence = sequence, modules = {}}
+    for name, value in pairs(extra or {}) do
+        request[name] = value
+    end
+    control_dispatch(1, 99, command, request)
     return control_answer
 end
 registration.before_upgrade = function() return false end
@@ -381,6 +391,61 @@ assert(control_answer.ok, control_answer.message)
 assert(extra.value() == 2 and package.loaded.hotupgrade_extra == extra)
 assert(package.loaded["lualib.hotupgrade_extra"] == extra)
 assert(target_control("abort", 7).ok and extra.value == original_value)
+
+-- 仅声明新模块的 Service Patch 可递归登记清单内依赖，不申请普通首次加载许可。
+local function write_new_module_fixture(name, source)
+    local output = assert(io.open("build/hotupgrade-tests/host/lualib/" .. name .. ".lua", "wb"))
+    assert(output:write(source) and output:close())
+end
+write_new_module_fixture("hotupgrade_new_dependency", "return {value = function() return 40 end}")
+write_new_module_fixture("hotupgrade_new_rules", [[
+local hotupgrade = require "flywow_hotupgrade"
+local dependency = hotupgrade.require("hotupgrade_new_dependency")
+return {value = function() return dependency.value() + 2 end}
+]])
+write_new_module_fixture("hotupgrade_early_module", "return {value = 1}")
+write_new_module_fixture("hotupgrade_unlisted_dependency", "return {value = 1}")
+write_new_module_fixture("hotupgrade_bad_new_parent", [[
+local hotupgrade = require "flywow_hotupgrade"
+return hotupgrade.require("hotupgrade_unlisted_dependency")
+]])
+registration.service_update = {state = {}, functions = {}}
+local declarations_before_new_modules = begin_count
+active_new_module_batch = "fixture:8"
+assert(target_control("prepare", 8).ok)
+local new_module_service_source = [[return function()
+    return {new_modules = {"hotupgrade_new_rules", "hotupgrade_new_dependency"}}
+end]]
+local new_module_update = target_control("update", 8, {service_source = new_module_service_source})
+assert(new_module_update.ok, new_module_update.message)
+assert(begin_count == declarations_before_new_modules)
+assert(table.concat(new_module_registrations, ",") == "lualib.hotupgrade_new_dependency,lualib.hotupgrade_new_rules")
+assert(hotupgrade.require("hotupgrade_new_rules").value() == 42)
+assert(target_control("finish", 8).ok)
+active_new_module_batch = "fixture:9"
+assert(target_control("prepare", 9).ok)
+local early_require_source = [[return function()
+    local hotupgrade = require "flywow_hotupgrade"
+    hotupgrade.require("hotupgrade_early_module")
+    return {new_modules = {"hotupgrade_early_module"}}
+end]]
+local early_result = target_control("update", 9, {service_source = early_require_source})
+assert(not early_result.ok and early_result.code == "HU_SERVICE_STAGE_FAILED")
+assert(early_result.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
+assert(target_control("abort", 9).ok)
+active_new_module_batch = "fixture:10"
+assert(target_control("prepare", 10).ok)
+local undeclared_result = target_control("update", 10,
+    {service_source = [[return function() return {new_modules = {"hotupgrade_bad_new_parent"}} end]]})
+assert(not undeclared_result.ok and undeclared_result.code == "HU_NEW_MODULE_FAILED")
+assert(undeclared_result.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
+assert(begin_count == declarations_before_new_modules)
+assert(target_control("abort", 10).ok)
+for _, name in ipairs({"hotupgrade_new_dependency", "hotupgrade_new_rules", "hotupgrade_early_module",
+    "hotupgrade_unlisted_dependency", "hotupgrade_bad_new_parent"}) do
+    assert(os.remove("build/hotupgrade-tests/host/lualib/" .. name .. ".lua"))
+end
+registration.service_update = nil
 package.path = original_path
 print("HOTUPGRADE_FOUNDATION_LIFECYCLE_OK")
 print("HOTUPGRADE_FOUNDATION_OK")

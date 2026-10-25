@@ -713,6 +713,67 @@ local function run_test_group()
         local new_handle = module_state.hotupgrade_api.newservice("skynet_hotupgrade_worker")
         assert(module_state.hotupgrade_api.cancel_service_creation(new_handle).ok)
         print("HOTUPGRADE_SKYNET_PARTIAL_OK")
+    elseif group == "new_modules" then
+        controller = create_controller()
+        worker_service_handle = create_worker_service()
+        local first = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules"), "COMPLETED")
+        local first_state = read_worker_state(worker_service_handle)
+        assert(first.success == 1 and first_state.module_value == 42 and first_state.module_identity)
+        assert(lifecycle_status(controller).pending_module_loads == 0)
+        local next_batch = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules_followup"), "COMPLETED")
+        assert(next_batch.success == 1 and read_worker_state(worker_service_handle).module_value == 52)
+        print("HOTUPGRADE_SKYNET_NEW_MODULES_OK")
+    elseif group == "new_modules_concurrent_conflict" then
+        controller = create_controller()
+        worker_service_handle = create_worker_service()
+        assert(skynet.call(worker_service_handle, "lua", "start_new_module_conflict", {}) == true)
+        local failed = wait_for_batch_phase(controller,
+            begin_update_batch(controller, "new_modules_concurrent"), "ABORTED")
+        assert(failed.error.code == "HU_NEW_MODULE_FAILED")
+        assert(failed.error.cause_code == "HU_MODULE_LOADING")
+        local ordinary = skynet.call(worker_service_handle, "lua", "new_module_conflict_result", {})
+        assert(not ordinary.ok and ordinary.message ~= "")
+        assert(lifecycle_status(controller).pending_module_loads == 0)
+        print("HOTUPGRADE_SKYNET_NEW_MODULES_CONCURRENT_CONFLICT_OK")
+    elseif group == "new_modules_candidate_undeclared" then
+        controller = create_controller()
+        worker_service_handle = create_worker_service()
+        local root = require("hotupgrade_test_options").root_path
+        local native = require "flywow_hotupgrade_native"
+        local failed = wait_for_batch_phase(controller,
+            begin_update_batch(controller, "new_modules_candidate_undeclared"), "ABORTED")
+        assert(failed.error.code == "HU_MODULE_STAGE_FAILED")
+        assert(failed.error.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
+        assert_original_state(worker_service_handle)
+        assert(native.read_file(root, "lualib/hotupgrade_new_rules.lua") == false)
+        assert(lifecycle_status(controller).pending_module_loads == 0)
+        local next_batch = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules"), "COMPLETED")
+        assert(next_batch.success == 1 and read_worker_state(worker_service_handle).module_value == 42)
+        print("HOTUPGRADE_SKYNET_NEW_MODULE_CANDIDATE_UNDECLARED_OK")
+    elseif group == "new_modules_candidate_caught_error" then
+        controller = create_controller()
+        worker_service_handle = create_worker_service()
+        local failed = wait_for_batch_phase(controller,
+            begin_update_batch(controller, "new_modules_candidate_caught_error"), "ABORTED")
+        assert(failed.error.code == "HU_MODULE_STAGE_FAILED")
+        assert(failed.error.cause_code == nil)
+        assert(failed.error.message:find("injected unrelated candidate failure", 1, true))
+        assert_original_state(worker_service_handle)
+        print("HOTUPGRADE_SKYNET_NEW_MODULE_CAUGHT_ERROR_OK")
+    elseif group == "new_modules_failure" then
+        controller = create_controller()
+        worker_service_handle = create_worker_service()
+        local root = require("hotupgrade_test_options").root_path
+        local native = require "flywow_hotupgrade_native"
+        local failed = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules_failure"), "ABORTED")
+        assert(failed.error.code == "HU_MODULE_STAGE_FAILED")
+        assert_original_state(worker_service_handle)
+        local remaining_rules = native.read_file(root, "lualib/hotupgrade_new_rules.lua")
+        assert(remaining_rules == false, "failed batch left new module file: " .. tostring(remaining_rules))
+        assert(lifecycle_status(controller).pending_module_loads == 0)
+        local next_batch = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules_followup"), "COMPLETED")
+        assert(next_batch.success == 1 and read_worker_state(worker_service_handle).module_value == 52)
+        print("HOTUPGRADE_SKYNET_NEW_MODULES_FAILURE_CONTINUES_OK")
     elseif group == "management_abort" then
         controller = create_controller()
         worker_service_handle = create_worker_service()

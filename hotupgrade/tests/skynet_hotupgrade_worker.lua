@@ -35,6 +35,7 @@ local business = {}
 local worker_test_config -- 本 State 的故障注入配置。
 local startup_registration -- 独立启动登记协程的结果；业务观察等待它完成。
 local extra_logic  -- 登记后才声明的模块，用于验证 register_module 真实链路。
+local new_module_conflict_result -- 后台协程的同名模块首次加载结果；测试查询后即可结束夹具。
 
 function business.load(item)
     return item.base_attack
@@ -302,6 +303,32 @@ skynet.start(function()
             assert(not loaded_ok and package.loaded.hotupgrade_extra == nil
                 and package.loaded["lualib.hotupgrade_extra"] == nil)
             answer = true
+        elseif command == "start_new_module_conflict" then
+            local original_call = skynet.call
+            local dependency_registration_started = false
+            local ordinary_load_waiting = false
+            new_module_conflict_result = nil
+            skynet.fork(function()
+                while not dependency_registration_started do skynet.sleep(1) end
+                local ok, message = pcall(hotupgrade.require, "hotupgrade_new_rules")
+                new_module_conflict_result = {ok = ok, message = tostring(message)}
+                skynet.call = original_call
+            end)
+            skynet.call = function(target, protocol, operation, request)
+                if protocol == "hotupgrade" and operation == "register_new_module"
+                    and request.name == "lualib.hotupgrade_new_dependency" then
+                    dependency_registration_started = true
+                    while not ordinary_load_waiting do skynet.sleep(1) end
+                elseif protocol == "hotupgrade" and operation == "begin_module_load"
+                    and request.name == "lualib.hotupgrade_new_rules" then
+                    ordinary_load_waiting = true
+                end
+                return original_call(target, protocol, operation, request)
+            end
+            answer = true
+        elseif command == "new_module_conflict_result" then
+            while not new_module_conflict_result do skynet.sleep(1) end
+            answer = new_module_conflict_result
         elseif command == "declare" then
             extra_logic = hotupgrade.require("hotupgrade_extra")
             answer = extra_logic.value()

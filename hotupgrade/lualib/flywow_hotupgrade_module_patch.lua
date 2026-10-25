@@ -180,7 +180,9 @@ function M.stage(module_patches, module_loaders)
         end
     end)
     if not ok then
-        return hotupgrade_result.failure("HU_MODULE_STAGE_FAILED", tostring(message))
+        local cause = type(message) == "table" and message.ok == false and message or nil
+        return hotupgrade_result.failure("HU_MODULE_STAGE_FAILED",
+            cause and cause.message or tostring(message), nil, cause and cause.code)
     end
 
     module_state.active_module_stage = module_stage
