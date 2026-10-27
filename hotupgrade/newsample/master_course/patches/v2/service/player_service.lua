@@ -13,6 +13,8 @@ local holding_thread        -- hold 占用 queue 时正在 wait 的业务协程�
 local waiting_spends = 0    -- 已通过入口但尚未拿到 queue 的 spend 请求数量。
 local fail_restore = false  -- 只用于故障实验，正常运行恒为 false。
 
+--- 在业务 queue 内生成当前 Service 快照；用于比较模块版本、状态身份和新旧函数引用。
+---@return table snapshot 当前玩家字段及课堂观测字段；不返回内部状态表或函数表本身。
 local function inspect_state()
     return
     {
@@ -32,6 +34,8 @@ local function inspect_state()
     }
 end
 
+--- 首次加载业务模块、创建本地玩家状态并向 Controller 登记；可能因 require/登记 RPC yield。
+---@return FlyWowResult<nil> register_service 的结果；失败时 registered 保持 false，可定位初始化未完成。
 local function initialize_player()
     if registered then
         return {ok = false, code = "ALREADY_INITIALIZED"}
@@ -56,6 +60,9 @@ local function initialize_player()
             state = state,
             functions = operations,
             -- 课堂故障需要显式控制恢复失败，所以这里使用成对自定义快照。
+            --- 快照当前私有状态字段；Controller 不接收状态本体，快照只留在本 Service 供 Abort 使用。
+            ---@param source table 当前 Service 私有状态根表
+            ---@return table 独立快照，仅含本课程需要验证的玩家字段
             snapshot = function(source)
                 return
                 {
@@ -65,6 +72,10 @@ local function initialize_player()
                     schema_version = source.schema_version,
                 }
             end,
+            --- Abort 时将快照写回同一状态根表；课堂故障开关可让恢复抛错以验证失败报告。
+            ---@param destination table 仍在线的 Service 私有状态根表，恢复时保持该表身份
+            ---@param snapshot table snapshot 返回的状态副本
+            ---@return boolean true 表示状态已恢复；异常由框架转换成恢复失败
             restore = function(destination, snapshot)
                 if fail_restore then
                     error("injected restore failure")
@@ -78,10 +89,14 @@ local function initialize_player()
                 return true
             end,
         },
+        --- Prepare 时排在已接纳业务之后取得同一条 queue；返回 true 表示业务已到安全点。
+        ---@return boolean 安全点确认值；queue 回调可能 yield，返回 false 会拒绝 Prepare
         before_upgrade = function()
             -- 必须排在所有已接纳业务之后取得同一条 queue。
             return business_queue(function() return true end)
         end,
+        --- Update 提交状态后、Finish 前做同步校验；false 或异常会触发整批恢复。
+        ---@return boolean 当前 schema 是否允许完成本批 Update
         after_upgrade = function()
             -- 同步状态检查；故障实验把 schema 改成 99，以触发 Update 失败。
             return state.schema_version ~= 99

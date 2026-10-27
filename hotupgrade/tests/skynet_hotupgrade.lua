@@ -389,6 +389,8 @@ local function drain_lifecycle_tests(group)
     print("HOTUPGRADE_SKYNET_DRAIN_OK " .. group)
 end
 
+--- Dispatch one isolated Skynet integration scenario selected by HOTUPGRADE_TEST_GROUP; failed assertions terminate that scenario.
+---@return nil Scenario-specific checks pass or raise an error collected by the service runner.
 local function run_test_group()
     local group = assert(os.getenv("HOTUPGRADE_TEST_GROUP"), "HOTUPGRADE_TEST_GROUP is required")
     local controller = nil
@@ -756,7 +758,7 @@ local function run_test_group()
         local failed = wait_for_batch_phase(controller,
             begin_update_batch(controller, "new_modules_candidate_caught_error"), "ABORTED")
         assert(failed.error.code == "HU_MODULE_STAGE_FAILED")
-        assert(failed.error.details.cause_code == nil)
+        assert(failed.error.details == nil or failed.error.details.cause_code == nil)
         assert(failed.error.message:find("injected unrelated candidate failure", 1, true))
         assert_original_state(worker_service_handle)
         print("HOTUPGRADE_SKYNET_NEW_MODULE_CAUGHT_ERROR_OK")

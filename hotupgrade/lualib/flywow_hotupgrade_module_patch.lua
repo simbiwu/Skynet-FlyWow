@@ -8,6 +8,10 @@ local module_state =
     active_module_stage = nil, -- 当前 State 唯一未完成的模块暂存记录，保留到 finish/abort。
 }
 
+---@class FlyWowHotUpgradeModuleStage
+---@field entries table[] 本 State 每个候选模块的旧字段与新字段记录；Commit/Abort 处理，Finish 释放。
+---@field committed boolean 是否已开始安装线上导出；部分提交失败时也必须恢复。
+
 --- 将普通状态数据图从 source_graph 复制到 target_graph，保留共享引用和循环引用。
 --- 恢复时复用目标根表；若来源中的 self 指向来源根表，复制后 self 会指向目标根表。
 ---@param source_graph any 待复制的状态数据图
@@ -17,7 +21,10 @@ local function copy_state_graph(source_graph, target_graph)
     local copied_tables = {} -- 源表到目标表的映射，用于保留共享引用和循环引用。
     local field_count = 0    -- 当前快照复制的字段数；达到上限时拒绝继续复制。
 
-    ---@return any copied_value 深复制后的标量或表引用。
+    --- 递归复制标量或表，并通过 copied_tables 维持共享引用和循环引用。
+    ---@param source_value any 当前字段值；只接受普通标量或无元表数据表
+    ---@param nesting_depth integer 从根表开始的嵌套层数；超过公共上限时抛出错误
+    ---@return any copied_value 深复制后的标量或目标表引用。
     local function copy_state_value(source_value, nesting_depth)
         local value_type = type(source_value)
         if value_type ~= "table" then
@@ -127,12 +134,9 @@ local function check_exports(module_exports, module_name)
 end
 
 --- 编译全部源码后加载候选和迁移模块私有状态；受信顶层及钩子必须同步且无外部副作用。
----@param module_patches table[] 待暂存模块项；每项包含规范模块名 name 和冻结源码 source。
+---@param module_patches table[] 按 Controller 顺序冻结的模块项；每项含规范模块名 name 和源码 source。
 ---@param module_loaders? table<string, {name:string, path:string}> 本 State 首次声明的加载名和路径；独立调用省略时使用规范名，路径为 nil。
----@class FlyWowHotUpgradeModuleStage
----@field entries table[] 本 State 每个候选模块的旧字段与新字段记录；Commit/Abort 处理，Finish 释放。
----@field committed boolean 是否已开始安装线上导出；部分提交失败时也必须恢复。
----@return FlyWowResult<{stage:FlyWowHotUpgradeModuleStage}> 成功载荷含 stage；失败不安装线上导出。
+---@return FlyWowResult<{stage:FlyWowHotUpgradeModuleStage}> 成功载荷含 stage；失败不安装线上导出。候选顶层代码和状态钩子必须同步执行。
 function M.stage(module_patches, module_loaders)
     if module_state.active_module_stage then
         return flywow_result.failure("HU_UPGRADE_BUSY", "模块 Stage 尚未结束")
@@ -144,7 +148,7 @@ function M.stage(module_patches, module_loaders)
         entries   = {},    -- 按输入顺序保存模块记录；Commit 安装候选，Abort 恢复各记录的旧字段。
         committed = false, -- 开始写线上字段前置为 true；即使部分提交失败，Abort 也会执行恢复。
     }
-    local ok, message = pcall(function()
+    local stage_succeeded, stage_failure = pcall(function()
         -- 数组结构、模块名、源码及唯一性已由 Controller 建立；这里只检查本 State 的实际对象。
         -- 先编译全部 Patch 并保存每个线上模块的旧字段。
         for _, module_patch in ipairs(module_patches) do
@@ -186,24 +190,25 @@ function M.stage(module_patches, module_loaders)
             entry.chunk = nil
         end
     end)
-    if not ok then
-        local cause = type(message) == "table" and message.ok == false and message or nil
+    if not stage_succeeded then
+        local cause = type(stage_failure) == "table" and stage_failure.ok == false and stage_failure or nil
         return flywow_result.failure("HU_MODULE_STAGE_FAILED",
-            cause and cause.message or tostring(message), cause and {cause_code = cause.code} or nil)
+            cause and cause.message or tostring(stage_failure), cause and {cause_code = cause.code} or nil)
     end
 
     module_state.active_module_stage = module_stage
     return flywow_result.success({stage = module_stage})
 end
 
---- 业务安全点已确认后同步安装；旧导出保留至 finish，供组合 Service 提交失败时恢复。
+--- 业务安全点已确认后同步安装候选字段；旧导出仍由 Stage 持有，供后续 Abort 恢复。
+---@param module_stage FlyWowHotUpgradeModuleStage 当前 State 尚未提交的候选 Stage
 ---@return FlyWowResult<nil> 同步提交结果；提交回调失败时返回 HU_MODULE_COMMIT_FAILED。
 function M.commit(module_stage)
     if module_state.active_module_stage ~= module_stage or module_stage.committed then
         return flywow_result.failure("HU_PHASE_INVALID", "模块 Stage 无效或已提交")
     end
 
-    local ok, message = pcall(function()
+    local commit_succeeded, commit_failure = pcall(function()
         -- 先确认所有根表身份仍有效；全部通过后才开始修改线上导出。
         for _, entry in ipairs(module_stage.entries) do
             assert(package.loaded[entry.name] == entry.live and getmetatable(entry.live) == nil,
@@ -216,10 +221,12 @@ function M.commit(module_stage)
             replace_exports(entry.live, entry.candidate)
         end
     end)
-    return ok and flywow_result.success() or flywow_result.failure("HU_MODULE_COMMIT_FAILED", tostring(message))
+    return commit_succeeded and flywow_result.success()
+        or flywow_result.failure("HU_MODULE_COMMIT_FAILED", tostring(commit_failure))
 end
 
---- 尽量恢复所有旧表；任一身份变化均报告故障，结束时释放本批 Stage。
+--- 按模块逐项恢复旧导出表；单项失败不跳过其余模块，最后释放 Stage 供后续更新使用。
+---@param module_stage FlyWowHotUpgradeModuleStage 当前 State 正在回退的候选 Stage
 ---@return FlyWowResult<nil> 恢复结果；恢复失败返回 HU_RECOVERY_REQUIRED。
 function M.abort(module_stage)
     if module_state.active_module_stage ~= module_stage then
@@ -229,15 +236,15 @@ function M.abort(module_stage)
     -- 尝试恢复每个模块并收集全部故障；单个模块失败不跳过其他模块。
     local errors = {}
     for _, entry in ipairs(module_stage.entries) do
-        local ok, message = pcall(function()
+        local restore_succeeded, restore_failure = pcall(function()
             assert(package.loaded[entry.name] == entry.live and getmetatable(entry.live) == nil,
                 "模块缓存身份或元表变化: " .. entry.name)
             if module_stage.committed then
                 replace_exports(entry.live, entry.old)
             end
         end)
-        if not ok then
-            errors[#errors + 1] = tostring(message)
+        if not restore_succeeded then
+            errors[#errors + 1] = tostring(restore_failure)
         end
     end
 
@@ -250,7 +257,8 @@ function M.abort(module_stage)
     return finished
 end
 
---- 确认本地模块更新结束并释放旧快照；不负责开放业务入口。
+--- 确认本地模块更新结束并释放候选/旧导出快照；Service 的业务门禁由外层事务管理。
+---@param module_stage FlyWowHotUpgradeModuleStage 当前 State 已完成 Commit 或 Abort 的 Stage
 ---@return FlyWowResult<nil> 清理结果；不执行回滚。
 function M.finish(module_stage)
     if module_state.active_module_stage ~= module_stage then

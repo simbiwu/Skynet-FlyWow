@@ -2,22 +2,36 @@
 local skynet = require "skynet"
 local SCENARIO = os.getenv("FLYWOW_MASTER_SCENARIO") or "v1"
 
+--- 校验受信 Skynet/FlyWow 调用返回成功；失败时抛出机器错误码和消息。
+---@param answer FlyWowResult<any> 待检查的统一结果表
+---@return FlyWowResult<any> 原样返回成功结果，调用者可继续读取 value。
 local function expect(answer)
     assert(type(answer) == "table" and answer.ok,
         type(answer) == "table" and (answer.message or answer.code) or tostring(answer))
     return answer
 end
 
+--- 通过 PlayerService 的 inspect 命令读取业务快照；RPC 可能 yield。
+---@param player integer 目标 PlayerService handle
+---@return table snapshot inspect 返回的玩家状态与课堂观测字段
 local function get_player_snapshot(player)
     return expect(skynet.call(player, "lua", "inspect"))
 end
 
+--- 将玩家版本、状态和攻击结果打印为一行，便于比较热更前后的可见结果。
+---@param label string 本次观察阶段名称
+---@param snapshot table get_player_snapshot 返回的字段集合
+---@return nil
 local function print_player(label, snapshot)
     print(string.format("%s handle=%d version=%s weapon=%s gold=%d schema=%d attack=%d old_attack=%d",
         label, snapshot.handle, snapshot.version, snapshot.weapon,
         snapshot.gold, snapshot.schema_version, snapshot.attack, snapshot.old_attack))
 end
 
+--- 每个 Skynet tick 检查一次异步条件；返回首个 truthy 结果，超时则抛错。
+---@param check fun():any 可 yield 的查询函数；返回 truthy 值表示条件成立
+---@param description string 用于定位超时阶段的说明
+---@return any result check 首次返回的 truthy 值
 local function wait_for(check, description)
     for _ = 1, 3000 do
         local answer = check()
@@ -27,6 +41,10 @@ local function wait_for(check, description)
     error("等待超时: " .. description)
 end
 
+--- 发起一次发布并轮询到终态；BEGIN 与 status RPC/等待都会 yield。
+---@param controller integer HotUpgrade Controller Service handle
+---@param patch_name string 相对 Patch 根目录的发布目录
+---@return table terminal_record status 返回的终态记录，包含 phase/error/各目标结果；失败批次也由场景自行断言
 local function publish(controller, patch_name)
     local begun = expect(skynet.call(controller, "hotupgrade", "begin", {path = patch_name}))
     print("BEGIN " .. patch_name .. " batch=" .. begun.value.batch_id)
@@ -43,6 +61,8 @@ local function publish(controller, patch_name)
     end, "发布 " .. patch_name)
 end
 
+--- 启动或取得唯一 HotUpgrade Controller 并初始化当前运行夹具路径。
+---@return integer controller 已完成配置初始化的 Controller Service handle
 local function initialize_controller()
     local controller = skynet.uniqueservice("flywow_hotupgrade_service")
     local runtime_root = assert(os.getenv("FLYWOW_MASTER_RUNTIME_ROOT"))
@@ -55,12 +75,20 @@ local function initialize_controller()
     return controller
 end
 
+--- 创建受管理 PlayerService 并完成其 init/register_service 握手；RPC 可能 yield。
+---@param hot table flywow_hotupgrade 模块，提供 newservice 适配入口
+---@return integer player_handle 成功初始化并已登记的 PlayerService handle
 local function create_player(hot)
     local handle = hot.newservice("player_service")
     expect(skynet.call(handle, "lua", "init"))
     return handle
 end
 
+--- 验证 V1 初始状态、Service handle 与模块身份；只断言并输出结果。
+---@param _controller integer 为共享场景签名保留，本场景不使用
+---@param hot table flywow_hotupgrade 模块句柄；本场景不创建额外 Service
+---@param player integer 已初始化的 PlayerService handle
+---@return nil
 local function run_v1(_controller, hot, player)
     local before = get_player_snapshot(player)
     print_player("V1", before)
@@ -69,6 +97,11 @@ local function run_v1(_controller, hot, player)
     print("MASTER_V1_OK")
 end
 
+--- 执行正常 V1→V2 发布，检查旧实例原地更新及新实例从 V2 启动。
+---@param controller integer HotUpgrade Controller Service handle
+---@param hot table flywow_hotupgrade 模块，用于创建第二个 PlayerService
+---@param player integer 已登记的 V1 PlayerService handle
+---@return nil 断言失败时抛错；成功时打印 MASTER_NORMAL_OK
 local function run_normal(controller, hot, player)
     local before = get_player_snapshot(player)
     print_player("BEFORE", before)
@@ -89,6 +122,11 @@ local function run_normal(controller, hot, player)
     print("MASTER_NORMAL_OK")
 end
 
+--- 构造 A 占用 queue、B 排队、Prepare 入队、C 被门禁拒绝的并发时序。
+---@param controller integer HotUpgrade Controller Service handle
+---@param _hot table 为共享场景签名保留，本场景不调用热更模块 API
+---@param player integer 已登记的 PlayerService handle
+---@return nil 断言 A/B 在 V1 完成、发布后 C 收到 HU_UPGRADING
 local function run_queue(controller, _hot, player)
     local first_done = false
     local second_done = false
@@ -142,6 +180,11 @@ local function run_queue(controller, _hot, player)
     print("MASTER_QUEUE_OK")
 end
 
+--- 演示恢复失败只报告、后续 V3 发布以当前真实状态为基准继续修复。
+---@param controller integer HotUpgrade Controller Service handle
+---@param hot table flywow_hotupgrade 模块，用于最后创建 V3 新实例
+---@param player integer 已登记的 PlayerService handle
+---@return nil 断言故障结果、V3 修复状态和新实例结果
 local function run_forward(controller, hot, player)
     assert(publish(controller, "v2").phase == "COMPLETED")
     local healthy = get_player_snapshot(player)
@@ -177,7 +220,7 @@ local function run_forward(controller, hot, player)
 end
 
 skynet.start(function()
-    local ok, failure = xpcall(function()
+    local scenario_succeeded, scenario_failure = xpcall(function()
         local hot = require "flywow_hotupgrade"
         local controller = initialize_controller()
         local player = create_player(hot)
@@ -193,10 +236,10 @@ skynet.start(function()
             error("未知实验: " .. tostring(SCENARIO))
         end
     end, debug.traceback)
-    if not ok then
-        skynet.error("MASTER_FAILED: " .. tostring(failure))
+    if not scenario_succeeded then
+        skynet.error("MASTER_FAILED: " .. tostring(scenario_failure))
     end
     io.stdout:flush()
     io.stderr:flush()
-    os.exit(ok and 0 or 1)
+    os.exit(scenario_succeeded and 0 or 1)
 end)

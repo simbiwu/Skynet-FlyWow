@@ -2,7 +2,7 @@
 local skynet = require "skynet"
 
 skynet.start(function()
-    local ok, failure = xpcall(function()
+    local sample_succeeded, sample_failure = xpcall(function()
         local hotupgrade = require "flywow_hotupgrade"
         local hotupgrade_handle = skynet.uniqueservice("flywow_hotupgrade_service")
 
@@ -75,10 +75,10 @@ skynet.start(function()
         print("HOTUPGRADE_SAMPLE_OK")
     end, debug.traceback)
 
-    if not ok then
-        skynet.error("HOTUPGRADE_SAMPLE_FAILED: " .. tostring(failure))
+    if not sample_succeeded then
+        skynet.error("HOTUPGRADE_SAMPLE_FAILED: " .. tostring(sample_failure))
     end
     io.stdout:flush()
     io.stderr:flush()
-    os.exit(ok and 0 or 1)
+    os.exit(sample_succeeded and 0 or 1)
 end)

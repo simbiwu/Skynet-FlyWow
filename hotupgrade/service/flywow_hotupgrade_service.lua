@@ -6,7 +6,9 @@ local hotupgrade_common = require "flywow_hotupgrade_common"
 local skynet_core = require "skynet.core"
 local controller_initialized = false -- 成功 init 后锁定配置；失败时保持 false 以允许重试。
 
-skynet.register_protocol({name = "hotupgrade", id = hotupgrade_common.PROTOCOL_ID, pack = skynet.pack, unpack = skynet.unpack})
+skynet.register_protocol({name = "hotupgrade", id = hotupgrade_common.PROTOCOL_ID,
+    pack = skynet.pack, unpack = skynet.unpack})
+-- client 消息只用于通知 Service 退出，没有请求体，因此解包回调不返回参数。
 skynet.register_protocol({name = "client", id = skynet.PTYPE_CLIENT, unpack = function() end})
 
 skynet.start(function()
@@ -50,10 +52,12 @@ skynet.start(function()
         if not controller_initialized then
             answer = flywow_result.failure("HU_NOT_INITIALIZED", "宿主尚未完成 init")
         else
-            local ok
-            ok, answer = pcall(hotupgrade_controller.handle_command, hotupgrade_controller, command, request, source)
-            if not ok then
-                answer = flywow_result.failure("HU_CONTROL_FAILED", tostring(answer))
+            local command_succeeded, command_result = pcall(
+                hotupgrade_controller.handle_command, hotupgrade_controller, command, request, source)
+            if not command_succeeded then
+                answer = flywow_result.failure("HU_CONTROL_FAILED", tostring(command_result))
+            else
+                answer = command_result
             end
         end
 

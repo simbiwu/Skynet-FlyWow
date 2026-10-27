@@ -199,7 +199,7 @@ bool resolveDirectory(const std::string &root_argument, const std::string &relat
     return true;
 }
 
-// 一次扫描整个选定 Patch 目录，返回其中全部 Lua 文件。
+// 一次扫描整个选定 Patch 目录，返回其中全部 .lua 和 .patch 文件。
 int listLuaFiles(const std::string &patch_root, const std::string &relative_patch_dir,
                  std::vector<std::string> &output)
 {
@@ -304,8 +304,9 @@ bool resolveFile(const std::string &root_argument, const std::string &relative,
     return true;
 }
 
-// 内部部署准备入口：返回完整旧内容；不存在返回 false；失败沿用 nil/error。
-// 不创建目录或文件，Controller 在任何目标 Prepare 前调用。
+/// 读取正式目录中的文件，供 Controller 保存部署前内容。
+/// @param state Lua 状态；参数依次为正式根目录和根目录相对文件路径。
+/// @return 成功返回完整文件内容；文件不存在返回 false；失败返回 nil 和错误对象。
 int read_file(lua_State *state)
 {
     try
@@ -370,8 +371,10 @@ int read_file(lua_State *state)
     }
 }
 
-// 同目录临时文件完整写入后 rename；nil 内容表示恢复时删除本批新增文件。
-// 临时文件由此同步调用负责清理；不提供跨进程、断电或外部并发改写恢复。
+/// 将源码完整写入正式文件；nil 内容用于删除本批新增文件。
+/// @param state Lua 状态；参数依次为正式根目录、相对文件路径和可选源码。
+/// @return 成功返回 true；失败返回 nil 和错误对象。
+/// @note 先写同目录临时文件，再 rename 替换，避免写入未完成的内容成为正式文件。
 int replace_file(lua_State *state)
 {
     std::string temporary;
@@ -457,7 +460,9 @@ int replace_file(lua_State *state)
 }
 
 // 参数 1 是已存在的路径；可选参数 2 是其下的相对目录，复用扫描器的包含关系和链接检查。
-// 成功返回规范化绝对路径；失败返回 nil/error。
+/// 解析并校验宿主路径。
+/// @param state Lua 状态；参数为待解析路径，可选第二参数为其下相对目录。
+/// @return 成功返回规范化绝对路径；失败返回 nil 和错误对象。
 int resolve(lua_State *state)
 {
     try
@@ -504,9 +509,12 @@ int resolve(lua_State *state)
     }
 }
 
-// 参数依次为 Patch 根目录、相对发布目录；readValue 不改变参数栈。
-// LuaTable 以 registry 引用临时持有结果 table；returnValues 压入它并返回 1，
-// C++ 句柄析构只释放自身引用，不移除 Lua 返回栈中已压入的 table。
+/// 枚举发布目录中的 Lua 文件和 Service Patch。
+/// @param state Lua 状态；参数依次为 Patch 根目录和相对发布目录。
+/// @return 成功返回相对路径数组；失败或目录为空时返回 nil 和错误对象。
+///
+/// readValue 不改变参数栈。LuaTable 用 registry 引用暂存结果；returnValues
+/// 将结果表压入返回栈。局部句柄析构时只释放 registry 引用，不会移除返回值。
 int list_lua(lua_State *state)
 {
     try
@@ -565,9 +573,11 @@ extern "C" int luaopen_flywow_hotupgrade_native(lua_State *state)
         // [S] -> [S, module]；返回 1 后 VM 保留该 table，Binding 析构只释放临时引用。
         LuaBinding binding(state);
         LuaTable   module = binding.newTable();
-        if (!module.valid() || !module.setFunction("resolve", resolve) ||
+        if (!module.valid() ||
+            !module.setFunction("resolve", resolve) ||
             !module.setFunction("list_lua", list_lua) ||
-            !module.setFunction("read_file", read_file) || !module.setFunction("replace_file", replace_file))
+            !module.setFunction("read_file", read_file) ||
+            !module.setFunction("replace_file", replace_file))
         {
             return binding.pushError();
         }
