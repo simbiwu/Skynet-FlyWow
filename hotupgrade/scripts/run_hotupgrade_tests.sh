@@ -23,11 +23,11 @@ for scenario in shared custom nested_shared cycles old_alias types empty direct_
 done
 CONTROLLER_LOG="$FRAMEWORK_DIR/build/hotupgrade-tests/controller.log"
 : > "$CONTROLLER_LOG"
-for scenario in lifecycle interleaved matching combined paths custom_paths unique resources draining drain_abort_rejected drain_unsupported drain_new_failure; do
+for scenario in lifecycle interleaved creation_returned matching combined paths custom_paths unique resources draining drain_abort_rejected drain_unsupported drain_new_failure; do
     "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_controller.lua "$scenario" \
         2>&1 | tee -a "$CONTROLLER_LOG"
 done
-test "$(grep -c HOTUPGRADE_CONTROLLER_SCENARIO_OK "$CONTROLLER_LOG")" -eq 12
+test "$(grep -c HOTUPGRADE_CONTROLLER_SCENARIO_OK "$CONTROLLER_LOG")" -eq 13
 cp -a build/hotupgrade-tests/host build/hotupgrade-tests/host-original
 cd "$FRAMEWORK_DIR/../.."
 LOG="$FRAMEWORK_DIR/build/hotupgrade-tests/skynet.log"

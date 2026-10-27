@@ -63,7 +63,7 @@ bool resolvePath(const std::string &path, std::string &output)
 
 // 递归枚举受信任根目录内的普通 Lua 文件；拒绝符号链接和特殊文件。
 // 返回 0 成功，-1 路径或文件结构无效。
-int scanDirectory(const std::string &root, const std::string &directory,
+int scanDirectory(const std::string &directory,
                   const std::string &relative, FileList &files)
 {
     // DIR 归当前递归层所有；字符串/vector 分配异常也必须关闭，不泄漏祖先层的目录 fd。
@@ -108,7 +108,7 @@ int scanDirectory(const std::string &root, const std::string &directory,
         }
         if (S_ISDIR(attributes.st_mode))
         {
-            status = scanDirectory(root, absolute, child_relative, files);
+            status = scanDirectory(absolute, child_relative, files);
             if (status != 0)
             {
                 break;
@@ -128,21 +128,6 @@ int scanDirectory(const std::string &root, const std::string &directory,
             continue;
         }
         // 只登记 .lua/.patch；相对路径交由 Controller 检查和分类。
-        char canonical[PATH_MAX];
-        if (realpath(absolute.c_str(), canonical) == nullptr)
-        {
-            status = -1;
-            break;
-        }
-        // realpath 复核规范化目标仍在 root 内，阻止扫描期间目录路径被替换后越界。
-        const std::string canonical_path = canonical;
-        if (root != "/" && (canonical_path.size() <= root.size() ||
-                            canonical_path.compare(0, root.size(), root) != 0 ||
-                            canonical_path[root.size()] != '/'))
-        {
-            status = -1;
-            break;
-        }
         files.paths.push_back(child_relative);
     }
     return status;
@@ -211,7 +196,7 @@ int listLuaFiles(const std::string &patch_root, const std::string &relative_patc
     }
 
     FileList  files;
-    const int status = scanDirectory(root, directory, "", files);
+    const int status = scanDirectory(directory, "", files);
     if (status != 0)
     {
         return -1;
@@ -459,8 +444,7 @@ int replace_file(lua_State *state)
     }
 }
 
-// 参数 1 是已存在的路径；可选参数 2 是其下的相对目录，复用扫描器的包含关系和链接检查。
-/// 解析并校验宿主路径。
+/// 解析已存在路径；提供相对目录时，校验其在根目录内并逐级拒绝链接。
 /// @param state Lua 状态；参数为待解析路径，可选第二参数为其下相对目录。
 /// @return 成功返回规范化绝对路径；失败返回 nil 和错误对象。
 int resolve(lua_State *state)

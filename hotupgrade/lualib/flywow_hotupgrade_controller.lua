@@ -43,6 +43,18 @@ local function lifecycle_closed(controller)
     return batch ~= nil and batch.phase ~= "WAITING_CREATIONS" and batch.phase ~= "PREPARE"
 end
 
+--- 只统计原生 newservice 尚未返回的调用；等待业务登记的记录不属于此窗口。
+---@param controller FlyWowHotUpgradeController 持有创建记录的控制面
+---@return boolean 是否仍可能收到尚未返回创建的真实 handle
+local function has_unreturned_native_creation(controller)
+    for _, creation in pairs(controller.pending_creations) do
+        if creation.native_create_returned == false then
+            return true
+        end
+    end
+    return false
+end
+
 --- 统一提取 Native 失败对象中的稳定错误码；没有有效 code 时返回 HU_NATIVE_ERROR。
 ---@param native_error any Native 返回的错误值
 ---@return string 稳定 Native 错误码。
@@ -96,11 +108,10 @@ end
 ---@class FlyWowHotUpgradeServiceTarget
 ---@field service_handle integer 从登记记录复制的业务 Service handle；当前热更 RPC 的接收者
 ---@field modules table[] 本批匹配到的完整模块 Patch
----@field service_patch_source? string Controller 冻结的 Service .patch 文件源码，Update 时发送给对应目标
----@field service_entry_file? string 本批 Service Patch 的相对路径，用于错误诊断
+---@field service_patch? FlyWowHotUpgradeServicePatchSource 引用本批唯一冻结记录；Update 源码与错误路径均从这里读取
 ---@field exited? boolean 原生 MONITOR 已确认目标退出；保留结果快照，停止对其发送控制消息
 ---@field participated? boolean 是否已进入本批控制流程，决定失败时是否发送 Abort
----@field result? FlyWowResult 该目标最近一次 Prepare/Update/Finish/Abort 结果
+---@field hotupgrade_result? FlyWowResult 本目标本批的汇总结果；失败或退出时提前写入，成功由 Finish 写入，恢复失败可覆盖为恢复结果
 
 ---@class FlyWowHotUpgradeServiceResult
 ---@field service_handle integer 本批结果所属业务 Service 的真实 handle
@@ -128,22 +139,20 @@ end
 ---@field entry_file string 发布包内模块文件的相对路径，用于冻结和错误诊断
 ---@field source string 本批冻结的模块源码，随 Update 发给匹配 Service
 
----@class FlyWowHotUpgradeServicePatch
+---@class FlyWowHotUpgradeServicePatchSource
 ---@field entry_file string 发布包内 Service .patch 的相对路径，用于错误诊断
----@field source string 本批冻结的一次性 Service 更新脚本源码
+---@field service_patch_source string 本批冻结的 Service .patch 源码，随 Update 请求发送
 
 ---@class FlyWowHotUpgradeBatch
 ---@field batch_id string 本批唯一身份
 ---@field sequence integer Controller 生命周期内递增的本批序号
 ---@field patch_dir string begin 接受时固定的发布包目录；相对 Controller 的 patch_root，冻结本批源码时从此目录读取
 ---@field modules FlyWowHotUpgradeModulePatch[] 本批冻结的普通模块源码；不携带文件恢复快照
----@field service_patches table<string, FlyWowHotUpgradeServicePatch> 本批冻结的 Service Patch，重匹配直接复用
+---@field service_patches table<string, FlyWowHotUpgradeServicePatchSource> 本批冻结的 Service Patch，重匹配直接复用
 ---@field phase string 本批当前阶段及终态
 ---@field service_results FlyWowHotUpgradeServiceResult[] 本批参与控制的 Service 结果；终态汇总并由 status 返回
 ---@field service_targets FlyWowHotUpgradeServiceTarget[] 本批匹配到的目标 Service 记录；Prepare 期间可增长，Update 前固定并保留参与记录
 ---@field files? FlyWowHotUpgradePatchFile[] 本批冻结的宿主文件及恢复快照
----@field succeeded_service_count integer 已收到成功事务结果的目标 Service 数
----@field failed_service_count integer 已收到失败事务结果的目标 Service 数
 ---@field target_service_count integer 当前匹配到的目标 Service 数；Prepare 期间可增长，Update 前确定最终数量
 ---@field current_service_handle? integer 当前或最近一次处理的业务 Service handle；status 对外返回此值
 ---@field waiter? thread 等待创建/登记或首次模块加载完成的批次协程
@@ -242,7 +251,7 @@ function M.initialize(controller_config)
     return flywow_result.success()
 end
 
---- 释放一条已登记到 pending_creations 的在途记录，并在计数归零时唤醒批次/登记等待者。
+--- 结束一条受管理创建记录，移除 handle 索引并递减在途计数，通知批次与登记等待者。
 ---@param creation FlyWowHotUpgradeServiceCreation 待释放的 Controller 创建记录
 ---@return nil
 function M:finish_creation(creation)
@@ -255,14 +264,7 @@ function M:finish_creation(creation)
         self:wake_batch()
         self:wake_registration()
 
-        local native_pending = false
-        for _, pending in pairs(self.pending_creations) do
-            if not pending.native_create_returned then
-                native_pending = true
-                break
-            end
-        end
-        if not native_pending then
+        if not has_unreturned_native_creation(self) then
             self.early_exit_handles = {}
         end
     end
@@ -310,13 +312,13 @@ function M:on_service_exit(service_handle)
         for _, service_target in ipairs(batch.service_targets) do
             if service_target.service_handle == service_handle and not service_target.exited then
                 service_target.exited = true
-                service_target.result = flywow_result.failure("HU_SERVICE_EXITED",
+                service_target.hotupgrade_result = flywow_result.failure("HU_SERVICE_EXITED",
                     "Service " .. service_handle .. " 在发布期间退出")
                 if batch.phase == "PREPARE" or batch.phase == "UPDATE" then
-                    batch.error = batch.error or service_target.result
+                    batch.error = batch.error or service_target.hotupgrade_result
                 elseif batch.phase == "PUBLISH_DECIDED" then
                     batch.error = batch.error or flywow_result.failure("HU_RECOVERY_REQUIRED",
-                        service_target.result.message, {step = "finish"})
+                        service_target.hotupgrade_result.message, {step = "finish"})
                 end
                 tracked = true
             end
@@ -324,11 +326,8 @@ function M:on_service_exit(service_handle)
     end
 
     if not tracked then
-        for _, pending in pairs(self.pending_creations) do
-            if not pending.native_create_returned then
-                self.early_exit_handles[service_handle] = true
-                break
-            end
+        if has_unreturned_native_creation(self) then
+            self.early_exit_handles[service_handle] = true
         end
     end
     self:wake_batch()
@@ -396,11 +395,11 @@ end
 local function start_service(self, request, source, unique_name)
     local creation =
     {
-        creator_service_handle = source,                -- 原创建者拥有返回后未登记 Service 的取消权。
-        service_name    = request.service_name,  -- Patch 匹配使用的原生 Service 入口名。
-        service_handle  = nil,                   -- 仅由原生返回值建立真实来源索引。
-        unique_name     = unique_name,            -- 本地唯一预留名，不改变其既有语义。
-        native_create_returned = false,                  -- 原生返回前，早到登记只能让出执行权等待。
+        creator_service_handle = source,               -- 原创建者拥有返回后未登记 Service 的取消权。
+        service_name           = request.service_name, -- Patch 匹配使用的原生 Service 入口名。
+        service_handle         = nil,                  -- 仅由原生返回值建立真实来源索引。
+        unique_name            = unique_name,          -- 本地唯一预留名，不改变其既有语义。
+        native_create_returned = false,                -- 原生 newservice 返回后置 true；与业务登记完成分开。
     }
     self.pending_creations[creation] = creation
     self.pending_service_count = self.pending_service_count + 1
@@ -420,8 +419,13 @@ local function start_service(self, request, source, unique_name)
     creation.service_handle = service_handle
     self.service_creations[service_handle] = creation
     creation.native_create_returned = true
-    if self.early_exit_handles[service_handle] then
-        self.early_exit_handles[service_handle] = nil
+    local exited_before_return = self.early_exit_handles[service_handle]
+    self.early_exit_handles[service_handle] = nil
+    -- 先保留当前 handle 的退出事实；其余记录只在还有原生调用未返回时有匹配价值。
+    if not has_unreturned_native_creation(self) then
+        self.early_exit_handles = {}
+    end
+    if exited_before_return then
         self:finish_creation(creation)
         return flywow_result.failure("HU_SERVICE_EXITED", "Service 在原生创建返回前退出")
     end
@@ -672,14 +676,7 @@ function M:register(request, service_handle)
     -- 不猜测名称或创建顺序；原生调用返回前，登记必须让出执行权等待真实 handle。
     local creation = self.service_creations[service_handle]
     while not creation do
-        local native_pending = false
-        for _, pending in pairs(self.pending_creations) do
-            if not pending.native_create_returned then
-                native_pending = true
-                break
-            end
-        end
-        if not native_pending then
+        if not has_unreturned_native_creation(self) then
             return flywow_result.failure("HU_CREATION_MISSING", "来源不是受管理入口创建的待登记 Service")
         end
 
@@ -700,11 +697,11 @@ function M:register(request, service_handle)
     ---@type FlyWowHotUpgradeRegisteredService
     local registered_service =
     {
-        service_handle      = service_handle,                     -- register 消息头中的真实来源，也是后续热更 RPC 目标。
-        service_name        = creation.service_name,       -- 来自该 handle 对应的受管理创建记录。
-        modules             = modules,                    -- 该 State 明确声明的可更新模块集合。
-        loading_modules     = {},                          -- 同一 Service/模块同时只允许一项首次加载操作。
-        has_service_update  = request.has_service_update,  -- 是否提供本地 Service 状态/函数入口。
+        service_handle     = service_handle,             -- register 消息头中的真实来源，也是后续热更 RPC 目标。
+        service_name       = creation.service_name,      -- 来自该 handle 对应的受管理创建记录。
+        modules            = modules,                    -- 该 State 明确声明的可更新模块集合。
+        loading_modules    = {},                         -- 同一 Service/模块同时只允许一项首次加载操作。
+        has_service_update = request.has_service_update, -- 是否提供本地 Service 状态/函数入口。
     }
     self.service_registrations[service_handle] = registered_service
     self:finish_creation(creation)
@@ -748,10 +745,9 @@ local function match_service_targets(batch, registered_services)
                 service_target =
                 {
                     service_handle = service_registration.service_handle,
-                    service_patch_source = service_patch and service_patch.service_patch_source,
-                    service_entry_file = service_patch and service_patch.entry_file,
                 }
             end
+            service_target.service_patch = service_patch
             service_target.modules = modules
             if not service_target.participated then
                 needs_prepare = true
@@ -775,16 +771,17 @@ local function match_service_targets(batch, registered_services)
     return flywow_result.success({needs_prepare = needs_prepare})
 end
 
---- 将发布包直接冻结到批次，再完成初次目标匹配；后续只复用批次数据。
----@param batch FlyWowHotUpgradeBatch 本批 patch_dir 已由 begin 固定；内部测试也可提供仅含 patch_dir 的记录
----@return FlyWowResult<{needs_prepare:boolean}> 成功时已冻结发布文件并匹配目标；失败时携带稳定错误码。
-function M:load_patch(batch)
+--- 扫描并冻结发布包：读取源码、只编译检查语法，再分类为正式文件、普通候选与 Service Patch。
+---@param controller FlyWowHotUpgradeController 提供受信发布根目录和 Service 路径
+---@param batch FlyWowHotUpgradeBatch 本批固定的发布目录及冻结输出
+---@return FlyWowResult<nil> 失败返回路径、读取或语法错误；成功时三个发布视图均已建立
+local function freeze_patch_files(controller, batch)
     if type(batch.patch_dir) ~= "string" then
         return flywow_result.failure("HU_INVALID_PATCH", "需要相对 patch_root 的 patch_dir")
     end
 
     -- 一次扫描并冻结所选发布目录；扫描结果排序后，后续读取和目标匹配顺序稳定。
-    local paths, failure = hotupgrade_native.list_lua(self.patch_root, batch.patch_dir)
+    local paths, failure = hotupgrade_native.list_lua(controller.patch_root, batch.patch_dir)
     if not paths then
         local code = native_code(failure)
         return flywow_result.failure(code,
@@ -798,9 +795,9 @@ function M:load_patch(batch)
     batch.service_patches = {}
     -- 逐个读取并只编译检查源码，不执行 Patch；普通 Lua 文件与 Service .patch 在此分流。
     local module_names = {} -- 原始路径可能映射到同一规范名，冻结时一次性拒绝冲突。
-    local service_prefix = self.service_path .. "/"
+    local service_prefix = controller.service_path .. "/"
     for _, relative_path in ipairs(paths) do
-        local source, read_failure = hotupgrade_native.read_file(self.patch_root, batch.patch_dir .. "/" .. relative_path)
+        local source, read_failure = hotupgrade_native.read_file(controller.patch_root, batch.patch_dir .. "/" .. relative_path)
         if source == nil or source == false then
             return flywow_result.failure(source == false and "HU_FILE_NOT_FOUND" or native_code(read_failure),
                 "发布包读取失败: " .. batch.patch_dir .. "/" .. relative_path)
@@ -833,13 +830,20 @@ function M:load_patch(batch)
             end
         end
     end
-    -- 发布文件全部通过读取、语法和路径分类后，才形成初始 Service 目标匹配。
-    if #batch.files == 0 and next(batch.service_patches) == nil then
-        return flywow_result.failure("HU_PATCH_EMPTY", "发布包至少要有一个 .lua 或 Service .patch")
-    end
     table.sort(batch.modules, function(left, right)
         return left.name < right.name
     end)
+    return flywow_result.success()
+end
+
+--- 将发布包直接冻结到批次，再完成初次目标匹配；后续只复用批次数据。
+---@param batch FlyWowHotUpgradeBatch 本批 patch_dir 已由 begin 固定；内部测试也可提供仅含 patch_dir 的记录
+---@return FlyWowResult<{needs_prepare:boolean}> 成功时已冻结发布文件并匹配目标；失败时携带稳定错误码。
+function M:load_patch(batch)
+    local frozen = freeze_patch_files(self, batch)
+    if not frozen.ok then
+        return frozen
+    end
     return match_service_targets(batch, self.service_registrations)
 end
 
@@ -858,30 +862,29 @@ function M:step(batch, service_target, command)
 
     if command == "update" then
         request.modules = service_target.modules
-        request.service_patch_source = service_target.service_patch_source
+        request.service_patch_source = service_target.service_patch and service_target.service_patch.service_patch_source
     end
 
     if service_target.exited then
-        return service_target.result
+        return service_target.hotupgrade_result
     end
 
     batch.control_started = true
     local call_succeeded, service_result = pcall(skynet.call,
         service_target.service_handle, "hotupgrade", command, request)
     if service_target.exited then
-        return service_target.result
+        return service_target.hotupgrade_result
     end
     if not call_succeeded or type(service_result) ~= "table" or type(service_result.ok) ~= "boolean" then
         return flywow_result.failure("HU_RPC_FAILED", tostring(service_result), {step = command})
     end
 
-    if not service_result.ok and service_target.service_entry_file then
-        service_result.message = service_target.service_entry_file .. ": " .. (service_result.message or service_result.code)
+    if not service_result.ok and service_target.service_patch then
+        service_result.message = service_target.service_patch.entry_file .. ": " .. (service_result.message or service_result.code)
     end
     return service_result
 end
 
--- 等待已接纳的 Service 创建和首次模块加载全部结束；等待期间由完成回调唤醒批次。
 --- 等待 begin 前或 Prepare 期间已受理的创建/首次加载收敛；通过完成回调唤醒而非轮询。
 ---@param controller FlyWowHotUpgradeController 当前唯一控制面
 ---@param batch FlyWowHotUpgradeBatch 正在等待的批次
@@ -894,13 +897,11 @@ local function wait_for_batch_work(controller, batch)
     end
 end
 
---- 冻结发布包、准备目标、部署正式文件并执行全部 Update。
---- 冻结 Patch 并保存旧文件后逐轮 Prepare；确认依赖排空，再部署正式文件、清缓存并串行 Update。
---- 该阶段可能在等待或目标 RPC 时 yield；异常由 run_batch 转成 HU_CONTROL_FAILED，失败结果写入 batch.error。
+--- 冻结发布包并保存每份正式文件更新前的内容；只读文件，不部署也不发目标 RPC。
 ---@param controller FlyWowHotUpgradeController 当前唯一控制面
----@param batch FlyWowHotUpgradeBatch 当前活动批次
----@return nil 成功表示所有目标 Update 完成；失败通过 batch.error 返回。
-local function prepare_and_update_batch(controller, batch)
+---@param batch FlyWowHotUpgradeBatch 当前批次及本阶段共享记录
+---@return nil 读取或匹配失败写入 batch.error；成功保留 file.old_source
+local function load_and_snapshot_batch_files(controller, batch)
     -- DEPLOYING 阶段只读取一次发布包，并保存所有正式文件的旧内容。
     local load_result = controller:load_patch(batch)
     if not load_result.ok then
@@ -916,7 +917,13 @@ local function prepare_and_update_batch(controller, batch)
         end
         file.old_source = old_source
     end
+end
 
+--- 逐轮 Prepare、等待依赖收敛并重匹配；RPC 和等待可能 yield，恢复后先检查异步 batch.error。
+---@param controller FlyWowHotUpgradeController 当前唯一控制面
+---@param batch FlyWowHotUpgradeBatch 当前批次及本阶段共享记录
+---@return nil 匹配目标全部准备后返回；失败写入 batch.error 并停止本阶段
+local function prepare_batch_targets(controller, batch)
     -- Prepare 期间继续接纳依赖；每轮排空后用同一份冻结 Patch 重新匹配目标。
     batch.phase = "PREPARE"
     while true do
@@ -929,7 +936,7 @@ local function prepare_and_update_batch(controller, batch)
                     return
                 end
                 if not service_result.ok then
-                    service_target.result = service_result
+                    service_target.hotupgrade_result = service_result
                     batch.error = service_result
                     return
                 end
@@ -951,7 +958,13 @@ local function prepare_and_update_batch(controller, batch)
             break
         end
     end
+end
 
+--- Prepare 收口后进入 UPDATE 关闭生命周期入口，部署全部正式 Lua 文件并清理缓存。
+---@param controller FlyWowHotUpgradeController 当前唯一控制面
+---@param batch FlyWowHotUpgradeBatch 当前批次及本阶段共享记录
+---@return nil 写入成功标记 file.touched；部署或清缓存失败写入 batch.error
+local function deploy_batch_files(controller, batch)
     -- PREPARE 收口后无 yield 地关闭入口；先部署本批完整 Lua 文件并清缓存。
     batch.phase = "UPDATE"
     for _, file in ipairs(batch.files) do
@@ -970,7 +983,13 @@ local function prepare_and_update_batch(controller, batch)
             return
         end
     end
+end
 
+--- 正式文件就绪后串行调用目标 Update；每次 RPC yield 恢复后先检查目标退出写入的 batch.error。
+---@param controller FlyWowHotUpgradeController 当前唯一控制面
+---@param batch FlyWowHotUpgradeBatch 当前批次及本阶段共享记录
+---@return nil 失败保存目标结果和 batch.error；成功表示所有目标 Update 完成
+local function update_batch_targets(controller, batch)
     -- 全部文件就绪后才向目标发送 Update；新生命周期请求继续等待批次终态。
     for _, service_target in ipairs(batch.service_targets) do
         batch.current_service_handle = service_target.service_handle
@@ -979,25 +998,46 @@ local function prepare_and_update_batch(controller, batch)
             return
         end
         if not service_result.ok then
-            service_target.result = service_result
+            service_target.hotupgrade_result = service_result
             batch.error = service_result
             return
         end
     end
 end
 
---- 文件恢复和目标 Abort 按原顺序尽力执行；任一项失败都记录后继续其余恢复。
+--- 按快照、Prepare、部署、Update 顺序推进本批；任一阶段失败立即交回 run_batch 统一恢复。
+---@param controller FlyWowHotUpgradeController 当前唯一控制面
+---@param batch FlyWowHotUpgradeBatch 当前活动批次
+---@return nil 等待或 RPC 可 yield；失败写入 batch.error，异常由 run_batch 转换为 HU_CONTROL_FAILED。
+local function prepare_and_update_batch(controller, batch)
+    load_and_snapshot_batch_files(controller, batch)
+    if batch.error then
+        return
+    end
+
+    prepare_batch_targets(controller, batch)
+    if batch.error then
+        return
+    end
+
+    deploy_batch_files(controller, batch)
+    if batch.error then
+        return
+    end
+
+    update_batch_targets(controller, batch)
+end
+
 --- 先逆序恢复已部署文件并清缓存，再逆序 Abort 已参与目标；单项失败会收集后继续。
---- Abort RPC 可能 yield；全部尝试后按恢复结果设置 ABORTED 或 RECOVERY_REQUIRED，不锁定后续批次。
 ---@param controller FlyWowHotUpgradeController 当前唯一控制面
 ---@param batch FlyWowHotUpgradeBatch 失败批次及其文件、目标快照
----@return nil 更新恢复结果，并将阶段设为 ABORTED 或 RECOVERY_REQUIRED。
+---@return nil Abort RPC 可 yield；尽力恢复后设为 ABORTED 或 RECOVERY_REQUIRED，后续批次仍可执行。
 local function recover_batch(controller, batch)
-    local recovery_errors = {} -- 汇总所有恢复失败；单项失败不停止其余文件或目标恢复。
-    local recovery_failure -- 保留第一份结构化恢复错误，供最终结果携带诊断。
-    local files_touched = false -- 只有正式文件被替换后才需要清理文件缓存。
+    local recovery_errors = {}    -- 汇总所有恢复失败；单项失败不停止其余文件或目标恢复。
+    local recovery_failure        -- 保留第一份结构化恢复错误，供最终结果携带诊断。
+    local files_touched   = false -- 只有正式文件被替换后才需要清理文件缓存。
 
-    -- 先恢复正式文件并清缓存，保证目标重新开放时看到旧代码。
+    -- 恢复后的文件供后续创建和首次加载使用；文件恢复失败也必须继续尝试目标 Abort。
     for index = #(batch.files or {}), 1, -1 do
         local file = batch.files[index]
         if file.touched then
@@ -1029,21 +1069,19 @@ local function recover_batch(controller, batch)
                 recovery_failure = recovery_failure or restored
                 recovery_errors[#recovery_errors + 1] = service_target.service_handle .. ": "
                     .. tostring(restored.message or restored.code)
-                service_target.result = restored
+                service_target.hotupgrade_result = restored
             end
         end
     end
 
     if #recovery_errors > 0 then
-        local original = batch.error
-        batch.error = flywow_result.failure("HU_RECOVERY_REQUIRED", table.concat(recovery_errors, "; "))
-        batch.error.details = {original_error = original or recovery_failure, recovery_error = recovery_failure}
+        batch.error = flywow_result.failure("HU_RECOVERY_REQUIRED", table.concat(recovery_errors, "; "),
+            {original_error = batch.error or recovery_failure, recovery_error = recovery_failure})
     end
     batch.phase = (#recovery_errors > 0 or batch.error.code == "HU_RECOVERY_REQUIRED")
         and "RECOVERY_REQUIRED" or "ABORTED"
 end
 
---- 发布决定后逐目标 Finish；失败只报告收尾故障，不回滚已提交目标。
 --- 进入 PUBLISH_DECIDED 后逐目标 Finish；Finish RPC 可能 yield，失败只报告收尾故障、不回滚已提交目标。
 ---@param controller FlyWowHotUpgradeController 当前唯一控制面
 ---@param batch FlyWowHotUpgradeBatch 已完成所有 Update 的批次
@@ -1053,17 +1091,16 @@ local function finish_batch(controller, batch)
     for _, service_target in ipairs(batch.service_targets) do
         batch.current_service_handle = service_target.service_handle
         if not service_target.exited then
-            service_target.result = controller:step(batch, service_target, "finish")
+            service_target.hotupgrade_result = controller:step(batch, service_target, "finish")
         end
-        if not service_target.result.ok then
+        if not service_target.hotupgrade_result.ok then
             batch.error = flywow_result.failure("HU_RECOVERY_REQUIRED",
-                service_target.result.message or service_target.result.code, {step = "finish"})
+                service_target.hotupgrade_result.message or service_target.hotupgrade_result.code, {step = "finish"})
         end
     end
     batch.phase = batch.error and "RECOVERY_REQUIRED" or "COMPLETED"
 end
 
---- 汇总逐目标结果、释放本批冻结内容并开放下一批生命周期请求。
 --- 汇总已参与目标的结果，释放本批冻结源码/恢复快照，保存最近批次并唤醒门禁等待者。
 ---@param controller FlyWowHotUpgradeController 当前唯一控制面
 ---@param batch FlyWowHotUpgradeBatch 已进入 ABORTED、RECOVERY_REQUIRED 或成功终态的批次
@@ -1071,7 +1108,7 @@ end
 local function complete_batch(controller, batch)
     for _, service_target in ipairs(batch.service_targets) do
         if service_target.participated then
-            local service_result = service_target.result or (batch.error
+            local service_result = service_target.hotupgrade_result or (batch.error
                 and flywow_result.failure("HU_BATCH_ABORTED", "本批失败，已尝试恢复")
                 or flywow_result.success())
             batch.service_results[#batch.service_results + 1] =
@@ -1079,11 +1116,6 @@ local function complete_batch(controller, batch)
                 service_handle = service_target.service_handle,
                 hotupgrade_result = service_result,
             }
-            if service_result.ok then
-                batch.succeeded_service_count = batch.succeeded_service_count + 1
-            else
-                batch.failed_service_count = batch.failed_service_count + 1
-            end
         end
     end
 
@@ -1097,9 +1129,8 @@ local function complete_batch(controller, batch)
 end
 
 --- 驱动一批热更：等已有操作结束，准备并更新；失败走恢复，成功走 Finish，最后汇总并开放门禁。
---- 等待和目标 RPC 可能 yield；终态错误保存在 batch.error/phase，供 status 查询。
 ---@param batch FlyWowHotUpgradeBatch 当前唯一活动批次
----@return nil 批次处理完毕后由 complete_batch 保存为最近结果。
+---@return nil 等待和 RPC 可 yield；错误保存在 batch.error/phase，终态由 complete_batch 保存。
 function M:run_batch(batch)
     -- 批次开始前已接纳的创建和首次加载必须先收敛，再关闭入口准备目标。
     wait_for_batch_work(self, batch)
@@ -1146,15 +1177,13 @@ function M:begin(request)
     ---@type FlyWowHotUpgradeBatch
     local batch =
     {
-        batch_id                 = tostring(skynet.self()) .. ":" .. self.batch_sequence,                 -- begin 返回给管理端，并作为 status 查询本批的身份。
-        sequence                 = self.batch_sequence,                                                   -- 本 Controller 内递增；控制 RPC 用它拒绝迟到的旧批消息。
-        patch_dir                = request.path,                                                              -- 相对 patch_root 的发布目录；begin 接受时固定并从此冻结源码。
-        phase                    = "WAITING_CREATIONS",                                             -- run_batch 推进；生命周期门禁和 status 视图据此生成。
-        service_results          = {},                                                              -- run_batch 终态汇总参与控制的 Service 结果，供 status 返回。
-        service_targets          = {},                                                              -- 目标 Service 记录；Prepare 重匹配时补齐，Update 前固定，终态后释放。
-        succeeded_service_count  = 0,                                                               -- run_batch 汇总成功事务结果的目标 Service 数，供 status 返回。
-        failed_service_count     = 0,                                                               -- run_batch 汇总失败事务结果的目标 Service 数，供 status 返回。
-        target_service_count     = 0,                                                               -- 当前匹配的目标 Service 数；Prepare 可增长，Update 前确定最终值。
+        batch_id             = tostring(skynet.self()) .. ":" .. self.batch_sequence, -- begin 返回给管理端，并作为 status 查询本批的身份。
+        sequence             = self.batch_sequence,                                   -- 本 Controller 内递增；控制 RPC 用它拒绝迟到的旧批消息。
+        patch_dir            = request.path,                                          -- 相对 patch_root 的发布目录；begin 接受时固定并从此冻结源码。
+        phase                = "WAITING_CREATIONS",                                   -- run_batch 推进；生命周期门禁和 status 视图据此生成。
+        service_results      = {},                                                    -- run_batch 终态汇总参与控制的 Service 结果，供 status 返回。
+        service_targets      = {},                                                    -- 目标 Service 记录；Prepare 重匹配时补齐，Update 前固定，终态后释放。
+        target_service_count = 0,                                                     -- 当前匹配的目标 Service 数；Prepare 可增长，Update 前确定最终值。
     }
     self.active_batch = batch
     skynet.fork(function()
@@ -1219,24 +1248,24 @@ function M:handle_command(command, request, source)
     end
 
     if command == "status" then
-        local batch = self.active_batch or self.last_batch
-        local phase = batch and batch.phase or "IDLE"
+        local lifecycle_batch = self.active_batch or self.last_batch
+        local phase = lifecycle_batch and lifecycle_batch.phase or "IDLE"
         if self.active_batch then
             if phase == "PREPARE" or phase == "UPDATE" or phase == "PUBLISH_DECIDED" then
                 phase = "APPLYING"
             end
-        elseif batch and batch.error then
+        elseif lifecycle_batch and lifecycle_batch.error then
             phase = "IDLE"
         end
         -- 管理查询字段由批次事实生成，沿用现有对外值，不独立保存和同步。
         local recovery_required = self.last_batch ~= nil and self.last_batch.phase == "RECOVERY_REQUIRED"
-        if self.active_batch and batch.phase == "PUBLISH_DECIDED" and batch.error then
-            recovery_required = batch.error.code == "HU_RECOVERY_REQUIRED"
+        if self.active_batch and lifecycle_batch.phase == "PUBLISH_DECIDED" and lifecycle_batch.error then
+            recovery_required = lifecycle_batch.error.code == "HU_RECOVERY_REQUIRED"
         end
         local lifecycle =
         {
             phase = phase,
-            batch_id = batch and batch.batch_id,
+            batch_id = lifecycle_batch and lifecycle_batch.batch_id,
             pending_service_count = self.pending_service_count,
             pending_module_count = self.pending_module_count,
             active_batch_id = self.active_batch and self.active_batch.batch_id,
@@ -1246,18 +1275,29 @@ function M:handle_command(command, request, source)
             return flywow_result.success({lifecycle = lifecycle, recovery_required = recovery_required})
         end
 
-        batch = self.active_batch and self.active_batch.batch_id == request.batch_id and self.active_batch or self.last_batch
-        if not batch or batch.batch_id ~= request.batch_id then
+        local requested_batch = self.active_batch and self.active_batch.batch_id == request.batch_id and self.active_batch or self.last_batch
+        if not requested_batch or requested_batch.batch_id ~= request.batch_id then
             return flywow_result.failure("HU_BATCH_MISSING", "仅保留活动及最近终态批次")
+        end
+
+        -- 活动期间结果列表为空，计数自然为 0；终态直接统计保留的结果快照。
+        local succeeded_service_count = 0 -- 本批成功的终态目标数。
+        local failed_service_count    = 0 -- 本批失败的终态目标数。
+        for _, service_result in ipairs(requested_batch.service_results) do
+            if service_result.hotupgrade_result.ok then
+                succeeded_service_count = succeeded_service_count + 1
+            else
+                failed_service_count = failed_service_count + 1
+            end
         end
 
         ---@type FlyWowHotUpgradeBatchStatus
         local batch_status =
         {
-            batch_id = batch.batch_id, phase = batch.phase, succeeded_service_count = batch.succeeded_service_count,
-            failed_service_count = batch.failed_service_count,
-            target_service_count = batch.target_service_count, current_service_handle = batch.current_service_handle,
-            service_results = batch.service_results, error = batch.error, control_started = batch.control_started == true,
+            batch_id = requested_batch.batch_id, phase = requested_batch.phase, succeeded_service_count = succeeded_service_count,
+            failed_service_count = failed_service_count,
+            target_service_count = requested_batch.target_service_count, current_service_handle = requested_batch.current_service_handle,
+            service_results = requested_batch.service_results, error = requested_batch.error, control_started = requested_batch.control_started == true,
         }
         return flywow_result.success({record = batch_status,
             lifecycle = lifecycle, recovery_required = recovery_required})

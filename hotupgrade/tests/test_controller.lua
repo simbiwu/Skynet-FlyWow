@@ -49,6 +49,47 @@ scenarios["interleaved"] = function()
     module_state.launch_hook = nil
 end
 
+-- 原生创建已返回但业务尚未登记时，未知来源不能继续等这条业务登记。
+scenarios["creation_returned"] = function()
+    local instance = initialize_controller()
+    local created -- 原生创建返回结果；与业务 register 的完成时间分开观察。
+    local unknown -- 未知来源的登记结果；原生创建收敛后必须立即返回。
+    module_state.launch_hook = function() coroutine.yield() end
+    local creator = coroutine.create(function()
+        created = instance:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 1)
+    end)
+    local registrar = coroutine.create(function()
+        unknown = instance:handle_command("register", metadata, 902)
+    end)
+    assert(coroutine.resume(creator))
+    assert(coroutine.resume(registrar) and unknown == nil)
+    instance:on_service_exit(903)
+    assert(instance.early_exit_handles[903])
+
+    -- handle 901 已返回但不登记：902 必须结束等待，903 的早退记录也不再可能匹配后续返回。
+    module_state.launch_service_handle = 901
+    assert(coroutine.resume(creator))
+    module_state.launch_hook = nil
+    assert(created.ok and instance.pending_service_count == 1)
+    assert(unknown and unknown.code == "HU_CREATION_MISSING")
+    assert(coroutine.status(registrar) == "dead")
+    assert(next(instance.early_exit_handles) == nil)
+    instance:on_service_exit(904)
+    assert(next(instance.early_exit_handles) == nil)
+    assert(instance:handle_command("register", metadata, 901).ok)
+
+    -- 当前创建自身早退仍须匹配；退出记录处理完后才能清理剩余记录。
+    module_state.launch_service_handle = 905
+    module_state.launch_hook = function()
+        instance:on_service_exit(905)
+        instance:on_service_exit(906)
+    end
+    local exited = instance:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 1)
+    module_state.launch_hook = nil
+    assert(exited.code == "HU_SERVICE_EXITED")
+    assert(instance.pending_service_count == 0 and next(instance.early_exit_handles) == nil)
+end
+
 scenarios['lifecycle'] = function()
     local lifecycle = initialize_controller()
     -- 原生退出通知移除登记与加载许可，重复通知不重复减计数。
@@ -396,7 +437,8 @@ scenarios['combined'] = function()
     local answer = publish(combined, {path = "combined"})
     assert(answer.ok and answer.value.batch_id)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(combined.last_batch.succeeded_service_count == 2 and combined.last_batch.target_service_count == 2)
+    local status = combined:handle_command("status", {batch_id = combined.last_batch.batch_id}, 1).value.record
+    assert(status.succeeded_service_count == 2 and status.target_service_count == 2)
 end
 
 scenarios['paths'] = function()
@@ -566,7 +608,8 @@ scenarios['draining'] = function()
     local id = begin_deployment(c, "draining")
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(c.last_batch.batch_id == id and c.last_batch.phase == "COMPLETED")
-    assert(c.last_batch.target_service_count == 4 and c.last_batch.succeeded_service_count == 4 and scans == 1)
+    local status = c:handle_command("status", {batch_id = id}, 1).value.record
+    assert(status.target_service_count == 4 and status.succeeded_service_count == 4 and scans == 1)
     local prepares = {}
     for _, operation in ipairs(module_state.operations) do
         local service_handle = operation:match("^(%d+):prepare$")
@@ -631,7 +674,8 @@ scenarios['drain_new_failure'] = function()
     end
     begin_deployment(c, "module")
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(c.last_batch.phase == "ABORTED" and c.last_batch.failed_service_count == 2)
+    local status = c:handle_command("status", {batch_id = c.last_batch.batch_id}, 1).value.record
+    assert(status.phase == "ABORTED" and status.failed_service_count == 2)
     assert(table.concat(module_state.operations, ",") == "10:prepare,30:prepare,30:abort,10:abort")
 end
 
@@ -679,7 +723,8 @@ scenarios['resources'] = function()
         end
         assert(publish(ordered, {path = "module"}).ok)
         module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-        assert(lifecycle_status(ordered).phase == "IDLE" and ordered.last_batch.succeeded_service_count == 2 and ordered.last_batch.failed_service_count == 1)
+        local status = ordered:handle_command("status", {batch_id = ordered.last_batch.batch_id}, 1).value.record
+        assert(lifecycle_status(ordered).phase == "IDLE" and status.succeeded_service_count == 2 and status.failed_service_count == 1)
         assert(table.concat(module_state.operations, ",") ==
             "101:prepare,102:prepare,103:prepare,file:lualib/test_worker_logic.lua,cache,101:update,102:update,103:update,101:finish,102:finish,103:finish")
         assert(module_state.file_contents["lualib/test_worker_logic.lua"])
