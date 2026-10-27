@@ -133,7 +133,7 @@ end
 local function begin_deployment(instance, path)
     local begun = instance:handle_command("begin", {path = path}, 1)
     assert(begun.ok)
-    return begun.batch_id
+    return begun.value.batch_id
 end
 
 local function publish(instance, request)
@@ -160,7 +160,7 @@ local function register_module(instance, name, service_handle)
     if not allowed.ok then
         return allowed
     end
-    return instance:handle_command("register_module", {name = name, permit_id = allowed.permit_id}, service_handle)
+    return instance:handle_command("register_module", {name = name, permit_id = allowed.value.permit_id}, service_handle)
 end
 
 local metadata = {modules = {"lualib.test_worker_logic"}, has_service_update = false}

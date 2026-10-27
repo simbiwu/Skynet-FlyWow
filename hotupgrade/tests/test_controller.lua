@@ -11,7 +11,7 @@ local register_module = fixture.register_module
 local scenario = assert(arg[1], "需要测试场景名")
 
 local function lifecycle_status(controller)
-    return controller:handle_command("status", {}, 1).lifecycle
+    return controller:handle_command("status", {}, 1).value.lifecycle
 end
 
 local scenarios = {}
@@ -40,11 +40,11 @@ scenarios["interleaved"] = function()
     module_state.launch_service_handle = 73
     assert(coroutine.resume(creators[2]))
     assert(registered_by_source[73].ok and not registered_by_source[72] and not registered_by_source[74])
-    assert(interleaved.pending_creation_count == 1 and lifecycle_status(interleaved).phase == "WAITING_CREATIONS")
+    assert(interleaved.pending_service_count == 1 and lifecycle_status(interleaved).phase == "WAITING_CREATIONS")
     module_state.launch_service_handle = 72
     assert(coroutine.resume(creators[1]))
     assert(registered_by_source[72].ok and registered_by_source[74].code == "HU_CREATION_MISSING")
-    assert(lifecycle_status(interleaved).phase == "COMPLETED" and interleaved.pending_creation_count == 0)
+    assert(lifecycle_status(interleaved).phase == "COMPLETED" and interleaved.pending_service_count == 0)
     assert(next(interleaved.service_creations) == nil and next(interleaved.service_registration_waiters) == nil)
     module_state.launch_hook = nil
 end
@@ -54,13 +54,13 @@ scenarios['lifecycle'] = function()
     -- 原生退出通知移除登记与加载许可，重复通知不重复减计数。
     assert(managed_register(lifecycle, metadata, 61).ok)
     local permit = lifecycle:handle_command("begin_module_load", {name = "lualib.exit_pending"}, 61)
-    assert(permit.ok and lifecycle.pending_load_count == 1)
+    assert(permit.ok and lifecycle.pending_module_count == 1)
     lifecycle:on_service_exit(61)
     assert(lifecycle.service_registrations[61] == nil)
-    assert(lifecycle.pending_load_count == 0 and next(lifecycle.module_load_permits) == nil)
+    assert(lifecycle.pending_module_count == 0 and next(lifecycle.module_load_permits) == nil)
     lifecycle:on_service_exit(61)
     lifecycle:on_service_exit(999)
-    assert(lifecycle.pending_load_count == 0 and lifecycle.pending_creation_count == 0)
+    assert(lifecycle.pending_module_count == 0 and lifecycle.pending_service_count == 0)
 
     -- 退出只删除匹配 handle 的唯一实例；保留批次快照并记录失败。
     assert(managed_register(lifecycle, metadata, 62).ok)
@@ -110,7 +110,7 @@ scenarios['lifecycle'] = function()
             module_state.last_control_command_by_service_handle = {}
             local answer = instance:handle_command(command, {path = "module"}, 1)
             local expected = "HU_UNKNOWN_COMMAND"
-            assert(answer.code == expected and answer.batch_id == nil)
+            assert(answer.code == expected and answer.value == nil)
             assert(#module_state.pending_control_coroutines == calls)
             assert(next(module_state.last_control_command_by_service_handle) == nil and not instance.active)
         end
@@ -143,23 +143,23 @@ scenarios['lifecycle'] = function()
     module_state.launch_service_handle = 70
     assert(coroutine.resume(early_create))
     module_state.launch_hook = nil
-    assert(early_created.service_handle == 70)
+    assert(early_created.value.service_handle == 70)
     assert((early_registered.ok and duplicate_registered.code == "HU_DUPLICATE_SERVICE")
         or (duplicate_registered.ok and early_registered.code == "HU_DUPLICATE_SERVICE"))
     assert(unknown_registered.code == "HU_CREATION_MISSING")
-    assert(lifecycle.pending_creation_count == 0 and lifecycle.service_registrations[70] and next(lifecycle.service_registration_waiters) == nil)
-    local batch = {patch_path = "module"}
+    assert(lifecycle.pending_service_count == 0 and lifecycle.service_registrations[70] and next(lifecycle.service_registration_waiters) == nil)
+    local batch = {patch_dir = "module"}
     assert(lifecycle:load_patch(batch).ok and #batch.service_targets == 1)
     assert(lifecycle:handle_command("unknown_command", {path = "module"}, 1).code == "HU_UNKNOWN_COMMAND")
     assert(lifecycle:handle_command("cancel_service_creation", {service_handle = 70}, 1).code == "HU_SERVICE_ALREADY_REGISTERED")
 
     -- 原生返回早于登记；显式取消、初始化失败和创建失败均不留记录。
     module_state.launch_service_handle = 80
-    assert(lifecycle:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 2).service_handle == 80)
+    assert(lifecycle:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 2).value.service_handle == 80)
     blocked(lifecycle)
     assert(lifecycle:handle_command("cancel_service_creation", {service_handle = 80}, 1).code == "HU_UNAUTHORIZED")
-    assert(not module_state.killed[80] and lifecycle.pending_creation_count == 1)
-    assert(lifecycle:handle_command("register", metadata, 80).ok and lifecycle.pending_creation_count == 0)
+    assert(not module_state.killed[80] and lifecycle.pending_service_count == 1)
+    assert(lifecycle:handle_command("register", metadata, 80).ok and lifecycle.pending_service_count == 0)
     assert(lifecycle:handle_command("register", metadata, 81).code == "HU_CREATION_MISSING")
     -- 原生失败唤醒早到登记并释放记录，失败的来源不会进入 targets。
     local failed_registration
@@ -172,28 +172,28 @@ scenarios['lifecycle'] = function()
     end
     assert(lifecycle:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 1).code == "HU_SERVICE_CREATE_FAILED")
     assert(failed_registration.code == "HU_CREATION_MISSING")
-    assert(lifecycle.pending_creation_count == 0 and not lifecycle.service_registrations[81] and next(lifecycle.service_registration_waiters) == nil)
+    assert(lifecycle.pending_service_count == 0 and not lifecycle.service_registrations[81] and next(lifecycle.service_registration_waiters) == nil)
     module_state.launch_hook = nil
     module_state.launch_service_handle = 82
     assert(lifecycle:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 2).ok)
     assert(lifecycle:handle_command("register", {}, 82).code == "HU_INVALID_OPTIONS")
     assert(lifecycle:handle_command("cancel_service_creation", {service_handle = 82}, 2).ok)
-    assert(module_state.killed[82] and lifecycle.pending_creation_count == 0)
+    assert(module_state.killed[82] and lifecycle.pending_service_count == 0)
     assert(lifecycle:handle_command("cancel_service_creation", {service_handle = 82}, 2).code == "HU_CREATION_MISSING")
 
     local permit = lifecycle:handle_command("begin_module_load", {name = "extra"}, 70)
     assert(permit.ok)
     assert(lifecycle:handle_command("begin_module_load", {name = "extra"}, 70).code == "HU_MODULE_LOADING")
     blocked(lifecycle)
-    local request = {name = "extra", permit_id = permit.permit_id}
+    local request = {name = "extra", permit_id = permit.value.permit_id}
     assert(lifecycle:handle_command("register_module", request, 80).code == "HU_UNAUTHORIZED")
-    assert(lifecycle:handle_command("register_module", {name = "wrong", permit_id = permit.permit_id}, 70).code == "HU_MODULE_PERMIT_MISMATCH")
-    assert(lifecycle.pending_load_count == 1)
-    assert(lifecycle:handle_command("register_module", request, 70).ok and lifecycle.pending_load_count == 0)
+    assert(lifecycle:handle_command("register_module", {name = "wrong", permit_id = permit.value.permit_id}, 70).code == "HU_MODULE_PERMIT_MISMATCH")
+    assert(lifecycle.pending_module_count == 1)
+    assert(lifecycle:handle_command("register_module", request, 70).ok and lifecycle.pending_module_count == 0)
     assert(lifecycle:handle_command("register_module", request, 70).code == "HU_MODULE_PERMIT_MISSING")
     permit = lifecycle:handle_command("begin_module_load", {name = "cancelled"}, 70)
-    assert(lifecycle:handle_command("cancel_module_load", {name = "cancelled", permit_id = permit.permit_id}, 70).ok)
-    assert(lifecycle.pending_load_count == 0 and not lifecycle.service_registrations[70].modules.cancelled)
+    assert(lifecycle:handle_command("cancel_module_load", {name = "cancelled", permit_id = permit.value.permit_id}, 70).ok)
+    assert(lifecycle.pending_module_count == 0 and not lifecycle.service_registrations[70].modules.cancelled)
     assert(lifecycle:handle_command("begin_module_load", {name = "extra"}, 90).code == "HU_SERVICE_NOT_REGISTERED")
     local started_lifecycle = publish(lifecycle, {path = "module"})
     assert(started_lifecycle.ok)
@@ -203,7 +203,7 @@ scenarios['lifecycle'] = function()
     end
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(lifecycle.active_batch.phase == "UPDATE")
-    local new_module_request = {batch_id = started_lifecycle.batch_id, name = "lualib.new_rules"}
+    local new_module_request = {batch_id = started_lifecycle.value.batch_id, name = "lualib.new_rules"}
     assert(lifecycle:handle_command("register_new_module", new_module_request, 71).code == "HU_NEW_MODULE_NOT_ALLOWED")
     assert(lifecycle:handle_command("register_new_module", {batch_id = "stale", name = new_module_request.name}, 70).code
         == "HU_NEW_MODULE_NOT_ALLOWED")
@@ -216,20 +216,20 @@ scenarios['lifecycle'] = function()
     end)
     module_state.launch_service_handle = 83
     assert(coroutine.resume(queued) and queued_result == nil)
-    assert(lifecycle.pending_creation_count == 0)
+    assert(lifecycle.pending_service_count == 0)
     assert(lifecycle:handle_command("register", metadata, 90).code == "HU_CREATION_MISSING")
     local queued_module
     local module_waiter = coroutine.create(function()
         queued_module = lifecycle:handle_command("begin_module_load", {name = "late"}, 70)
     end)
     assert(coroutine.resume(module_waiter) and queued_module == nil)
-    local view = lifecycle:handle_command("status", {}, 1).lifecycle
-    assert(view.pending_creations == 0 and view.pending_loads == 0 and view.active_batch_id == started_lifecycle.batch_id)
+    local view = lifecycle:handle_command("status", {}, 1).value.lifecycle
+    assert(view.pending_service_count == 0 and view.pending_module_count == 0 and view.active_batch_id == started_lifecycle.value.batch_id)
     module_state.control_hook = nil
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(queued_module.ok and lifecycle.pending_load_count == 1)
-    assert(lifecycle:handle_command("register_module", {name = "late", permit_id = queued_module.permit_id}, 70).ok)
-    assert(queued_result.ok and queued_result.service_handle == 83)
+    assert(queued_module.ok and lifecycle.pending_module_count == 1)
+    assert(lifecycle:handle_command("register_module", {name = "late", permit_id = queued_module.value.permit_id}, 70).ok)
+    assert(queued_result.ok and queued_result.value.service_handle == 83)
     assert(lifecycle:handle_command("cancel_service_creation", {service_handle = 83}, 1).ok)
     assert(lifecycle:handle_command("register_new_module", new_module_request, 70).code == "HU_NEW_MODULE_NOT_ALLOWED")
     assert(lifecycle:handle_command("status", {batch_id = "unknown"}, 1).code == "HU_BATCH_MISSING")
@@ -252,22 +252,22 @@ scenarios['matching'] = function()
     assert(c:handle_command("register", {modules = {}, has_service_update = 1}, 30).code == "HU_INVALID_OPTIONS")
     assert(register_module(c, "extra", 10).ok)
     assert(not register_module(c, "extra", 30).ok)
-    local batch = {patch_path = "module"}
+    local batch = {patch_dir = "module"}
     assert(c:load_patch(batch).ok and #batch.service_targets == 2)
     -- 未登记模块只部署；一次性 Service .patch 仍须匹配。
-    local unmatched = {patch_path = "unmatched_module"}
+    local unmatched = {patch_dir = "unmatched_module"}
     assert(c:load_patch(unmatched).ok and #unmatched.service_targets == 2 and #unmatched.files == 2)
     module_state.last_control_command_by_service_handle = {}
     local accepted = publish(c, {path = "unmatched_service"})
-    assert(accepted.ok and accepted.batch_id)
+    assert(accepted.ok and accepted.value.batch_id)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    local rejected = c:handle_command("status", {batch_id = accepted.batch_id}, 1).record.error
+    local rejected = c:handle_command("status", {batch_id = accepted.value.batch_id}, 1).value.record.error
     assert(rejected.code == "HU_TARGET_MISSING" and rejected.message:find("service/unused.patch", 1, true))
     assert(next(module_state.last_control_command_by_service_handle) == nil and lifecycle_status(c).phase == "IDLE")
     assert(c.last_batch.phase == "ABORTED" and not c.last_batch.control_started)
     -- 同一模块仍可匹配多个 Service，组合包中的 Service 脚本也必须覆盖所有目标。
 
-    local unsupported = c:load_patch({patch_path = "combined"})
+    local unsupported = c:load_patch({patch_dir = "combined"})
     assert(unsupported.code == "HU_SERVICE_PATCH_UNSUPPORTED")
     assert(unsupported.message:find("combined/service/skynet_hotupgrade_worker.patch", 1, true))
 
@@ -276,16 +276,16 @@ scenarios['matching'] = function()
         assert(answer.ok)
         assert(not c:handle_command("apply", {path = "module"}, 1).ok)
         module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-        return c:handle_command("status", {batch_id = answer.batch_id}, 1)
+        return c:handle_command("status", {batch_id = answer.value.batch_id}, 1)
     end
     local status = publish_and_complete_module_batch()
-    assert(status.record.phase == "COMPLETED" and status.record.succeeded_service_count == 2
-        and status.record.target_service_count == 2 and #status.record.service_results == 2
+    assert(status.value.record.phase == "COMPLETED" and status.value.record.succeeded_service_count == 2
+        and status.value.record.target_service_count == 2 and #status.value.record.service_results == 2
         and module_state.last_control_command_by_service_handle[20] == "finish")
     module_state.injected_control_failure = {service_handle = 20, command = "update"}
     status = publish_and_complete_module_batch()
-    assert(status.record.phase == "ABORTED" and status.record.succeeded_service_count == 0
-        and status.record.failed_service_count == 2 and #status.record.service_results == 2)
+    assert(status.value.record.phase == "ABORTED" and status.value.record.succeeded_service_count == 0
+        and status.value.record.failed_service_count == 2 and #status.value.record.service_results == 2)
     assert(lifecycle_status(c).phase == "IDLE" and module_state.last_control_command_by_service_handle[10] == "abort")
     assert(module_state.last_control_command_by_service_handle[20] == "abort")
     module_state.injected_control_failure = nil
@@ -298,21 +298,21 @@ scenarios['matching'] = function()
     assert(lifecycle_status(c).phase == "APPLYING" and #module_state.operations == 1)
     assert(module_state.operations[1] == "10:prepare")
     local active_before_abort = c.active_batch
-    assert(c:handle_command("abort", {batch_id = started.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
+    assert(c:handle_command("abort", {batch_id = started.value.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
     assert(c.active_batch == active_before_abort and #module_state.operations == 1)
     module_state.control_hook = function(_handle, command)
         assert(command == "prepare" or command == "update" or command == "finish")
-        assert(c:handle_command("abort", {batch_id = started.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
+        assert(c:handle_command("abort", {batch_id = started.value.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
         assert(c.active_batch == active_before_abort)
     end
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(c:handle_command("status", {batch_id = started.batch_id}, 1).record.phase == "COMPLETED")
+    assert(c:handle_command("status", {batch_id = started.value.batch_id}, 1).value.record.phase == "COMPLETED")
     assert(table.concat(module_state.operations, ",") == "10:prepare,20:prepare,file:lualib/test_worker_logic.lua,cache,10:update,20:update,10:finish,20:finish")
-    assert(c:handle_command("abort", {batch_id = started.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
+    assert(c:handle_command("abort", {batch_id = started.value.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
     module_state.control_hook = nil
     module_state.injected_control_failure = {service_handle = 10, command = "finish"}
     status = publish_and_complete_module_batch()
-    assert(status.recovery_required and status.record.phase == "RECOVERY_REQUIRED")
+    assert(status.value.recovery_required and status.value.record.phase == "RECOVERY_REQUIRED")
     assert(not c:handle_command("apply", {path = "module"}, 1).ok)
     assert(not c:handle_command("history", {}, 1).ok)
     -- 仅保留活动批次和最近终态；更早批次不能继续查询。
@@ -321,7 +321,7 @@ scenarios['matching'] = function()
     assert(lifecycle_status(c).phase == "IDLE")
     local allowed_after_failure = c:handle_command("begin_module_load", {name = "late"}, 10)
     assert(allowed_after_failure.ok)
-    assert(c:handle_command("cancel_module_load", {name = "late", permit_id = allowed_after_failure.permit_id}, 10).ok)
+    assert(c:handle_command("cancel_module_load", {name = "late", permit_id = allowed_after_failure.value.permit_id}, 10).ok)
     module_state.injected_control_failure = nil
 
     local waiting = c
@@ -333,8 +333,8 @@ scenarios['matching'] = function()
     assert(waiting:handle_command("unknown_command", {}, 1).code == "HU_UNKNOWN_COMMAND")
     assert(waiting:handle_command("register", metadata, 84).ok and lifecycle_status(waiting).phase == "WAITING_CREATIONS")
     assert(waiting:handle_command("abort", {batch_id = "stale"}, 1).code == "HU_UNKNOWN_COMMAND")
-    assert(waiting:handle_command("abort", {batch_id = begun.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
-    assert(waiting.active_batch.batch_id == begun.batch_id)
+    assert(waiting:handle_command("abort", {batch_id = begun.value.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
+    assert(waiting.active_batch.batch_id == begun.value.batch_id)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(waiting.last_batch.phase == "COMPLETED")
 
@@ -347,10 +347,10 @@ scenarios['matching'] = function()
     assert(pending_batch.ok and lifecycle_status(waiting).phase == "WAITING_CREATIONS")
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(waiting.active_batch.waiter)
-    assert(waiting:handle_command("abort", {batch_id = pending_batch.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
-    assert(waiting.active_batch.batch_id == pending_batch.batch_id and waiting.pending_creation_count == 1)
+    assert(waiting:handle_command("abort", {batch_id = pending_batch.value.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
+    assert(waiting.active_batch.batch_id == pending_batch.value.batch_id and waiting.pending_service_count == 1)
     assert(waiting:handle_command("cancel_service_creation", {service_handle = 86}, 1).ok)
-    assert(waiting.last_batch.phase == "COMPLETED" and waiting.pending_creation_count == 0)
+    assert(waiting.last_batch.phase == "COMPLETED" and waiting.pending_service_count == 0)
 
     local allowed = waiting:handle_command("begin_module_load", {name = "later"}, 84)
     assert(allowed.ok)
@@ -358,7 +358,7 @@ scenarios['matching'] = function()
     assert(module_batch.ok and lifecycle_status(waiting).phase == "WAITING_CREATIONS")
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(waiting.active_batch.waiter and lifecycle_status(waiting).phase == "WAITING_CREATIONS")
-    assert(waiting:handle_command("register_module", {name = "later", permit_id = allowed.permit_id}, 84).ok)
+    assert(waiting:handle_command("register_module", {name = "later", permit_id = allowed.value.permit_id}, 84).ok)
     assert(lifecycle_status(waiting).phase == "COMPLETED")
 
     -- begin 后仍接纳创建；完成登记后才能进行整包检查，失败前没有目标控制命令。
@@ -366,11 +366,11 @@ scenarios['matching'] = function()
     module_state.launch_service_handle = 85
     local admitted_creation = waiting:handle_command("newservice",
         {service_name = "fixture", arguments = {n = 0}}, 1)
-    assert(admitted_creation.service_handle == 85 and waiting.pending_creation_count == 1)
+    assert(admitted_creation.value.service_handle == 85 and waiting.pending_service_count == 1)
     assert(waiting:handle_command("register", metadata, 85).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     local failed = waiting:handle_command("status", {batch_id = failed_batch}, 1)
-    assert(failed.record.error.code == "HU_TARGET_MISSING" and not failed.record.control_started)
+    assert(failed.value.record.error.code == "HU_TARGET_MISSING" and not failed.value.record.control_started)
     assert(lifecycle_status(waiting).phase == "IDLE" and waiting.service_registrations[85])
 
     -- preload 由原生启动处理；Controller 不拒绝、不改写目标名或启动参数。
@@ -378,7 +378,7 @@ scenarios['matching'] = function()
     module_state.launch_service_handle = 89
     for _, command in ipairs({"newservice", "uniqueservice"}) do
         local created = waiting:handle_command(command, {service_name = "fixture", arguments = table.pack("head", nil, "tail")}, 1)
-        assert(created.service_handle == 89)
+        assert(created.value.service_handle == 89)
         local launch = module_state.launches[#module_state.launches]
         assert(launch.name == "fixture" and launch.arguments.n == 3 and launch.arguments[3] == "tail")
         assert(waiting:handle_command("cancel_service_creation", {service_handle = 89}, 1).ok)
@@ -394,7 +394,7 @@ scenarios['combined'] = function()
             has_service_update = true}, service_handle).ok)
     end
     local answer = publish(combined, {path = "combined"})
-    assert(answer.ok and answer.batch_id)
+    assert(answer.ok and answer.value.batch_id)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(combined.last_batch.succeeded_service_count == 2 and combined.last_batch.target_service_count == 2)
 end
@@ -404,14 +404,14 @@ scenarios['paths'] = function()
     assert(managed_register(paths,
         {modules = {"config.settings", "lualib.battle.state_sync.runtime", "lualib.packages.demo.init"},
             has_service_update = true}, 50, "battle/worker").ok)
-    local batch = {patch_path = "host_paths"}
+    local batch = {patch_dir = "host_paths"}
     assert(paths:load_patch(batch).ok and #batch.modules == 3)
     assert(batch.modules[1].entry_file == "config/settings.lua")
     assert(batch.modules[2].name == "lualib.battle.state_sync.runtime")
-    assert(paths:load_patch({patch_path = "nested_named_service"}).ok)
+    assert(paths:load_patch({patch_dir = "nested_named_service"}).ok)
 
     for _, path in ipairs({"duplicate_module", "duplicate_service"}) do
-        assert(paths:load_patch({patch_path = path}).code == "HU_INVALID_PATCH")
+        assert(paths:load_patch({patch_dir = path}).code == "HU_INVALID_PATCH")
     end
 end
 
@@ -419,7 +419,7 @@ scenarios['custom_paths'] = function()
     local changed = initialize_controller("actors")
     assert(managed_register(changed,
         {modules = {}, has_service_update = true}, 60, "zone/player").ok)
-    assert(changed:load_patch({patch_path = "custom_named_service"}).ok)
+    assert(changed:load_patch({patch_dir = "custom_named_service"}).ok)
 end
 
 scenarios['unique'] = function()
@@ -442,8 +442,8 @@ scenarios['unique'] = function()
     module_state.launch_service_handle = 90
     module_state.launch_hook = nil
     assert(coroutine.resume(first_co))
-    assert(first_unique.service_handle == 90 and second_unique.service_handle == 90 and unique.pending_creation_count == 1)
-    assert(unique:handle_command("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 1).service_handle == 90)
+    assert(first_unique.value.service_handle == 90 and second_unique.value.service_handle == 90 and unique.pending_service_count == 1)
+    assert(unique:handle_command("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 1).value.service_handle == 90)
     assert(unique:handle_command("cancel_service_creation", {service_handle = 90}, 2).code == "HU_UNAUTHORIZED")
     assert(unique:handle_command("cancel_service_creation", {service_handle = 90}, 1).ok and not unique.unique_service_entries.fixture)
 
@@ -462,37 +462,37 @@ scenarios['unique'] = function()
     assert(coroutine.resume(first_co) and coroutine.resume(duplicate_co))
     assert(coroutine.resume(first_co))
     assert(first_unique.code == "HU_SERVICE_CREATE_FAILED" and second_unique.code == first_unique.code)
-    assert(unique.pending_creation_count == 0 and not unique.unique_service_entries.fixture)
+    assert(unique.pending_service_count == 0 and not unique.unique_service_entries.fixture)
     module_state.launch_hook = nil
     module_state.launch_service_handle = 91
-    assert(unique:handle_command("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 1).service_handle == 91)
+    assert(unique:handle_command("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 1).value.service_handle == 91)
     assert(unique:handle_command("register", metadata, 91).ok)
     local unique_batch = begin_deployment(unique, "missing")
-    assert(unique:handle_command("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 2).service_handle == 91)
+    assert(unique:handle_command("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 2).value.service_handle == 91)
     local new_unique
     local unique_waiter = coroutine.create(function()
         new_unique = unique:handle_command("uniqueservice", {service_name = "fixture_other", arguments = {n = 0}}, 2)
     end)
     launch_count = #module_state.launches
     module_state.launch_service_handle = 92
-    assert(coroutine.resume(unique_waiter) and new_unique.service_handle == 92)
-    assert(#module_state.launches == launch_count + 1 and unique.pending_creation_count == 1)
+    assert(coroutine.resume(unique_waiter) and new_unique.value.service_handle == 92)
+    assert(#module_state.launches == launch_count + 1 and unique.pending_service_count == 1)
     assert(unique:handle_command("cancel_service_creation", {service_handle = 92}, 2).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(unique:handle_command("status", {batch_id = unique_batch}, 1).record.error.code == "HU_PATCH_EMPTY")
-    assert(lifecycle_status(unique).phase == "IDLE" and unique.pending_creation_count == 0)
+    assert(unique:handle_command("status", {batch_id = unique_batch}, 1).value.record.error.code == "HU_PATCH_EMPTY")
+    assert(lifecycle_status(unique).phase == "IDLE" and unique.pending_service_count == 0)
 
     launch_count = #module_state.launches
     assert(unique:handle_command("uniqueservice", {global = true}, 1).code == "HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED")
     for _, command in ipairs({"newservice", "uniqueservice"}) do
         assert(unique:handle_command(command, {service_name = "snaxd", arguments = {n = 0}}, 1).code == "HU_SPECIAL_SERVICE_UNSUPPORTED")
     end
-    assert(#module_state.launches == launch_count and unique.pending_creation_count == 0)
+    assert(#module_state.launches == launch_count and unique.pending_service_count == 0)
 
     assert(managed_register(unique, metadata, 93).ok)
     local failed_id = begin_deployment(unique, "unmatched_service")
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(unique:handle_command("status", {batch_id = failed_id}, 1).record.error.code == "HU_TARGET_MISSING")
+    assert(unique:handle_command("status", {batch_id = failed_id}, 1).value.record.error.code == "HU_TARGET_MISSING")
     assert(lifecycle_status(unique).phase == "IDLE" and unique.last_batch.error.code == "HU_TARGET_MISSING" and not unique.last_batch.control_started)
     module_state.injected_control_failure = {service_handle = 93, command = "update"}
     assert(publish(unique, {path = "module"}).ok)
@@ -506,7 +506,7 @@ scenarios['unique'] = function()
     end
     assert(publish(unique, {path = "module"}).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(lifecycle_status(unique).phase == "IDLE" and unique.last_batch.error.recovery_error.code == "HU_FIXTURE_FAILED")
+    assert(lifecycle_status(unique).phase == "IDLE" and unique.last_batch.error.details.recovery_error.code == "HU_FIXTURE_FAILED")
     module_state.control_hook = nil
     module_state.injected_control_failure = nil
     print("HOTUPGRADE_CONTROLLER_LOCAL_UNIQUE_OK")
@@ -539,11 +539,11 @@ scenarios['draining'] = function()
         elseif command == "prepare" and service_handle == 30 then
             module_state.launch_service_handle = 40
             assert(c:handle_command("uniqueservice",
-                {service_name = "child", arguments = {n = 0}}, 30).service_handle == 40)
+                {service_name = "child", arguments = {n = 0}}, 30).value.service_handle == 40)
             assert(c:handle_command("register", metadata, 40).ok)
         elseif command == "update" and service_handle == 10 then
             assert(c.active_batch.service_targets[1] == prepared_service_target)
-            assert(#request.modules == 2 and c.pending_creation_count == 0 and c.pending_load_count == 0)
+            assert(#request.modules == 2 and c.pending_service_count == 0 and c.pending_module_count == 0)
             for _, module_patch in ipairs(request.modules) do
                 assert(module_patch.old_source == nil and module_patch.touched == nil)
             end
@@ -575,13 +575,13 @@ scenarios['draining'] = function()
     for _, service_handle in ipairs({10, 20, 30, 40}) do
         assert(prepares[tostring(service_handle)] == 1)
     end
-    assert(not prepares["31"] and queued_unique[1].service_handle == 50
-        and queued_unique[2].service_handle == 50)
+    assert(not prepares["31"] and queued_unique[1].value.service_handle == 50
+        and queued_unique[2].value.service_handle == 50)
     assert(#module_state.launches == launches_at_update + 1 and queued_permit.ok)
     assert(c:handle_command("register_module",
-        {name = "late", permit_id = queued_permit.permit_id}, 10).ok)
+        {name = "late", permit_id = queued_permit.value.permit_id}, 10).ok)
     assert(c:handle_command("cancel_service_creation", {service_handle = 50}, 10).ok)
-    assert(c.pending_creation_count == 0 and c.pending_load_count == 0 and next(c.lifecycle_gate_waiters) == nil)
+    assert(c.pending_service_count == 0 and c.pending_module_count == 0 and next(c.lifecycle_gate_waiters) == nil)
 end
 
 scenarios['drain_abort_rejected'] = function()
@@ -595,13 +595,13 @@ scenarios['drain_abort_rejected'] = function()
     end
     local id = begin_deployment(c, "module")
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-    assert(c.active_batch.phase == "PREPARE" and c.active_batch.waiter and c.pending_creation_count == 1)
+    assert(c.active_batch.phase == "PREPARE" and c.active_batch.waiter and c.pending_service_count == 1)
     local active_before_abort = c.active_batch
     assert(c:handle_command("abort", {batch_id = id}, 1).code == "HU_UNKNOWN_COMMAND")
-    assert(c.active_batch == active_before_abort and c.pending_creation_count == 1)
+    assert(c.active_batch == active_before_abort and c.pending_service_count == 1)
     assert(table.concat(module_state.operations, ",") == "10:prepare")
     assert(c:handle_command("cancel_service_creation", {service_handle = 30}, 10).ok)
-    assert(c.last_batch.phase == "COMPLETED" and c.pending_creation_count == 0)
+    assert(c.last_batch.phase == "COMPLETED" and c.pending_service_count == 0)
     assert(table.concat(module_state.operations, ",") == "10:prepare,file:lualib/test_worker_logic.lua,cache,10:update,10:finish")
 end
 
@@ -647,7 +647,7 @@ scenarios['resources'] = function()
         local accepted = publish(ordered, {path = "module"})
         assert(accepted.ok)
         module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
-        local record = ordered:handle_command("status", {batch_id = accepted.batch_id}, 1).record
+        local record = ordered:handle_command("status", {batch_id = accepted.value.batch_id}, 1).value.record
         assert(record.phase == "ABORTED" and not record.control_started and #module_state.operations == 0)
         assert(record.error.code == (failure == "missing" and "HU_FILE_NOT_FOUND" or "HU_FILE_READ_FAILED"))
         assert(record.error.message:find("module/lualib/test_worker_logic.lua", 1, true))
@@ -724,13 +724,13 @@ scenarios['resources'] = function()
     assert(publish(deployment, {path = "deploy_failure"}).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(lifecycle_status(deployment).phase == "IDLE" and lifecycle_status(deployment).recovery_required)
-    assert(deployment.last_batch.error.original_error.code == "HU_FILE_DEPLOY_FAILED")
-    assert(deployment.last_batch.error.recovery_error.code == "HU_FILE_DEPLOY_FAILED")
+    assert(deployment.last_batch.error.details.original_error.code == "HU_FILE_DEPLOY_FAILED")
+    assert(deployment.last_batch.error.details.recovery_error.code == "HU_FILE_DEPLOY_FAILED")
     module_state.injected_restore_failure = false
     module_state.injected_file_failure = nil
     local files_only = deployment
     local started_files = publish(files_only, {path = "service_file"})
-    assert(started_files.ok and started_files.batch_id)
+    assert(started_files.ok and started_files.value.batch_id)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(files_only.last_batch.phase == "COMPLETED" and files_only.last_batch.target_service_count == 0 and module_state.file_contents["service/new_service.lua"])
 

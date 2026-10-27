@@ -33,15 +33,15 @@ local function register_fixture(instance, service_handle, metadata, service_name
 end
 assert(register_fixture(c, 10, {modules = {"lualib.test_worker_logic"},
     has_service_update = true}, "battle/worker").ok)
-assert(c:load_patch({patch_path = "module"}).ok)
-assert(not c:load_patch({patch_path = "invalid"}).ok)
+assert(c:load_patch({patch_dir = "module"}).ok)
+assert(not c:load_patch({patch_dir = "invalid"}).ok)
 for _, path in ipairs({"../module", "/module", "module/../module", "module//lualib",
     "module/", "module/./lualib", "module\\lualib", "module" .. string.char(0)}) do
     assert(not hotupgrade_native.list_lua(root, path), path)
 end
 
 for _, path in ipairs({"duplicate_module"}) do
-    assert(c:load_patch({patch_path = path}).code == "HU_INVALID_PATCH")
+    assert(c:load_patch({patch_dir = path}).code == "HU_INVALID_PATCH")
 end
 local many_files = assert(hotupgrade_native.list_lua(root, "count_unlimited"))
 assert(#many_files == 1025)
@@ -49,7 +49,7 @@ assert(#assert(hotupgrade_native.list_lua(root, "file_unlimited")) == 1)
 assert(#assert(hotupgrade_native.list_lua(root, "total_unlimited")) == 9)
 -- Lua Controller 也必须读取完整源码；未登记普通 .lua 现在可直接进入部署集合。
 for _, path in ipairs({"count_unlimited", "file_unlimited", "total_unlimited"}) do
-    assert(c:load_patch({patch_path = path}).ok)
+    assert(c:load_patch({patch_dir = path}).ok)
 end
 local other_root = config.root_path .. "/another"
 assert(os.execute("mkdir -p " .. other_root .. "/service"))
@@ -91,7 +91,7 @@ assert(os.remove(service_link))
 assert(not rejected.ok and rejected.code == "HU_INVALID_PATH")
 assert(register_fixture(c, 20,
     {modules = {}, has_service_update = true}, "skynet_hotupgrade_worker").ok)
-assert(c:load_patch({patch_path = "custom_service_files"}).ok)
+assert(c:load_patch({patch_dir = "custom_service_files"}).ok)
 local file_path = "native_files/nested/value.lua"
 assert(hotupgrade_native.read_file(config.root_path, file_path) == false)
 assert(hotupgrade_native.replace_file(config.root_path, file_path, "old"))

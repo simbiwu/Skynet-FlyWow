@@ -261,7 +261,7 @@ skynet.start(function()
             skynet.call = original_call
             assert(not ok and tostring(message):find("injected declaration failure", 1, true))
             assert(package.loaded["lualib.hotupgrade_extra"] == nil and package.loaded.hotupgrade_extra == nil)
-            assert(skynet.call(skynet.uniqueservice("flywow_hotupgrade_service"), "hotupgrade", "status", {}).lifecycle.pending_loads == 0)
+            assert(skynet.call(skynet.uniqueservice("flywow_hotupgrade_service"), "hotupgrade", "status", {}).value.lifecycle.pending_module_count == 0)
             answer = true
         elseif command == "allow_next_upgrade" then
             -- 测试宿主修正注入的根表缓存故障，并提交下一批针对现场的修复包。

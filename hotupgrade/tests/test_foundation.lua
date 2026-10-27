@@ -1,6 +1,12 @@
 --- 普通 Lua 状态图、模块身份、状态迁移与安全点失败合同。
 local patch = require "flywow_hotupgrade_module_patch"
+local flywow_result = require "flywow_result"
 local common = require "flywow_hotupgrade_common"
+local success = flywow_result.success({service_handle = 42})
+assert(success.ok and success.value.service_handle == 42 and success.code == nil and success.details == nil)
+local failure = flywow_result.failure("HU_FIXTURE_FAILED", "fixture failed", {cause_code = "HU_FIXTURE_CAUSE"})
+assert(not failure.ok and failure.code == "HU_FIXTURE_FAILED" and failure.message == "fixture failed")
+assert(failure.value == nil and failure.details.cause_code == "HU_FIXTURE_CAUSE")
 for _, prefix in ipairs({"", "\239\187\191", "#!/usr/bin/env lua\n", "\239\187\191#!/usr/bin/env lua\r\n"}) do
     assert(assert(load(common.normalize_source(prefix .. "return 42"), "@header.lua", "t"))() == 42)
     local _, message = load(common.normalize_source(prefix .. "\nlocal ="), "@header.lua", "t")
@@ -46,10 +52,10 @@ return {
 local staged = patch.stage({{name = "logic", source = source}})
 assert(staged.ok, staged.message)
 assert(live.value() == 7 and old_state.count == 7)
-assert(patch.commit(staged.stage).ok)
+assert(patch.commit(staged.value.stage).ok)
 assert(package.loaded.logic == live and live.value() == 8 and cached() == 7)
 assert(live.added == 42 and live.removed == nil)
-assert(patch.abort(staged.stage).ok)
+assert(patch.abort(staged.value.stage).ok)
 assert(live.value == cached and live.removed and live.added == nil)
 
 local dependency_name = "hotupgrade_stage_dependency_fixture"
@@ -72,11 +78,11 @@ assert(not failed.ok and live.value() == 7)
 failed = patch.stage({{name = "logic", source = "return {value=function() return 3 end, export_state=function() return {} end}"}})
 assert(not failed.ok and live.value() == 7)
 staged = patch.stage({{name = "logic", source = source}})
-assert(staged.ok and patch.commit(staged.stage).ok)
+assert(staged.ok and patch.commit(staged.value.stage).ok)
 package.loaded.logic = {}
-assert(patch.abort(staged.stage).code == "HU_RECOVERY_REQUIRED")
+assert(patch.abort(staged.value.stage).code == "HU_RECOVERY_REQUIRED")
 package.loaded.logic = live
-assert(patch.abort(staged.stage).code == "HU_PHASE_INVALID")
+assert(patch.abort(staged.value.stage).code == "HU_PHASE_INVALID")
 -- 无状态模块不需要钩子；多模块中一个 Stage 失败不能提前安装其他模块。
 local simple = {value = function() return 1 end}
 package.loaded.a = simple
@@ -94,14 +100,14 @@ local combined = patch.stage({
     {name = "b", source = "return {value = function() return 20 end, added = true}"},
     {name = "a", source = "return {value = function() return 10 end}"},
 })
-assert(combined.ok and patch.commit(combined.stage).ok)
+assert(combined.ok and patch.commit(combined.value.stage).ok)
 assert(package.loaded.a == simple and package.loaded.b == second)
 assert(simple.value() == 10 and second.value() == 20 and second.added)
-assert(patch.abort(combined.stage).ok)
+assert(patch.abort(combined.value.stage).ok)
 assert(simple.value == old_first_value and second.value == old_second_value and second.added == nil)
 package.loaded.a = {export_state = function() return {old = true} end, import_state = function() end}
 local reset_state = patch.stage({{name = "a", source = "return {}"}})
-assert(reset_state.ok and patch.abort(reset_state.stage).ok)
+assert(reset_state.ok and patch.abort(reset_state.value.stage).ok)
 package.loaded.a = {
     value = function() return 1 end,
     export_state = function() return {} end,
@@ -128,7 +134,7 @@ local retried = patch.stage({{name = "a", source = [[return {
     export_state = function() return {} end,
     import_state = function() end,
 }]]}})
-assert(retried.ok and patch.abort(retried.stage).ok)
+assert(retried.ok and patch.abort(retried.value.stage).ok)
 -- 嵌套配置、辅助函数、共享与循环图均按完整新版本安装；回滚必须找回原引用。
 local old_config = {max_level = 50, items = {sword = {attack = 10}}}
 local old_helper = {calculate = function(value) return value end}
@@ -148,14 +154,14 @@ return M
 local nested_stage = patch.stage({{name = nested_name, source = nested_source}})
 assert(nested_stage.ok, nested_stage.message)
 assert(nested_live.config == old_config and old_config.max_level == 50)
-assert(patch.commit(nested_stage.stage).ok)
+assert(patch.commit(nested_stage.value.stage).ok)
 assert(package.loaded[nested_name] == nested_live and nested_live.config ~= old_config)
 assert(nested_live.config.max_level == 100 and nested_live.config.items.sword.attack == 20)
 assert(nested_live.config.self == nested_live.config and nested_live.alias == nested_live.config.items)
 assert(nested_live.config[1] == "index" and nested_live.config[false] == true)
 assert(nested_live.helper.calculate(3) == 6 and nested_live.get_max_level() == 100)
 assert(nested_live.removed == nil and old_config.max_level == 50)
-assert(patch.abort(nested_stage.stage).ok)
+assert(patch.abort(nested_stage.value.stage).ok)
 assert(package.loaded[nested_name] == nested_live and nested_live.config == old_config)
 assert(nested_live.helper == old_helper and nested_live.removed and nested_live.alias == nil)
 assert(nested_live.get_max_level == nil)
@@ -176,20 +182,20 @@ for _, invalid_source in ipairs({
     assert(nested_live.helper == old_helper and nested_live.removed)
 end
 local scalar_stage = patch.stage({{name = nested_name, source = "return {config = 100}"}})
-assert(scalar_stage.ok and patch.commit(scalar_stage.stage).ok and nested_live.config == 100)
-assert(patch.abort(scalar_stage.stage).ok and nested_live.config == old_config)
+assert(scalar_stage.ok and patch.commit(scalar_stage.value.stage).ok and nested_live.config == 100)
+assert(patch.abort(scalar_stage.value.stage).ok and nested_live.config == old_config)
 local root_reference = patch.stage({{name = nested_name,
     source = "local M = {}; M.config = {root = M}; return M"}})
 assert(not root_reference.ok and root_reference.message:find("根导出表", 1, true))
 -- 成功 finish 后，下一次 Stage 也能够校验并回滚已经在线的嵌套循环图。
 nested_stage = patch.stage({{name = nested_name, source = nested_source}})
-assert(nested_stage.ok and patch.commit(nested_stage.stage).ok)
-assert(patch.finish(nested_stage.stage).ok)
+assert(nested_stage.ok and patch.commit(nested_stage.value.stage).ok)
+assert(patch.finish(nested_stage.value.stage).ok)
 local installed_config = nested_live.config
 nested_stage = patch.stage({{name = nested_name, source = "return {config = {max_level = 200}}"}})
-assert(nested_stage.ok and patch.commit(nested_stage.stage).ok)
+assert(nested_stage.ok and patch.commit(nested_stage.value.stage).ok)
 assert(nested_live.helper == nil and nested_live.config.max_level == 200)
-assert(patch.abort(nested_stage.stage).ok)
+assert(patch.abort(nested_stage.value.stage).ok)
 assert(nested_live.config == installed_config and nested_live.config.self == installed_config)
 assert(nested_live.helper.calculate(3) == 6)
 package.loaded[nested_name] = nil
@@ -230,7 +236,7 @@ package.loaded.skynet =
             return {ok = true}
         elseif command == "newservice" or command == "uniqueservice" then
             forwarded[command] = request
-            return {ok = true, service_handle = command == "newservice" and 101 or 102}
+            return {ok = true, value = {service_handle = command == "newservice" and 101 or 102}}
         elseif command == "cancel_service_creation" then
             forwarded.cancel = request
             return {ok = true}
@@ -239,7 +245,7 @@ package.loaded.skynet =
             permit_sequence = permit_sequence + 1
             local id = tostring(permit_sequence)
             permits[id] = request.name
-            return {ok = true, permit_id = id}
+            return {ok = true, value = {permit_id = id}}
         elseif command == "register_module" then
             assert(permits[request.permit_id] == request.name)
             assert(package.loaded.hotupgrade_extra == package.loaded[request.name])
@@ -429,14 +435,14 @@ local early_require_source = [[return function()
 end]]
 local early_result = target_control("update", 9, {service_source = early_require_source})
 assert(not early_result.ok and early_result.code == "HU_SERVICE_STAGE_FAILED")
-assert(early_result.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
+assert(early_result.details.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
 assert(target_control("abort", 9).ok)
 active_new_module_batch = "fixture:10"
 assert(target_control("prepare", 10).ok)
 local undeclared_result = target_control("update", 10,
     {service_source = [[return function() return {new_modules = {"hotupgrade_bad_new_parent"}} end]]})
 assert(not undeclared_result.ok and undeclared_result.code == "HU_NEW_MODULE_FAILED")
-assert(undeclared_result.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
+assert(undeclared_result.details.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
 assert(begin_count == declarations_before_new_modules)
 assert(target_control("abort", 10).ok)
 for _, name in ipairs({"hotupgrade_new_dependency", "hotupgrade_new_rules", "hotupgrade_early_module",

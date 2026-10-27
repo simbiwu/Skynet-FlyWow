@@ -200,12 +200,12 @@ bool resolveDirectory(const std::string &root_argument, const std::string &relat
 }
 
 // 一次扫描整个选定 Patch 目录，返回其中全部 Lua 文件。
-int listLuaFiles(const std::string &root_argument, const std::string &relative,
+int listLuaFiles(const std::string &patch_root, const std::string &relative_patch_dir,
                  std::vector<std::string> &output)
 {
     std::string root;
     std::string directory;
-    if (!resolveDirectory(root_argument, relative, root, directory))
+    if (!resolveDirectory(patch_root, relative_patch_dir, root, directory))
     {
         return -1;
     }
@@ -504,7 +504,7 @@ int resolve(lua_State *state)
     }
 }
 
-// 参数依次为 Patch Root、相对 Patch 目录；readValue 不改变参数栈。
+// 参数依次为 Patch 根目录、相对发布目录；readValue 不改变参数栈。
 // LuaTable 以 registry 引用临时持有结果 table；returnValues 压入它并返回 1，
 // C++ 句柄析构只释放自身引用，不移除 Lua 返回栈中已压入的 table。
 int list_lua(lua_State *state)
@@ -512,18 +512,18 @@ int list_lua(lua_State *state)
     try
     {
         // 两个 readValue 只读取原参数槽；临时 table 由 registry 引用持有，不占用工作栈。
-        // returnValues 压入 table 后：[S, root, relative] -> [..., result_table]；
+        // returnValues 压入 table 后：[S, patch_root, relative_patch_dir] -> [..., result_table]；
         // 返回 1 时 VM 保留最顶层 table，LuaTable 析构 unref 不弹栈或移除它。
         LuaBinding  binding(state);
-        std::string root;
-        std::string relative;
-        if (!binding.readValue(1, root) || !binding.readValue(2, relative))
+        std::string patch_root;
+        std::string relative_patch_dir;
+        if (!binding.readValue(1, patch_root) || !binding.readValue(2, relative_patch_dir))
         {
             return binding.pushError();
         }
 
         std::vector<std::string> paths;
-        const int                status = listLuaFiles(root, relative, paths);
+        const int                status = listLuaFiles(patch_root, relative_patch_dir, paths);
         if (status != 0)
         {
             return binding.pushError(status == 1 ? "HU_PATCH_EMPTY" : "HU_INVALID_PATH",

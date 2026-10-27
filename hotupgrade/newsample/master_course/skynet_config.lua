@@ -21,6 +21,7 @@ lua_path = runtime_root .. "/host/?.lua;"
     .. runtime_root .. "/host/lualib/?/init.lua;"
     .. skynet_root .. "/lualib/?.lua;"
     .. skynet_root .. "/lualib/?/init.lua;"
+    .. framework_root .. "/common/lualib/?.lua;"
     .. framework_root .. "/hotupgrade/lualib/?.lua"
 
 lua_cpath = skynet_root .. "/luaclib/?.so;"

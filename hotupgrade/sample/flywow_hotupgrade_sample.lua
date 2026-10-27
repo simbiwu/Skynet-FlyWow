@@ -32,23 +32,23 @@ skynet.start(function()
         if not batch.ok then
             error(batch.code .. ": " .. batch.message)
         end
-        print("发布批次 " .. batch.batch_id)
+        print("发布批次 " .. batch.value.batch_id)
 
         local completed
         for _ = 1, 3000 do
             local status = skynet.call(hotupgrade_handle, "hotupgrade", "status",
-                {batch_id = batch.batch_id})
+                {batch_id = batch.value.batch_id})
             if not status.ok then
                 error(status.code .. ": " .. status.message)
             end
 
-            local phase = status.record.phase
+            local phase = status.value.record.phase
             if phase == "COMPLETED" then
                 completed = true
                 break
             end
             if phase == "ABORTED" or phase == "RECOVERY_REQUIRED" then
-                local failure_result = status.record.error
+                local failure_result = status.value.record.error
                 error((failure_result and failure_result.code or phase) .. ": "
                     .. (failure_result and failure_result.message or "发布失败"))
             end

@@ -44,14 +44,14 @@ end
 local function begin_update_batch(hotupgrade_handle, selected_patch_path)
     local begin_result = skynet.call(hotupgrade_handle, "hotupgrade", "begin", {path = selected_patch_path})
     assert(begin_result.ok, tostring(begin_result.code) .. ":" .. tostring(begin_result.message))
-    return begin_result.batch_id
+    return begin_result.value.batch_id
 end
 
 local function wait_for_batch_phase(hotupgrade_handle, batch_id, expected_phase)
     for _ = 1, 1000 do
         local batch_status = skynet.call(hotupgrade_handle, "hotupgrade", "status", {batch_id = batch_id})
         assert(batch_status.ok, batch_status.message)
-        local batch_record = batch_status.record
+        local batch_record = batch_status.value.record
         if batch_record.phase == "COMPLETED"
             or batch_record.phase == "ABORTED" or batch_record.phase == "PARTIAL" or batch_record.phase == "RECOVERY_REQUIRED" then
             assert(batch_record.phase == expected_phase or (type(expected_phase) == "table" and expected_phase[batch_record.phase]), batch_record.phase .. ":" ..
@@ -75,14 +75,14 @@ end
 local function lifecycle_status(hotupgrade_handle)
     local controller_status = skynet.call(hotupgrade_handle, "hotupgrade", "status", {})
     assert(controller_status.ok)
-    return controller_status.lifecycle
+    return controller_status.value.lifecycle
 end
 
 local function lifecycle_blocked(hotupgrade_handle)
     for _, command in ipairs({"unknown_command", "validate", "apply"}) do
         local rejected = skynet.call(hotupgrade_handle, "hotupgrade", command, {path = "module"})
         local expected_code = "HU_UNKNOWN_COMMAND"
-        assert(rejected.code == expected_code and rejected.batch_id == nil)
+        assert(rejected.code == expected_code and rejected.value == nil)
     end
     assert(lifecycle_status(hotupgrade_handle).active_batch_id == nil)
 end
@@ -91,32 +91,32 @@ local function creation_lifecycle_tests()
     local hotupgrade_handle = create_controller()
     -- 原生 kill 不经包装，退出通知必须释放尚未登记的创建记录。
     local killed = module_state.hotupgrade_api.newservice("skynet_hotupgrade_worker")
-    assert(lifecycle_status(hotupgrade_handle).pending_creations == 1)
+    assert(lifecycle_status(hotupgrade_handle).pending_service_count == 1)
     skynet.kill(killed)
     for _ = 1, 1000 do
-        if lifecycle_status(hotupgrade_handle).pending_creations == 0 then
+        if lifecycle_status(hotupgrade_handle).pending_service_count == 0 then
             break
         end
         skynet.sleep(1)
     end
-    assert(lifecycle_status(hotupgrade_handle).pending_creations == 0)
+    assert(lifecycle_status(hotupgrade_handle).pending_service_count == 0)
     local pending = module_state.hotupgrade_api.newservice("skynet_hotupgrade_worker")
-    assert(lifecycle_status(hotupgrade_handle).pending_creations == 1)
+    assert(lifecycle_status(hotupgrade_handle).pending_service_count == 1)
     lifecycle_blocked(hotupgrade_handle)
     assert(not skynet.call(pending, "lua", "init", {init_failure = true}).ok)
     local registered = create_worker_service()
     local unauthorized = skynet.call(registered, "lua", "cancel_creation",
         {service_handle = pending})
-    assert(unauthorized.code == "HU_UNAUTHORIZED" and lifecycle_status(hotupgrade_handle).pending_creations == 1)
+    assert(unauthorized.code == "HU_UNAUTHORIZED" and lifecycle_status(hotupgrade_handle).pending_service_count == 1)
     assert(module_state.hotupgrade_api.cancel_service_creation(pending).ok)
-    assert(lifecycle_status(hotupgrade_handle).pending_creations == 0)
+    assert(lifecycle_status(hotupgrade_handle).pending_service_count == 0)
     assert(module_state.hotupgrade_api.cancel_service_creation(registered).code == "HU_SERVICE_ALREADY_REGISTERED")
     pending = module_state.hotupgrade_api.newservice("skynet_hotupgrade_worker")
     assert(module_state.hotupgrade_api.cancel_service_creation(pending).ok)
 
     -- Worker 的独立协程可在原生返回前发出登记，但不阻止 start 回调结束。
     local early = module_state.hotupgrade_api.newservice("skynet_hotupgrade_worker", "auto", "original_tail")
-    assert(assert_original_state(early).service_handle == early and lifecycle_status(hotupgrade_handle).pending_creations == 0)
+    assert(assert_original_state(early).service_handle == early and lifecycle_status(hotupgrade_handle).pending_service_count == 0)
     -- 并发启动按各自真实 Service handle 关联；一项登记不能解除另一项的待登记屏障。
     local concurrent_early
     local concurrent_late
@@ -135,15 +135,15 @@ local function creation_lifecycle_tests()
     end
     assert(concurrent_early and concurrent_late and concurrent_early ~= concurrent_late)
     assert_original_state(concurrent_early)
-    assert(lifecycle_status(hotupgrade_handle).pending_creations == 1)
+    assert(lifecycle_status(hotupgrade_handle).pending_service_count == 1)
     lifecycle_blocked(hotupgrade_handle)
     assert(skynet.call(concurrent_late, "lua", "init", {}).ok)
-    assert(lifecycle_status(hotupgrade_handle).pending_creations == 0)
+    assert(lifecycle_status(hotupgrade_handle).pending_service_count == 0)
     assert_original_state(concurrent_early)
     local rejected = wait_for_batch_phase(hotupgrade_handle, begin_update_batch(hotupgrade_handle, "unmatched_service"), "ABORTED")
     assert(rejected.error.code == "HU_TARGET_MISSING")
     local idle = lifecycle_status(hotupgrade_handle)
-    assert(idle.pending_creations == 0 and idle.phase == "IDLE")
+    assert(idle.pending_service_count == 0 and idle.phase == "IDLE")
     for _, fixture in ipairs({
         {name = "hotupgrade_missing_service"},
         {name = "skynet_hotupgrade_worker", mode = "fail"},
@@ -151,11 +151,11 @@ local function creation_lifecycle_tests()
         local created, message = pcall(module_state.hotupgrade_api.newservice, fixture.name,
             fixture.mode)
         assert(not created and tostring(message):find("HU_SERVICE_CREATE_FAILED", 1, true))
-        assert(lifecycle_status(hotupgrade_handle).pending_creations == 0)
+        assert(lifecycle_status(hotupgrade_handle).pending_service_count == 0)
         local rejected = wait_for_batch_phase(hotupgrade_handle, begin_update_batch(hotupgrade_handle, "unmatched_service"), "ABORTED")
         assert(rejected.error.code == "HU_TARGET_MISSING")
         local idle = lifecycle_status(hotupgrade_handle)
-        assert(idle.pending_creations == 0 and idle.phase == "IDLE")
+        assert(idle.pending_service_count == 0 and idle.phase == "IDLE")
     end
     print("HOTUPGRADE_SKYNET_CREATION_LIFECYCLE_OK")
 end
@@ -164,7 +164,7 @@ local function module_lifecycle_tests()
     local hotupgrade_handle = create_controller()
     local worker_service_handle = create_worker_service()
     assert(skynet.call(worker_service_handle, "lua", "declare_failure", {}))
-    assert(lifecycle_status(hotupgrade_handle).pending_loads == 0)
+    assert(lifecycle_status(hotupgrade_handle).pending_module_count == 0)
     local loaded = false
     local concurrent_loaded = false
     skynet.fork(function()
@@ -172,12 +172,12 @@ local function module_lifecycle_tests()
         loaded = true
     end)
     for _ = 1, 1000 do
-        if lifecycle_status(hotupgrade_handle).pending_loads == 1 then
+        if lifecycle_status(hotupgrade_handle).pending_module_count == 1 then
             break
         end
         skynet.sleep(1)
     end
-    assert(lifecycle_status(hotupgrade_handle).pending_loads == 1)
+    assert(lifecycle_status(hotupgrade_handle).pending_module_count == 1)
     lifecycle_blocked(hotupgrade_handle)
     skynet.fork(function()
         assert(skynet.call(worker_service_handle, "lua", "declare", {}) == 1)
@@ -189,7 +189,7 @@ local function module_lifecycle_tests()
         end
         skynet.sleep(1)
     end
-    assert(loaded and concurrent_loaded and lifecycle_status(hotupgrade_handle).pending_loads == 0)
+    assert(loaded and concurrent_loaded and lifecycle_status(hotupgrade_handle).pending_module_count == 0)
     local extra_batch = begin_update_batch(hotupgrade_handle, "extra")
     assert(wait_for_batch_phase(hotupgrade_handle, extra_batch, "COMPLETED").target_service_count == 1)
     assert(read_worker_state(worker_service_handle).extra_value == 2)
@@ -209,7 +209,7 @@ local function module_lifecycle_tests()
     assert(read_worker_state(admitted_handle).module_value == 1)
     assert(skynet.call(worker_service_handle, "lua", "declare", {}) == 2)
     local status = lifecycle_status(hotupgrade_handle)
-    assert(status.pending_creations == 0 and status.pending_loads == 0 and status.active_batch_id == id)
+    assert(status.pending_service_count == 0 and status.pending_module_count == 0 and status.active_batch_id == id)
     wait_for_batch_phase(hotupgrade_handle, id, "COMPLETED")
     assert(read_worker_state(admitted_handle).module_value == 2)
     assert(module_state.hotupgrade_api.cancel_service_creation(admitted_handle).code == "HU_SERVICE_ALREADY_REGISTERED")
@@ -222,7 +222,7 @@ local function unique_lifecycle_tests()
     assert(not global_ok and tostring(global_error):find("HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED", 1, true))
     local special_ok, special_error = pcall(module_state.hotupgrade_api.uniqueservice, "snaxd", "fixture")
     assert(not special_ok and tostring(special_error):find("HU_SPECIAL_SERVICE_UNSUPPORTED", 1, true))
-    assert(lifecycle_status(hotupgrade_handle).pending_creations == 0)
+    assert(lifecycle_status(hotupgrade_handle).pending_service_count == 0)
 
     local first
     local concurrent
@@ -241,7 +241,7 @@ local function unique_lifecycle_tests()
     assert(module_state.hotupgrade_api.cancel_service_creation(second).ok)
     for _, mode in ipairs({"fail"}) do
         local ok = pcall(module_state.hotupgrade_api.uniqueservice, "skynet_hotupgrade_unique_b", mode)
-        assert(not ok and lifecycle_status(hotupgrade_handle).pending_creations == 0)
+        assert(not ok and lifecycle_status(hotupgrade_handle).pending_service_count == 0)
     end
     second = module_state.hotupgrade_api.uniqueservice("skynet_hotupgrade_unique_b")
     local begun = skynet.call(hotupgrade_handle, "hotupgrade", "begin", {path = "module"})
@@ -250,11 +250,11 @@ local function unique_lifecycle_tests()
     assert(module_state.hotupgrade_api.uniqueservice("skynet_hotupgrade_unique_a") == first)
     local admitted = module_state.hotupgrade_api.uniqueservice("skynet_hotupgrade_worker")
     assert(admitted ~= first and admitted ~= second)
-    assert(lifecycle_status(hotupgrade_handle).pending_creations == 2)
+    assert(lifecycle_status(hotupgrade_handle).pending_service_count == 2)
     assert(skynet.call(admitted, "lua", "init", {}).ok)
     assert(skynet.call(second, "lua", "init", {}).ok)
     assert(skynet.call(hotupgrade_handle, "hotupgrade", "unknown_command", {path = "module"}).code == "HU_UNKNOWN_COMMAND")
-    wait_for_batch_phase(hotupgrade_handle, begun.batch_id, "COMPLETED")
+    wait_for_batch_phase(hotupgrade_handle, begun.value.batch_id, "COMPLETED")
     assert(read_worker_state(admitted).module_value == 2 and read_worker_state(second).module_value == 2)
     assert(module_state.hotupgrade_api.cancel_service_creation(admitted).code == "HU_SERVICE_ALREADY_REGISTERED")
     skynet.kill(first)
@@ -288,7 +288,7 @@ local function preload_contract_tests()
             skynet.kill(worker_service_handle)
         end
     end
-    assert(lifecycle_status(hotupgrade_handle).pending_creations == 0)
+    assert(lifecycle_status(hotupgrade_handle).pending_service_count == 0)
     print("HOTUPGRADE_SKYNET_PRELOAD_CONTRACT_OK")
 end
 
@@ -385,7 +385,7 @@ local function drain_lifecycle_tests(group)
         assert(completed_operation.value == 1 and inspect(parent).extra == 2)
     end
     local lifecycle = lifecycle_status(controller)
-    assert(lifecycle.pending_creations == 0 and lifecycle.pending_loads == 0)
+    assert(lifecycle.pending_service_count == 0 and lifecycle.pending_module_count == 0)
     print("HOTUPGRADE_SKYNET_DRAIN_OK " .. group)
 end
 
@@ -428,16 +428,16 @@ local function run_test_group()
             pcall(skynet.call, worker, "lua", "declare_slow", {})
         end)
         for _ = 1, 1000 do
-            if lifecycle_status(controller).pending_loads == 1 then break end
+            if lifecycle_status(controller).pending_module_count == 1 then break end
             skynet.sleep(1)
         end
-        assert(lifecycle_status(controller).pending_loads == 1)
+        assert(lifecycle_status(controller).pending_module_count == 1)
         skynet.kill(worker)
         for _ = 1, 1000 do
-            if lifecycle_status(controller).pending_loads == 0 then break end
+            if lifecycle_status(controller).pending_module_count == 0 then break end
             skynet.sleep(1)
         end
-        assert(lifecycle_status(controller).pending_loads == 0)
+        assert(lifecycle_status(controller).pending_module_count == 0)
         local record = wait_for_batch_phase(controller, begin_update_batch(controller, "module"), "COMPLETED")
         assert(record.target_service_count == 0)
     elseif group:match("^exit_") or group:match("^kill_") then
@@ -568,11 +568,11 @@ local function run_test_group()
             local rejected = record.error
             assert(rejected.code == fixture.code and rejected.message and #rejected.message > 0)
             local status = skynet.call(controller, "hotupgrade", "status", {batch_id = id})
-            assert(status.ok and status.record.phase == "ABORTED")
-            assert(status.record.error.code == fixture.code and not status.record.control_started)
+            assert(status.ok and status.value.record.phase == "ABORTED")
+            assert(status.value.record.error.code == fixture.code and not status.value.record.control_started)
             assert(assert_original_state(worker_service_handle).marker_token == before.marker_token)
             assert(native.read_file(root, "lualib/test_worker_logic.lua") == old_source)
-            assert(status.lifecycle.phase == "IDLE")
+            assert(status.value.lifecycle.phase == "IDLE")
         end
         assert(skynet.call(controller, "hotupgrade", "unknown_command", {path = "module"}).code == "HU_UNKNOWN_COMMAND")
         print("HOTUPGRADE_SKYNET_PATCH_MATCH_OK")
@@ -607,7 +607,7 @@ local function run_test_group()
         local registration_result = skynet.call(worker_service_handle, "lua", "init", {before_missing = true})
         assert(not registration_result.ok and registration_result.code == "HU_INVALID_OPTIONS")
         assert(module_state.hotupgrade_api.cancel_service_creation(worker_service_handle).ok)
-        assert(lifecycle_status(controller).pending_creations == 0)
+        assert(lifecycle_status(controller).pending_service_count == 0)
     elseif group == "prepare_false" or group == "prepare_error" then
         controller = create_controller()
         local config = {[group == "prepare_false" and "before_false" or "before_error"] = true}
@@ -662,11 +662,11 @@ local function run_test_group()
     elseif group == "bad_functions" or group == "stage_failure" then
         controller = create_controller()
         worker_service_handle = create_worker_service()
-        local patch_path = group == "bad_functions" and "bad_functions" or "stage_failure"
+        local patch_dir = group == "bad_functions" and "bad_functions" or "stage_failure"
         local native = require "flywow_hotupgrade_native"
         local root = require("hotupgrade_test_options").root_path
         local old_source = assert(native.read_file(root, "lualib/test_worker_logic.lua"))
-        wait_for_batch_phase(controller, begin_update_batch(controller, patch_path), "ABORTED")
+        wait_for_batch_phase(controller, begin_update_batch(controller, patch_dir), "ABORTED")
         assert_original_state(worker_service_handle)
         assert(native.read_file(root, "lualib/test_worker_logic.lua") == old_source)
         print(group == "bad_functions" and "HOTUPGRADE_SKYNET_BAD_FUNCTIONS_OK" or "HOTUPGRADE_SKYNET_STAGE_FAILURE_OK")
@@ -719,7 +719,7 @@ local function run_test_group()
         local first = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules"), "COMPLETED")
         local first_state = read_worker_state(worker_service_handle)
         assert(first.succeeded_service_count == 1 and first_state.module_value == 42 and first_state.module_identity)
-        assert(lifecycle_status(controller).pending_loads == 0)
+        assert(lifecycle_status(controller).pending_module_count == 0)
         local next_batch = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules_followup"), "COMPLETED")
         assert(next_batch.succeeded_service_count == 1 and read_worker_state(worker_service_handle).module_value == 52)
         print("HOTUPGRADE_SKYNET_NEW_MODULES_OK")
@@ -730,10 +730,10 @@ local function run_test_group()
         local failed = wait_for_batch_phase(controller,
             begin_update_batch(controller, "new_modules_concurrent"), "ABORTED")
         assert(failed.error.code == "HU_NEW_MODULE_FAILED")
-        assert(failed.error.cause_code == "HU_MODULE_LOADING")
+        assert(failed.error.details.cause_code == "HU_MODULE_LOADING")
         local ordinary = skynet.call(worker_service_handle, "lua", "new_module_conflict_result", {})
         assert(not ordinary.ok and ordinary.message ~= "")
-        assert(lifecycle_status(controller).pending_loads == 0)
+        assert(lifecycle_status(controller).pending_module_count == 0)
         print("HOTUPGRADE_SKYNET_NEW_MODULES_CONCURRENT_CONFLICT_OK")
     elseif group == "new_modules_candidate_undeclared" then
         controller = create_controller()
@@ -743,10 +743,10 @@ local function run_test_group()
         local failed = wait_for_batch_phase(controller,
             begin_update_batch(controller, "new_modules_candidate_undeclared"), "ABORTED")
         assert(failed.error.code == "HU_MODULE_STAGE_FAILED")
-        assert(failed.error.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
+        assert(failed.error.details.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
         assert_original_state(worker_service_handle)
         assert(native.read_file(root, "lualib/hotupgrade_new_rules.lua") == false)
-        assert(lifecycle_status(controller).pending_loads == 0)
+        assert(lifecycle_status(controller).pending_module_count == 0)
         local next_batch = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules"), "COMPLETED")
         assert(next_batch.succeeded_service_count == 1 and read_worker_state(worker_service_handle).module_value == 42)
         print("HOTUPGRADE_SKYNET_NEW_MODULE_CANDIDATE_UNDECLARED_OK")
@@ -756,7 +756,7 @@ local function run_test_group()
         local failed = wait_for_batch_phase(controller,
             begin_update_batch(controller, "new_modules_candidate_caught_error"), "ABORTED")
         assert(failed.error.code == "HU_MODULE_STAGE_FAILED")
-        assert(failed.error.cause_code == nil)
+        assert(failed.error.details.cause_code == nil)
         assert(failed.error.message:find("injected unrelated candidate failure", 1, true))
         assert_original_state(worker_service_handle)
         print("HOTUPGRADE_SKYNET_NEW_MODULE_CAUGHT_ERROR_OK")
@@ -770,7 +770,7 @@ local function run_test_group()
         assert_original_state(worker_service_handle)
         local remaining_rules = native.read_file(root, "lualib/hotupgrade_new_rules.lua")
         assert(remaining_rules == false, "failed batch left new module file: " .. tostring(remaining_rules))
-        assert(lifecycle_status(controller).pending_loads == 0)
+        assert(lifecycle_status(controller).pending_module_count == 0)
         local next_batch = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules_followup"), "COMPLETED")
         assert(next_batch.succeeded_service_count == 1 and read_worker_state(worker_service_handle).module_value == 52)
         print("HOTUPGRADE_SKYNET_NEW_MODULES_FAILURE_CONTINUES_OK")

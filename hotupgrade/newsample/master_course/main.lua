@@ -29,11 +29,11 @@ end
 
 local function publish(controller, patch_name)
     local begun = expect(skynet.call(controller, "hotupgrade", "begin", {path = patch_name}))
-    print("BEGIN " .. patch_name .. " batch=" .. begun.batch_id)
+    print("BEGIN " .. patch_name .. " batch=" .. begun.value.batch_id)
     return wait_for(function()
         local status = expect(skynet.call(controller, "hotupgrade", "status",
-            {batch_id = begun.batch_id}))
-        local record = status.record
+            {batch_id = begun.value.batch_id}))
+        local record = status.value.record
         if record.phase == "COMPLETED" or record.phase == "ABORTED"
             or record.phase == "RECOVERY_REQUIRED" then
             print("END " .. patch_name .. " phase=" .. record.phase
@@ -128,10 +128,10 @@ local function run_queue(controller, _hot, player)
     assert(b_result.version == "v1" and b_result.gold == 70)
 
     local finished = wait_for(function()
-        local status = expect(skynet.call(controller, "hotupgrade", "status", {batch_id = begun.batch_id}))
-        local phase = status.record.phase
+        local status = expect(skynet.call(controller, "hotupgrade", "status", {batch_id = begun.value.batch_id}))
+        local phase = status.value.record.phase
         if phase == "COMPLETED" or phase == "ABORTED" or phase == "RECOVERY_REQUIRED" then
-            return status.record
+            return status.value.record
         end
     end, "并发热更批次")
     assert(finished.phase == "COMPLETED")
@@ -151,7 +151,7 @@ local function run_forward(controller, hot, player)
     expect(skynet.call(player, "lua", "inject_restore_failure", {enabled = true}))
     local faulty = publish(controller, "faulty")
     assert(faulty.phase == "RECOVERY_REQUIRED")
-    assert(faulty.error and faulty.error.original_error and faulty.error.recovery_error)
+    assert(faulty.error and faulty.error.details.original_error and faulty.error.details.recovery_error)
 
     local damaged = get_player_snapshot(player)
     print_player("DAMAGED", damaged)

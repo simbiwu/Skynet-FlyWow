@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 FRAMEWORK_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 SKYNET_ROOT="$(realpath -- "${1:?需要 Skynet 根目录}")"
 cd "$FRAMEWORK_DIR"
-export LUA_PATH="$FRAMEWORK_DIR/hotupgrade/lualib/?.lua;$FRAMEWORK_DIR/hotupgrade/tests/?.lua;;"
+export LUA_PATH="$FRAMEWORK_DIR/common/lualib/?.lua;$FRAMEWORK_DIR/hotupgrade/lualib/?.lua;$FRAMEWORK_DIR/hotupgrade/tests/?.lua;;"
 export LUA_CPATH="$FRAMEWORK_DIR/build/native/?.so;;"
 rm -rf build/hotupgrade-tests/patches build/hotupgrade-tests/host build/hotupgrade-tests/host-original
 mkdir -p build/hotupgrade-tests/patches

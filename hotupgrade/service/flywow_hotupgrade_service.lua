@@ -1,7 +1,7 @@
 --- 唯一控制 Service；宿主通过一次性 lua/init 交付配置。
 local skynet = require "skynet"
 local hotupgrade_controller = require "flywow_hotupgrade_controller"
-local hotupgrade_result = require "flywow_hotupgrade_error"
+local flywow_result = require "flywow_result"
 local hotupgrade_common = require "flywow_hotupgrade_common"
 local skynet_core = require "skynet.core"
 local controller_initialized = false -- 成功 init 后锁定配置；失败时保持 false 以允许重试。
@@ -13,20 +13,20 @@ skynet.start(function()
     skynet.dispatch("lua", function(session, _source, command, controller_config)
         local answer
         if command ~= "init" then
-            answer = hotupgrade_result.failure("HU_UNKNOWN_COMMAND", tostring(command))
+            answer = flywow_result.failure("HU_UNKNOWN_COMMAND", tostring(command))
         elseif controller_initialized then
-            answer = hotupgrade_result.failure("HU_ALREADY_INITIALIZED", "控制面已初始化")
+            answer = flywow_result.failure("HU_ALREADY_INITIALIZED", "控制面已初始化")
         else
             -- MONITOR 是进程级单例；先查询，已有宿主监视器时不能覆盖。
             local monitor = skynet_core.command("MONITOR")
             if monitor then
-                answer = hotupgrade_result.failure("HU_MONITOR_OCCUPIED", "进程退出监视器已被占用: " .. monitor)
+                answer = flywow_result.failure("HU_MONITOR_OCCUPIED", "进程退出监视器已被占用: " .. monitor)
             else
                 answer = hotupgrade_controller.initialize(controller_config)
                 if answer.ok then
                     skynet_core.command("MONITOR", skynet.address(skynet.self()))
                     controller_initialized = true
-                    answer = hotupgrade_result.success()
+                    answer = flywow_result.success()
                 end
             end
         end
@@ -48,12 +48,12 @@ skynet.start(function()
     skynet.dispatch("hotupgrade", function(session, source, command, request)
         local answer
         if not controller_initialized then
-            answer = hotupgrade_result.failure("HU_NOT_INITIALIZED", "宿主尚未完成 init")
+            answer = flywow_result.failure("HU_NOT_INITIALIZED", "宿主尚未完成 init")
         else
             local ok
             ok, answer = pcall(hotupgrade_controller.handle_command, hotupgrade_controller, command, request, source)
             if not ok then
-                answer = hotupgrade_result.failure("HU_CONTROL_FAILED", tostring(answer))
+                answer = flywow_result.failure("HU_CONTROL_FAILED", tostring(answer))
             end
         end
 
