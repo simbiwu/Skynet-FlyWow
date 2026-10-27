@@ -1,5 +1,9 @@
 --- 失败报告后释放本批占用；下一批以失败后现场为基准。
 local scenario = assert(arg[1])
+local function lifecycle_status(controller)
+    return controller:handle_command("status", {}, 1).lifecycle
+end
+
 if scenario == "controller" then
     local fixture = require "test_controller_fixture"
     local state = fixture.module_state
@@ -14,11 +18,17 @@ if scenario == "controller" then
     assert(controller.last_batch.phase == "RECOVERY_REQUIRED")
     assert(controller.last_batch.error.original_error and controller.last_batch.error.recovery_error)
     state.injected_control_failure = nil
-    state.control_hook = nil
+    state.control_hook = function(_, command)
+        if command == "prepare" or command == "update" then
+            local lifecycle = lifecycle_status(controller)
+            assert(lifecycle.phase == "APPLYING" and lifecycle.recovery_required)
+        end
+    end
     local next_batch = controller:handle_command("begin", {path = "module"}, 1)
     assert(next_batch.ok, next_batch.code)
+    assert(lifecycle_status(controller).recovery_required) -- 新批次进行中仍保留最近终态的诊断。
     state.pending_control_coroutines[#state.pending_control_coroutines]()
-    assert(controller.last_batch.phase == "COMPLETED" and not controller.recovery_required)
+    assert(controller.last_batch.phase == "COMPLETED" and not lifecycle_status(controller).recovery_required)
 elseif scenario == "diagnostic" then
     local fixture = require "test_controller_fixture"
     local controller = fixture.initialize_controller()
@@ -32,8 +42,8 @@ elseif scenario == "diagnostic" then
     end
     assert(controller:handle_command("begin", {path = "module"}, 1).ok)
     state.pending_control_coroutines[#state.pending_control_coroutines]()
-    assert(controller.last_batch.phase == "RECOVERY_REQUIRED" and controller.recovery_required)
-    assert(controller.phase == "IDLE")
+    assert(controller.last_batch.phase == "RECOVERY_REQUIRED" and lifecycle_status(controller).recovery_required)
+    assert(lifecycle_status(controller).phase == "IDLE")
     skynet.call = original_call
     assert(controller:handle_command("begin", {path = "module"}, 1).ok)
     state.pending_control_coroutines[#state.pending_control_coroutines]()
@@ -45,14 +55,14 @@ elseif scenario == "management_abort" then
     state.launch_service_handle = 10
     assert(controller:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 1).ok)
     local begun = controller:handle_command("begin", {path = "module"}, 1)
-    assert(begun.ok and controller.creation_count == 1)
+    assert(begun.ok and controller.pending_creation_count == 1)
     state.pending_control_coroutines[#state.pending_control_coroutines]()
     assert(controller.active_batch.waiter)
     assert(controller:handle_command("abort", {batch_id = begun.batch_id}, 1).code == "HU_UNKNOWN_COMMAND")
-    assert(controller.active_batch.batch_id == begun.batch_id and controller.creation_count == 1)
+    assert(controller.active_batch.batch_id == begun.batch_id and controller.pending_creation_count == 1)
     assert(controller:handle_command("cancel_service_creation", {service_handle = 10}, 1).ok)
     assert(controller.last_batch.phase == "COMPLETED" and controller.active_batch == nil)
-    assert(controller.creation_count == 0)
+    assert(controller.pending_creation_count == 0)
 elseif scenario == "module" then
     local patch = require "flywow_hotupgrade_module_patch"
     local live = {value = 1}

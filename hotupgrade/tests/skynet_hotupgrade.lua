@@ -164,7 +164,7 @@ local function module_lifecycle_tests()
     local hotupgrade_handle = create_controller()
     local worker_service_handle = create_worker_service()
     assert(skynet.call(worker_service_handle, "lua", "declare_failure", {}))
-    assert(lifecycle_status(hotupgrade_handle).pending_module_loads == 0)
+    assert(lifecycle_status(hotupgrade_handle).pending_loads == 0)
     local loaded = false
     local concurrent_loaded = false
     skynet.fork(function()
@@ -172,12 +172,12 @@ local function module_lifecycle_tests()
         loaded = true
     end)
     for _ = 1, 1000 do
-        if lifecycle_status(hotupgrade_handle).pending_module_loads == 1 then
+        if lifecycle_status(hotupgrade_handle).pending_loads == 1 then
             break
         end
         skynet.sleep(1)
     end
-    assert(lifecycle_status(hotupgrade_handle).pending_module_loads == 1)
+    assert(lifecycle_status(hotupgrade_handle).pending_loads == 1)
     lifecycle_blocked(hotupgrade_handle)
     skynet.fork(function()
         assert(skynet.call(worker_service_handle, "lua", "declare", {}) == 1)
@@ -189,9 +189,9 @@ local function module_lifecycle_tests()
         end
         skynet.sleep(1)
     end
-    assert(loaded and concurrent_loaded and lifecycle_status(hotupgrade_handle).pending_module_loads == 0)
+    assert(loaded and concurrent_loaded and lifecycle_status(hotupgrade_handle).pending_loads == 0)
     local extra_batch = begin_update_batch(hotupgrade_handle, "extra")
-    assert(wait_for_batch_phase(hotupgrade_handle, extra_batch, "COMPLETED").target_count == 1)
+    assert(wait_for_batch_phase(hotupgrade_handle, extra_batch, "COMPLETED").target_service_count == 1)
     assert(read_worker_state(worker_service_handle).extra_value == 2)
 
     -- queue 排空期间仍接纳创建和首次声明，新目标使用旧文件并参与当前批次。
@@ -209,7 +209,7 @@ local function module_lifecycle_tests()
     assert(read_worker_state(admitted_handle).module_value == 1)
     assert(skynet.call(worker_service_handle, "lua", "declare", {}) == 2)
     local status = lifecycle_status(hotupgrade_handle)
-    assert(status.pending_creations == 0 and status.pending_module_loads == 0 and status.active_batch_id == id)
+    assert(status.pending_creations == 0 and status.pending_loads == 0 and status.active_batch_id == id)
     wait_for_batch_phase(hotupgrade_handle, id, "COMPLETED")
     assert(read_worker_state(admitted_handle).module_value == 2)
     assert(module_state.hotupgrade_api.cancel_service_creation(admitted_handle).code == "HU_SERVICE_ALREADY_REGISTERED")
@@ -367,9 +367,9 @@ local function drain_lifecycle_tests(group)
     if peer then check_tree(peer) end
     local target_count = 0
     for _ in pairs(visited) do target_count = target_count + 1 end
-    assert(record.target_count == target_count)
-    assert(record.success == (failed and 0 or target_count))
-    assert(record.failed == (failed and target_count or 0))
+    assert(record.target_service_count == target_count)
+    assert(record.succeeded_service_count == (failed and 0 or target_count))
+    assert(record.failed_service_count == (failed and target_count or 0))
     local expected_targets = group == "drain_queue" and 4 or group == "drain_creation" and 3
         or group == "drain_modules" and 1 or 2
     assert(target_count == expected_targets)
@@ -385,7 +385,7 @@ local function drain_lifecycle_tests(group)
         assert(completed_operation.value == 1 and inspect(parent).extra == 2)
     end
     local lifecycle = lifecycle_status(controller)
-    assert(lifecycle.pending_creations == 0 and lifecycle.pending_module_loads == 0)
+    assert(lifecycle.pending_creations == 0 and lifecycle.pending_loads == 0)
     print("HOTUPGRADE_SKYNET_DRAIN_OK " .. group)
 end
 
@@ -411,7 +411,7 @@ local function run_test_group()
         for index = 1, 4 do
             local path = "source_headers_" .. index
             local record = wait_for_batch_phase(controller, begin_update_batch(controller, path), "COMPLETED")
-            assert(record.target_count == 1)
+            assert(record.target_service_count == 1)
             local state = read_worker_state(worker)
             assert(state.module_value == 2 and state.level == 51 and not state.paused)
             for _, file in ipairs({"lualib/test_worker_logic.lua", "config/headers.lua"}) do
@@ -428,18 +428,18 @@ local function run_test_group()
             pcall(skynet.call, worker, "lua", "declare_slow", {})
         end)
         for _ = 1, 1000 do
-            if lifecycle_status(controller).pending_module_loads == 1 then break end
+            if lifecycle_status(controller).pending_loads == 1 then break end
             skynet.sleep(1)
         end
-        assert(lifecycle_status(controller).pending_module_loads == 1)
+        assert(lifecycle_status(controller).pending_loads == 1)
         skynet.kill(worker)
         for _ = 1, 1000 do
-            if lifecycle_status(controller).pending_module_loads == 0 then break end
+            if lifecycle_status(controller).pending_loads == 0 then break end
             skynet.sleep(1)
         end
-        assert(lifecycle_status(controller).pending_module_loads == 0)
+        assert(lifecycle_status(controller).pending_loads == 0)
         local record = wait_for_batch_phase(controller, begin_update_batch(controller, "module"), "COMPLETED")
-        assert(record.target_count == 0)
+        assert(record.target_service_count == 0)
     elseif group:match("^exit_") or group:match("^kill_") then
         controller = create_controller()
         local survivor = create_worker_service()
@@ -448,7 +448,7 @@ local function run_test_group()
         -- 不限定 RPC 错误与退出通知次序；按已知结果尽力恢复并报告失败。
         local expected = command == "finish" and "RECOVERY_REQUIRED" or {ABORTED = true, RECOVERY_REQUIRED = true}
         local record = wait_for_batch_phase(controller, begin_update_batch(controller, "combined"), expected)
-        assert(record.failed >= 1)
+        assert(record.failed_service_count >= 1)
         local state = read_worker_state(survivor)
         if command == "finish" then
             assert(state.module_value == 2 and not state.paused)
@@ -459,12 +459,12 @@ local function run_test_group()
                 assert(lifecycle_status(controller).phase == "IDLE")
                 assert(record.error and record.error.code == "HU_RECOVERY_REQUIRED")
                 local repaired = wait_for_batch_phase(controller, begin_update_batch(controller, "module"), "COMPLETED")
-                assert(repaired.target_count == 1)
+                assert(repaired.target_service_count == 1)
             else
                 assert(lifecycle_status(controller).phase == "IDLE")
                 -- 退出登记已删除，下一批不能继续向旧 handle 发送事务命令。
                 local next_record = wait_for_batch_phase(controller, begin_update_batch(controller, "module"), "COMPLETED")
-                assert(next_record.target_count == 1)
+                assert(next_record.target_service_count == 1)
             end
         end
     elseif group:match("^drain_") then
@@ -475,11 +475,11 @@ local function run_test_group()
         local root = require("hotupgrade_test_options").root_path
         assert(native.read_file(root, "service/new_service.lua") == false)
         local record = wait_for_batch_phase(controller, begin_update_batch(controller, "service_file"), "COMPLETED")
-        assert(record.target_count == 0 and not record.control_started)
+        assert(record.target_service_count == 0 and not record.control_started)
         assert(assert(load(assert(native.read_file(root, "service/new_service.lua"))))().version == 2)
         assert(native.read_file(root, "service/skynet_hotupgrade_worker.patch") == false)
         local only_files = wait_for_batch_phase(controller, begin_update_batch(controller, "unmatched_module"), "COMPLETED")
-        assert(only_files.target_count == 0)
+        assert(only_files.target_service_count == 0)
         assert(read_worker_state(create_worker_service()).module_value == 2)
         print("HOTUPGRADE_SKYNET_SERVICE_FILE_OK")
     elseif group == "deployment" then
@@ -511,7 +511,7 @@ local function run_test_group()
         assert(os.execute("mkdir " .. root .. "/service/z_blocked.lua"))
         local record = wait_for_batch_phase(controller, id, "ABORTED")
         assert(record.error.code == "HU_INVALID_PATH" and record.control_started
-            and record.target_count == 1 and record.failed == 1 and lifecycle_status(controller).phase == "IDLE")
+            and record.target_service_count == 1 and record.failed_service_count == 1 and lifecycle_status(controller).phase == "IDLE")
         assert_original_state(worker_service_handle)
         assert(native.read_file(root, "lualib/test_worker_logic.lua") == old)
         assert(native.read_file(root, "lualib/a_added.lua") == false)
@@ -699,14 +699,14 @@ local function run_test_group()
         local first = create_worker_service()
         local second = create_worker_service()
         local record = wait_for_batch_phase(controller, begin_update_batch(controller, "module"), "COMPLETED")
-        assert(record.success == 2 and read_worker_state(first).module_value == 2 and read_worker_state(second).module_value == 2)
+        assert(record.succeeded_service_count == 2 and read_worker_state(first).module_value == 2 and read_worker_state(second).module_value == 2)
         print("HOTUPGRADE_SKYNET_MULTIPLE_TARGETS_OK")
     elseif group == "partial" then
         controller = create_controller()
         local first = create_worker_service()
         local second = create_worker_service({after_upgrade_failure = true})
         local record = wait_for_batch_phase(controller, begin_update_batch(controller, "combined"), "ABORTED")
-        assert(record.success == 0 and record.failed == 2)
+        assert(record.succeeded_service_count == 0 and record.failed_service_count == 2)
         assert_original_state(first)
         assert_original_state(second)
         assert(lifecycle_status(controller).phase == "IDLE")
@@ -718,10 +718,10 @@ local function run_test_group()
         worker_service_handle = create_worker_service()
         local first = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules"), "COMPLETED")
         local first_state = read_worker_state(worker_service_handle)
-        assert(first.success == 1 and first_state.module_value == 42 and first_state.module_identity)
-        assert(lifecycle_status(controller).pending_module_loads == 0)
+        assert(first.succeeded_service_count == 1 and first_state.module_value == 42 and first_state.module_identity)
+        assert(lifecycle_status(controller).pending_loads == 0)
         local next_batch = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules_followup"), "COMPLETED")
-        assert(next_batch.success == 1 and read_worker_state(worker_service_handle).module_value == 52)
+        assert(next_batch.succeeded_service_count == 1 and read_worker_state(worker_service_handle).module_value == 52)
         print("HOTUPGRADE_SKYNET_NEW_MODULES_OK")
     elseif group == "new_modules_concurrent_conflict" then
         controller = create_controller()
@@ -733,7 +733,7 @@ local function run_test_group()
         assert(failed.error.cause_code == "HU_MODULE_LOADING")
         local ordinary = skynet.call(worker_service_handle, "lua", "new_module_conflict_result", {})
         assert(not ordinary.ok and ordinary.message ~= "")
-        assert(lifecycle_status(controller).pending_module_loads == 0)
+        assert(lifecycle_status(controller).pending_loads == 0)
         print("HOTUPGRADE_SKYNET_NEW_MODULES_CONCURRENT_CONFLICT_OK")
     elseif group == "new_modules_candidate_undeclared" then
         controller = create_controller()
@@ -746,9 +746,9 @@ local function run_test_group()
         assert(failed.error.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
         assert_original_state(worker_service_handle)
         assert(native.read_file(root, "lualib/hotupgrade_new_rules.lua") == false)
-        assert(lifecycle_status(controller).pending_module_loads == 0)
+        assert(lifecycle_status(controller).pending_loads == 0)
         local next_batch = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules"), "COMPLETED")
-        assert(next_batch.success == 1 and read_worker_state(worker_service_handle).module_value == 42)
+        assert(next_batch.succeeded_service_count == 1 and read_worker_state(worker_service_handle).module_value == 42)
         print("HOTUPGRADE_SKYNET_NEW_MODULE_CANDIDATE_UNDECLARED_OK")
     elseif group == "new_modules_candidate_caught_error" then
         controller = create_controller()
@@ -770,9 +770,9 @@ local function run_test_group()
         assert_original_state(worker_service_handle)
         local remaining_rules = native.read_file(root, "lualib/hotupgrade_new_rules.lua")
         assert(remaining_rules == false, "failed batch left new module file: " .. tostring(remaining_rules))
-        assert(lifecycle_status(controller).pending_module_loads == 0)
+        assert(lifecycle_status(controller).pending_loads == 0)
         local next_batch = wait_for_batch_phase(controller, begin_update_batch(controller, "new_modules_followup"), "COMPLETED")
-        assert(next_batch.success == 1 and read_worker_state(worker_service_handle).module_value == 52)
+        assert(next_batch.succeeded_service_count == 1 and read_worker_state(worker_service_handle).module_value == 52)
         print("HOTUPGRADE_SKYNET_NEW_MODULES_FAILURE_CONTINUES_OK")
     elseif group == "management_abort" then
         controller = create_controller()
@@ -796,7 +796,7 @@ local function run_test_group()
         assert(lifecycle_status(controller).phase == "IDLE")
         assert(skynet.call(worker_service_handle, "lua", "allow_next_upgrade", {}).ok)
         local repaired = wait_for_batch_phase(controller, begin_update_batch(controller, "repair"), "COMPLETED")
-        assert(repaired.success == 1 and not lifecycle_status(controller).recovery_required)
+        assert(repaired.succeeded_service_count == 1 and not lifecycle_status(controller).recovery_required)
         local current = read_worker_state(worker_service_handle)
         assert(current.module_value == 3 and current.level == 60 and current.schema_version == 3 and not current.paused)
         assert(read_worker_state(create_worker_service()).module_value == 3)

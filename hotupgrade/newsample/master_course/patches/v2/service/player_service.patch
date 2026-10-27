@@ -1,0 +1,22 @@
+-- 一次性 Patch：仅更新已经运行的 PlayerService。
+return function(state)
+    return
+    {
+        -- 先声明本批 Update 中需要首次加载的新模块。
+        new_modules = {"combat_rules"},
+        -- 在 Activate 阶段执行，不在构建 Patch 时提前改线上数据。
+        update_state = function()
+            assert(state.schema_version == 1, "V2 要求从 schema 1 更新")
+            state.weapon = "剑"
+            state.schema_version = 2
+            -- gold、level 不修改，保持原来的玩家运行数据。
+        end,
+        -- 只替换已有的业务函数字段；不新建业务函数表。
+        replace_functions =
+        {
+            attack = function(base_attack)
+                return base_attack + (state.weapon == "剑" and 20 or 0)
+            end,
+        },
+    }
+end

@@ -29,7 +29,7 @@ end)
 - lua_path：./third_party/skynet-flywow/hotupgrade/lualib/?.lua
 - lua_cpath：./third_party/skynet-flywow/build/native/?.so
 
-公开入口是 hotupgrade/lualib/flywow_hotupgrade.lua；控制 Service 入口是 hotupgrade/service/flywow_hotupgrade_service.lua。Controller 加载 flywow_hotupgrade_native 时，Lua 从 Native 搜索路径定位统一构建入口产出的 build/native/flywow_hotupgrade_native.so。宿主先在 composition root 初始化 Controller 并确认成功，再创建受管理业务 Service。业务 Service 可以在文件顶部 require 公开入口并调用 hotupgrade.require()；这两步不会获取 Controller handle 或执行 RPC。Controller handle 仅在首次实际需要 RPC 时通过原生 skynet.uniqueservice() 获取并缓存。register_service() 会发送登记 RPC，必须在可 yield 的 Skynet 协程内调用。管理 State 无需登记为业务目标。
+公开入口是 hotupgrade/lualib/flywow_hotupgrade.lua；控制 Service 入口是 hotupgrade/service/flywow_hotupgrade_service.lua。Controller 加载 flywow_hotupgrade_native 时，Lua 从 Native 搜索路径定位统一构建入口产出的 build/native/flywow_hotupgrade_native.so。宿主先在 composition root 初始化 Controller 并确认成功，再创建受管理业务 Service。业务 Service 可先在文件顶部 require 公开入口，并在 register_service() 前调用 hotupgrade.require() 声明初始模块；此时 Service 尚未登记，不会获取 Controller handle 或执行 Controller RPC。Service 登记后首次加载未声明模块时，hotupgrade.require() 会向 Controller 申请许可并在加载后登记；等待首次登记结果、Controller 响应或同一 State 的同模块首次加载也可能 yield。调用会在等待完成后返回模块表；缓存命中且已声明的模块通常直接返回。Controller handle 仅在首次实际需要 RPC 时通过原生 skynet.uniqueservice() 获取并缓存。register_service() 会发送登记 RPC，必须在可 yield 的 Skynet 协程内调用。管理 State 无需登记为业务目标。
 
 patch_path 必须存在且可读取。root_path 是已存在的宿主项目根目录，service_path 是它下面已存在的相对 Service 目录；拒绝绝对路径、空路径段、.、..、反斜杠和符号链接目录。目录允许多级，例如 service/battle。
 
@@ -270,7 +270,7 @@ end
 
 构建函数接收现存 state，只准备闭包，不修改线上状态。update_state() 不接收参数、不返回候选状态，在 Update 同步提交阶段直接修改现存 state。嵌套赋值、共享引用、循环引用和赋 nil 删除字段均遵循普通 Lua 语义；未修改字段自然保留，不生成候选状态、不递归合并。
 
-replace_functions 只列出需要替换的现有业务函数；未列出的函数保持原样，新函数捕获原 state。update_state、非空 replace_functions、非空 new_modules 至少提供一项。旧 migrate / functions 字段不再接受。
+replace_functions 只列出需要替换的现有业务函数；未列出的函数保持原样，新函数捕获原 state。update_state、非空 replace_functions、非空 new_modules 至少提供一项。
 
 准备阶段保存旧状态快照和旧函数。提交前先标记 touched，再调用 update_state()，随后安装 replace_functions，最后执行 after_upgrade。部分写入抛错及后续失败沿现有 Abort 恢复；恢复失败报告 RECOVERY_REQUIRED，结束本批后仍释放入口。迁移运行错误在 Update 提交时发现。成功 Finish 后清理快照。
 
@@ -279,7 +279,7 @@ replace_functions 只列出需要替换的现有业务函数；未列出的函�
 - snapshot(state)：返回与线上可变数据隔离的旧状态快照，可将特殊对象编码为普通表。
 - restore(state, old_state)：恢复现存状态及特殊业务对象；返回 false 或抛错表示恢复失败。
 
-service_update.commit 已删除，不保留兼容。构建、更新、快照、恢复和检查都必须同步，不得 yield、执行外部 I/O 或产生不可撤销副作用；不得替换整个线上状态根表。框架不提供安全沙箱。
+构建、更新、快照、恢复和检查都必须同步，不得 yield、执行外部 I/O 或产生不可撤销副作用；不得替换整个线上状态根表。框架不提供安全沙箱。
 
 ## 发布生命周期、文件部署与恢复
 
@@ -301,7 +301,11 @@ while true do
 end
 ~~~
 
-begin 建立批次后立即返回 batch_id，由 Controller 的原有协程继续发布。排空和 PREPARE 窗口继续接纳依赖，创建、登记和首次加载完成或取消后，由原有完成回调唤醒发布协程；完成通知只唤醒，不自动关闭门禁。协程恢复后重新检查批次、计数和新增目标，没有定时扫描或轮询排空。遗漏登记或取消会持续等待，不自动清理记录。重复 begin 返回 HU_UPGRADE_BUSY。
+Controller 从 begin 到终态复用同一个 batch。load_patch(batch) 将冻结源码和初次匹配目标直接写入该记录，Prepare 重匹配复用原目标对象。batch.phase 是唯一保存的发布进度，门禁直接读取活动批次。status 的 lifecycle.phase 和 recovery_required 保持现有字段及取值，由当前和最近终态批次推导；新批次进行中仍保留最近终态的恢复诊断。
+
+每个目标 Lua State 使用一个 transaction 持有 Service Patch 提交内容、恢复快照和 module_stage。相同对象沿内部调用链保持名称，Abort、Finish 和控制异常共用事务结束操作。输入在首次可信边界检查，内部不重复校验没有变化的数据；Service Patch 返回值、自定义快照和候选导出在产生处检查，执行 import_state 后才再次检查候选图。跨 yield 后的来源、许可、缓存身份和模块代码可能改变的状态仍在使用处核对。
+
+begin 建立批次后立即返回 batch_id，由 Controller 的原有协程继续发布。排空和 PREPARE 窗口继续接纳依赖，创建、登记和首次加载完成或取消后，由原有完成回调唤醒发布协程；完成通知只唤醒，不自动关闭门禁。协程恢复后重新检查在途计数，并重新匹配新增目标，没有定时扫描或轮询排空。遗漏登记或取消会持续等待，不自动清理记录。重复 begin 返回 HU_UPGRADE_BUSY。
 
 正式顺序为：
 
@@ -323,7 +327,7 @@ prepare/update/finish 是正常目标控制 RPC，abort 用于失败恢复。没
 
 Finish 发生在新版文件和全部 Update 已确认成功之后。某个 Finish 失败或结果不明时，继续尝试其余目标，逐项报告收尾错误并结束本批；不回滚已经 Finish 的目标，也不撤回新版文件。批量更新不承诺严格跨 Service 原子性。
 
-status 不带 batch_id 返回生命周期概览；带 batch_id 还返回当前或最近终态 record。begin 接受后的异步检查、更新和恢复错误均保存在 record.error。只保留活动及最近批次，不持久化历史。target_count 在 Prepare 期间随重新匹配更新，进入 Update 前确定最终目标数；success/failed 统计参与目标的逐项结果；整批已恢复的失败中，其他参与目标以 HU_BATCH_ABORTED 表示已尝试恢复。
+status 不带 batch_id 返回生命周期概览；带 batch_id 还返回当前或最近终态 record。begin 接受后的异步检查、更新和恢复错误均保存在 record.error。只保留活动及最近批次，不持久化历史。target_service_count 在 Prepare 期间随重新匹配更新，进入 Update 前确定最终目标 Service 数；succeeded_service_count/failed_service_count 分别统计成功和失败的目标 Service，service_results 保存参与控制的逐 Service 结果；整批已恢复的失败中，其他参与目标以 HU_BATCH_ABORTED 表示已尝试恢复。
 
 ### 失败报告与后续发布
 

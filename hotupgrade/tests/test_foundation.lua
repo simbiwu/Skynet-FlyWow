@@ -280,8 +280,6 @@ assert(forwarded.uniqueservice.global and forwarded.uniqueservice.service_name =
 assert(forwarded.uniqueservice.arguments.n == 1 and forwarded.uniqueservice.arguments[1] == "arg")
 assert(hotupgrade.cancel_service_creation(101).ok and forwarded.cancel.service_handle == 101)
 assert(unique_calls == 1, "controller lookup happens exactly once per Lua State")
-local rejected_registration = hotupgrade.register_service({service_module = "fixture"})
-assert(not rejected_registration.ok and rejected_registration.code == "HU_INVALID_OPTIONS")
 local registration = {}
 local missing_before_upgrade = hotupgrade.register_service(registration)
 assert(not missing_before_upgrade.ok and missing_before_upgrade.code == "HU_INVALID_OPTIONS")

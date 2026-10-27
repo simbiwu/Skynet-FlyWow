@@ -172,9 +172,9 @@ function M.stage(module_patches, module_loaders)
             if entry.live.export_state and candidate.import_state then
                 local snapshot = M.snapshot_state(entry.live.export_state())
                 assert(candidate.import_state(snapshot) ~= false, "模块拒绝状态导入")
+                -- 导入钩子可能改变候选导出；只在执行过该钩子后重新检查。
+                check_exports(candidate, entry.name)
             end
-            -- import_state 属于受信钩子，但可能改变候选导出图；提交前重新验证最终图。
-            check_exports(candidate, entry.name)
             entry.candidate = candidate
             entry.chunk = nil
         end

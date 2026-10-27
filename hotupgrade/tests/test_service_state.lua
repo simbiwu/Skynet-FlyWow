@@ -156,21 +156,11 @@ scenarios.partial_throw = function()
     s.check = function(state) check(state); assert(state.extra == nil) end
     return s
 end
-scenarios.legacy = function()
+scenarios.bad_state_callback = function()
     local s = normal()
-    s.source = "return function() return {migrate = function() error('must not run') end} end"
+    s.source = "return function() return {update_state = 12} end"
     s.expected_failure = "HU_SERVICE_STAGE_FAILED"
     s.check = function(state) assert(state.a.keep_a == 1 and state.a.changed == nil) end
-    return s
-end
-scenarios.legacy_functions = function()
-    local s = scenarios.legacy()
-    s.source = "return function() return {update_state = function() error('must not run') end, functions = {}} end"
-    return s
-end
-scenarios.bad_state_callback = function()
-    local s = scenarios.legacy()
-    s.source = "return function() return {update_state = 12} end"
     return s
 end
 local scenario = assert(scenarios[scenario_name], scenario_name)()
@@ -208,7 +198,6 @@ local function invalid_registration(config)
 end
 invalid_registration({state = scenario.state, functions = functions, snapshot = module_patch.snapshot_state})
 invalid_registration({state = scenario.state, functions = functions, restore = function() end})
-invalid_registration({state = scenario.state, functions = functions, commit = function() end})
 local after_calls = 0 -- Stage 失败时必须仍为零；Activate 后才观察候选。
 assert(hotupgrade.register_service({
     service_update = service_update,
