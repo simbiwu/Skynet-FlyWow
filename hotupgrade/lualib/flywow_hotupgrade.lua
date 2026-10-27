@@ -12,10 +12,9 @@ local M =
 local module_state =
 {
     hotupgrade_handle = nil, -- 首次跨 Service RPC 时取得；宿主必须先完成控制面初始化。
-    registered            = false,                            -- Controller 已确认首次登记；配置建立早于此确认。
-    registration_complete = false,                            -- 首次登记 RPC 已返回；失败后不得继续本 State 的业务启动。
-    registration_waiters  = {},                               -- 首次登记 RPC 期间的声明等待者，避免遗漏初始元数据快照。
-    registration          = nil,                              -- 本 Lua State 登记配置；私有表和函数不发送给 Controller。
+    registration_config  = nil,                              -- 本 Lua State 的回调配置；登记结果单独保存在 registration_result。
+    registration_result  = nil,                              -- nil 表示无最终结果；配置存在时为 RPC 在途，true/false 表示登记成功/失败。
+    registration_waiters  = {},                               -- 登记 RPC 期间等待最终结果的首次 require 协程。
     active_batch          = nil,                              -- 当前批次的恢复数据保留至 finish/abort 确认完成。
     completed_sequence    = 0,                                -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
     last_batch_id         = nil,                              -- 最近完成的批次，用于 finish/abort 幂等响应。
@@ -131,7 +130,7 @@ local function restore_service(batch)
         return
     end
 
-    local service_update = module_state.registration.service_update
+    local service_update = module_state.registration_config.service_update
     -- 自定义恢复只处理 Service 自己的对象；即使它失败也继续尝试还原函数字段。
     local restore_succeeded, restore_failure = pcall(function()
         if batch.service_patch.old_state then
@@ -201,7 +200,7 @@ end
 ---@return FlyWowHotUpgradeServicePatchState service_patch 本 State 的提交内容及恢复快照；准备失败抛出异常，由控制入口转换为 FlyWowResult。
 local function stage_service_patch(service_patch_source)
     -- 执行受信 Patch 构建函数并校验结果；此时尚不写入线上状态。
-    local service_update = module_state.registration.service_update
+    local service_update = module_state.registration_config.service_update
     local chunk = assert(load(hotupgrade_common.normalize_source(service_patch_source), "=Service Patch", "t", _G))
     local build_patch = chunk()
     assert(type(build_patch) == "function", "Service Patch 必须返回构建函数")
@@ -321,7 +320,7 @@ local function prepare_batch(request)
     }
     M.patching = true
 
-    local prepare_succeeded, prepare_result = pcall(module_state.registration.before_upgrade)
+    local prepare_succeeded, prepare_result = pcall(module_state.registration_config.before_upgrade)
 
     if not prepare_succeeded then
         return flywow_result.failure("HU_PREPARE_FAILED", tostring(prepare_result))
@@ -372,7 +371,7 @@ local function update_batch(batch, request)
     end
     local activation_succeeded, activation_failure = pcall(function()
         if service_patch then
-            local service_update = module_state.registration.service_update
+            local service_update = module_state.registration_config.service_update
             service_patch.touched = true
             if service_patch.update_state then
                 service_patch.update_state()
@@ -383,8 +382,8 @@ local function update_batch(batch, request)
             end
         end
 
-        if module_state.registration.after_upgrade then
-            assert(module_state.registration.after_upgrade() ~= false, "after_upgrade 拒绝更新")
+        if module_state.registration_config.after_upgrade then
+            assert(module_state.registration_config.after_upgrade() ~= false, "after_upgrade 拒绝更新")
         end
     end)
 
@@ -504,7 +503,7 @@ end
 ---@return FlyWowResult<nil> 登记结果
 function M.register_service(registration)
     -- 先验证回调与可选更新入口合同；检查完成前不安装 dispatch 或登记状态。
-    if module_state.registration then
+    if module_state.registration_config then
         return flywow_result.failure("HU_DUPLICATE_SERVICE", "当前 State 已登记")
     end
 
@@ -541,7 +540,7 @@ function M.register_service(registration)
     end
 
     -- 合同有效后固定本地登记配置并安装接收器，再向 Controller 登记元数据。
-    module_state.registration = registration
+    module_state.registration_config = registration
     skynet.dispatch("hotupgrade", dispatch_upgrade_command)
     -- 收集完整模块声明并排序，形成跨 Service 传递的稳定元数据快照。
     local names = {}
@@ -555,20 +554,19 @@ function M.register_service(registration)
         modules = names,
         has_service_update = service_update ~= nil,
     }
-    local registration_call_succeeded, registration_result = pcall(
+    local registration_call_succeeded, registration_response = pcall(
         skynet.call, get_hotupgrade_handle(), "hotupgrade", "register", metadata)
     -- 发布登记 RPC 的最终结果，再唤醒等待首次 require 的协程。
-    module_state.registration_complete = true
-    module_state.registered = registration_call_succeeded and registration_result.ok == true
+    module_state.registration_result = registration_call_succeeded and registration_response.ok == true
     for _, thread in ipairs(module_state.registration_waiters) do
         skynet.wakeup(thread)
     end
     module_state.registration_waiters = {}
     -- RPC 失败可能意味着 Controller 已登记；保持本 State 配置，要求宿主终止未 READY 的启动。
     if not registration_call_succeeded then
-        return flywow_result.failure("HU_RPC_FAILED", tostring(registration_result))
+        return flywow_result.failure("HU_RPC_FAILED", tostring(registration_response))
     end
-    return registration_result
+    return registration_response
 end
 
 --- 执行一次首次加载与登记；许可、缓存和本地声明构成同一恢复边界，失败先回退再抛出原错误。
@@ -593,7 +591,7 @@ local function load_and_register_module(name, module_identity, new_module_contex
         module_declaration_added = false,       -- 只撤销本次新增的本地模块声明。
     }
     local load_succeeded, load_failure = pcall(function()
-        if module_state.registration and not module_state.declared_modules[canonical_name] and not register_new_module then
+        if module_state.registration_config and not module_state.declared_modules[canonical_name] and not register_new_module then
             local answer = skynet.call(get_hotupgrade_handle(), "hotupgrade",
                 "begin_module_load", {name = canonical_name})
             assert(answer.ok, tostring(answer.code) .. ": " .. tostring(answer.message))
@@ -694,13 +692,14 @@ require_module = function(name, module_identity)
     end
 
     -- 当前 State 已进入首次登记时先等待 Controller 结果，避免声明越过登记快照。
-    if module_state.registration and not module_state.registered then
-        if not module_state.registration_complete then
+    if module_state.registration_config then
+        if module_state.registration_result == nil then
             local thread = coroutine.running()
             module_state.registration_waiters[#module_state.registration_waiters + 1] = thread
             skynet.wait(thread)
         end
-        assert(module_state.registered, "HU_SERVICE_NOT_REGISTERED: 首次登记失败，须终止本次启动")
+        assert(module_state.registration_result == true,
+            "HU_SERVICE_NOT_REGISTERED: 首次登记失败，须终止本次启动")
     end
 
     -- 同一规范路径首次加载串行化，等待者完成后重新检查缓存和声明。

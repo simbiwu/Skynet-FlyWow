@@ -211,6 +211,9 @@ local unique_calls = 0
 local last_loaded_value
 local new_module_registrations = {}
 local active_new_module_batch
+local pause_service_registration   = false -- 让 Service 登记 RPC 暂停，制造其他协程并发 require 的窗口。
+local fail_service_registration    = false -- 模拟登记 RPC 失败，检查等待者醒来后会拒绝加载。
+local registration_wake_results    = {}    -- 记录测试调度器唤醒协程后的执行结果。
 local forwarded = {}
 local control_dispatch
 local control_answer
@@ -229,10 +232,23 @@ package.loaded.skynet =
     retpack = function(answer) control_answer = answer end,
     pack = function() end,
     unpack = function() end,
+    wait = function(thread)
+        assert(thread == coroutine.running())
+        coroutine.yield()
+    end,
+    wakeup = function(thread)
+        registration_wake_results[thread] = table.pack(coroutine.resume(thread))
+    end,
     getenv = function() return "build/hotupgrade-tests/host" end,
     call = function(hotupgrade_service_handle, _protocol, command, request)
         assert(hotupgrade_service_handle == 99)
         if command == "register" then
+            if pause_service_registration then
+                coroutine.yield()
+            end
+            if fail_service_registration then
+                error("injected service registration RPC failure")
+            end
             return {ok = true}
         elseif command == "newservice" or command == "uniqueservice" then
             forwarded[command] = request
@@ -248,8 +264,11 @@ package.loaded.skynet =
             return {ok = true, value = {permit_id = id}}
         elseif command == "register_module" then
             assert(permits[request.permit_id] == request.name)
-            assert(package.loaded.hotupgrade_extra == package.loaded[request.name])
-            last_loaded_value = package.loaded.hotupgrade_extra
+            assert(package.loaded[request.name] ~= nil)
+            if request.name == "lualib.hotupgrade_extra" then
+                assert(package.loaded.hotupgrade_extra == package.loaded[request.name])
+                last_loaded_value = package.loaded.hotupgrade_extra
+            end
             if fail_registration == "rpc" then
                 error("injected registration RPC failure")
             elseif fail_registration == "register" then
@@ -294,8 +313,33 @@ registration.service_update = false
 local invalid_service_update = hotupgrade.register_service(registration)
 assert(not invalid_service_update.ok and invalid_service_update.code == "HU_INVALID_OPTIONS")
 registration.service_update = nil
-local registered = hotupgrade.register_service(registration)
+local registration_module_path = "build/hotupgrade-tests/host/lualib/hotupgrade_registration_waiter.lua"
+local registration_module_file = assert(io.open(registration_module_path, "wb"))
+assert(registration_module_file:write("return {value = function() return 7 end}"))
+assert(registration_module_file:close())
+pause_service_registration = true
+local registered
+local registration_thread = coroutine.create(function()
+    registered = hotupgrade.register_service(registration)
+end)
+assert(coroutine.resume(registration_thread) and coroutine.status(registration_thread) == "suspended")
+pause_service_registration = false
+local registration_module
+local registration_waiter = coroutine.create(function()
+    registration_module = hotupgrade.require("hotupgrade_registration_waiter")
+end)
+assert(coroutine.resume(registration_waiter) and coroutine.status(registration_waiter) == "suspended")
+assert(begin_count == 0, "登记结果未确定前 require 不应申请普通模块许可")
+assert(coroutine.resume(registration_thread) and coroutine.status(registration_thread) == "dead")
 assert(registered.ok, tostring(registered.code) .. ": " .. tostring(registered.message))
+local registration_wake_result = registration_wake_results[registration_waiter]
+assert(registration_wake_result and registration_wake_result[1]
+    and coroutine.status(registration_waiter) == "dead")
+assert(registration_module.value() == 7 and begin_count == 1)
+print("HOTUPGRADE_SERVICE_REGISTRATION_WAIT_OK")
+assert(os.remove(registration_module_path))
+package.loaded.hotupgrade_registration_waiter = nil
+package.loaded["lualib.hotupgrade_registration_waiter"] = nil
 local function target_control(command, sequence, extra)
     local request = {batch_id = "fixture:" .. sequence, sequence = sequence, modules = {}}
     for name, value in pairs(extra or {}) do
@@ -450,6 +494,36 @@ for _, name in ipairs({"hotupgrade_new_dependency", "hotupgrade_new_rules", "hot
     assert(os.remove("build/hotupgrade-tests/host/lualib/" .. name .. ".lua"))
 end
 registration.service_update = nil
+
+-- 新 Lua State 的登记 RPC 失败后，已等待的首次 require 必须醒来并拒绝加载。
+local registration_module_file = assert(io.open(registration_module_path, "wb"))
+assert(registration_module_file:write("return {value = function() return 7 end}"))
+assert(registration_module_file:close())
+local isolated_hotupgrade = assert(loadfile("hotupgrade/lualib/flywow_hotupgrade.lua", "t", _ENV))()
+fail_service_registration = true
+pause_service_registration = true
+local failed_registration
+local failed_registration_thread = coroutine.create(function()
+    failed_registration = isolated_hotupgrade.register_service({before_upgrade = function() return true end})
+end)
+assert(coroutine.resume(failed_registration_thread) and coroutine.status(failed_registration_thread) == "suspended")
+pause_service_registration = false
+local failed_require_error
+local failed_require_thread = coroutine.create(function()
+    local loaded, failure = pcall(isolated_hotupgrade.require, "hotupgrade_registration_waiter")
+    assert(not loaded)
+    failed_require_error = failure
+end)
+local begin_count_before_failed_registration = begin_count
+assert(coroutine.resume(failed_require_thread) and coroutine.status(failed_require_thread) == "suspended")
+assert(coroutine.resume(failed_registration_thread) and coroutine.status(failed_registration_thread) == "dead")
+assert(failed_registration.code == "HU_RPC_FAILED")
+local failed_wake_result = registration_wake_results[failed_require_thread]
+assert(failed_wake_result and failed_wake_result[1] and coroutine.status(failed_require_thread) == "dead")
+assert(tostring(failed_require_error):find("HU_SERVICE_NOT_REGISTERED", 1, true))
+assert(begin_count == begin_count_before_failed_registration)
+assert(os.remove(registration_module_path))
+print("HOTUPGRADE_SERVICE_REGISTRATION_FAILURE_OK")
 package.path = original_path
 print("HOTUPGRADE_FOUNDATION_LIFECYCLE_OK")
 print("HOTUPGRADE_FOUNDATION_OK")

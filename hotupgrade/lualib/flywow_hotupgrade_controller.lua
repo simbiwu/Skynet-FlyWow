@@ -16,9 +16,7 @@ local M =
     service_creations              = nil,                 -- Service handle 到创建记录的索引；用于匹配早到的 register。
     early_exit_handles             = nil,                 -- 原生创建尚未返回时收到的退出 handle；创建调用收敛后立即清空。
     service_registration_waiters   = nil,                 -- 等待原生 Service handle 建立映射的登记协程；映射完成后唤醒。
-    pending_service_count          = nil,                 -- 尚未完成创建或首次登记的受管理 Service 数；归零后批次可重匹配并完成 Prepare 收口。
     module_load_permits            = nil,                 -- 许可 ID 到来源 Service/模块名的映射；登记或取消时移除。
-    pending_module_count           = nil,                 -- 尚未完成登记或取消的普通模块首次加载许可数；全部完成后才能关闭 Update 门禁。
     module_permit_sequence         = nil,                 -- 本 Controller 内递增的许可序号，用于生成不重复的许可 ID。
     batch_sequence                 = nil,                 -- 本 Controller 生命周期内递增的批次序号，用来拒绝迟到控制消息。
     lifecycle_gate_waiters         = nil,                 -- Update 起等待创建或首次模块加载的协程，终态时统一唤醒。
@@ -30,8 +28,6 @@ local M =
 ---@class FlyWowHotUpgradeController
 ---@field root_path string 已解析的宿主目录；正式文件读取、部署和恢复共用此根。
 ---@field service_registrations table<integer, FlyWowHotUpgradeRegisteredService> 按真实 Service handle 索引的登记信息。
----@field pending_service_count integer 已受理但尚未结束的 Service 创建/登记数。
----@field pending_module_count integer 已取得许可但尚未登记或取消的普通模块首次加载数。
 ---@field active_batch? FlyWowHotUpgradeBatch 当前唯一活动批次。
 ---@field last_batch? FlyWowHotUpgradeBatch 最近结束并供 status 查询的批次。
 
@@ -228,9 +224,7 @@ function M.initialize(controller_config)
         service_creations             = {},                                             -- 按 Service handle 索引创建记录；用于匹配早到的 register。
         early_exit_handles            = {},                                             -- 记录原生创建返回前收到的退出 handle；对应创建结果收敛后清除。
         service_registration_waiters  = {},                                             -- 保存等待 register 来源与原生 handle 匹配的协程；映射变化时唤醒重查。
-        pending_service_count         = 0,                                              -- 尚未完成登记或取消的受管理 Service 数；归零后批次可继续重匹配。
         module_load_permits           = {},                                             -- 按许可 ID 保存 Service handle 与模块名；登记、取消或 Service 退出时消费。
-        pending_module_count          = 0,                                              -- 尚未完成登记或取消的普通模块首次加载许可数；归零后批次可关闭 Update 门禁。
         module_permit_sequence        = 0,                                              -- 本 Controller 内递增的许可序号；生成不复用的首次加载许可 ID。
         batch_sequence                = 0,                                              -- 本 Controller 内递增的批次序号；生成批次身份并拒绝迟到控制消息。
         lifecycle_gate_waiters        = {},                                             -- 保存因 Update 门禁暂停的创建/首次加载协程；批次终态后统一唤醒。
@@ -251,7 +245,7 @@ function M.initialize(controller_config)
     return flywow_result.success()
 end
 
---- 结束一条受管理创建记录，移除 handle 索引并递减在途计数，通知批次与登记等待者。
+--- 结束一条受管理创建记录，移除创建事实与 handle 索引，通知批次和登记等待者。
 ---@param creation FlyWowHotUpgradeServiceCreation 待释放的 Controller 创建记录
 ---@return nil
 function M:finish_creation(creation)
@@ -260,7 +254,6 @@ function M:finish_creation(creation)
         if creation.service_handle then
             self.service_creations[creation.service_handle] = nil
         end
-        self.pending_service_count = self.pending_service_count - 1
         self:wake_batch()
         self:wake_registration()
 
@@ -299,7 +292,6 @@ function M:on_service_exit(service_handle)
     for permit_id, permit in pairs(self.module_load_permits) do
         if permit.service_handle == service_handle then
             self.module_load_permits[permit_id] = nil
-            self.pending_module_count = self.pending_module_count - 1
             if service_registration then
                 service_registration.loading_modules[permit.module_name] = nil
             end
@@ -386,8 +378,8 @@ local function valid_service_creation_request(request, source)
         and (request.global == nil or type(request.global) == "boolean")
 end
 
---- 已通过门禁和参数检查的共同创建过程；原生调用可能 yield，计数保留至登记完成。
----@param self FlyWowHotUpgradeController 保存创建记录和在途计数的唯一控制面
+--- 已通过门禁和参数检查的共同创建过程；原生调用可能 yield，创建记录保留至登记完成。
+---@param self FlyWowHotUpgradeController 保存受管理 Service 创建记录的控制面
 ---@param request FlyWowHotUpgradeServiceCreationRequest 已校验的创建请求
 ---@param source integer 已校验的真实创建者来源
 ---@param unique_name? string 仅本地唯一入口在内部传入的逻辑预留名
@@ -402,7 +394,6 @@ local function start_service(self, request, source, unique_name)
         native_create_returned = false,                -- 原生 newservice 返回后置 true；与业务登记完成分开。
     }
     self.pending_creations[creation] = creation
-    self.pending_service_count = self.pending_service_count + 1
 
     -- 打包参数的 n 保留包括中间 nil 在内的完整签名；启动行约束仍由原生 Skynet 决定。
     local create_succeeded, service_handle_or_failure = pcall(function()
@@ -577,7 +568,6 @@ function M:begin_module_load(request, source)
         module_name    = request.name, -- 与 Service 本地 loading_modules 对应的规范模块名。
     }
     service_registration.loading_modules[request.name] = permit_id
-    self.pending_module_count = self.pending_module_count + 1
     return flywow_result.success({permit_id = permit_id})
 end
 
@@ -610,7 +600,6 @@ function M:complete_module_load(request, source, cancel)
 
     self.module_load_permits[request.permit_id] = nil
     service_registration.loading_modules[request.name] = nil
-    self.pending_module_count = self.pending_module_count - 1
     self:wake_batch()
     return flywow_result.success()
 end
@@ -888,9 +877,9 @@ end
 --- 等待 begin 前或 Prepare 期间已受理的创建/首次加载收敛；通过完成回调唤醒而非轮询。
 ---@param controller FlyWowHotUpgradeController 当前唯一控制面
 ---@param batch FlyWowHotUpgradeBatch 正在等待的批次
----@return nil 可能 yield；在途计数归零后返回。
+---@return nil 可能 yield；创建和模块许可记录全部清空后返回。
 local function wait_for_batch_work(controller, batch)
-    while controller.pending_service_count > 0 or controller.pending_module_count > 0 do
+    while next(controller.pending_creations) ~= nil or next(controller.module_load_permits) ~= nil do
         batch.waiter = coroutine.running()
         skynet.wait(batch.waiter)
         batch.waiter = nil
@@ -1149,11 +1138,11 @@ function M:run_batch(batch)
     complete_batch(self, batch)
 end
 
---- 在途创建/首次加载计数全部归零后唤醒批次；最终关闭入口由 run_batch 在 Prepare 收口后执行。
+--- 创建和模块许可记录全部清空后唤醒批次；最终关闭入口由 run_batch 在 Prepare 收口后执行。
 ---@return nil
 function M:wake_batch()
     local batch = self.active_batch
-    if batch and batch.waiter and self.pending_service_count == 0 and self.pending_module_count == 0 then
+    if batch and batch.waiter and next(self.pending_creations) == nil and next(self.module_load_permits) == nil then
         skynet.wakeup(batch.waiter)
     end
 end
@@ -1262,12 +1251,21 @@ function M:handle_command(command, request, source)
         if self.active_batch and lifecycle_batch.phase == "PUBLISH_DECIDED" and lifecycle_batch.error then
             recovery_required = lifecycle_batch.error.code == "HU_RECOVERY_REQUIRED"
         end
+        -- 对外保留在途数量，但每次从唯一事实表统计，不另存同步计数。
+        local pending_service_count = 0
+        for _ in pairs(self.pending_creations) do
+            pending_service_count = pending_service_count + 1
+        end
+        local pending_module_count = 0
+        for _ in pairs(self.module_load_permits) do
+            pending_module_count = pending_module_count + 1
+        end
         local lifecycle =
         {
             phase = phase,
             batch_id = lifecycle_batch and lifecycle_batch.batch_id,
-            pending_service_count = self.pending_service_count,
-            pending_module_count = self.pending_module_count,
+            pending_service_count = pending_service_count,
+            pending_module_count = pending_module_count,
             active_batch_id = self.active_batch and self.active_batch.batch_id,
             recovery_required = recovery_required,
         }
