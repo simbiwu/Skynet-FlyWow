@@ -16,7 +16,7 @@ local module_state =
     registration_complete = false,                            -- 首次登记 RPC 已返回；失败后不得继续本 State 的业务启动。
     registration_waiters  = {},                               -- 首次登记 RPC 期间的声明等待者，避免遗漏初始元数据快照。
     registration          = nil,                              -- 本 Lua State 登记配置；私有表和函数不发送给 Controller。
-    active_transaction    = nil,                              -- 当前事务的撤销数据保留至 finish/abort 确认完成。
+    active_batch          = nil,                              -- 当前批次的恢复数据保留至 finish/abort 确认完成。
     completed_sequence    = 0,                                -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
     last_batch_id         = nil,                              -- 最近完成的批次，用于 finish/abort 幂等响应。
     declared_modules      = {},                               -- 规范名到首次加载名/路径的记录；声明与候选执行共用。
@@ -29,13 +29,13 @@ local module_state =
 ---@field batch_id string 当前 Controller 批次身份；写入 register_new_module 请求。
 ---@field names table<string, boolean> 已核验的新模块规范名集合；阻止候选加载未声明依赖。
 
----@class FlyWowHotUpgradeTransaction
+---@class FlyWowHotUpgradeServiceBatch
 ---@field batch_id string Controller 为本次发布生成的身份；用于拒绝其他批次的控制命令。
 ---@field sequence integer Controller 单调递增的本地序号；finish/abort 后写入 completed_sequence。
----@field phase? string nil 表示 Update 尚未开始，之后为 STAGED 或 ACTIVATED；Finish/Abort 结束时事务本身被清除。
+---@field phase? string nil 表示 Update 尚未开始，之后为 STAGED 或 ACTIVATED；Finish/Abort 结束时批次记录本身被清除。
 ---@field new_module_context? FlyWowHotUpgradeNewModuleContext Update 中的临时声明权限；候选 Stage 完成后立即清除。
 ---@field module_stage? FlyWowHotUpgradeModuleStage 候选模块的旧/新导出记录；保留至 Finish 或 Abort。
----@field service_patch? FlyWowHotUpgradeServicePatchTransaction Service 私有状态与函数的提交/恢复记录。
+---@field service_patch? FlyWowHotUpgradeServicePatchState Service 私有状态与函数的提交/恢复记录。
 
 local require_module -- 公共 require 和 new_modules 复用已验证身份的同一加载流程。
 
@@ -124,62 +124,62 @@ function M.cancel_service_creation(service_handle)
 end
 
 --- 恢复 Service 私有状态和被替换的函数；Abort 调用，恢复回调失败时抛出异常供上层汇总。
----@param transaction FlyWowHotUpgradeTransaction 当前 Service 的失败事务记录
+---@param batch FlyWowHotUpgradeServiceBatch 当前 Service 本批的恢复记录
 ---@return nil 无返回值；恢复回调失败时抛出异常。
-local function restore_service(transaction)
-    if not transaction.service_patch or not transaction.service_patch.touched then
+local function restore_service(batch)
+    if not batch.service_patch or not batch.service_patch.touched then
         return
     end
 
     local service_update = module_state.registration.service_update
     -- 自定义恢复只处理 Service 自己的对象；即使它失败也继续尝试还原函数字段。
     local restore_succeeded, restore_failure = pcall(function()
-        if transaction.service_patch.old_state then
+        if batch.service_patch.old_state then
             if service_update.restore then
-                assert(service_update.restore(service_update.state, transaction.service_patch.old_state) ~= false, "Service 拒绝恢复")
+                assert(service_update.restore(service_update.state, batch.service_patch.old_state) ~= false, "Service 拒绝恢复")
             else
-                hotupgrade_module_patch.restore_state(transaction.service_patch.old_state, service_update.state)
+                hotupgrade_module_patch.restore_state(batch.service_patch.old_state, service_update.state)
             end
         end
     end)
 
-    for name, fn in pairs(transaction.service_patch.old_functions) do
+    for name, fn in pairs(batch.service_patch.old_functions) do
         rawset(service_update.functions, name, fn)
     end
 
     assert(restore_succeeded, restore_failure)
 end
 
---- 统一结束本地事务：记录终态身份、清除活动事务并重新开放 Service 业务入口。
----@param transaction FlyWowHotUpgradeTransaction 已完成 Finish/Abort 的本地事务
+--- 统一结束本地批次：记录终态身份、清除活动批次并重新开放 Service 业务入口。
+---@param batch FlyWowHotUpgradeServiceBatch 已完成 Finish/Abort 的本地批次
 ---@return nil
-local function close_transaction(transaction)
-    module_state.completed_sequence = transaction.sequence
-    module_state.last_batch_id = transaction.batch_id
-    module_state.active_transaction = nil
+local function close_batch(batch)
+    module_state.completed_sequence = batch.sequence
+    module_state.last_batch_id = batch.batch_id
+    module_state.active_batch = nil
     M.patching = false
 end
 
---- 尝试恢复 Service 状态与模块导出；无论恢复成败都结束事务并释放本地门禁。
----@param transaction FlyWowHotUpgradeTransaction 当前正在回退的本地事务
+--- 尝试恢复 Service 状态与模块导出；无论恢复成败都结束本批并释放本地门禁。
+---@param batch FlyWowHotUpgradeServiceBatch 当前正在恢复的本地批次
 ---@return FlyWowResult<nil> 成功表示本地恢复完成；失败以 HU_RECOVERY_REQUIRED 报告全部恢复错误。
-local function abort(transaction)
+local function abort(batch)
     -- 先尝试恢复 Service 私有状态，再恢复模块导出；一个失败也继续另一项。
     local errors = {}
-    local service_restore_succeeded, service_restore_failure = pcall(restore_service, transaction)
+    local service_restore_succeeded, service_restore_failure = pcall(restore_service, batch)
     if not service_restore_succeeded then
         errors[#errors + 1] = tostring(service_restore_failure)
     end
 
-    if transaction.module_stage then
-        local restored = hotupgrade_module_patch.abort(transaction.module_stage)
+    if batch.module_stage then
+        local restored = hotupgrade_module_patch.abort(batch.module_stage)
         if not restored.ok then
             errors[#errors + 1] = restored.message
         end
     end
 
-    -- 本批尽力恢复后释放事务与临时门禁；错误只通过结果报告。
-    close_transaction(transaction)
+    -- 尽力恢复后清除本地批次并开放临时门禁；错误只通过结果报告。
+    close_batch(batch)
     if #errors > 0 then
         return flywow_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
     end
@@ -191,14 +191,14 @@ end
 ---@field update_state? fun() 在 Update 提交时直接修改构建函数捕获的现存 state；不得 yield 或产生外部副作用。
 ---@field replace_functions? table<string, function> 本次要替换的现有业务函数；未列出的字段保持原样。
 
----@class FlyWowHotUpgradeServicePatchTransaction: FlyWowHotUpgradeServicePatchDefinition
+---@class FlyWowHotUpgradeServicePatchState: FlyWowHotUpgradeServicePatchDefinition
 ---@field old_functions table<string, function> 本次替换前的函数；Abort 时逐项装回原业务函数表。
 ---@field old_state? table 提交前的隔离状态快照；只有 update_state 存在时保存。
 ---@field touched boolean 提交开始写入业务状态或函数前置 true，失败时据此恢复。
 
 --- 在业务安全点加载构建函数并保存恢复数据；只准备回调，不执行状态更新。
 ---@param service_patch_source string Controller 已完成语法检查的 Service Patch 源码
----@return FlyWowHotUpgradeServicePatchTransaction service_patch 本 State 的提交内容及恢复快照；准备失败抛出异常，由控制入口转换为 FlyWowResult。
+---@return FlyWowHotUpgradeServicePatchState service_patch 本 State 的提交内容及恢复快照；准备失败抛出异常，由控制入口转换为 FlyWowResult。
 local function stage_service_patch(service_patch_source)
     -- 执行受信 Patch 构建函数并校验结果；此时尚不写入线上状态。
     local service_update = module_state.registration.service_update
@@ -229,7 +229,7 @@ local function stage_service_patch(service_patch_source)
         or (patch_definition.new_modules and next(patch_definition.new_modules)), "Service Patch 没有更新内容")
 
     -- 保存本次可能替换的旧函数，Activate 失败时逐字段恢复。
-    ---@type FlyWowHotUpgradeServicePatchTransaction
+    ---@type FlyWowHotUpgradeServicePatchState
     local service_patch =
     {
         update_state      = patch_definition.update_state,      -- 本 State 的提交回调，不发送给 Controller。
@@ -259,13 +259,13 @@ local function stage_service_patch(service_patch_source)
 end
 
 --- 构建 Service Patch 并加载登记 new_modules；清单也必须覆盖这些模块尚未登记的依赖。
----@param transaction FlyWowHotUpgradeTransaction 当前 Update 事务；其中的 batch_id 限定新模块归属
+---@param batch FlyWowHotUpgradeServiceBatch 当前 Update 批次记录；其中的 batch_id 限定新模块归属
 ---@param service_patch_source? string Controller 已部署并发送的目标 Service .patch 文件内容；未匹配 Patch 时为 nil
----@return FlyWowResult<FlyWowHotUpgradeServicePatchTransaction|nil> 加载/登记可能 yield；成功返回提交记录或 nil，失败清除上下文并报告 HU_ 错误码。
-local function stage_service_patch_and_new_modules(transaction, service_patch_source)
+---@return FlyWowResult<FlyWowHotUpgradeServicePatchState|nil> 加载/登记可能 yield；成功返回提交记录或 nil，失败清除上下文并报告 HU_ 错误码。
+local function stage_service_patch_and_new_modules(batch, service_patch_source)
     -- 清单保留到普通候选 Stage 结束；未声明的新依赖立即失败，不能申请普通许可后与本批 Update 互等。
-    local new_module_context = {owner = coroutine.running(), batch_id = transaction.batch_id, names = {}}
-    transaction.new_module_context = new_module_context
+    local new_module_context = {owner = coroutine.running(), batch_id = batch.batch_id, names = {}}
+    batch.new_module_context = new_module_context
     local failure_code = "HU_SERVICE_STAGE_FAILED"
     local stage_succeeded, service_patch_or_error = pcall(function()
         if not service_patch_source then
@@ -292,7 +292,7 @@ local function stage_service_patch_and_new_modules(transaction, service_patch_so
     end)
     if not stage_succeeded then
         local cause = type(service_patch_or_error) == "table" and service_patch_or_error.ok == false and service_patch_or_error or nil
-        transaction.new_module_context = nil
+        batch.new_module_context = nil
         return flywow_result.failure(failure_code,
             cause and cause.message or tostring(service_patch_or_error), cause and {cause_code = cause.code} or nil)
     end
@@ -305,15 +305,15 @@ end
 ---| "abort"
 ---| "finish"
 
---- 建立本批本地事务并关闭新业务入口，再通过业务自己的 queue 等待安全点；before_upgrade 可 yield。
+--- 为本批建立 Service 本地记录并关闭新业务入口，再通过业务自己的 queue 等待安全点；before_upgrade 可 yield。
 ---@param request FlyWowHotUpgradeControlRequest Controller 已核验身份的 Prepare 请求
----@return FlyWowResult<nil> 回调失败或未确认安全点时保留事务，交由现有 Abort 收尾
-local function prepare_transaction(request)
-    if module_state.active_transaction then
+---@return FlyWowResult<nil> 回调失败或未确认安全点时保留批次记录，交由现有 Abort 收尾
+local function prepare_batch(request)
+    if module_state.active_batch then
         return flywow_result.failure("HU_UPGRADE_BUSY", "当前批次已在处理中")
     end
 
-    module_state.active_transaction =
+    module_state.active_batch =
     {
         batch_id = request.batch_id,
         sequence = request.sequence,
@@ -334,15 +334,15 @@ local function prepare_transaction(request)
 end
 
 --- 准备候选并同步提交模块、Service 状态与函数；仅新模块加载/登记阶段可能 yield。
----@param transaction FlyWowHotUpgradeTransaction Prepare 已建立的当前事务
+---@param batch FlyWowHotUpgradeServiceBatch Prepare 已建立的本地批次
 ---@param request FlyWowHotUpgradeControlRequest 本批冻结的普通候选及可选 Service Patch 源码
----@return FlyWowResult<nil> 成功将事务设为 ACTIVATED；失败保留恢复记录，交由 Abort 处理
-local function update_transaction(transaction, request)
-    if transaction.phase ~= nil then
+---@return FlyWowResult<nil> 成功将批次记录设为 ACTIVATED；失败保留恢复记录，交由 Abort 处理
+local function update_batch(batch, request)
+    if batch.phase ~= nil then
         return flywow_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
     -- Controller 在 Prepare 收口时已固定普通候选；new_modules 在这里才首次加载并登记，从下一批 Stage 起才会匹配。
-    local service_patch_result = stage_service_patch_and_new_modules(transaction, request.service_patch_source)
+    local service_patch_result = stage_service_patch_and_new_modules(batch, request.service_patch_source)
     if not service_patch_result.ok then
         return service_patch_result
     end
@@ -351,7 +351,7 @@ local function update_transaction(transaction, request)
     -- 保留同一声明上下文直到候选模块执行结束，漏列的新依赖须立即失败，不能在 UPDATE 等许可。
     local stage_succeeded, module_result = pcall(hotupgrade_module_patch.stage,
         request.modules, module_state.declared_modules)
-    transaction.new_module_context = nil
+    batch.new_module_context = nil
     if not stage_succeeded then
         local cause = type(module_result) == "table" and module_result.ok == false and module_result or nil
         return flywow_result.failure("HU_MODULE_STAGE_FAILED",
@@ -361,12 +361,12 @@ local function update_transaction(transaction, request)
         return module_result
     end
 
-    transaction.module_stage = module_result.value.stage
-    transaction.service_patch = service_patch
-    transaction.phase = "STAGED"
+    batch.module_stage = module_result.value.stage
+    batch.service_patch = service_patch
+    batch.phase = "STAGED"
 
     -- Activate 同步提交；失败先报告，再由 Controller 串行 Abort 整批目标。
-    local commit_result = hotupgrade_module_patch.commit(transaction.module_stage)
+    local commit_result = hotupgrade_module_patch.commit(batch.module_stage)
     if not commit_result.ok then
         return flywow_result.failure("HU_ACTIVATE_FAILED", commit_result.message)
     end
@@ -393,29 +393,29 @@ local function update_transaction(transaction, request)
         return flywow_result.failure("HU_ACTIVATE_FAILED", tostring(activation_failure))
     end
 
-    transaction.phase = "ACTIVATED"
+    batch.phase = "ACTIVATED"
     return flywow_result.success()
 end
 
---- 仅收尾已完成 Activate 的事务；释放候选快照并重新开放业务，不执行回滚。
----@param transaction FlyWowHotUpgradeTransaction 当前 Service 事务
+--- 仅收尾已完成 Activate 的批次记录；释放候选快照并重新开放业务，不执行回滚。
+---@param batch FlyWowHotUpgradeServiceBatch 当前 Service 本地批次
 ---@return FlyWowResult<nil> 模块快照清理结果；未 Activate 时返回 HU_PHASE_INVALID
-local function finish_transaction(transaction)
-    if transaction.phase ~= "ACTIVATED" then
+local function finish_batch(batch)
+    if batch.phase ~= "ACTIVATED" then
         return flywow_result.failure("HU_PHASE_INVALID", "当前阶段不能执行 finish")
     end
-    local finished = hotupgrade_module_patch.finish(transaction.module_stage)
-    close_transaction(transaction)
+    local finished = hotupgrade_module_patch.finish(batch.module_stage)
+    close_batch(batch)
     return finished
 end
 
---- 核验 Controller 来源、命令和批次，再分派本 Service 的事务阶段；不在此处执行各阶段细节。
+--- 核验 Controller 来源、命令和批次，再分派本 Service 的批次记录阶段；不在此处执行各阶段细节。
 ---@param command FlyWowHotUpgradeServiceCommand Controller Service 分发的稳定控制命令
 ---@param request FlyWowHotUpgradeControlRequest 当前批次和序号；Update 另含本目标模块及可选 Service Patch 源码
 ---@param source integer 由 Skynet 提供的真实调用来源
 ---@return FlyWowResult<nil> Prepare/Update/Abort 可能 yield；阶段错误原样返回，异常交由 dispatch_upgrade_command 转换。
 local function handle_upgrade(command, request, source)
-    -- 先核验 Controller 来源；批次身份由 Controller 生成，再与本地事务记录比对。
+    -- 先核验 Controller 来源；批次身份由 Controller 生成，再与本地批次记录比对。
     if source ~= module_state.hotupgrade_handle then
         return flywow_result.failure("HU_UNAUTHORIZED", "控制来源不匹配")
     end
@@ -428,34 +428,34 @@ local function handle_upgrade(command, request, source)
         return flywow_result.success()
     end
 
-    if request.sequence <= module_state.completed_sequence or (module_state.active_transaction and module_state.active_transaction.batch_id ~= request.batch_id) then
-        return flywow_result.failure("HU_STALE_TRANSACTION", "过期或冲突批次命令")
+    if request.sequence <= module_state.completed_sequence or (module_state.active_batch and module_state.active_batch.batch_id ~= request.batch_id) then
+        return flywow_result.failure("HU_STALE_BATCH", "过期或冲突批次命令")
     end
 
     if command == "prepare" then
-        return prepare_transaction(request)
+        return prepare_batch(request)
     end
 
-    local transaction = module_state.active_transaction
-    if not transaction or transaction.sequence ~= request.sequence then
-        return flywow_result.failure("HU_STALE_TRANSACTION", "未取得本批次安全点")
+    local batch = module_state.active_batch
+    if not batch or batch.sequence ~= request.sequence then
+        return flywow_result.failure("HU_STALE_BATCH", "未取得本批次安全点")
     end
 
     if command == "abort" then
-        return abort(transaction)
+        return abort(batch)
     end
 
     if command == "update" then
-        return update_transaction(transaction, request)
+        return update_batch(batch, request)
     end
     if command == "finish" then
-        return finish_transaction(transaction)
+        return finish_batch(batch)
     end
 
     return flywow_result.failure("HU_PHASE_INVALID", "当前阶段不能执行 " .. tostring(command))
 end
 
---- 执行目标控制命令并回复 RPC；命令可 yield，异常时按发布决定前后分别恢复或释放事务。
+--- 执行目标控制命令并回复 RPC；命令可 yield，异常时按发布决定前后分别恢复或释放批次记录。
 ---@param session integer 原生 RPC 会话；0 表示无需回复
 ---@param source integer 原生消息来源，由 handle_upgrade 核验 Controller 身份
 ---@param command FlyWowHotUpgradeServiceCommand 当前控制命令
@@ -466,18 +466,18 @@ local function dispatch_upgrade_command(session, source, command, request)
     if not control_succeeded then
         -- 异常也必须结束本批；Finish 已越过发布决定，只释放快照而不回滚。
         local original = flywow_result.failure("HU_CONTROL_FAILED", tostring(control_result))
-        local transaction = module_state.active_transaction
-        if transaction and command ~= "finish" then
-            control_result = abort(transaction)
+        local batch = module_state.active_batch
+        if batch and command ~= "finish" then
+            control_result = abort(batch)
             if control_result.ok then
                 control_result = original
             else
                 control_result.details = {original_error = original}
             end
         else
-            if transaction then
-                if transaction.module_stage then hotupgrade_module_patch.finish(transaction.module_stage) end
-                close_transaction(transaction)
+            if batch then
+                if batch.module_stage then hotupgrade_module_patch.finish(batch.module_stage) end
+                close_batch(batch)
             end
             control_result = original
         end
@@ -492,7 +492,7 @@ end
 ---@field state table 现存 Service 私有状态表；更新只改其字段，不替换该表。
 ---@field functions table Service 原有业务函数表；Patch 只替换本次列出的现有函数字段。
 ---@field snapshot? fun(state:table):table 更新前生成与线上对象隔离的恢复快照；与 restore 成对提供。
----@field restore? fun(state:table, old_state:table) 提交失败时同步恢复快照；返回 false 或抛错报告恢复失败，仍结束本批事务。
+---@field restore? fun(state:table, old_state:table) 提交失败时同步恢复快照；返回 false 或抛错报告恢复失败，仍结束本批次记录。
 
 ---@class FlyWowHotUpgradeRegistration
 ---@field service_update? FlyWowHotUpgradeServiceUpdate 可选 Service 内部状态/函数更新入口
@@ -684,8 +684,8 @@ end
 require_module = function(name, module_identity)
     -- 入口已固定模块身份；等待和加载后的缓存/来源检查保留在实际变化点。
     local canonical_name = module_identity.canonical_name
-    local transaction = module_state.active_transaction
-    local new_module_context = transaction and transaction.new_module_context
+    local batch = module_state.active_batch
+    local new_module_context = batch and batch.new_module_context
     local in_new_module_context = new_module_context and new_module_context.owner == coroutine.running()
     local register_new_module = in_new_module_context and new_module_context.names[canonical_name] == true
     if in_new_module_context and not module_state.declared_modules[canonical_name] and not register_new_module then

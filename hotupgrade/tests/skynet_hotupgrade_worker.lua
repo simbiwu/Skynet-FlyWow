@@ -45,6 +45,7 @@ function business.save()
 end
 local original_save = business.save
 
+--- 按场景配置 Service 更新回调与故障注入，再登记本测试 Service。
 local function initialize(request)
     worker_test_config = request
     local service_update = {state = service_state, functions = business}
@@ -73,7 +74,7 @@ local function initialize(request)
             value.nested.count = next_state.nested.count
         end
     end
-    -- 在接收真实事务消息时退出，验证 Controller 对原生退出与 RPC 失败交错的处理。
+    -- 在接收真实热更控制消息时退出，验证 Controller 对原生退出与 RPC 失败交错的处理。
     if worker_test_config.exit_command then
         local dispatch = skynet.dispatch
         skynet.dispatch = function(protocol, callback)

@@ -543,7 +543,7 @@ MASTER_V1_OK
 
 ---
 
-# 第二部分：亲手发布 V2，再沿完整事务进入 Controller
+# 第二部分：亲手发布 V2，再沿完整批次记录进入 Controller
 
 ## 第 5 章：为什么复制一个 `player_logic.lua` 还不够
 
@@ -1240,19 +1240,19 @@ function M:step(batch, service_target, command)
 end
 ```
 
-Prepare 只需要 `batch_id`、`sequence` 等事务身份，不发送完整模块源码。Update 才另外携带本目标的冻结模块源码及可选 Service Patch 源码。目标 handle 来自已登记的真实 Service 身份，不是凭文件名猜测出来的。
+Prepare 只需要 `batch_id`、`sequence` 等批次身份，不发送完整模块源码。Update 才另外携带本目标的冻结模块源码及可选 Service Patch 源码。目标 handle 来自已登记的真实 Service 身份，不是凭文件名猜测出来的。
 
-**接收方在哪里？** `hotupgrade/lualib/flywow_hotupgrade.lua` → `register_service()` 安装的 `dispatch_upgrade_command()` → `handle_upgrade(command,request,source)` → `prepare_transaction(request)`。当收到 Prepare 时：
+**接收方在哪里？** `hotupgrade/lualib/flywow_hotupgrade.lua` → `register_service()` 安装的 `dispatch_upgrade_command()` → `handle_upgrade(command,request,source)` → `prepare_batch(request)`。当收到 Prepare 时：
 
-**【真实源码摘录】** `flywow_hotupgrade.lua` → `prepare_transaction(request)`：
+**【真实源码摘录】** `flywow_hotupgrade.lua` → `prepare_batch(request)`：
 
 ```lua
-local function prepare_transaction(request)
-    if module_state.active_transaction then
+local function prepare_batch(request)
+    if module_state.active_batch then
         return flywow_result.failure("HU_UPGRADE_BUSY", "当前批次已在处理中")
     end
 
-    module_state.active_transaction =
+    module_state.active_batch =
     {
         batch_id = request.batch_id,
         sequence = request.sequence,
@@ -1378,21 +1378,21 @@ end
 | 受管理普通首次加载门禁               | 关闭；新请求等待本批终态                      |
 | 本批普通模块 Stage                   | 尚未开始                                      |
 
-这里必须接受一个短暂的、受控的版本窗口：磁盘文件已更新，而旧 Service 内存尚未更新。但是已经 Prepare 的目标业务入口仍关闭；新 Service 创建和普通首次加载也被 Controller 门禁阻挡。失败时才有条件按当前事务的恢复顺序回滚文件和目标。
+这里必须接受一个短暂的、受控的版本窗口：磁盘文件已更新，而旧 Service 内存尚未更新。但是已经 Prepare 的目标业务入口仍关闭；新 Service 创建和普通首次加载也被 Controller 门禁阻挡。失败时才有条件按当前批次记录的恢复顺序回滚文件和目标。
 
 ### 第 7.8 节：第三跳——目标 Update RPC 到达 PlayerService
 
-现在 Controller 在 update_batch_targets() 循环调用 `controller:step(batch,service_target,"update")`。`M:step()` 将 `service_target.modules` 和 `service_target.service_patch.service_patch_source` 放进请求，通过 `skynet.call` 发送给 PlayerService。这里的 `service_patch_source` 是 `.patch` 文件内容，不是文件路径。Controller 协程等待这个 RPC 结果；目标所在 Lua State 由 dispatch_upgrade_command() 进入 handle_upgrade("update")，完成公共校验后分派到 update_transaction(transaction,request)。
+现在 Controller 在 update_batch_targets() 循环调用 `controller:step(batch,service_target,"update")`。`M:step()` 将 `service_target.modules` 和 `service_target.service_patch.service_patch_source` 放进请求，通过 `skynet.call` 发送给 PlayerService。这里的 `service_patch_source` 是 `.patch` 文件内容，不是文件路径。Controller 协程等待这个 RPC 结果；目标所在 Lua State 由 dispatch_upgrade_command() 进入 handle_upgrade("update")，完成公共校验后分派到 update_batch(batch,request)。
 
-**【真实源码摘录】** `hotupgrade/lualib/flywow_hotupgrade.lua` → `update_transaction()`，从准备到提交的连续逻辑：
+**【真实源码摘录】** `hotupgrade/lualib/flywow_hotupgrade.lua` → `update_batch()`，从准备到提交的连续逻辑：
 
 ```lua
-local function update_transaction(transaction, request)
-    if transaction.phase ~= nil then
+local function update_batch(batch, request)
+    if batch.phase ~= nil then
         return flywow_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
     -- Controller 在 Prepare 收口时已固定普通候选；new_modules 在这里才首次加载并登记，从下一批 Stage 起才会匹配。
-    local service_patch_result = stage_service_patch_and_new_modules(transaction, request.service_patch_source)
+    local service_patch_result = stage_service_patch_and_new_modules(batch, request.service_patch_source)
     if not service_patch_result.ok then
         return service_patch_result
     end
@@ -1401,7 +1401,7 @@ local function update_transaction(transaction, request)
     -- 保留同一声明上下文直到候选模块执行结束，漏列的新依赖须立即失败，不能在 UPDATE 等许可。
     local stage_succeeded, module_result = pcall(hotupgrade_module_patch.stage,
         request.modules, module_state.declared_modules)
-    transaction.new_module_context = nil
+    batch.new_module_context = nil
     if not stage_succeeded then
         local cause = type(module_result) == "table" and module_result.ok == false and module_result or nil
         return flywow_result.failure("HU_MODULE_STAGE_FAILED",
@@ -1411,12 +1411,12 @@ local function update_transaction(transaction, request)
         return module_result
     end
 
-    transaction.module_stage = module_result.value.stage
-    transaction.service_patch = service_patch
-    transaction.phase = "STAGED"
+    batch.module_stage = module_result.value.stage
+    batch.service_patch = service_patch
+    batch.phase = "STAGED"
 
     -- Activate 同步提交；失败先报告，再由 Controller 串行 Abort 整批目标。
-    local commit_result = hotupgrade_module_patch.commit(transaction.module_stage)
+    local commit_result = hotupgrade_module_patch.commit(batch.module_stage)
     if not commit_result.ok then
         return flywow_result.failure("HU_ACTIVATE_FAILED", commit_result.message)
     end
@@ -1443,7 +1443,7 @@ local function update_transaction(transaction, request)
         return flywow_result.failure("HU_ACTIVATE_FAILED", tostring(activation_failure))
     end
 
-    transaction.phase = "ACTIVATED"
+    batch.phase = "ACTIVATED"
     return flywow_result.success()
 end
 ```
@@ -1456,7 +1456,7 @@ end
 4. 执行 `update_state()`、替换 `operations.attack` 等函数字段。
 5. 同步执行 `after_upgrade()` 检查；成功则返回 `{ok=true}`。
 
-这里沿调用链固定两个名字：`transaction` 是当前 PlayerService 从 Prepare 保留到 Finish/Abort 的本地事务；`service_patch` 是本次准备好的 Service 提交内容及恢复快照，返回后存入 `transaction.service_patch`。执行 .patch 构建函数得到的 `patch_definition` 属于首次接收的业务输入，stage_service_patch() 检查它后，提取 update_state、replace_functions、new_modules，并保存 old_state、old_functions、touched。准备结果直接持有这些字段，提交时使用 service_patch.update_state 访问同一份提交回调。普通模块 Stage 的返回操作结果叫 `module_result`，其中真正的暂存记录存入 `transaction.module_stage`；这两者分别是操作结果和恢复数据，不是同一对象的改名。
+这里沿调用链固定两个名字：`batch` 是当前 PlayerService 从 Prepare 保留到 Finish/Abort 的本地批次记录；`service_patch` 是本次准备好的 Service 提交内容及恢复快照，返回后存入 `batch.service_patch`。执行 .patch 构建函数得到的 `patch_definition` 属于首次接收的业务输入，stage_service_patch() 检查它后，提取 update_state、replace_functions、new_modules，并保存 old_state、old_functions、touched。准备结果直接持有这些字段，提交时使用 service_patch.update_state 访问同一份提交回调。普通模块 Stage 的返回操作结果叫 `module_result`，其中真正的暂存记录存入 `batch.module_stage`；这两者分别是操作结果和恢复数据，不是同一对象的改名。
 
 本课程 V2 的第 1 步成功登记 `combat_rules`，第 2 步才执行 `player_logic` 候选；候选文件顶部依赖 `combat_rules`，这时已经可以从本 State 加载结果中复用。**第 2 步不会对刚刚首次登记的 `combat_rules` 再 Stage 一次**，因为本批普通模块目标集合早已在 Controller 中冻结。
 
@@ -1471,7 +1471,7 @@ end
 我们现在仍在 **旧 PlayerService 的 Lua State**。Controller 的发布协程正在等待 `skynet.call(player,"hotupgrade","update",...)` 返回，而 PlayerService 的 `handle_upgrade("update")` 刚刚做完 Service Patch 构建、`new_modules` 登记，即将调用：
 
 ```lua
--- 真实调用位置：flywow_hotupgrade.lua / update_transaction(transaction, request)。
+-- 真实调用位置：flywow_hotupgrade.lua / update_batch(batch, request)。
 local stage_succeeded, module_result = pcall(hotupgrade_module_patch.stage,
     request.modules, module_state.declared_modules)
 ```
@@ -1616,7 +1616,7 @@ module_stage.entries[1]
 
 ## 第 11 章：Commit 为什么不把 `package.loaded` 指到 candidate？
 
-**调用者**：Stage 返回 `{ok=true,stage=...}` 到 PlayerService 的 `handle_upgrade("update")`，该函数把记录保存到 `transaction.module_stage`，然后调用 `hotupgrade_module_patch.commit(transaction.module_stage)`。我们在这里再次进入模块引擎。
+**调用者**：Stage 返回 `{ok=true,stage=...}` 到 PlayerService 的 `handle_upgrade("update")`，该函数把记录保存到 `batch.module_stage`，然后调用 `hotupgrade_module_patch.commit(batch.module_stage)`。我们在这里再次进入模块引擎。
 
 **【真实源码摘录】** `flywow_hotupgrade_module_patch.lua` → `M.commit()` 中验证与安装逻辑：
 
@@ -1705,7 +1705,7 @@ end
 
 这张表是**依据代码推导的阶段快照**，不是声称这些中间状态都能通过普通业务 RPC 直接读取。恰恰因为 `hot.patching=true`，此时业务入口不应该能随意观察和修改中间状态。
 
-`after_upgrade()` 返回 true 后，本地 `transaction.phase="ACTIVATED"`，目标 RPC 成功返回 Controller。**Update 的成功不等于 Finish**，因为如果后面其他目标 Update 失败，Controller 仍需要使用旧快照向已经更新成功的目标发送 Abort。
+`after_upgrade()` 返回 true 后，本地 `batch.phase="ACTIVATED"`，目标 RPC 成功返回 Controller。**Update 的成功不等于 Finish**，因为如果后面其他目标 Update 失败，Controller 仍需要使用旧快照向已经更新成功的目标发送 Abort。
 
 ## 第 13 章：回到 Controller，了解 PUBLISH_DECIDED 与 Finish
 
@@ -1732,37 +1732,37 @@ end
 
 `PUBLISH_DECIDED` 的含义：正式文件和全部目标 Update 已经确认成功，Controller 作出发布决定。随后逐个 Finish，不再采取整批回滚，因为此前成功 Finish 的目标可能已释放旧快照并开放业务。
 
-再跟踪 Finish 的接收方。`M:step` 再次 `skynet.call` 目标 → PlayerService `dispatch_upgrade_command()` → `handle_upgrade("finish")` → `finish_transaction(transaction)`：
+再跟踪 Finish 的接收方。`M:step` 再次 `skynet.call` 目标 → PlayerService `dispatch_upgrade_command()` → `handle_upgrade("finish")` → `finish_batch(batch)`：
 
-**【真实源码摘录】** `flywow_hotupgrade.lua/finish_transaction()`：
+**【真实源码摘录】** `flywow_hotupgrade.lua/finish_batch()`：
 
 ```lua
-local function finish_transaction(transaction)
-    if transaction.phase ~= "ACTIVATED" then
+local function finish_batch(batch)
+    if batch.phase ~= "ACTIVATED" then
         return flywow_result.failure("HU_PHASE_INVALID", "当前阶段不能执行 finish")
     end
-    local finished = hotupgrade_module_patch.finish(transaction.module_stage)
-    close_transaction(transaction)
+    local finished = hotupgrade_module_patch.finish(batch.module_stage)
+    close_batch(batch)
     return finished
 end
 ```
 
-Finish 中调用的 `close_transaction(transaction)` 定义在同一个 `flywow_hotupgrade.lua`，仍运行在 PlayerService 的 Lua State。进入它时，模块引擎已经完成本次 Finish；它负责结束本地事务和开放业务，返回后 finish_transaction() 将结果交回 handle_upgrade()，再由 dispatch_upgrade_command() 回复 Controller。
+Finish 中调用的 `close_batch(batch)` 定义在同一个 `flywow_hotupgrade.lua`，仍运行在 PlayerService 的 Lua State。进入它时，模块引擎已经完成本次 Finish；它负责结束本地批次记录和开放业务，返回后 finish_batch() 将结果交回 handle_upgrade()，再由 dispatch_upgrade_command() 回复 Controller。
 
-**【真实源码摘录】** 同文件 `close_transaction()` 的完整实现：
+**【真实源码摘录】** 同文件 `close_batch()` 的完整实现：
 
 ```lua
-local function close_transaction(transaction)
-    module_state.completed_sequence = transaction.sequence
-    module_state.last_batch_id = transaction.batch_id
-    module_state.active_transaction = nil
+local function close_batch(batch)
+    module_state.completed_sequence = batch.sequence
+    module_state.last_batch_id = batch.batch_id
+    module_state.active_batch = nil
     M.patching = false
 end
 ```
 
-Abort 和控制异常也调用同一函数结束本地事务，避免不同出口分别维护序号、活动事务和 patching。
+Abort 和控制异常也调用同一函数清理本地批次记录，避免不同出口分别维护序号、活动批次记录和 patching。
 
-`module_patch.finish()` 释放记录中保留的旧导出与候选引用；然后清理 Service 本地事务，将 `patching=false`，新业务可以进入 queue。Controller 收到 Finish 回复，保存 `last_batch`、释放 `active_batch` 并唤醒生命周期门禁等待者。管理端的 `status(batch_id)` 最终读到 `COMPLETED`，我们 `run_normal()` 才继续创建第二个 PlayerService。
+`module_patch.finish()` 释放记录中保留的旧导出与候选引用；然后清理 Service 本地批次记录，将 `patching=false`，新业务可以进入 queue。Controller 收到 Finish 回复，保存 `last_batch`、释放 `active_batch` 并唤醒生命周期门禁等待者。管理端的 `status(batch_id)` 最终读到 `COMPLETED`，我们 `run_normal()` 才继续创建第二个 PlayerService。
 
 **这就闭合了第一条完整发布链路**：
 
@@ -1772,11 +1772,11 @@ main/publish (管理 Service)
        └─ fork run_batch
             ├─ 等在途创建与加载
             ├─ 冻结完整 Patch、保存旧文件、匹配目标
-            ├─ RPC prepare → dispatch_upgrade_command → handle_upgrade → prepare_transaction → before_upgrade → queue 安全点
+            ├─ RPC prepare → dispatch_upgrade_command → handle_upgrade → prepare_batch → before_upgrade → queue 安全点
             ├─ 等在途依赖、最终重匹配
             ├─ batch.phase=UPDATE（关闭普通生命周期门禁）
             ├─ 部署完整 .lua → skynet.cache.clear
-            ├─ RPC update → dispatch_upgrade_command → handle_upgrade → update_transaction
+            ├─ RPC update → dispatch_upgrade_command → handle_upgrade → update_batch
             │    ├─ stage_service_patch_and_new_modules → require_module → load_and_register_module → register_new_module RPC
             │    ├─ module_patch.stage → live/old/candidate
             │    ├─ module_patch.commit → 原地覆盖普通模块根表字段
@@ -1784,7 +1784,7 @@ main/publish (管理 Service)
             │    ├─ replace_functions → 更新业务函数表字段
             │    └─ after_upgrade → 结果返回 Controller
             ├─ PUBLISH_DECIDED
-            └─ RPC finish → dispatch_upgrade_command → handle_upgrade → finish_transaction → module_patch.finish → patching=false
+            └─ RPC finish → dispatch_upgrade_command → handle_upgrade → finish_batch → module_patch.finish → patching=false
 main/status → COMPLETED → 验证旧 Service → 创建新 Service 并验证 V2
 ```
 
@@ -1804,15 +1804,15 @@ Controller 只有发布终态才放开门禁，而发布终态又依赖这个 Up
 1. Controller 先把本批完整 `.lua` 放入正式宿主目录并清理缓存，使 `combat_rules.lua` 确实能被搜索和加载。
 2. PlayerService 在 Update 期间通过 Service Patch 的 `new_modules` 声明获得受控的新模块登记通道；这条通道不申请普通首次加载许可。
 
-**实际调用者**：`flywow_hotupgrade.lua/handle_upgrade("update")` 分派到 `update_transaction()`，再调用 `stage_service_patch_and_new_modules(transaction,request.service_patch_source)`。后者先调用 stage_service_patch() 执行 Service Patch 构建函数，取得 `new_modules={"combat_rules"}`。清单中的每项在准备时解析身份，规范名直接填入 new_module_context.names，解析结果按声明顺序保存到 new_module_identities；随后调用私有 `require_module(identity.name, identity)` 复用这些已确认的身份。公共 `M.require(name)` 仍负责检查新调用的模块名、解析身份，再进入同一个加载流程。
+**实际调用者**：`flywow_hotupgrade.lua/handle_upgrade("update")` 分派到 `update_batch()`，再调用 `stage_service_patch_and_new_modules(batch,request.service_patch_source)`。后者先调用 stage_service_patch() 执行 Service Patch 构建函数，取得 `new_modules={"combat_rules"}`。清单中的每项在准备时解析身份，规范名直接填入 new_module_context.names，解析结果按声明顺序保存到 new_module_identities；随后调用私有 `require_module(identity.name, identity)` 复用这些已确认的身份。公共 `M.require(name)` 仍负责检查新调用的模块名、解析身份，再进入同一个加载流程。
 
 **【真实源码摘录】** `flywow_hotupgrade.lua` → `stage_service_patch_and_new_modules()` 中新模块清单处理逻辑：
 
 ```lua
-local function stage_service_patch_and_new_modules(transaction, service_patch_source)
+local function stage_service_patch_and_new_modules(batch, service_patch_source)
     -- 清单保留到普通候选 Stage 结束；未声明的新依赖立即失败，不能申请普通许可后与本批 Update 互等。
-    local new_module_context = {owner = coroutine.running(), batch_id = transaction.batch_id, names = {}}
-    transaction.new_module_context = new_module_context
+    local new_module_context = {owner = coroutine.running(), batch_id = batch.batch_id, names = {}}
+    batch.new_module_context = new_module_context
     local failure_code = "HU_SERVICE_STAGE_FAILED"
     local stage_succeeded, service_patch_or_error = pcall(function()
         if not service_patch_source then
@@ -1839,7 +1839,7 @@ local function stage_service_patch_and_new_modules(transaction, service_patch_so
     end)
     if not stage_succeeded then
         local cause = type(service_patch_or_error) == "table" and service_patch_or_error.ok == false and service_patch_or_error or nil
-        transaction.new_module_context = nil
+        batch.new_module_context = nil
         return flywow_result.failure(failure_code,
             cause and cause.message or tostring(service_patch_or_error), cause and {cause_code = cause.code} or nil)
     end
@@ -1914,7 +1914,7 @@ function M.finish(module_stage)
 end
 ```
 
-Finish 只释放暂存记录，不重装旧字段。即使 Abort 已确认部分恢复失败，当前设计仍释放本批的引擎临时事务，使后续批次能够从当前状态重新开始。
+Finish 只释放暂存记录，不重装旧字段。即使 Abort 已确认部分恢复失败，当前设计仍释放本批的引擎临时批次记录，使后续批次能够从当前状态重新开始。
 
 **这一章结束时请记住四个不同层次的对象：**
 
@@ -2064,7 +2064,7 @@ Controller：Finish → patching=false → 业务恢复接纳
 | 机制                    | 所有者             | 阻挡什么                              | 谁解除                       |
 | ----------------------- | ------------------ | ------------------------------------- | ---------------------------- |
 | 业务 `business_queue`   | PlayerService      | 先前已经被接纳的串行业务              | 当前持有 queue 的任务退出    |
-| `hot.patching`          | PlayerService      | 后续新的业务入口                      | 本地 Finish/Abort 结束事务   |
+| `hot.patching`          | PlayerService      | 后续新的业务入口                      | 本地 Finish/Abort 结束批次记录   |
 | Controller 生命周期门禁 | HotUpgrade Service | 受管理 Service 创建、普通首次模块加载 | 当前发布批次结束后唤醒等待者 |
 
 `hot.patching` 不会自动暂停已进入 queue 的 B；Controller 门禁也不等同于业务 queue。只有准确区分这三者，才能判断一个 Service 到底有没有到达安全点。
@@ -2113,7 +2113,7 @@ MASTER_QUEUE_OK
 2. Controller 尽力向已经参加 Prepare 的目标发送内部 Abort。
 3. 目标尽力恢复 Service 私有状态和函数，以及普通模块导出字段；新依赖成功加载及登记后不保证被撤销。
 4. 恢复成功，批次报告 `ABORTED`；恢复失败或 Finish 收尾故障，报告 `RECOVERY_REQUIRED`。
-5. **不因为这次恢复失败永久锁定 Controller**。当前批次释放临时事务与门禁，后续正常热更可以按实际状态再次实施修复。
+5. **不因为这次恢复失败永久锁定 Controller**。当前批次释放临时批次记录与门禁，后续正常热更可以按实际状态再次实施修复。
 
 这里的“允许继续”并非宣称所有历史问题已经解决：下一批成功只能证明下一批自己成功；修复包必须真正覆盖前次遗留问题。课程下一节就要把这点写成能运行的代码，而不止讲概念。
 
@@ -2188,28 +2188,28 @@ end
 
 ### 第 18.2 节：PlayerService 的 Abort 实际恢复什么？
 
-**调用链**：Controller `M:step(...,"abort")` → PlayerService 的 `hotupgrade` dispatch → `handle_upgrade("abort")` → 同文件局部 `abort(transaction)` → `restore_service(transaction)` 与 `module_patch.abort(transaction.module_stage)`。
+**调用链**：Controller `M:step(...,"abort")` → PlayerService 的 `hotupgrade` dispatch → `handle_upgrade("abort")` → 同文件局部 `abort(batch)` → `restore_service(batch)` 与 `module_patch.abort(batch.module_stage)`。
 
-**【真实源码摘录】** `flywow_hotupgrade.lua` → 局部 `abort(transaction)` 的关键逻辑：
+**【真实源码摘录】** `flywow_hotupgrade.lua` → 局部 `abort(batch)` 的关键逻辑：
 
 ```lua
-local function abort(transaction)
+local function abort(batch)
     -- 先尝试恢复 Service 私有状态，再恢复模块导出；一个失败也继续另一项。
     local errors = {}
-    local ok, message = pcall(restore_service, transaction)
+    local ok, message = pcall(restore_service, batch)
     if not ok then
         errors[#errors + 1] = tostring(message)
     end
 
-    if transaction.module_stage then
-        local restored = hotupgrade_module_patch.abort(transaction.module_stage)
+    if batch.module_stage then
+        local restored = hotupgrade_module_patch.abort(batch.module_stage)
         if not restored.ok then
             errors[#errors + 1] = restored.message
         end
     end
 
-    -- 本批尽力恢复后释放事务与临时门禁；错误只通过结果报告。
-    close_transaction(transaction)
+    -- 本批尽力恢复后释放批次记录与临时门禁；错误只通过结果报告。
+    close_batch(batch)
     if #errors > 0 then
         return flywow_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
     end
@@ -2217,11 +2217,11 @@ local function abort(transaction)
 end
 ```
 
-它会先尝试恢复 Service 状态，再尝试恢复模块导出；**即使 Service 的恢复失败，也会继续尝试模块恢复**。最后释放事务、`patching=false`，将恢复失败通过结果报告出去。这正是我们选择“失败可继续修复，而不永久锁定”的实现。
+它会先尝试恢复 Service 状态，再尝试恢复模块导出；**即使 Service 的恢复失败，也会继续尝试模块恢复**。最后释放批次记录、`patching=false`，将恢复失败通过结果报告出去。这正是我们选择“失败可继续修复，而不永久锁定”的实现。
 
-其中 close_transaction() 就是第 13 章已经沿 Finish 调用点进入过的同一个结束函数。此时返回到 handle_upgrade(`abort`)，结果再经目标 dispatch 回复 Controller；Controller 继续下一目标的 Abort，随后形成整批终态。
+其中 close_batch() 就是第 13 章已经沿 Finish 调用点进入过的同一个结束函数。此时返回到 handle_upgrade(`abort`)，结果再经目标 dispatch 回复 Controller；Controller 继续下一目标的 Abort，随后形成整批终态。
 
-`restore_service(transaction)` 中会分别处理状态与函数字段；即使自定义状态恢复抛错，它仍会在状态恢复的 `pcall` 之后尝试把已保存的旧业务函数字段重新安装，随后报告状态恢复错误。不要把“恢复失败”误解为“一个东西也没恢复”。
+`restore_service(batch)` 中会分别处理状态与函数字段；即使自定义状态恢复抛错，它仍会在状态恢复的 `pcall` 之后尝试把已保存的旧业务函数字段重新安装，随后报告状态恢复错误。不要把“恢复失败”误解为“一个东西也没恢复”。
 
 ## 第 19 章：准备确定会失败的 `faulty` 批次
 
@@ -2567,7 +2567,7 @@ MASTER_FORWARD_OK
 | ---------------- | -------------------------------------- | ----------------------------------------------- |
 | 正常 V2 完成     | `version=v2`、`schema=2`、`gold=100`   | Controller 正常发布、Service Update/Finish      |
 | faulty Update 后 | `schema=99`、`gold=0`                  | `faulty` Patch 的 `update_state`                |
-| faulty Abort 后  | `RECOVERY_REQUIRED`、状态仍坏          | `restore` 人为报错，但释放事务与门禁            |
+| faulty Abort 后  | `RECOVERY_REQUIRED`、状态仍坏          | `restore` 人为报错，但释放批次记录与门禁            |
 | 进入下一批 `v3`  | 不需管理端 `resolve_deployment`        | Controller 没有永久失败锁定                     |
 | V3 完成          | `version=v3`、`schema=3`、`gold=88`    | 新的完整 Lua + Service Patch 从真实状态继续修复 |
 | 新建 V3 Service  | `version=v3`、`schema=3`、`attack=125` | 使用已正式部署的 V3 Service 入口与模块          |
@@ -2662,7 +2662,7 @@ A: Update 成功，已提交 V2，但保留旧快照，patching=true
 B: Update 失败，可能已经局部修改自身状态
 Controller: 恢复文件并清缓存
 Controller: 对所有已参与目标逆序 Abort（先 B 后 A）
-A/B: 尽可能恢复各自的旧对象，释放本地事务
+A/B: 尽可能恢复各自的旧对象，释放本地批次记录
 Controller: 报告 ABORTED 或 RECOVERY_REQUIRED
 ```
 
@@ -2698,7 +2698,7 @@ Controller: 报告 ABORTED 或 RECOVERY_REQUIRED
 
 路径 `hotupgrade/native/hotupgrade_native.cpp` 是 Native 实现；它编译为 `build/native/flywow_hotupgrade_native.so`，通过 `require "flywow_hotupgrade_native"` 供 Controller 和业务入口调用。
 
-它主要提供可信路径解析、发布文件扫描与同步文件读写/替换等能力。跨多个 Service 协调 Prepare/Update/Finish 的策略在 Lua Controller 内，不应把 Native 文件接口误认为“热更事务管理器”。
+它主要提供可信路径解析、发布文件扫描与同步文件读写/替换等能力。跨多个 Service 协调 Prepare/Update/Finish 的策略在 Lua Controller 内，不应把 Native 文件接口误认为“热更批次协调器”。
 
 例如 `deploy_batch_files()` 把冻结好的 `file.source` 交给 `hotupgrade_native.replace_file()`；Native 只负责按接口合同处理该文件，**是否继续更新、失败如何 Abort、是否标记 RECOVERY_REQUIRED** 属于 Controller 的职责。
 
@@ -2745,14 +2745,14 @@ root_path：.../build/hotupgrade-master-course/host
 | Service 没被热更匹配           | `flywow_hotupgrade_controller.lua` 的 `load_patch/match_service_targets`               | 是否受管理创建、已登记、模块名和 `.patch` 路径是否匹配          |
 | 首次 `hotupgrade.require` 失败 | `flywow_hotupgrade.lua/M.require`、`resolve_module_identity`                   | 原名/规范名/真实路径/许可/缓存占用                              |
 | 一直停在 `WAITING_CREATIONS`   | Controller `run_batch/wake_batch`                                              | 在途 Service 创建或首次模块登记是否正常结束                     |
-| 一直停在 Prepare               | 目标 `prepare_transaction()`、业务 `before_upgrade`                        | 是否已有请求永久占有 queue；是否正确使用同一条 queue            |
+| 一直停在 Prepare               | 目标 `prepare_batch()`、业务 `before_upgrade`                        | 是否已有请求永久占有 queue；是否正确使用同一条 queue            |
 | 创建/首次加载在 Update 等待    | Controller `lifecycle_closed/wait_lifecycle`                                   | 是否处于预期的关门阶段，还是业务绕开了显式新模块清单            |
 | 新模块首次加载失败             | `stage_service_patch_and_new_modules`、`require_module`、Controller `register_new_module` | 是否在 `new_modules` 声明，是否当前目标、是否有并发首次加载冲突 |
 | Stage 失败                     | `flywow_hotupgrade_module_patch.lua/M.stage`                                   | 候选语法、导出根表、依赖、私有状态钩子                          |
-| Commit 或 Activate 失败        | `M.commit` 和目标 `update_transaction()`                                   | 模块身份是否稳定、Service 状态更新/回调是否抛错                 |
+| Commit 或 Activate 失败        | `M.commit` 和目标 `update_batch()`                                   | 模块身份是否稳定、Service 状态更新/回调是否抛错                 |
 | 文件部署/清缓存失败            | Controller `M:run_batch` 和 Native `replace_file`                              | 哪些文件 touched，恢复是否成功                                  |
 | Abort 失败                     | 目标 `abort/restore_service`、`module_patch.abort`                             | 具体哪份状态或模块字段没恢复                                    |
-| Finish 失败                    | Controller 的 `PUBLISH_DECIDED` 以后、目标 `finish_transaction()`          | 已有目标是否释放快照，是否进入 RECOVERY_REQUIRED                |
+| Finish 失败                    | Controller 的 `PUBLISH_DECIDED` 以后、目标 `finish_batch()`          | 已有目标是否释放快照，是否进入 RECOVERY_REQUIRED                |
 
 注意结果对象中的 `code` 和 `details.cause_code` 语义：前者通常表示当前阶段的错误类型；后者在有明确传播原因时表达内层异常根因。**不能依赖解析日志中文字符串来判断业务错误类型**。如果异常由候选代码用 `pcall` 捕获，后续另一种失败不能沿用先前已经被捕获的 `details.cause_code`。
 
@@ -2822,7 +2822,7 @@ bash hotupgrade/scripts/run_hotupgrade_tests.sh ../skynet
 7. 原 Lua 函数引用不因 module table 的字段被重写而自动重绑定；旧闭包引用仍持有自己的函数代码与 upvalue。
 8. yield 只挂起协程，不自动退出 `business_queue` 的作用域；A 必须从 queue 包裹的函数真正返回，B 才能获得执行权。
 9. A 先 Update 成功，B 仍可能 Update 失败；直到整个批次决定成功之前，A 需要保留旧字段供 Abort。
-10. Controller 释放临时事务，允许下一次从实际状态前向修复；但下一批只保证自己修改和验证的范围，未涉及问题不会神奇消失。
+10. Controller 释放临时批次记录，允许下一次从实际状态前向修复；但下一批只保证自己修改和验证的范围，未涉及问题不会神奇消失。
 
 ## 第 26 章：最后一次完整状态盘点
 

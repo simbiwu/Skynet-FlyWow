@@ -2,7 +2,7 @@
 
 贯穿 PlayerService V1/V2 发布的可运行流程见 [HotUpgrade Sample](../../hotupgrade/sample/README.md)。
 
-HotUpgrade 在现存 Skynet Service、现存 Lua State 内更新受信 Lua 代码和必要业务状态。更新保持 Service handle、模块导出表和 Service 私有状态根表的身份。普通模块提交完整新版本；可选 Service 更新脚本在同一事务内迁移私有状态并直接替换指定业务函数。
+HotUpgrade 在现存 Skynet Service、现存 Lua State 内更新受信 Lua 代码和必要业务状态。更新保持 Service handle、模块导出表和 Service 私有状态根表的身份。普通模块提交完整新版本；可选 Service 更新脚本在同一批次中迁移私有状态并直接替换指定业务函数。
 
 ## 启动与登记
 
@@ -143,7 +143,7 @@ end
 
 业务返回值和异常由业务自己定义。HotUpgrade 不管理 queue、不包装业务返回值，也不计数业务协程。queue 内的业务可以正常 yield；脱离该 queue 的协程不在排空保证范围内。
 
-register_service 必须提供 before_upgrade 函数；缺失或非函数会在登记时以 HU_INVALID_OPTIONS 拒绝。每次 Prepare 建立本地事务并设置 hot.patching=true 后都会调用该回调。回调允许 yield，必须通过上述同一个 queue 等待此前已进入的业务全部退出，例如 return business_queue(function() return true end)。Prepare 不维护额外阶段状态或比较回调前后的事务表身份；目标控制 RPC 由 Controller 串行等待；begin 接受后不允许管理端主动取消，失败时由 Controller 执行内部 Abort。只有 true 或 {ok=true} 确认业务安全点；回调失败、拒绝或异常均使 Prepare 失败，不能进入 Update。框架不轮询或超时放行业务。
+register_service 必须提供 before_upgrade 函数；缺失或非函数会在登记时以 HU_INVALID_OPTIONS 拒绝。每次 Prepare 建立本地记录并设置 hot.patching=true 后都会调用该回调。回调允许 yield，必须通过上述同一个 queue 等待此前已进入的业务全部退出，例如 return business_queue(function() return true end)。Prepare 不维护额外阶段状态或比较回调前后本地记录的表身份；目标控制 RPC 由 Controller 串行等待；begin 接受后不允许管理端主动取消，失败时由 Controller 执行内部 Abort。只有 true 或 {ok=true} 确认业务安全点；回调失败、拒绝或异常均使 Prepare 失败，不能进入 Update。框架不轮询或超时放行业务。
 
 业务 Service 的 hot.patching 与 Controller 创建/加载门禁职责不同：Prepare 设置 hot.patching 后，业务入口按现有接入方式停止新业务；此前已进入 queue 的业务仍可调用创建和首次加载 API，Controller 在 PREPARE 窗口正常处理这些依赖。
 
@@ -152,7 +152,7 @@ Prepare 期间继续使用旧宿主文件，允许正常创建和首次加载。
 普通模块 Stage 依赖 Controller 已完成的路径映射、语法检查、模块名去重与连续数组构建，不重复校验这些输入。Stage 在目标 Lua State 内检查线上及候选导出，准备隔离状态，并按输入顺序保存模块记录；每条记录集中持有线上根表、候选与旧字段，供 Commit 安装和 Abort 恢复。Commit/Abort 核对根表身份后，字段覆盖函数直接执行原地替换。
 
 
-Finish 释放旧快照并结束本地事务后将 hot.patching 设为 false。Abort 尽力恢复 Service 状态、函数和普通模块导出；无论恢复结果如何，都报告结果并释放本批事务、快照和 patching。Prepare 失败仍由本批 Abort 收尾。
+Finish 释放旧快照并清除本地批次后将 hot.patching 设为 false。Abort 尽力恢复 Service 状态、函数和普通模块导出；无论恢复结果如何，都报告结果并释放本批记录、快照并清除 patching。Prepare 失败仍由本批 Abort 收尾。
 
 ## Patch 布局与普通模块
 
@@ -179,7 +179,7 @@ Service Patch 返回表中的 `new_modules` 是普通 require 名称数组。框
 
 两类均可单独存在。每份普通模块文件必须是完整模块新版本。只改一个函数也必须保留新版仍需要的全部导出字段。提交会更新所有新字段，并删除新版已去掉的字段，原导出表和两种 package.loaded 名称的身份保持不变。
 
-模块根导出必须是无元表 table，且候选必须是新根表。顶层导出字段名必须是字符串；导出值可为函数、数字、字符串、布尔值或普通嵌套表。嵌套表不得带元表，键只能是字符串、数字或布尔值，值可使用上述类型并继续嵌套；共享引用和循环引用允许，但数据图不得直接或间接引用模块根表，否则提交后会指向候选根表。引擎不限制新旧版本同名字段的类型。提交按候选根表完整替换字段，嵌套对象不递归合并、不保证身份；缓存的旧嵌套引用仍指向旧对象，回滚恢复旧字段及其原引用。可变私有状态放在模块闭包或由 Service 持有。候选源码接收首次 hotupgrade.require 使用的原始模块名和加载路径作为两个可变参数；该记录留在本 Lua State，不使用 Controller 的规范登记名替代。候选源码中的 require 使用 Lua 原生实现，可以按普通 Lua 规则加载当前 State 尚未加载的依赖。成功加载的依赖会留在 package.loaded；即使 Stage 或后续发布步骤失败，模块更新引擎也不清理这些新依赖、不回滚它们的模块初始化状态。本次事务只回滚明确纳入更新的模块导出和状态。候选模块顶层及状态钩子仍须受信、同步，不得 yield、I/O、写全局、修改线上状态或启动任务。
+模块根导出必须是无元表 table，且候选必须是新根表。顶层导出字段名必须是字符串；导出值可为函数、数字、字符串、布尔值或普通嵌套表。嵌套表不得带元表，键只能是字符串、数字或布尔值，值可使用上述类型并继续嵌套；共享引用和循环引用允许，但数据图不得直接或间接引用模块根表，否则提交后会指向候选根表。引擎不限制新旧版本同名字段的类型。提交按候选根表完整替换字段，嵌套对象不递归合并、不保证身份；缓存的旧嵌套引用仍指向旧对象，回滚恢复旧字段及其原引用。可变私有状态放在模块闭包或由 Service 持有。候选源码接收首次 hotupgrade.require 使用的原始模块名和加载路径作为两个可变参数；该记录留在本 Lua State，不使用 Controller 的规范登记名替代。候选源码中的 require 使用 Lua 原生实现，可以按普通 Lua 规则加载当前 State 尚未加载的依赖。成功加载的依赖会留在 package.loaded；即使 Stage 或后续发布步骤失败，模块更新引擎也不清理这些新依赖、不回滚它们的模块初始化状态。本批次只回滚明确纳入更新的模块导出和状态。候选模块顶层及状态钩子仍须受信、同步，不得 yield、I/O、写全局、修改线上状态或启动任务。
 
 ### 函数引用与候选根表
 
@@ -307,7 +307,7 @@ end
 
 Controller 从 begin 到终态复用同一个 batch。load_patch(batch) 将冻结源码和初次匹配目标直接写入该记录，Prepare 重匹配复用原目标对象。batch.phase 是唯一保存的发布进度，门禁直接读取活动批次。status 的 lifecycle.pending_service_count 和 pending_module_count 分别表示尚未完成创建或登记的受管理 Service 数、尚未完成首次加载或登记的普通模块数；phase 和 recovery_required 仍由当前及最近终态批次生成，新批次进行中保留最近终态的恢复诊断。
 
-每个目标 Lua State 使用一个 transaction 持有 Service Patch 提交内容、恢复快照和 module_stage。相同对象沿内部调用链保持名称，Abort、Finish 和控制异常共用事务结束操作。输入在首次可信边界检查，内部不重复校验没有变化的数据；Service Patch 返回值、自定义快照和候选导出在产生处检查，执行 import_state 后才再次检查候选图。跨 yield 后的来源、许可、缓存身份和模块代码可能改变的状态仍在使用处核对。
+每个目标 Lua State 都保存本批次的 Service Patch 提交内容、恢复快照和 module_stage；本地记录沿内部调用链统一称为 batch。Abort、Finish 和控制异常共用同一批次收尾操作。输入在首次可信边界检查，内部不重复校验没有变化的数据；Service Patch 返回值、自定义快照和候选导出在产生处检查，执行 import_state 后才再次检查候选图。跨 yield 后的来源、许可、缓存身份和模块代码可能改变的状态仍在使用处核对。
 
 begin 建立批次后立即返回 batch_id，由 Controller 的原有协程继续发布。排空和 PREPARE 窗口继续接纳依赖，创建、登记和首次加载完成或取消后，由原有完成回调唤醒发布协程；完成通知只唤醒，不自动关闭门禁。协程恢复后重新检查在途计数，并重新匹配新增目标，没有定时扫描或轮询排空。遗漏登记或取消会持续等待，不自动清理记录。重复 begin 返回 HU_UPGRADE_BUSY。
 
@@ -341,7 +341,7 @@ status 不带 batch_id 返回生命周期概览；带 batch_id 还返回当前�
 
 begin 成功后不提供管理端主动取消。向 Controller 发送 abort 返回 HU_UNKNOWN_COMMAND，不改变活动批次；管理端使用 status 等待最终结果。内部目标控制协议的 abort 仍用于失败恢复。创建失败后的 cancel_service_creation 和首次加载失败后的 cancel_module_load 继续用于结束各自的生命周期记录，不是取消热更批次。
 
-本模块不支持 Service 替换、跨节点原子事务、运行中 coroutine 栈更新或 Native/C 热替换。业务仍需自行验证权威数据、持久化一致性和部署权限；重新执行旧 Patch 也不能恢复过去的数据库内容。
+本模块不支持 Service 替换、跨节点原子热更、运行中 coroutine 栈更新或 Native/C 热替换。业务仍需自行验证权威数据、持久化一致性和部署权限；重新执行旧 Patch 也不能恢复过去的数据库内容。
 
 ## 文件边界与验证
 

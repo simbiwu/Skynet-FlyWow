@@ -464,7 +464,7 @@ local function run_test_group()
                 assert(repaired.target_service_count == 1)
             else
                 assert(lifecycle_status(controller).phase == "IDLE")
-                -- 退出登记已删除，下一批不能继续向旧 handle 发送事务命令。
+                -- 退出登记已删除，下一批不能继续向旧 handle 发送批次命令。
                 local next_record = wait_for_batch_phase(controller, begin_update_batch(controller, "module"), "COMPLETED")
                 assert(next_record.target_service_count == 1)
             end

@@ -257,7 +257,7 @@ function M.abort(module_stage)
     return finished
 end
 
---- 确认本地模块更新结束并释放候选/旧导出快照；Service 的业务门禁由外层事务管理。
+--- 确认本地模块更新结束并释放候选/旧导出快照；Service 的业务门禁由外层批次控制。
 ---@param module_stage FlyWowHotUpgradeModuleStage 当前 State 已完成 Commit 或 Abort 的 Stage
 ---@return FlyWowResult<nil> 清理结果；不执行回滚。
 function M.finish(module_stage)

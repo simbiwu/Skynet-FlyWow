@@ -72,7 +72,7 @@ for _, link in ipairs({
     assert(listed == nil)
 end
 
--- 特殊文件和 Controller 的非法目录配置同样在启动事务前拒绝。
+-- 特殊文件和 Controller 的非法目录配置同样在启动热更前拒绝。
 local fifo = root .. "/module/special"
 assert(os.execute("mkfifo " .. fifo))
 assert(not hotupgrade_native.list_lua(root, "module"))

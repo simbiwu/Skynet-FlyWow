@@ -115,13 +115,13 @@ end
 
 ---@class FlyWowHotUpgradeServiceResult
 ---@field service_handle integer 本批结果所属业务 Service 的真实 handle
----@field hotupgrade_result FlyWowResult 该目标的事务结果
+---@field hotupgrade_result FlyWowResult 该目标的热更结果
 
 ---@class FlyWowHotUpgradeBatchStatus
 ---@field batch_id string 本批唯一身份
 ---@field phase string 本批最终或当前阶段
----@field succeeded_service_count integer 已收到成功事务结果的目标 Service 数
----@field failed_service_count integer 已收到失败事务结果的目标 Service 数
+---@field succeeded_service_count integer 已收到成功热更结果的目标 Service 数
+---@field failed_service_count integer 已收到失败热更结果的目标 Service 数
 ---@field target_service_count integer 当前匹配到的目标 Service 数；Prepare 期间可增长，Update 前确定最终数量
 ---@field current_service_handle? integer status 查询时当前或最近一次处理的业务 Service handle
 ---@field service_results FlyWowHotUpgradeServiceResult[] 各业务 Service 的处理结果
@@ -850,8 +850,8 @@ end
 --- 直接使用 Skynet 原生 call；该 RPC 可能 yield，调用失败不代表远端操作已取消，协调方仍须明确恢复。
 ---@param batch FlyWowHotUpgradeBatch 当前 Controller 正在协调的批次
 ---@param service_target FlyWowHotUpgradeServiceTarget 本次 RPC 的目标快照，handle 来自 register 消息的真实 source
----@param command string 发送给目标的事务命令
----@return FlyWowResult<nil> 目标返回的事务结果，或本地 RPC 失败结果；调用可能 yield。
+---@param command string 发送给目标的热更命令
+---@return FlyWowResult<nil> 目标返回的热更结果，或本地 RPC 失败结果；调用可能 yield。
 function M:step(batch, service_target, command)
     ---@type FlyWowHotUpgradeControlRequest
     local request =

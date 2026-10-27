@@ -199,7 +199,7 @@ assert(patch.abort(nested_stage.value.stage).ok)
 assert(nested_live.config == installed_config and nested_live.config.self == installed_config)
 assert(nested_live.helper.calculate(3) == 6)
 package.loaded[nested_name] = nil
--- 独立 Lua 验证首次声明的本地事务：许可先于模块执行，失败回退缓存/来源/声明并释放许可。
+-- 独立 Lua 验证首次模块声明的本地加载记录：许可先于模块执行，失败回退缓存/来源/声明并释放许可。
 local original_path = package.path
 package.path = "build/hotupgrade-tests/host/lualib/?.lua;" .. package.path
 local original_require = require
@@ -347,7 +347,7 @@ assert(target_control("prepare", 5).ok and target_control("update", 5).ok)
 local original_finish = patch.finish
 patch.finish = function(stage) original_finish(stage); return {ok = false, code = "HU_FIXTURE_FINISH_FAILED"} end
 assert(target_control("finish", 5).code == "HU_FIXTURE_FINISH_FAILED" and not hotupgrade.patching)
-assert(target_control("update", 5).code == "HU_STALE_TRANSACTION")
+assert(target_control("update", 5).code == "HU_STALE_BATCH")
 patch.finish = original_finish
 assert(target_control("abort", 5).ok and not hotupgrade.patching)
 assert(target_control("stage", 6).code == "HU_UNKNOWN_COMMAND")
