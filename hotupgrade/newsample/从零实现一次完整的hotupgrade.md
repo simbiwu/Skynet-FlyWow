@@ -433,9 +433,7 @@ end)
         service_creations             = {},                                             -- 按 Service handle 索引创建记录；用于匹配早到的 register。
         early_exit_handles            = {},                                             -- 记录原生创建返回前收到的退出 handle；对应创建结果收敛后清除。
         service_registration_waiters  = {},                                             -- 保存等待 register 来源与原生 handle 匹配的协程；映射变化时唤醒重查。
-        pending_service_count          = 0,                                              -- 尚未完成登记或取消的受管理 Service 数；归零后批次可继续重匹配。
         module_load_permits           = {},                                             -- 按许可 ID 保存 Service handle 与模块名；登记、取消或 Service 退出时消费。
-        pending_module_count           = 0,                                              -- 尚未完成登记或取消的普通模块首次加载许可数；归零后批次可关闭 Update 门禁。
         module_permit_sequence        = 0,                                              -- 本 Controller 内递增的许可序号；生成不复用的首次加载许可 ID。
         batch_sequence                = 0,                                              -- 本 Controller 内递增的批次序号；生成批次身份并拒绝迟到控制消息。
         lifecycle_gate_waiters        = {},                                             -- 保存因 Update 门禁暂停的创建/首次加载协程；批次终态后统一唤醒。
@@ -450,7 +448,7 @@ end)
     M.initialized = true
 ```
 
-这里不是把 controller_initial_state 交给另一个协程：初始化循环把字段和值写入模块表 M，之后各 Controller 方法通过 self 中的同名字段访问它们。service_creations 是 Service 创建记录索引：键为 skynet.newservice 返回的 Service handle，值为对应创建记录；它用于匹配早到的 register 消息，不是普通 Lua 模块集合。pending_service_count 单独统计尚未完成的创建/登记，用于批次等待创建收敛。batch_sequence 是 Controller 内部序号，具体批次记录再保存本批的 sequence，控制 RPC 继续沿用 sequence 字段。
+这里不是把 controller_initial_state 交给另一个协程：初始化循环把字段和值写入模块表 M，之后各 Controller 方法通过 self 中的同名字段访问它们。service_creations 是 Service handle 到创建记录的索引，用于匹配早到的 register；pending_creations 保存尚未完成的创建记录；module_load_permits 保存尚未完成的首次加载许可。后两张表是批次等待直接检查的事实来源，不再另存同步计数。status 对外仍返回 pending_service_count 和 pending_module_count，但每次查询时分别统计这两张表。batch_sequence 是 Controller 内部序号，具体批次记录再保存本批的 sequence，控制 RPC 继续沿用 sequence 字段。
 
 为什么不能直接 `skynet.newservice("player_service")`？因为 HotUpgrade 需要在受管理创建时建立 Service 身份记录、创建屏障和后续登记关系。否则 Controller 没有充分依据把这个 Service 纳入目标集合。
 
@@ -1132,19 +1130,33 @@ end
 
 **调用现场**：刚才 `M:begin()` fork 的协程开始执行 `self:run_batch(batch)`。在它运行之前，游戏里可能已经有其他受管理 Service 正在创建，或者某个 Service 取得了首次模块加载许可但尚未完成登记。
 
-**【真实源码摘录】** `flywow_hotupgrade_controller.lua` → `M:run_batch()` 开头的等待段：
+**【真实源码摘录】** `flywow_hotupgrade_controller.lua` → `wait_for_batch_work()`：
+
+```lua
+local function wait_for_batch_work(controller, batch)
+    while next(controller.pending_creations) ~= nil or next(controller.module_load_permits) ~= nil do
+        batch.waiter = coroutine.running()
+        skynet.wait(batch.waiter)
+        batch.waiter = nil
+    end
+end
+```
+
+`next(map) ~= nil` 表示表中至少还有一条未完成记录。批次开始和每轮 Prepare 后都会调用这个函数；只要创建记录或模块许可仍存在，当前发布协程就记录自己的 waiter 并让出执行权。创建登记/取消或模块许可登记/取消时，Controller 删除对应记录并调用 `wake_batch()`。协程恢复后重新检查两张表；两张表都为空才从等待函数返回。这里没有定时轮询，也没有单独维护在途计数。
+
+`status` 仍对外报告 `pending_service_count` 和 `pending_module_count`，但它们是查询时根据 `pending_creations` 和 `module_load_permits` 统计出来的值，不是 Controller 内部状态字段。
+
+**返回调用主线**：在 `M:run_batch()` 中，这次等待返回后先把批次标为 `DEPLOYING`，再进入冻结 Patch 和旧文件快照流程：
 
 ```lua
 wait_for_batch_work(self, batch)
 batch.phase = "DEPLOYING"
-
+local control_succeeded, control_failure = pcall(prepare_and_update_batch, self, batch)
 ```
 
-wait_for_batch_work(controller, batch) 在 run_batch() 开始和每轮 Prepare 后复用同一段等待逻辑。这个函数只重复检查两个在途计数，并通过完成通知唤醒，不做定时轮询。
+`prepare_and_update_batch()` 完成每轮 Prepare 后也会复用同一个等待函数；因此等待结束后继续重新匹配目标，全部目标准备好后才部署正式文件并执行 Update。
 
-pending_service_count 代表已受理但尚未完成登记/取消的创建；pending_module_count 代表已取得许可但尚未完成登记/取消的首次加载。发布开始时必须等这些已接纳操作收敛，避免遗漏尚未登记完成的目标。
-
-这里不再检查活动批次是否被取消或替换：begin 会拒绝并行批次，管理端主动 abort 已被取消，运行期间没有另一条路径替换 active_batch。完成回调会改变的是创建和加载计数，所以被唤醒后只重查这些实际可变的条件。
+这里不再检查活动批次是否被取消或替换：`begin` 会拒绝并行批次，管理端主动 `abort` 已被取消，运行期间没有另一条路径替换 `active_batch`。完成回调改变的是两张在途事实表，所以被唤醒后只重查这两个实际可变的条件。
 
 这段结束后，进入同一个 `run_batch` 的“冻结发布包和旧文件快照”段，Controller 读取发布包 `v2/` 下的 `.lua` 与 `.patch`，检查路径和源码，并完成初次目标匹配。
 
