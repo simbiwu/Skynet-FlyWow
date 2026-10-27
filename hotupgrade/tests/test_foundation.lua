@@ -417,10 +417,10 @@ registration.service_update = {state = {}, functions = {}}
 local declarations_before_new_modules = begin_count
 active_new_module_batch = "fixture:8"
 assert(target_control("prepare", 8).ok)
-local new_module_service_source = [[return function()
+local new_module_service_patch_source = [[return function()
     return {new_modules = {"hotupgrade_new_rules", "hotupgrade_new_dependency"}}
 end]]
-local new_module_update = target_control("update", 8, {service_source = new_module_service_source})
+local new_module_update = target_control("update", 8, {service_patch_source = new_module_service_patch_source})
 assert(new_module_update.ok, new_module_update.message)
 assert(begin_count == declarations_before_new_modules)
 assert(table.concat(new_module_registrations, ",") == "lualib.hotupgrade_new_dependency,lualib.hotupgrade_new_rules")
@@ -428,19 +428,19 @@ assert(hotupgrade.require("hotupgrade_new_rules").value() == 42)
 assert(target_control("finish", 8).ok)
 active_new_module_batch = "fixture:9"
 assert(target_control("prepare", 9).ok)
-local early_require_source = [[return function()
+local early_service_patch_source = [[return function()
     local hotupgrade = require "flywow_hotupgrade"
     hotupgrade.require("hotupgrade_early_module")
     return {new_modules = {"hotupgrade_early_module"}}
 end]]
-local early_result = target_control("update", 9, {service_source = early_require_source})
+local early_result = target_control("update", 9, {service_patch_source = early_service_patch_source})
 assert(not early_result.ok and early_result.code == "HU_SERVICE_STAGE_FAILED")
 assert(early_result.details.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
 assert(target_control("abort", 9).ok)
 active_new_module_batch = "fixture:10"
 assert(target_control("prepare", 10).ok)
 local undeclared_result = target_control("update", 10,
-    {service_source = [[return function() return {new_modules = {"hotupgrade_bad_new_parent"}} end]]})
+    {service_patch_source = [[return function() return {new_modules = {"hotupgrade_bad_new_parent"}} end]]})
 assert(not undeclared_result.ok and undeclared_result.code == "HU_NEW_MODULE_FAILED")
 assert(undeclared_result.details.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
 assert(begin_count == declarations_before_new_modules)

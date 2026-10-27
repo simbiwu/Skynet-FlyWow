@@ -96,7 +96,7 @@ end
 ---@class FlyWowHotUpgradeServiceTarget
 ---@field service_handle integer 从登记记录复制的业务 Service handle；当前热更 RPC 的接收者
 ---@field modules table[] 本批匹配到的完整模块 Patch
----@field service_source? string 本批 Service Patch 的冻结源码
+---@field service_patch_source? string Controller 冻结的 Service .patch 文件源码，Update 时发送给对应目标
 ---@field service_entry_file? string 本批 Service Patch 的相对路径，用于错误诊断
 ---@field exited? boolean 原生 MONITOR 已确认目标退出；保留结果快照，停止对其发送控制消息
 ---@field participated? boolean 是否已进入本批控制流程，决定失败时是否发送 Abort
@@ -154,7 +154,7 @@ end
 ---@field batch_id string Controller Service handle 与本进程递增序号组成；仅在该 Controller 生命周期有效
 ---@field sequence integer 当前批次严格递增的序号，目标用来拒绝迟到消息
 ---@field modules? table[] Controller 按目标登记集合筛选、按模块名排序的 name/source 模块数组；不含业务对象
----@field service_source? string update 使用的可选一次性 Service 脚本源码
+---@field service_patch_source? string Update 请求携带的 Service .patch 源码；没有匹配的 Service Patch 时为 nil
 
 ---@class FlyWowHotUpgradeManagementRequest
 ---@field path? string begin 的 Patch Root 相对目录
@@ -257,7 +257,7 @@ function M:finish_creation(creation)
 
         local native_pending = false
         for _, pending in pairs(self.pending_creations) do
-            if not pending.returned then
+            if not pending.native_create_returned then
                 native_pending = true
                 break
             end
@@ -325,7 +325,7 @@ function M:on_service_exit(service_handle)
 
     if not tracked then
         for _, pending in pairs(self.pending_creations) do
-            if not pending.returned then
+            if not pending.native_create_returned then
                 self.early_exit_handles[service_handle] = true
                 break
             end
@@ -674,7 +674,7 @@ function M:register(request, service_handle)
     while not creation do
         local native_pending = false
         for _, pending in pairs(self.pending_creations) do
-            if not pending.returned then
+            if not pending.native_create_returned then
                 native_pending = true
                 break
             end
@@ -748,7 +748,7 @@ local function match_service_targets(batch, registered_services)
                 service_target =
                 {
                     service_handle = service_registration.service_handle,
-                    service_source = service_patch and service_patch.source,
+                    service_patch_source = service_patch and service_patch.service_patch_source,
                     service_entry_file = service_patch and service_patch.entry_file,
                 }
             end
@@ -819,7 +819,7 @@ function M:load_patch(batch)
             if not valid_service_name(service_name) or batch.service_patches[service_name] then
                 return flywow_result.failure("HU_INVALID_PATCH", "Service 路径映射重复或无效: " .. relative_path)
             end
-            batch.service_patches[service_name] = {entry_file = relative_path, source = source}
+            batch.service_patches[service_name] = {entry_file = relative_path, service_patch_source = source}
         else
             local file = {entry_file = relative_path, source = source}
             batch.files[#batch.files + 1] = file
@@ -858,7 +858,7 @@ function M:step(batch, service_target, command)
 
     if command == "update" then
         request.modules = service_target.modules
-        request.service_source = service_target.service_source
+        request.service_patch_source = service_target.service_patch_source
     end
 
     if service_target.exited then

@@ -193,12 +193,12 @@ end
 ---@field replace_functions? table<string, function> 本次要替换的现有业务函数；未列出的字段保持原样。
 
 --- 在业务安全点加载构建函数并保存恢复数据；只准备回调，不执行状态更新。
----@param patch_source string Controller 已完成语法检查的 Service Patch 源码
+---@param service_patch_source string Controller 已完成语法检查的 Service Patch 源码
 ---@return FlyWowHotUpgradeServicePatch service_patch 本 State 的提交内容及恢复快照；准备失败抛出异常，由控制入口转换为 FlyWowResult。
-local function stage_service_patch(patch_source)
+local function stage_service_patch(service_patch_source)
     -- 执行受信 Patch 构建函数并校验结果；此时尚不写入线上状态。
     local service_update = module_state.registration.service_update
-    local chunk = assert(load(hotupgrade_common.normalize_source(patch_source), "=Service Patch", "t", _G))
+    local chunk = assert(load(hotupgrade_common.normalize_source(service_patch_source), "=Service Patch", "t", _G))
     local build_patch = chunk()
     assert(type(build_patch) == "function", "Service Patch 必须返回构建函数")
     ---@type FlyWowHotUpgradeServicePatch
@@ -257,20 +257,20 @@ end
 --- 执行 Service Patch 构建、核对 new_modules 并立即登记这些新模块。
 --- 登记完成前保留本批声明上下文；新模块加载/登记可能 yield，失败清除上下文并返回错误。
 ---@param transaction FlyWowHotUpgradeTransaction 当前 Update 事务；其中的 batch_id 限定新模块归属
----@param patch_source? string Controller 已正式部署并发送的 Service Patch 源码；nil 表示没有 Service Patch
+---@param service_patch_source? string Controller 已部署并发送的目标 Service .patch 文件内容；未匹配 Patch 时为 nil
 ---@return FlyWowResult<FlyWowHotUpgradeServicePatch|nil> 成功载荷为 Patch 或 nil；失败包含 HU_ 错误码。
-local function stage_service_patch_and_new_modules(transaction, patch_source)
+local function stage_service_patch_and_new_modules(transaction, service_patch_source)
     -- context 跨可能 yield 的 require/登记保持有效；owner 与 batch_id 阻止其他协程或批次借用清单。
     local context = {owner = coroutine.running(), batch_id = transaction.batch_id, names = {}}
     transaction.new_module_context = context
     local failure_code = "HU_SERVICE_STAGE_FAILED"
     local stage_succeeded, patch_or_failure = pcall(function()
-        if not patch_source then
+        if not service_patch_source then
             return nil
         end
 
         -- 先构建并核验完整声明清单，再加载模块，避免边加载边发现重复路径。
-        local service_patch = stage_service_patch(patch_source)
+        local service_patch = stage_service_patch(service_patch_source)
         local new_modules = {} -- 保存已验证身份，首次加载直接复用，不再解析同一路径。
         for _, name in ipairs(service_patch.new_modules or {}) do
             local identity = resolve_module_identity(name)
@@ -366,8 +366,8 @@ local function handle_upgrade(command, request, source)
         if transaction.phase ~= nil then
             return flywow_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
         end
-        -- 先从已部署文件登记 Patch 声明的新模块；它们留给下一批普通 Stage。
-        local service_patch_result = stage_service_patch_and_new_modules(transaction, request.service_source)
+        -- 先加载并登记 Service Patch 声明的新模块。当前批次的模块候选列表已经生成，这些模块从下一批才参加普通模块更新。
+        local service_patch_result = stage_service_patch_and_new_modules(transaction, request.service_patch_source)
         if not service_patch_result.ok then
             return service_patch_result
         end

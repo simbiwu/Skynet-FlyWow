@@ -2,8 +2,8 @@
 local common = require "flywow_hotupgrade_common"
 local scenario_name = assert(arg[1])
 local scenarios = {}
-local function scenario(source, check, state)
-    return {state = state or {a = {keep_a = 1}, b = {keep_b = 2}}, source = source, check = check}
+local function scenario(service_patch_source, check, state)
+    return {state = state or {a = {keep_a = 1}, b = {keep_b = 2}}, service_patch_source = service_patch_source, check = check}
 end
 local function normal()
     return scenario([[return function(state)
@@ -144,7 +144,7 @@ scenarios.custom_recovery = function() local s = scenarios.recovery(); s.custom 
 
 scenarios.partial_throw = function()
     local s = restored()
-    s.source = [[return function(state) return {update_state = function()
+    s.service_patch_source = [[return function(state) return {update_state = function()
         state.a.changed = 99
         state.a.keep_a = nil
         state.extra = true
@@ -158,7 +158,7 @@ scenarios.partial_throw = function()
 end
 scenarios.bad_state_callback = function()
     local s = normal()
-    s.source = "return function() return {update_state = 12} end"
+    s.service_patch_source = "return function() return {update_state = 12} end"
     s.expected_failure = "HU_SERVICE_STAGE_FAILED"
     s.check = function(state) assert(state.a.keep_a == 1 and state.a.changed == nil) end
     return s
@@ -214,7 +214,7 @@ local request = {
     batch_id = "state_merge_" .. scenario_name,
     sequence = 1,
     modules = {{name = "state_merge_logic", source = "return {version = 2}"}},
-    service_source = scenario.source,
+    service_patch_source = scenario.service_patch_source,
 }
 local function command(name)
     answer = nil

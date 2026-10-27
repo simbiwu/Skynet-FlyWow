@@ -106,10 +106,15 @@ elseif scenario == "service" then
             restore = function() error("injected rollback failure") end,
         },
     }).ok)
+    --- 向模拟 Service 发送指定批次命令；Update Patch 将 state.count 改为 count，供后续恢复场景断言。
+    ---@param name string 要发送的控制命令
+    ---@param sequence integer 本批控制序号
+    ---@param count integer Patch 写入 Service 私有状态的值
+    ---@return table 模拟 Controller 返回的命令结果
     local function command(name, sequence, count)
         receiver(1, 99, name, {
             batch_id = "continuation:" .. sequence, sequence = sequence, modules = {},
-            service_source = "return function(state) return {update_state = function() state.count = " .. count .. " end} end",
+            service_patch_source = "return function(state) return {update_state = function() state.count = " .. count .. " end} end",
         })
         return answer
     end

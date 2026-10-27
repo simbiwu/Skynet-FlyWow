@@ -1194,7 +1194,7 @@ local request =
 }
 if command == "update" then
     request.modules = service_target.modules
-    request.service_source = service_target.service_source
+    request.service_patch_source = service_target.service_patch_source
 end
 batch.control_started = true
 local ok, answer = pcall(skynet.call,
@@ -1332,7 +1332,7 @@ end
 
 ### 第 7.8 节：第三跳——目标 Update RPC 到达 PlayerService
 
-现在 Controller 在上述循环调用 `self:step(batch,service_target,"update")`。`M:step()` 将 `service_target.modules` 和 `service_target.service_source` 放进请求，通过 `skynet.call` 发送给 PlayerService。Controller 协程等待这个 RPC 结果；目标所在 Lua State 进入 `flywow_hotupgrade.lua/handle_upgrade("update")`。
+现在 Controller 在上述循环调用 `self:step(batch,service_target,"update")`。`M:step()` 将 `service_target.modules` 和 `service_target.service_patch_source` 放进请求，通过 `skynet.call` 发送给 PlayerService。这里的 `service_patch_source` 是 `.patch` 文件内容，不是文件路径。Controller 协程等待这个 RPC 结果；目标所在 Lua State 进入 `flywow_hotupgrade.lua/handle_upgrade("update")`。
 
 **【真实源码摘录】** `hotupgrade/lualib/flywow_hotupgrade.lua` → `handle_upgrade()` 的 Update 分支，从准备到提交的连续逻辑：
 
@@ -1341,8 +1341,8 @@ if command == "update" then
     if transaction.phase ~= nil then
         return flywow_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
-    -- 先从已部署文件登记 Patch 声明的新模块；它们留给下一批普通 Stage。
-    local service_patch_result = stage_service_patch_and_new_modules(transaction, request.service_source)
+    -- 先加载并登记 Service Patch 声明的新模块。当前批次的模块候选列表已经生成，这些模块从下一批才参加普通模块更新。
+    local service_patch_result = stage_service_patch_and_new_modules(transaction, request.service_patch_source)
     if not service_patch_result.ok then
         return service_patch_result
     end
@@ -1749,21 +1749,21 @@ Controller 只有发布终态才放开门禁，而发布终态又依赖这个 Up
 1. Controller 先把本批完整 `.lua` 放入正式宿主目录并清理缓存，使 `combat_rules.lua` 确实能被搜索和加载。
 2. PlayerService 在 Update 期间通过 Service Patch 的 `new_modules` 声明获得受控的新模块登记通道；这条通道不申请普通首次加载许可。
 
-**实际调用者**：`flywow_hotupgrade.lua/handle_upgrade("update")` 先调用 `stage_service_patch_and_new_modules(transaction,request.service_source)`。后者先调用 stage_service_patch() 执行 Service Patch 构建函数，取得 `new_modules={"combat_rules"}`。清单中的每项在准备时解析身份，规范名直接填入 context.names，解析结果按声明顺序保存到 new_modules；随后调用私有 `require_module(identity.name, identity)` 复用这些已确认的身份。公共 `M.require(name)` 仍负责检查新调用的模块名、解析身份，再进入同一个加载流程。
+**实际调用者**：`flywow_hotupgrade.lua/handle_upgrade("update")` 先调用 `stage_service_patch_and_new_modules(transaction,request.service_patch_source)`。后者先调用 stage_service_patch() 执行 Service Patch 构建函数，取得 `new_modules={"combat_rules"}`。清单中的每项在准备时解析身份，规范名直接填入 context.names，解析结果按声明顺序保存到 new_modules；随后调用私有 `require_module(identity.name, identity)` 复用这些已确认的身份。公共 `M.require(name)` 仍负责检查新调用的模块名、解析身份，再进入同一个加载流程。
 
 **【真实源码摘录】** `flywow_hotupgrade.lua` → `stage_service_patch_and_new_modules()` 中新模块清单处理逻辑：
 
 ```lua
-local function stage_service_patch_and_new_modules(transaction, patch_source)
+local function stage_service_patch_and_new_modules(transaction, service_patch_source)
     local context = {owner = coroutine.running(), batch_id = transaction.batch_id, names = {}}
     transaction.new_module_context = context
     local failure_code = "HU_SERVICE_STAGE_FAILED"
     local ok, service_patch = pcall(function()
-        if not patch_source then
+        if not service_patch_source then
             return nil
         end
 
-        local service_patch = stage_service_patch(patch_source)
+        local service_patch = stage_service_patch(service_patch_source)
         local new_modules = {} -- 保存已验证身份，首次加载直接复用，不再解析同一路径。
         for _, name in ipairs(service_patch.new_modules or {}) do
             local identity = resolve_module_identity(name)
