@@ -346,7 +346,7 @@ scenarios['matching'] = function()
     local rejected = c:handle_command("status", {batch_id = accepted.value.batch_id}, 1).value.record.error -- 查询指定批次得到的错误对象，验证失败码和诊断信息。
     assert(rejected.code == "HU_TARGET_MISSING" and rejected.message:find("service/unused.patch", 1, true))
     assert(next(module_state.last_control_command_by_service_handle) == nil and lifecycle_status(c).phase == "IDLE")
-    assert(c.last_batch.phase == "ABORTED" and not c.last_batch.control_started)
+    assert(c.last_batch.phase == "ABORTED")
     -- 同一模块仍可匹配多个 Service，组合包中的 Service 脚本也必须覆盖所有目标。
 
     local unsupported = c:load_patch({patch_dir = "combined"}) -- 直接调用 load_patch 得到的协议拒绝结果。
@@ -453,7 +453,7 @@ scenarios['matching'] = function()
     assert(waiting:handle_command("register", metadata, 85).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     local failed = waiting:handle_command("status", {batch_id = failed_batch}, 1) -- 失败批次的查询结果，供后续确认错误和状态。
-    assert(failed.value.record.error.code == "HU_TARGET_MISSING" and not failed.value.record.control_started)
+    assert(failed.value.record.error.code == "HU_TARGET_MISSING")
     assert(lifecycle_status(waiting).phase == "IDLE" and waiting.service_registrations[85])
 
     -- preload 由原生启动处理；Controller 不拒绝、不改写目标名或启动参数。
@@ -589,7 +589,7 @@ scenarios['unique'] = function()
     local failed_id = begin_deployment(unique, "unmatched_service") -- 无法匹配目标的失败批次身份。
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(unique:handle_command("status", {batch_id = failed_id}, 1).value.record.error.code == "HU_TARGET_MISSING")
-    assert(lifecycle_status(unique).phase == "IDLE" and unique.last_batch.error.code == "HU_TARGET_MISSING" and not unique.last_batch.control_started)
+    assert(lifecycle_status(unique).phase == "IDLE" and unique.last_batch.error.code == "HU_TARGET_MISSING")
     module_state.injected_control_failure = {service_handle = 93, command = "update"}
     assert(publish(unique, {path = "module"}).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
@@ -750,7 +750,7 @@ scenarios['resources'] = function()
         assert(accepted.ok)
         module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
         local record = ordered:handle_command("status", {batch_id = accepted.value.batch_id}, 1).value.record -- 本批 status 返回的结果记录，包含目标数、错误和终态。
-        assert(record.phase == "ABORTED" and not record.control_started and #module_state.operations == 0)
+        assert(record.phase == "ABORTED" and #module_state.operations == 0)
         assert(record.error.code == (failure == "missing" and "HU_FILE_NOT_FOUND" or "HU_FILE_READ_FAILED"))
         assert(record.error.message:find("module/lualib/test_worker_logic.lua", 1, true))
     end
@@ -808,7 +808,7 @@ scenarios['resources'] = function()
     assert(rejected_file.ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(deployment.last_batch.error.code == "HU_FILE_READ_FAILED" and lifecycle_status(deployment).phase == "IDLE")
-    assert(#module_state.operations == 0 and not deployment.last_batch.control_started)
+    assert(#module_state.operations == 0)
     module_state.injected_read_failure = nil
     module_state.file_contents = {["lualib/test_worker_logic.lua"] = "old"}
     module_state.operations = {}

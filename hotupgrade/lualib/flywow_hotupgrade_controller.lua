@@ -163,7 +163,6 @@ end
 ---@field current_service_handle? integer status 查询时当前或最近一次处理的业务 Service handle
 ---@field service_results FlyWowHotUpgradeServiceResult[] 各业务 Service 的处理结果
 ---@field error? FlyWowResult 本批失败诊断
----@field control_started boolean 是否已开始调用目标控制 RPC；RPC 异常时不能据此判断远端是否执行
 
 ---@class FlyWowHotUpgradePatchFile
 ---@field entry_file string 宿主根目录下的 Lua 相对路径；部署和恢复均使用此路径
@@ -193,7 +192,6 @@ end
 ---@field current_service_handle? integer 当前或最近一次处理的业务 Service handle；status 对外返回此值
 ---@field waiter? thread 等待创建/登记或首次模块加载完成的批次协程
 ---@field error? FlyWowResult 本批首个失败或恢复失败结果
----@field control_started? boolean 是否已开始调用任一目标控制 RPC；true 不代表远端已执行
 
 ---@class FlyWowHotUpgradeControlRequest
 ---@field batch_id string Controller Service handle 与本进程递增序号组成；仅在该 Controller 生命周期有效
@@ -979,10 +977,10 @@ end
 
 --- 向一个目标 Service 发送 prepare、update、abort 或 finish RPC，并记录发送和返回结果。
 --- Skynet call 可能 yield；RPC 异常转换为 FlyWowResult，不推断远端是否已执行。
----@param batch FlyWowHotUpgradeBatch 当前发布记录；本函数在调用目标 RPC 前标记控制已开始，并保存正在处理的 Service handle 和结果。
+---@param batch FlyWowHotUpgradeBatch 当前发布记录；本函数保存正在处理的 Service handle 和结果。
 ---@param service_target FlyWowHotUpgradeServiceTarget 本次要更新的 Service 及其匹配结果；本函数读取 handle、普通模块源码和可选 Service .patch。
 ---@param command string 本次要发给 Service 的 prepare、update、abort 或 finish 命令；目标 Service 按它选择对应处理步骤。
----@return FlyWowResult<nil> 目标返回的热更结果，或本地 RPC 失败结果；RPC 异常时远端是否执行不确定，调用可能 yield。
+---@return FlyWowResult<nil> 目标返回的热更结果，或本地 RPC 失败结果；调用可能 yield。
 function M:step(batch, service_target, command)
     -- service_target 是本批复用的目标记录；modules 是筛选后的候选，service_patch 保存匹配到的 .patch 源码。
     ---@type FlyWowHotUpgradeControlRequest
@@ -1001,8 +999,6 @@ function M:step(batch, service_target, command)
         return service_target.hotupgrade_result
     end
 
-    -- 调用前置位；RPC 抛错时远端是否收到或执行命令未知，因此 status 保守报告控制已开始。
-    batch.control_started = true
     -- 目标 Service RPC 是否正常返回，以及它对本步控制命令的结果。
     local call_succeeded, service_result = pcall(skynet.call,
         service_target.service_handle, "hotupgrade", command, request)
@@ -1478,7 +1474,6 @@ local function handle_status_request(controller, request)
         current_service_handle = requested_batch.current_service_handle, -- 正在执行控制命令的 Service；无单个进行目标时为 nil。
         service_results = requested_batch.service_results, -- 各目标 Service 的控制结果及错误详情。
         error = requested_batch.error, -- 批次级失败或恢复报告；不作为下一批门禁。
-        control_started = requested_batch.control_started == true, -- 是否已开始调用目标控制 RPC；不表示远端已成功执行。
     }
     return flywow_result.success({record = batch_status,
         lifecycle = lifecycle, recovery_required = recovery_required})

@@ -558,7 +558,7 @@ local function run_test_group()
         local root = require("hotupgrade_test_options").root_path -- 宿主正式文件根目录；读取和恢复断言使用相同根路径。
         assert(native.read_file(root, "service/new_service.lua") == false)
         local record = wait_for_batch_phase(controller, begin_update_batch(controller, "service_file"), "COMPLETED") -- 等待到的本批终态记录。
-        assert(record.target_service_count == 0 and not record.control_started)
+        assert(record.target_service_count == 0)
         assert(assert(load(assert(native.read_file(root, "service/new_service.lua"))))().version == 2)
         assert(native.read_file(root, "service/skynet_hotupgrade_worker.patch") == false)
         local only_files = wait_for_batch_phase(controller, begin_update_batch(controller, "unmatched_module"), "COMPLETED") -- 没有匹配到模块/Service 目标的正式文件部署批次结果。
@@ -593,7 +593,7 @@ local function run_test_group()
         -- begin 已读取本批源码并保存正式文件旧内容；在 queue 排空窗口注入目标路径失效。
         assert(os.execute("mkdir " .. root .. "/service/z_blocked.lua"))
         local record = wait_for_batch_phase(controller, id, "ABORTED") -- 等待到的本批终态记录。
-        assert(record.error.code == "HU_INVALID_PATH" and record.control_started
+        assert(record.error.code == "HU_INVALID_PATH"
             and record.target_service_count == 1 and record.failed_service_count == 1 and lifecycle_status(controller).phase == "IDLE")
         assert_original_state(worker_service_handle)
         assert(native.read_file(root, "lualib/test_worker_logic.lua") == old)
@@ -652,7 +652,7 @@ local function run_test_group()
             assert(rejected.code == fixture.code and rejected.message and #rejected.message > 0)
             local status = skynet.call(controller, "hotupgrade", "status", {batch_id = id}) -- 通过管理 RPC 查询的批次状态。
             assert(status.ok and status.value.record.phase == "ABORTED")
-            assert(status.value.record.error.code == fixture.code and not status.value.record.control_started)
+            assert(status.value.record.error.code == fixture.code)
             assert(assert_original_state(worker_service_handle).marker_token == before.marker_token)
             assert(native.read_file(root, "lualib/test_worker_logic.lua") == old_source)
             assert(status.value.lifecycle.phase == "IDLE")
@@ -887,6 +887,8 @@ local function run_test_group()
     else
         error("unknown HOTUPGRADE_TEST_GROUP: " .. tostring(group))
     end
+
+    -- 任一场景分支正常完成后统一输出该组通过标记。
     print("HOTUPGRADE_SKYNET_GROUP_OK " .. group)
 end
 skynet.start(function()

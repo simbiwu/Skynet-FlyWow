@@ -308,7 +308,7 @@ while true do
 end
 ~~~
 
-Controller 从 begin 到终态复用同一个 batch。load_patch(batch) 将冻结源码和初次匹配目标直接写入该记录，Prepare 重匹配复用原目标对象。status.record.control_started 在首个目标 RPC 调用前置为 true，用来区分控制 RPC 尚未开始与调用已开始；RPC 异常时它不证明远端已收到或执行命令。它不与 service_target.participated（决定 Abort 范围）或 file.touched（记录文件部署结果）重复。batch.phase 是唯一保存的发布进度，门禁直接读取活动批次。目标 Service 的本地批次 phase 在首次 Update 入口立即从 nil 变为 UPDATING，因此新模块登记等可能 yield 的操作期间，重入 Update 会以 HU_PHASE_INVALID 拒绝；只有模块和 Service 状态全部提交成功后才变为 ACTIVATED。status 的 lifecycle.pending_service_count 和 pending_module_count 分别表示尚未完成创建或登记的受管理 Service 数、尚未完成首次加载或登记的普通模块数；phase 和 recovery_required 仍由当前及最近终态批次生成，新批次进行中保留最近终态的恢复诊断。
+Controller 从 begin 到终态复用同一个 batch。load_patch(batch) 将冻结源码和初次匹配目标直接写入该记录，Prepare 重匹配复用原目标对象。batch.phase 是唯一保存的发布进度，门禁直接读取活动批次。目标 Service 的本地批次 phase 在首次 Update 入口立即从 nil 变为 UPDATING，因此新模块登记等可能 yield 的操作期间，重入 Update 会以 HU_PHASE_INVALID 拒绝；只有模块和 Service 状态全部提交成功后才变为 ACTIVATED。status 的 lifecycle.pending_service_count 和 pending_module_count 分别表示尚未完成创建或登记的受管理 Service 数、尚未完成首次加载或登记的普通模块数；phase 和 recovery_required 仍由当前及最近终态批次生成，新批次进行中保留最近终态的恢复诊断。
 
 每个目标 Lua State 都保存本批次的 Service Patch 提交内容、恢复快照和 module_stage；本地记录沿内部调用链统一称为 batch。Abort、Finish 和控制异常共用同一批次收尾操作。输入在首次可信边界检查，内部不重复校验没有变化的数据；Service Patch 返回值、自定义快照和候选导出在产生处检查，执行 import_state 后才再次检查候选图。跨 yield 后的来源、许可、缓存身份和模块代码可能改变的状态仍在使用处核对。
 

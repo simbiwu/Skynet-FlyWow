@@ -1264,7 +1264,6 @@ function M:step(batch, service_target, command)
     end
 
     -- 调用前置位，RPC 抛错时不能判断远端是否已经执行。
-    batch.control_started = true
     local call_succeeded, service_result = pcall(skynet.call, -- 向目标 Service 发送控制 RPC 是否正常返回。
         service_target.service_handle, "hotupgrade", command, request)
     if service_target.exited then
@@ -2694,7 +2693,7 @@ faulty 结束后 last_batch.phase 为 RECOVERY_REQUIRED；V3 进行中仍能看�
 
 **结果**：错误发生在目标 Prepare 之前；Controller 尚未向目标发控制命令，也尚未部署正式 `.lua`。批次按具体错误结束；如果业务尚未被触及，就没有“需要恢复运行中玩家状态”的理由。
 
-判断方法：查看 `status(batch_id).value.record.control_started`，若为 `false`，本批还没有开始调用任何目标控制 RPC。但它不等于系统没有其它业务调用，仅说明**这批热更控制 RPC**尚未开始。`true` 只表示 Controller 已进入 RPC 调用边界；若 RPC 抛错，远端是否收到或执行仍不确定。
+排查这类失败时结合稳定错误码、失败消息和批次目标/结果字段确认故障阶段；不要仅凭终态 phase 推断目标是否已处理，因为 phase 只保存当前或最终阶段。
 
 ### 22.2 某个目标 Prepare 失败
 
@@ -2835,7 +2834,7 @@ root_path：.../build/hotupgrade-master-course/host
 
 1. 先看 `build/hotupgrade-master-course/course.log`，确认哪个阶段最后出现了有意义的日志。
 2. 看 `status(batch_id).value.record.phase/error`；如果 `record.error.details` 中有 `original_error` / `recovery_error`，要分别看首次故障和恢复故障。
-3. 区分 `control_started` 与 `file.touched` 的含义：前者记录是否开始调用目标控制 RPC，异常时不代表远端已执行；后者是 Controller 记录本批具体已部署文件的内部标记。
+3. 检查 file.touched 对应的文件恢复结果；它是 Controller 用来定位本批已成功替换文件的内部标记。
 4. 进入相应的真实函数，沿调用者和返回路径复现，而不是孤立阅读错误语句。
 5. 判断原 Service、正式文件、新 Service、`package.loaded` 和业务状态**分别**是否已经更新或恢复。
 6. 对后续修复包，明确它要覆盖的真实状态和验证项，不能默认历史问题都已消失。
