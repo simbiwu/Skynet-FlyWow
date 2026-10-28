@@ -809,16 +809,13 @@ end)
 return function(state)
     return
     {
-        -- 先声明本批 Update 中需要首次加载的新模块。
-        new_modules = {"combat_rules"},
-        -- 在 Activate 阶段执行，不在构建 Patch 时提前改线上数据。
-        update_state = function()
+        new_modules = {"combat_rules"}, -- .patch 返回表的 new_modules 数组；声明本批要首次加载并登记的依赖。
+        update_state = function() -- .patch 返回表的 update_state 回调；Update 时迁移现存状态，构建阶段不提前修改线上数据。
             state.weapon = "剑"
             state.schema_version = 2
             -- gold、level 不修改，保持原来的玩家运行数据。
         end,
-        -- 只替换已有的业务函数字段；不新建业务函数表。
-        replace_functions =
+        replace_functions = -- .patch 返回表的 replace_functions 表；列出要替换的现有业务函数，不替换整个业务函数表。
         {
             attack = function(base_attack)
                 return base_attack + (state.weapon == "剑" and 20 or 0)

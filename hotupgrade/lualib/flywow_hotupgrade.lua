@@ -243,9 +243,9 @@ local function abort(batch)
 end
 
 ---@class FlyWowHotUpgradeServicePatchDefinition
----@field new_modules? string[] 本 Service 本批首次加载的模块名；未登记依赖也须列入，从下一批普通 Stage 起参与候选匹配。
----@field update_state? fun() 在 Update 提交时直接修改构建函数捕获的现存 state；不得 yield 或产生外部副作用。
----@field replace_functions? table<string, function> 本次要替换的现有业务函数；未列出的字段保持原样。
+---@field new_modules? string[] .patch 构建函数返回表的 new_modules 数组；列出本批首次加载的依赖，它们从下一批普通模块 Stage 起参与候选匹配。
+---@field update_state? fun() .patch 构建函数返回表的 update_state 回调；Update 提交时原地修改其捕获的现存 state，不得 yield 或产生外部副作用。
+---@field replace_functions? table<string, function> .patch 构建函数返回表的 replace_functions 表；列出本批替换的现有业务函数，未列出的字段保持原样。
 
 ---@class FlyWowHotUpgradeServicePatchState: FlyWowHotUpgradeServicePatchDefinition
 ---@field old_functions table<string, function> 本次替换前的函数；Abort 时逐项装回原业务函数表。
@@ -325,9 +325,9 @@ local function stage_service_patch(service_patch_source)
     -- 定义字段和函数全部通过校验后，保存供 Update 与 Abort 使用的恢复记录。
     local service_patch =
     {
-        update_state      = patch_definition.update_state,      -- Update 时执行的状态迁移函数；Abort 用旧快照恢复它修改的状态。
-        replace_functions = patch_definition.replace_functions, -- Update 时安装的新业务函数；原函数由 old_functions 保存以供 Abort 恢复。
-        new_modules       = patch_definition.new_modules,       -- 本批首次加载并登记的模块名；加载成功后从下一批起参与匹配。
+        update_state      = patch_definition.update_state,       -- 来自 .patch 返回表的 update_state 函数；Update 时迁移状态，Abort 用旧快照恢复修改。
+        replace_functions = patch_definition.replace_functions,  -- 来自 .patch 返回表的 replace_functions 表；Update 安装这些函数，old_functions 保存旧函数供 Abort 恢复。
+        new_modules       = patch_definition.new_modules,        -- 来自 .patch 返回表的 new_modules 数组；本批加载并登记后，从下一批起参与候选匹配。
         old_functions     = {},                                  -- 保存将被替换的原函数引用，Abort 时逐项装回原 functions 表。
         has_old_state     = false,                               -- 标记旧状态快照是否存在；快照值为 nil 或 false 时仍能正确区分。
         touched           = false,                               -- Activate 开始应用 Service Patch 前为 false；Abort 据此判断是否要恢复。

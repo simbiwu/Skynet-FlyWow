@@ -2,12 +2,12 @@
 return function(state)
     return
     {
-        new_modules = {"combat_rules"},
-        update_state = function()
+        new_modules = {"combat_rules"}, -- .patch 返回表的 new_modules 数组；声明本批首次加载并登记的依赖。
+        update_state = function() -- .patch 返回表的 update_state 回调；Update 时迁移现存状态，构建阶段不提前修改线上数据。
             state.equip = "剑"
             state.schema_version = 2
         end,
-        replace_functions =
+        replace_functions = -- .patch 返回表的 replace_functions 表；列出要替换的现有业务函数，不替换整个业务函数表。
         {
             load = function(base_attack)
                 return base_attack + (state.equip == "剑" and 20 or 0)
