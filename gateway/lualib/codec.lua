@@ -27,6 +27,7 @@ end
 ---@param codec_config table descriptor_path 与已验证的 registry 索引。
 ---@return table 持有已加载 descriptor 的 codec；文件或 Protobuf 校验失败时抛错。
 function M.new(codec_config)
+    -- codec_config 来自 Gateway start；只读取 descriptor_path 与 registry，不保留宿主配置表。
     assert(type(codec_config) == "table", "gateway codec config is required")
     assert(type(codec_config.descriptor_path) == "string" and codec_config.descriptor_path ~= "",
            "gateway descriptor_path is required")
@@ -37,7 +38,7 @@ function M.new(codec_config)
     assert(pb.load(descriptor_bytes),
            "cannot load protobuf descriptor: " .. codec_config.descriptor_path)
 
-    local codec = {}
+    local codec = {} -- 当前 Gateway Service 独占的编解码入口，闭包读取本次配置。
 
     --- 解码一条完整 Envelope；payload 是 framing 后的 Protobuf bytes，由调用方借用且本函数不保留。
     --- 返回新 Lua table，由当前 Service 拥有；payload 格式错误或类型不匹配时抛错。
@@ -45,6 +46,7 @@ function M.new(codec_config)
     ---@param payload string 一条完整 Envelope 的 Protobuf bytes。
     ---@return table 解码后的 Envelope；格式错误时抛错。
     function codec.decode_envelope(payload)
+        -- envelope_type 是 Gateway 启动时已验证的完整消息类型名。
         return assert(pb.decode(codec_config.registry.envelope_type, payload))
     end
 
@@ -73,7 +75,8 @@ function M.new(codec_config)
         assert(definition.response_type ~= nil,
                "gateway command does not define a response: " .. definition.name)
 
-        local body = assert(pb.encode(definition.response_type, response))
+        local body = assert(pb.encode(definition.response_type, response)) -- 按 registry 响应类型编码的业务消息字节。
+        -- envelope 是待发送的完整协议记录，字段与共享 Envelope schema 一一对应。
         local envelope =
         {
             protocol_version = version, -- 宿主指定的 Envelope 兼容版本。

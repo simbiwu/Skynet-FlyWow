@@ -69,18 +69,21 @@ CryptoContext::~CryptoContext() noexcept
 /// @return 无返回值，成功时输出区包含完整 HMAC。
 void computeHmac(const unsigned char *key, const std::string &message, unsigned char *output_mac)
 {
+    // algorithm 是 OpenSSL provider 提供的 HMAC 实现，句柄离开作用域时释放。
     CryptoHandle<EVP_MAC, EVP_MAC_free> algorithm(EVP_MAC_fetch(nullptr, "HMAC", nullptr),
                                                   EVP_MAC_free);
     requireCryptoSuccess(bool(algorithm), "CRYPTO_PROVIDER");
 
+    // mac_context 独占本次消息的 HMAC 运算状态，不跨调用共享。
     CryptoHandle<EVP_MAC_CTX, EVP_MAC_CTX_free> mac_context(EVP_MAC_CTX_new(algorithm.get()),
                                                             EVP_MAC_CTX_free);
     requireCryptoSuccess(bool(mac_context), "CRYPTO_ALLOC");
 
-    char       digest[] = "SHA256";
+    char       digest[] = "SHA256"; // 本次 HMAC 运算使用的摘要算法名称。
+    // params 指定本次 HMAC 运算使用的 SHA-256 摘要。
     OSSL_PARAM params[] = {OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, digest, 0),
                            OSSL_PARAM_construct_end()};
-    size_t     size     = 0;
+    size_t     size     = 0; // EVP_MAC_final 写出的 MAC 长度，必须为 32 字节。
     requireCryptoSuccess(EVP_MAC_init(mac_context.get(), key, 32, params) == 1 &&
                              EVP_MAC_update(mac_context.get(),
                                             reinterpret_cast<const unsigned char *>(message.data()),
@@ -97,11 +100,12 @@ void computeHmac(const unsigned char *key, const std::string &message, unsigned 
 // ECDH 使用原始32字节Z，不使用各平台默认的二次散列；临时共享秘密离开函数时擦除。
 std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
 {
+    // keygen_context 配置 P-256 keygen，完成后不参与后续派生。
     CryptoHandle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> keygen_context(
         EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr), EVP_PKEY_CTX_free);
     requireCryptoSuccess(bool(keygen_context), "CRYPTO_ALLOC");
 
-    char       group[]        = "prime256v1";
+    char       group[]        = "prime256v1"; // OpenSSL EC group 参数，固定为协议要求的 P-256。
     OSSL_PARAM group_params[] = {
         OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, group, 0),
         OSSL_PARAM_construct_end()};
@@ -111,21 +115,25 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
                                  1,
                          "CRYPTO_KEYGEN");
 
+    // import_context 把 HELLO 中的公钥字节导入为 EVP 公钥对象。
     CryptoHandle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> import_context(
         EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr), EVP_PKEY_CTX_free);
     requireCryptoSuccess(bool(import_context), "CRYPTO_ALLOC");
+    // peer_params 描述曲线与客户端公钥的固定字节区间 [2,67)。
     OSSL_PARAM peer_params[] = {
         OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, group, 0),
         OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PUB_KEY, const_cast<char *>(hello + 2),
                                           65),
         OSSL_PARAM_construct_end()};
-    EVP_PKEY  *raw_peer = nullptr;
-    const bool imported =
+    EVP_PKEY  *raw_peer = nullptr; // EVP 导入产生的所有权指针，下一行交给 RAII 句柄。
+    const bool imported =          // 区分导入操作失败；peer 句柄随后统一释放成功导入的对象。
         EVP_PKEY_fromdata_init(import_context.get()) == 1 &&
         EVP_PKEY_fromdata(import_context.get(), &raw_peer, EVP_PKEY_PUBLIC_KEY, peer_params) == 1;
-    CryptoHandle<EVP_PKEY, EVP_PKEY_free> peer(raw_peer, EVP_PKEY_free);
+    CryptoHandle<EVP_PKEY, EVP_PKEY_free> peer(raw_peer,
+                                               EVP_PKEY_free); // 当前 HELLO 提供的客户端公钥。
     requireCryptoSuccess(imported, "INVALID_PUBLIC_KEY");
 
+    // public_key_check 验证导入点是否为有效曲线公钥。
     CryptoHandle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> public_key_check(
         EVP_PKEY_CTX_new(peer.get(), nullptr), EVP_PKEY_CTX_free);
     requireCryptoSuccess(bool(public_key_check) &&
@@ -133,10 +141,10 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
                          "INVALID_PUBLIC_KEY");
 
     // CHALLENGE：类型/版本占前 2 字节，公钥占 [2,67)，随机 salt 占 [67,99)。
-    std::string response(99, '\0');
+    std::string response(99, '\0'); // 固定长度 SERVER_CHALLENGE，按协议字段偏移填充。
     response[0] = 2;
     response[1] = 1;
-    size_t size = 0;
+    size_t size = 0; // 接收 OpenSSL 写入的服务端 P-256 公钥长度，协议要求恰为 65 字节。
     requireCryptoSuccess(EVP_PKEY_get_octet_string_param(
                              crypto_context->server_key, OSSL_PKEY_PARAM_PUB_KEY,
                              reinterpret_cast<unsigned char *>(&response[2]), 65, &size) == 1 &&
@@ -145,6 +153,7 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
     requireCryptoSuccess(RAND_bytes(reinterpret_cast<unsigned char *>(&response[67]), 32) == 1,
                          "CRYPTO_RANDOM");
 
+    // derive_context 使用服务端私钥和客户端公钥计算原始 ECDH Z。
     CryptoHandle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> derive_context(
         EVP_PKEY_CTX_new(crypto_context->server_key, nullptr), EVP_PKEY_CTX_free);
     requireCryptoSuccess(bool(derive_context), "CRYPTO_ALLOC");
@@ -158,7 +167,7 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
         }
     } shared_secret;
 
-    size = sizeof(shared_secret.bytes);
+    size = sizeof(shared_secret.bytes); // EVP_PKEY_derive 的输出容量，成功后改写为实际长度。
     requireCryptoSuccess(
         EVP_PKEY_derive_init(derive_context.get()) == 1 &&
             EVP_PKEY_derive_set_peer(derive_context.get(), peer.get()) == 1 &&
@@ -166,7 +175,7 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
         "CRYPTO_DERIVE");
 
     // transcript 严格拼接完整 HELLO 与 CHALLENGE，不包含 TCP/WS 帧头。
-    std::string transcript(hello, 67);
+    std::string transcript(hello, 67); // 完整 CLIENT_HELLO；追加 challenge 后计算 transcript 摘要。
     transcript += response;
     unsigned int hash_size = 0; // EVP 实际写入的摘要长度，必须等于 SHA-256 的 32 字节。
     requireCryptoSuccess(EVP_Digest(transcript.data(), transcript.size(),
@@ -176,17 +185,20 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
                          "CRYPTO_HASH");
 
     // HKDF info 用固定协议域与 transcript 摘要隔离不同握手及用途。
-    std::string info = "flywow/handshake/v1";
+    std::string info = "flywow/handshake/v1"; // HKDF 域分离前缀，后接 transcript_hash。
     info.append(reinterpret_cast<const char *>(crypto_context->transcript_hash.data()), 32);
 
+    // algorithm 是 OpenSSL provider 的 HKDF 实现。
     CryptoHandle<EVP_KDF, EVP_KDF_free> algorithm(EVP_KDF_fetch(nullptr, "HKDF", nullptr),
                                                   EVP_KDF_free);
     requireCryptoSuccess(bool(algorithm), "CRYPTO_PROVIDER");
+    // kdf 保存本次 HKDF 参数与派生过程，不跨连接共享。
     CryptoHandle<EVP_KDF_CTX, EVP_KDF_CTX_free> kdf(EVP_KDF_CTX_new(algorithm.get()),
                                                     EVP_KDF_CTX_free);
     requireCryptoSuccess(bool(kdf), "CRYPTO_ALLOC");
 
-    char       digest[] = "SHA256";
+    char       digest[] = "SHA256"; // 本次 HMAC 运算使用的摘要算法名称。
+    // params 将原始 Z、随机 salt 与域分离信息交给 OpenSSL HKDF。
     OSSL_PARAM params[] = {
         OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, digest, 0),
         OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, shared_secret.bytes, 32),
@@ -254,7 +266,7 @@ int verify(lua_State *state)
 {
     LuaBinding     lua_binding(state);
     CryptoContext *context = nullptr; // 从 Lua 栈借用的已构造对象；其内存仍由 userdata 拥有。
-    std::string    bytes;
+    std::string    bytes;             // 从第二个参数复制的完整 CLIENT_PROOF，验证期间只读。
     if (!lua_binding.readUserdata(1, kCryptoMetatable, context) || !lua_binding.readValue(2, bytes))
     {
         return lua_binding.pushError();
@@ -267,8 +279,8 @@ int verify(lua_State *state)
         return lua_binding.pushError();
     }
 
-    std::array<unsigned char, 32> expected = {};
-    std::string                   message  = "client-proof";
+    std::array<unsigned char, 32> expected = {}; // 预期客户端 HMAC；与输入证明做常量时间比较。
+    std::string                   message  = "client-proof"; // 证明用途前缀，后接握手摘要。
     message.append(reinterpret_cast<const char *>(context->transcript_hash.data()), 32);
     try
     {
@@ -279,7 +291,7 @@ int verify(lua_State *state)
 
         message = "server-ready";
         message.append(reinterpret_cast<const char *>(context->transcript_hash.data()), 32);
-        std::string response(33, '\0');
+        std::string response(33, '\0'); // SERVER_READY：1 字节类型加 32 字节服务端证明。
         response[0] = 4;
         computeHmac(context->proof_key.data(), message,
                     reinterpret_cast<unsigned char *>(&response[1]));
@@ -321,7 +333,7 @@ extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
 {
     using namespace flywow_gateway;
     LuaBinding lua_binding(state); // 借用当前 Lua State；参数和结果均由本次回调管理。
-    LuaTable   metatable;
+    LuaTable   metatable;          // 注册当前 userdata 类型及其由 LuaBinding 管理的 __gc 行为。
     if (!lua_binding.registerUserdata<CryptoContext>(kCryptoMetatable, metatable))
     {
         return lua_binding.pushError();

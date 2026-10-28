@@ -30,7 +30,7 @@ export function field(number, wire, value)
 // 解码样例所需的 wire=0/2 字段；返回字段号到值的 Map，截断或未知类型抛错。
 export function fields(bytes)
 {
-    const result = new Map();
+    const result = new Map(); // Protobuf 字段号到已解码数值或字节片段的样例索引。
     let offset = 0;
     const read_varint = () =>
     {
@@ -38,7 +38,7 @@ export function fields(bytes)
         let shift = 0;
         while (offset < bytes.length && shift < 35)
         {
-            const byte = bytes[offset++];
+            const byte = bytes[offset++]; // 当前 varint 字节；最高位标记后续字节是否存在。
             value |= (byte & 127) << shift;
             if ((byte & 128) === 0) return value >>> 0;
             shift += 7;
@@ -48,17 +48,17 @@ export function fields(bytes)
 
     while (offset < bytes.length)
     {
-        const key = read_varint();
-        const number = key >>> 3;
-        const wire = key & 7;
+        const key = read_varint(); // Protobuf tag：字段号与 wire type 的组合值。
+        const number = key >>> 3; // Protobuf 字段号，key 的低 3 位不属于字段号。
+        const wire = key & 7; // 当前字段的 wire type，决定后续值的读取方式。
         if (wire === 0)
         {
             result.set(number, read_varint());
         }
         else if (wire === 2)
         {
-            const length = read_varint();
-            const end = offset + length;
+            const length = read_varint(); // length-delimited 字段的字节长度。
+            const end = offset + length; // 当前字段数据的排他结束偏移，先检查再切片。
             if (end > bytes.length) throw new Error("INVALID_PROTOBUF_LENGTH");
             result.set(number, bytes.subarray(offset, end));
             offset = end;
@@ -81,9 +81,9 @@ export function frame_join()
 // 校验 FrameJoin 响应或 FramePush 的固定样例值，返回 response/push；不匹配时抛错。
 export function verify(bytes)
 {
-    const envelope = fields(bytes);
+    const envelope = fields(bytes); // 按共享 Envelope 字段号解出的外层消息。
     if (envelope.get(1) !== 4) throw new Error("UNEXPECTED_PROTOCOL_VERSION");
-    const body = fields(envelope.get(3));
+    const body = fields(envelope.get(3)); // command 对应业务消息的 Protobuf 字段集合。
     if (envelope.get(2) === 1101)
     {
         if (new TextDecoder().decode(body.get(1)) !== "OK" ||

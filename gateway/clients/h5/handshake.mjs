@@ -2,12 +2,12 @@
 // 边界：Client SDK；固定P-256/HKDF/HMAC；需要支持Web Crypto的安全上下文。
 // 生命周期：每实例只服务一条连接；close释放CryptoKey引用，不保存登录或业务状态。
 // 不负责：不加密业务数据、不自动重连、不假定Web Crypto可擦除内部密钥副本。
-const ascii = new TextEncoder();
+const ascii = new TextEncoder(); // 将握手域分离前缀编码为协议使用的 ASCII 字节。
 
 // 连接有限公开字节数组；返回新Uint8Array，不改变输入。
 function join(...parts)
 {
-    const joinedBytes = new Uint8Array(parts.reduce((n, part) => n + part.length, 0));
+    const joinedBytes = new Uint8Array(parts.reduce((n, part) => n + part.length, 0)); // 按输入总长度一次分配的输出字节串。
     let offset = 0;
     for (const part of parts)
     {
@@ -36,12 +36,12 @@ export class HandshakeClient
         this.phase = "generating";
         try
         {
-            const pair = await this.crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+            const pair = await this.crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]); // 当前连接的一次性 P-256 ECDH 密钥对。
             if (this.phase === "closed") throw new Error("HANDSHAKE_CLOSED");
-            this.pair = pair;
-            const publicKeyBytes = new Uint8Array(await this.crypto.subtle.exportKey("raw", pair.publicKey));
+            this.pair = pair; // 私钥留在当前实例，仅供本次 ECDH 派生使用。
+            const publicKeyBytes = new Uint8Array(await this.crypto.subtle.exportKey("raw", pair.publicKey)); // CLIENT_HELLO 中的 65 字节非压缩 P-256 公钥。
             if (this.phase === "closed") throw new Error("HANDSHAKE_CLOSED");
-            this.hello = join(new Uint8Array([1, 1]), publicKeyBytes);
+            this.hello = join(new Uint8Array([1, 1]), publicKeyBytes); // 本实例后续计算 transcript 使用的完整 CLIENT_HELLO。
             this.phase = "challenge";
             return this.hello.slice();
         }
@@ -67,16 +67,16 @@ export class HandshakeClient
             if (bytes.length !== 99 || bytes[0] !== 2 || bytes[1] !== 1 || bytes[2] !== 4)
                 throw new Error("HANDSHAKE_CHALLENGE");
             const subtle = this.crypto.subtle; // 本轮异步运算共用的平台密码入口。
-            const peer = await subtle.importKey("raw", bytes.slice(2, 67), { name: "ECDH", namedCurve: "P-256" }, false, []);
+            const peer = await subtle.importKey("raw", bytes.slice(2, 67), { name: "ECDH", namedCurve: "P-256" }, false, []); // 从 SERVER_CHALLENGE 导入的服务端公钥。
             sharedSecret = new Uint8Array(await subtle.deriveBits({ name: "ECDH", public: peer }, this.pair.privateKey, 256));
-            this.hash = new Uint8Array(await subtle.digest("SHA-256", join(this.hello, bytes)));
-            const hkdfKeyMaterial = await subtle.importKey("raw", sharedSecret, "HKDF", false, ["deriveKey"]);
-            const key = await subtle.deriveKey(
+            this.hash = new Uint8Array(await subtle.digest("SHA-256", join(this.hello, bytes))); // HELLO 与完整 CHALLENGE 的 transcript 摘要，complete 用于验证服务端证明。
+            const hkdfKeyMaterial = await subtle.importKey("raw", sharedSecret, "HKDF", false, ["deriveKey"]); // 原始 ECDH Z 的 HKDF 输入句柄，不暴露为字符串。
+            const key = await subtle.deriveKey( // 用于双向握手证明的 HMAC 密钥句柄，不导出密钥字节。
                 { name: "HKDF", hash: "SHA-256", salt: bytes.slice(67), info: join(ascii.encode("flywow/handshake/v1"), this.hash) },
                 hkdfKeyMaterial, { name: "HMAC", hash: "SHA-256", length: 256 }, false, ["sign", "verify"]);
-            const clientProof = new Uint8Array(await subtle.sign("HMAC", key, join(ascii.encode("client-proof"), this.hash)));
+            const clientProof = new Uint8Array(await subtle.sign("HMAC", key, join(ascii.encode("client-proof"), this.hash))); // 用握手 transcript 生成的客户端证明字节。
             if (this.phase === "closed") throw new Error("HANDSHAKE_CLOSED");
-            this.key = key;
+            this.key = key; // 暂存到 READY 校验阶段；成功或 close 后清除引用。
             this.pair = null;
             this.phase = "ready-proof";
             return join(new Uint8Array([3]), clientProof);
@@ -139,11 +139,11 @@ export function connectGateway(url, { onmessage, timeoutMs = 10000 } = {})
         return Promise.reject(new Error("HANDSHAKE_TIMEOUT_CONFIG"));
     return new Promise((resolve, reject) =>
     {
-        const handshake = new HandshakeClient();
-        const socket = new WebSocket(url);
+        const handshake = new HandshakeClient(); // 本次 WebSocket 独占的握手状态与临时密钥。
+        const socket = new WebSocket(url); // connectGateway 创建并独占关闭的传输连接。
         socket.binaryType = "arraybuffer";
-        let chain = Promise.resolve();
-        let ready = false;
+        let chain = Promise.resolve(); // 串行化异步握手与消息处理，保持收到消息的顺序。
+        let ready = false; // complete 成功后才允许把后续消息交给业务回调。
         // 统一失败路径只拒绝一次Promise；握手状态关闭阻止异步结果复活。
         const fail = error =>
         {
@@ -152,7 +152,7 @@ export function connectGateway(url, { onmessage, timeoutMs = 10000 } = {})
             socket.close();
             reject(error);
         };
-        const timer = setTimeout(() => fail(new Error("HANDSHAKE_TIMEOUT")), timeoutMs);
+        const timer = setTimeout(() => fail(new Error("HANDSHAKE_TIMEOUT")), timeoutMs); // 从连接建立流程开始计时的握手总期限。
         socket.onopen = () =>
         {
             chain = chain.then(async () => socket.send(await handshake.begin())).catch(fail);
@@ -163,7 +163,7 @@ export function connectGateway(url, { onmessage, timeoutMs = 10000 } = {})
             {
                 if (handshake.phase === "closed") return;
                 if (!(event.data instanceof ArrayBuffer)) throw new Error("BINARY_REQUIRED");
-                const bytes = new Uint8Array(event.data);
+                const bytes = new Uint8Array(event.data); // 当前完整 WebSocket binary message 的只读视图。
                 if (ready)
                 {
                     onmessage?.(bytes);

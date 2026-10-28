@@ -3,14 +3,14 @@
 -- 输入/输出：FlyWow 根路径 -> 断言或 GATEWAY_ASYNC_UNIT_OK。
 -- 生命周期：每场景重建 Lua State 模块状态；不启动网络，不冒充真实集成验证。
 -- 不负责：不验证 Protobuf 字节或真实 Skynet 调度，它们由宿主集成测试覆盖。
-local root = assert(arg[1])
+local root = assert(arg[1]) -- 被测 FlyWow 根路径；由测试入口显式传入。
 package.path = root .. "/gateway/lualib/?.lua;" .. package.path
 
 -- 创建独立的可控场景；overrides 为配置覆盖，无 I/O；返回由测试拥有的控制对象。
 ---@param overrides table|nil 可覆盖 TCP/WebSocket 模式等本场景启动配置；不会修改调用方的 table。
 ---@return table 包含替身状态、注入入口和已注册 Service 命令回调的测试场景。
 local function scenario(overrides)
-    local e =
+    local e = -- 当前场景的可控观测状态，由替身写入并由断言读取。
     {
         now     = 0,
         sends   = {},
@@ -20,7 +20,7 @@ local function scenario(overrides)
         writes  = {},
         closed  = {},
     }
-    local config =
+    local config = -- Gateway 的测试启动配置副本；overrides 只作用于当前场景。
     {
         host             = "127.0.0.1",
         port             = 19021,
@@ -33,7 +33,7 @@ local function scenario(overrides)
     end
 
     -- 注册 Skynet 替身，记录消息和协程，不启动真实 Service 调度。
-    local skynet = {}
+    local skynet = {} -- 记录并控制 Gateway 使用的 Skynet API 替身。
     -- 替身不允许数据平面出现同步 call；任何意外等待立即使测试失败。
     ---@return nil 测试中 Gateway 不应同步调用 handler；调用即抛出断言失败。
     function skynet.call()
@@ -110,7 +110,7 @@ local function scenario(overrides)
     end
 
     -- 注册 TCP Socket 替身；输入字节由场景提供，关闭和写入只更新测试状态。
-    local socket = {}
+    local socket = {} -- 记录 fd、读写和关闭行为的 Socket 替身。
     -- 固定监听 fd 和地址；无 I/O。
     ---@param host string Gateway 监听地址。
     ---@param port integer Gateway 监听端口。
@@ -149,7 +149,7 @@ local function scenario(overrides)
     ---@param size integer 本次读取所需的字节数。
     ---@return string|false, string|nil 字节齐全时返回数据；不足时挂起并模拟 EOF。
     function socket.read(fd, size)
-        local data = e.streams[fd] or ""
+        local data = e.streams[fd] or "" -- 当前 fd 尚未被测试读出的 TCP 字节尾部。
         if #data < size then
             -- 让 Gateway 等待下一次读取；测试通过 resume 控制何时返回。
             coroutine.yield("read")
@@ -200,7 +200,7 @@ local function scenario(overrides)
     end
 
     -- 注册 WebSocket 替身；将 HTTP Upgrade 和 binary 消息回调交给 Gateway。
-    local websocket = {}
+    local websocket = {} -- 将 WebSocket 回调交回 Gateway 的传输替身。
     -- 接受握手后模拟收到一个 binary 消息，再挂起等待后续消息。
     ---@param fd integer 新接入的 WebSocket fd。
     ---@param handler table Gateway 注册的 WebSocket 回调表。
@@ -242,7 +242,7 @@ local function scenario(overrides)
     end
 
     -- 提供单个 request/response command，供请求解码和主动下发路径共用。
-    local registry = {}
+    local registry = {} -- 为场景提供单一命令定义的 registry 替身。
     -- 提供只读测试索引。
     ---@return table 提供一个命令的只读测试索引。
     function registry.build_index()
@@ -268,7 +268,7 @@ local function scenario(overrides)
     end
 
     -- 用最小 codec 替身验证 Gateway 转发；Protobuf 字节由真实集成测试覆盖。
-    local codec = {}
+    local codec = {} -- 只模拟 Envelope/body 编解码边界，不验证 Protobuf wire bytes。
     -- payload 的数字只用于构造可重复的测试 request data。
     ---@param payload string 测试用 Envelope bytes。
     ---@return table 解码得到的 Envelope record；bad 输入抛出模拟解码错误。

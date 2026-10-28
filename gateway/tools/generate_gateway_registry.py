@@ -70,23 +70,23 @@ def parse_protos(sources: list[str]) -> tuple[str, list[dict[str, str | int | No
     if len(packages) != 1:
         raise ValueError("all proto files must use the same package")
     package = next(iter(packages))
-    structural = "\n".join(structural_sources)
+    structural = "\n".join(structural_sources)  # 合并后的无注释 proto 正文，供声明扫描共用。
     message_names = {
         match.group("name")
         for match in MESSAGE_RE.finditer(structural)
     }
-    enum_matches = list(ENUM_RE.finditer(structural))
+    enum_matches = list(ENUM_RE.finditer(structural))  # 所有 CommandId 声明；合同要求合并后恰有一个。
     if len(enum_matches) != 1:
         raise ValueError("proto files must declare exactly one enum CommandId")
-    enum_match = enum_matches[0]
+    enum_match = enum_matches[0]  # 唯一共享命令枚举，作为 registry 的命令来源。
 
-    commands: list[dict[str, str | int | None]] = []
+    commands: list[dict[str, str | int | None]] = []  # 当前输入文件实际提供请求或响应类型的命令记录。
     seen_ids: set[int] = set()  # 已扫描的数字命令号，拒绝 Protobuf 枚举别名。
     seen_names: set[str] = set()  # 已接受的消息前缀，拒绝转换后同名的枚举项。
 
     for match in ENUM_VALUE_RE.finditer(enum_match.group("body")):
-        enum_name = match.group("name")
-        command_id = int(match.group("id"))
+        enum_name = match.group("name")  # CommandId 中的稳定协议枚举名。
+        command_id = int(match.group("id"))  # 运行时 Envelope 使用的数值命令号。
 
         if enum_name == "COMMAND_UNSPECIFIED":
             if command_id != 0:
@@ -99,15 +99,17 @@ def parse_protos(sources: list[str]) -> tuple[str, list[dict[str, str | int | No
             raise ValueError(f"duplicate command id: {command_id}")
         seen_ids.add(command_id)
 
-        method_name = _pascal_name(enum_name)
-        request_name = f"{method_name}Request"
-        response_name = f"{method_name}Response"
+        method_name = _pascal_name(enum_name)  # 按生成规则转换出的消息名称前缀。
+        request_name = f"{method_name}Request"  # 该命令约定的 request 消息候选名。
+        response_name = f"{method_name}Response"  # 该命令约定的 response 消息候选名。
 
+        # 缺少 Request 消息时保留 None，供生成 registry 表达单向命令或主动下发。
         request_type = (
             f".{package}.{request_name}"
             if request_name in message_names
             else None
         )
+        # 缺少 Response 消息时保留 None，供 Gateway 拒绝构造业务响应。
         response_type = (
             f".{package}.{response_name}"
             if response_name in message_names
@@ -236,12 +238,12 @@ def main() -> int:
         help="Envelope 的完整 Protobuf 类型名；省略时使用当前 package 的 .Envelope",
     )
     parser.add_argument("--output", required=True, type=Path)
-    args = parser.parse_args()
+    args = parser.parse_args()  # CLI 校验后的输入路径、可选类型覆盖和输出位置。
 
     package, commands = parse_protos(
         [path.read_text(encoding="utf-8") for path in args.proto],
     )
-    content = render(package, commands)
+    content = render(package, commands)  # 按稳定顺序生成的完整 Lua registry 文本。
     if args.envelope_type:
         if not args.envelope_type.startswith("."):
             parser.error("--envelope-type 必须是以点开头的完整 Protobuf 类型名")

@@ -26,9 +26,9 @@ namespace FlyWow.Gateway
         /// <summary>创建本连接的P-256临时密钥；执行随机生成，不进行I/O。</summary>
         public HandshakeClient()
         {
-            var curve = SecNamedCurves.GetByName("secp256r1");
+            var curve = SecNamedCurves.GetByName("secp256r1"); // BouncyCastle 的 P-256 曲线参数源。
             domain = new ECDomainParameters(curve.Curve, curve.G, curve.N, curve.H);
-            var generator = new ECKeyPairGenerator();
+            var generator = new ECKeyPairGenerator(); // 仅用于创建本实例的临时 ECDH 密钥对。
             generator.Init(new ECKeyGenerationParameters(domain, new SecureRandom()));
             pair = generator.GenerateKeyPair();
         }
@@ -55,10 +55,10 @@ namespace FlyWow.Gateway
             {
                 if (challenge == null || challenge.Length != 99 || challenge[0] != 2 || challenge[1] != 1 || challenge[2] != 4)
                     throw new InvalidOperationException("HANDSHAKE_CHALLENGE");
-                var point = domain.Curve.DecodePoint(Slice(challenge, 2, 65));
+                var point = domain.Curve.DecodePoint(Slice(challenge, 2, 65)); // 从 challenge 公钥区间解码出的服务端曲线点。
                 if (point.IsInfinity || !point.IsValid()) throw new InvalidOperationException("INVALID_PUBLIC_KEY");
-                var peer = new ECPublicKeyParameters(point, domain);
-                var agreement = new ECDHBasicAgreement();
+                var peer = new ECPublicKeyParameters(point, domain); // 绑定到固定 P-256 域的服务端公钥。
+                var agreement = new ECDHBasicAgreement(); // 本次连接的 ECDH 运算器，不跨调用复用。
                 agreement.Init(pair.Private);
                 raw = agreement.CalculateAgreement(peer).ToByteArrayUnsigned();
                 z = new byte[32];
@@ -93,7 +93,7 @@ namespace FlyWow.Gateway
             {
                 if (ready == null || ready.Length != 33 || ready[0] != 4)
                     throw new InvalidOperationException("HANDSHAKE_READY");
-                var expected = Mac(key, Join(Encoding.ASCII.GetBytes("server-ready"), transcript));
+                var expected = Mac(key, Join(Encoding.ASCII.GetBytes("server-ready"), transcript)); // 与收到证明比较的服务端 HMAC。
                 int difference = 0;
                 for (int i = 0; i < 32; ++i) difference |= expected[i] ^ ready[i + 1];
                 if (difference != 0) throw new InvalidOperationException("HANDSHAKE_READY");
@@ -136,7 +136,7 @@ namespace FlyWow.Gateway
         /// <summary>复制已校验的固定区间；返回新数组，不改变输入。</summary>
         private static byte[] Slice(byte[] source, int start, int count)
         {
-            var result = new byte[count];
+            var result = new byte[count]; // 新建目标区，避免修改调用者提供的 source。
             Buffer.BlockCopy(source, start, result, 0, count);
             return result;
         }
@@ -144,10 +144,10 @@ namespace FlyWow.Gateway
         /// <summary>按顺序连接SDK内部的有限数组；返回新字节数组，无I/O。</summary>
         private static byte[] Join(params byte[][] parts)
         {
-            int count = 0;
+            int count = 0; // 所有输入片段合并后的总字节数。
             foreach (var part in parts) count = checked(count + part.Length);
-            var result = new byte[count];
-            int offset = 0;
+            var result = new byte[count]; // 新建目标区，避免修改调用者提供的 source。
+            int offset = 0; // 下一片段在 result 中的写入位置。
             foreach (var part in parts)
             {
                 Buffer.BlockCopy(part, 0, result, offset, part.Length);

@@ -33,7 +33,7 @@ function M.new(handshake_config)
     assert(math.type(timeout_ticks) == "integer" and timeout_ticks > 0 and timeout_ticks < 0x80000000)
 
     local pending = 0                                            -- 当前 manager 占用的握手名额；accept 增加，close 幂等释放。
-    local manager = {}
+    local manager = {} -- 暴露 accept/receive 等闭包方法；pending 计数仅由该实例持有。
 
     --- 释放当前握手占用；幂等，清理native对象；context由Gateway独占，不执行I/O/yield。
     ---@param context HandshakeContext|nil Gateway 为连接持有的上下文；本方法释放其名额及 Native 对象。
@@ -132,7 +132,7 @@ function M.new(handshake_config)
                 return nil, "HANDSHAKE_VERSION"
             end
 
-            local ok, native, response = pcall(crypto.new, bytes)
+            local ok, native, response = pcall(crypto.new, bytes) -- Native 创建是否成功、握手对象及待发送 challenge。
             if not ok then
                 manager.close(context)
                 return nil, "HANDSHAKE_CRYPTO"
@@ -144,7 +144,7 @@ function M.new(handshake_config)
 
         -- proof 阶段验证客户端证明；SERVER_READY 仍须由 Gateway 成功写出后确认。
         if context.phase == "proof" then
-            local ok, response = pcall(context.crypto.verify, context.crypto, bytes)
+            local ok, response = pcall(context.crypto.verify, context.crypto, bytes) -- proof 校验是否成功及待发送 SERVER_READY。
             if not ok then
                 manager.close(context)
                 return nil, "HANDSHAKE_PROOF"

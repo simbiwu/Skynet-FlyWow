@@ -5,7 +5,7 @@ import { HandshakeClient } from "../clients/h5/handshake.mjs";
 // 连接本机指定端口并串行完成握手；返回读帧、写帧和关闭接口，失败拒绝 Promise。
 export async function connectTcp(port)
 {
-    const socket = net.createConnection({host: "127.0.0.1", port});
+    const socket = net.createConnection({host: "127.0.0.1", port}); // 本 sample 独占的 TCP 连接。
     socket.setTimeout(10000);
     socket.once("timeout", () => socket.destroy(new Error("TCP_TIMEOUT")));
     await new Promise((resolve, reject) =>
@@ -23,7 +23,7 @@ export async function connectTcp(port)
         buffer = Buffer.concat([buffer, chunk]);
         while (buffer.length >= 2)
         {
-            const size = buffer.readUInt16BE(0);
+            const size = buffer.readUInt16BE(0); // uint16 大端头声明的单帧长度，不含 2 字节头。
             if (size === 0)
             {
                 failure = new Error("EMPTY_TCP_FRAME");
@@ -61,12 +61,12 @@ export async function connectTcp(port)
     const writeFrame = bytes =>
     {
         if (bytes.length < 1 || bytes.length > 65535) throw new Error("TCP_FRAME_LENGTH");
-        const header = Buffer.alloc(2);
+        const header = Buffer.alloc(2); // 新建网络序长度前缀，避免修改调用方 payload。
         header.writeUInt16BE(bytes.length, 0);
         writeRaw(Buffer.concat([header, bytes]));
     };
 
-    const handshake = new HandshakeClient(globalThis.crypto);
+    const handshake = new HandshakeClient(globalThis.crypto); // 仅服务当前 TCP socket 的握手状态。
     writeFrame(await handshake.begin());
     writeFrame(await handshake.respond(await readFrame()));
     await handshake.complete(await readFrame());

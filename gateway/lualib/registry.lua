@@ -32,7 +32,7 @@ function M.build_index(definitions)
     -- 校验每项定义后建立独立索引，不修改构建产物。
     local by_id = {} -- command id 到只读协议定义的索引，供解码和路由查询。
     local count = 0  -- 已登记 command 数量；构建结束时用于拒绝空 registry。
-    for command_id, definition in pairs(definitions.commands) do
+    for command_id, definition in pairs(definitions.commands) do -- 命令号与生成器提供的类型定义，逐项校验后复制。
         assert_command_id(command_id)
         assert(type(definition) == "table", "gateway command definition must be a table")
         assert(type(definition.name) == "string" and definition.name ~= "",

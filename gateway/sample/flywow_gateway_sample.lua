@@ -2,10 +2,10 @@
 local skynet = require "skynet"
 require "skynet.manager"
 
-local SAMPLE_HANDLER_SERVICE = ".flywow_gateway_sample_handler"
-local SAMPLE_PORT = assert(tonumber(os.getenv("FLYWOW_GATEWAY_SAMPLE_PORT")))
-local SAMPLE_MODE = assert(os.getenv("FLYWOW_GATEWAY_SAMPLE_MODE"))
-local SAMPLE_TRANSPORT = SAMPLE_MODE == "websocket" and "websocket" or "tcp"
+local SAMPLE_HANDLER_SERVICE = ".flywow_gateway_sample_handler" -- 本进程注册的 handler 名称，显式传给 Gateway 配置。
+local SAMPLE_PORT = assert(tonumber(os.getenv("FLYWOW_GATEWAY_SAMPLE_PORT"))) -- Shell 为本次运行选取的 loopback 端口。
+local SAMPLE_MODE = assert(os.getenv("FLYWOW_GATEWAY_SAMPLE_MODE")) -- Shell 选定的 sample 传输模式。
+local SAMPLE_TRANSPORT = SAMPLE_MODE == "websocket" and "websocket" or "tcp" -- 将样例启动模式映射为 Gateway 支持的传输名。
 
 local module_state =
 {
@@ -62,7 +62,7 @@ skynet.start(function()
     end)
 
     module_state.gateway_service_handle = skynet.newservice("gateway/flywow_gateway")
-    local gateway_config = {}
+    local gateway_config = {} -- 从宿主预设复制的启动配置副本，仅追加本 sample 的 handler/端口/传输设置。
     for key, value in pairs(require "gateway_frame_sync") do
         gateway_config[key] = value
     end
@@ -72,7 +72,7 @@ skynet.start(function()
     gateway_config.max_clients = 4
     gateway_config.max_pending_handshakes = 4
 
-    local gateway_start_result = skynet.call(module_state.gateway_service_handle, "lua", "start", gateway_config)
+    local gateway_start_result = skynet.call(module_state.gateway_service_handle, "lua", "start", gateway_config) -- Gateway start 的真实 RPC 结果，用于确认绑定地址、传输与命令索引。
     assert(gateway_start_result.address == "127.0.0.1" and gateway_start_result.port == SAMPLE_PORT)
     assert(gateway_start_result.transport == SAMPLE_TRANSPORT and gateway_start_result.command_count > 0)
     skynet.error("FLYWOW_GATEWAY_READY transport=" .. SAMPLE_TRANSPORT)
