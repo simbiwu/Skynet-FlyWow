@@ -84,6 +84,7 @@ local function resolve_module_identity(name)
         return flywow_result.failure(code, message)
     end
 
+    -- 真实文件路径已确认在宿主根目录内，再准备前缀完成逐级边界校验。
     local root_prefix = root_path == "/" and "/" or root_path .. "/"
     if resolved_path:sub(1, #root_prefix) ~= root_prefix then
         return flywow_result.failure("HU_INVALID_PATH", "模块文件不在 root_path 内: " .. resolved_path)
@@ -94,6 +95,8 @@ local function resolve_module_identity(name)
     if relative_path:sub(-4) ~= ".lua" or relative_path:find("\\", 1, true) then
         return flywow_result.failure("HU_INVALID_PATH", "模块必须对应宿主目录中的 Lua 文件: " .. relative_path)
     end
+
+    -- 路径边界通过后，从相对文件路径生成统一模块名。
     local canonical_name = relative_path:sub(1, -5):gsub("/", ".")
     if canonical_name == "" then
         return flywow_result.failure("HU_INVALID_PATH", "模块文件路径无效")
@@ -136,6 +139,8 @@ function M.uniqueservice(name_or_global, ...)
         name = arguments[1]
         arguments = table.pack(table.unpack(arguments, 2, arguments.n))
     end
+
+    -- 调用 Controller 查询或创建唯一 Service，并保留原生 handle/抛错合同。
     -- Controller 返回的 FlyWowResult；成功值里包含唯一 Service 的 handle。
     local answer = skynet.call(get_hotupgrade_handle(), "hotupgrade", "uniqueservice",
         {service_name = name, global = global, arguments = arguments})
@@ -161,6 +166,7 @@ local function restore_service(batch)
         return flywow_result.success()
     end
 
+    -- 本批没有 Service Patch 时无需恢复；存在时从快照恢复 Service 私有状态。
     local service_update = module_state.registration_config.service_update
     local restore_result = flywow_result.success()
 
@@ -183,6 +189,7 @@ local function restore_service(batch)
         end
     end
 
+    -- 旧状态恢复完成后，再恢复原函数引用并保留 functions 表身份。
     for name, fn in pairs(batch.service_patch.old_functions) do
         rawset(service_update.functions, name, fn)
     end
@@ -215,6 +222,7 @@ local function abort(batch)
         errors[#errors + 1] = service_restore_result.message
     end
 
+    -- Service 私有状态恢复后，再恢复本批可能已提交的普通模块导出。
     if batch.module_stage then
         -- 模块导出恢复结果；失败时记录错误并继续结束本地批次。
         local restored = hotupgrade_module_patch.abort(batch.module_stage)
@@ -253,6 +261,7 @@ local function stage_service_patch(service_patch_source)
         return flywow_result.failure("HU_SERVICE_STAGE_FAILED", tostring(compile_failure))
     end
 
+    -- 源码编译成功后才执行候选 chunk，取得构建函数并生成本批定义。
     local service_update = module_state.registration_config.service_update
     local build_succeeded, build_patch = pcall(chunk)
     if not build_succeeded then
@@ -264,6 +273,8 @@ local function stage_service_patch(service_patch_source)
     if type(build_patch) ~= "function" then
         return flywow_result.failure("HU_SERVICE_STAGE_FAILED", "Service Patch 必须返回构建函数")
     end
+
+    -- 候选 chunk 返回构建函数后，以现存 Service 状态生成更新定义。
     local definition_succeeded, patch_definition = pcall(build_patch, service_update.state)
     if not definition_succeeded then
         local failure_text = tostring(patch_definition)
@@ -282,6 +293,8 @@ local function stage_service_patch(service_patch_source)
         or getmetatable(patch_definition.replace_functions) ~= nil) then
         return flywow_result.failure("HU_SERVICE_STAGE_FAILED", "replace_functions 必须是普通表")
     end
+
+    -- 基础更新回调和替换表通过后，校验可选的新模块声明数组。
     if patch_definition.new_modules ~= nil then
         if type(patch_definition.new_modules) ~= "table" or getmetatable(patch_definition.new_modules) ~= nil then
             return flywow_result.failure("HU_SERVICE_STAGE_FAILED", "new_modules 必须是普通数组")
@@ -299,12 +312,14 @@ local function stage_service_patch(service_patch_source)
             return flywow_result.failure("HU_SERVICE_STAGE_FAILED", "new_modules 必须是连续数组")
         end
     end
+    -- 各更新字段的结构已通过校验；拒绝没有任何实际更新内容的定义。
     if not (patch_definition.update_state
         or (patch_definition.replace_functions and next(patch_definition.replace_functions))
         or (patch_definition.new_modules and next(patch_definition.new_modules))) then
         return flywow_result.failure("HU_SERVICE_STAGE_FAILED", "Service Patch 没有更新内容")
     end
 
+    -- 定义字段和函数全部通过校验后，保存供 Update 与 Abort 使用的恢复记录。
     local service_patch =
     {
         update_state = patch_definition.update_state,
@@ -373,6 +388,8 @@ local function stage_service_patch_and_new_modules(batch, service_patch_source)
         batch.new_module_context = nil
         return service_patch_result
     end
+
+    -- Service Patch 构建成功后，解析并登记它声明的新模块清单。
     local service_patch = service_patch_result.value
     local identities = {}
     for _, name in ipairs(service_patch.new_modules or {}) do
@@ -419,6 +436,7 @@ local function prepare_batch(request)
         return flywow_result.failure("HU_UPGRADE_BUSY", "当前批次已在处理中")
     end
 
+    -- 批次身份和阶段均已校验；现在记录活动批次以拒绝并行更新。
     module_state.active_batch =
     {
         batch_id = request.batch_id, -- Controller 为本次发布生成的身份，后续控制命令必须一致。
@@ -452,6 +470,8 @@ local function update_batch(batch, request)
     if batch.phase ~= nil then
         return flywow_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
+
+    -- Prepare 状态校验通过后进入 Update 阶段，后续只允许本批次受控加载。
     batch.phase = "UPDATING"
     -- Controller 在 Prepare 收口时已固定普通候选；new_modules 在这里才首次加载并登记，从下一批 Stage 起才会匹配。
     -- Service Patch 构建和 new_modules 登记结果；成功后才能执行普通候选 Stage。
@@ -459,6 +479,7 @@ local function update_batch(batch, request)
     if not service_patch_result.ok then
         return service_patch_result
     end
+
     -- 当前 Service 的提交定义和恢复材料；本批没有匹配的 Service Patch 时为 nil。
     local service_patch = service_patch_result.value
 
@@ -470,6 +491,7 @@ local function update_batch(batch, request)
         return module_result
     end
 
+    -- 候选模块 Stage 成功后，记录模块暂存和 Service Patch 供提交或恢复。
     batch.module_stage = module_result.value.stage
     batch.service_patch = service_patch
 
@@ -479,6 +501,7 @@ local function update_batch(batch, request)
     if not commit_result.ok then
         return flywow_result.failure("HU_ACTIVATE_FAILED", commit_result.message)
     end
+
     -- 捕获 Service 状态、函数及 after_upgrade 提交异常，交由 Controller 统一 Abort。
     local activation_succeeded, after_upgrade_result = pcall(function()
         if service_patch then
@@ -510,6 +533,7 @@ local function update_batch(batch, request)
         return flywow_result.failure("HU_ACTIVATE_FAILED", "after_upgrade 拒绝更新")
     end
 
+    -- Service 更新和 after_upgrade 均成功后，记录本地批次已激活。
     batch.phase = "ACTIVATED"
     return flywow_result.success()
 end
@@ -523,6 +547,7 @@ local function finish_batch(batch)
     if batch.phase ~= "ACTIVATED" then
         return flywow_result.failure("HU_PHASE_INVALID", "当前阶段不能执行 finish")
     end
+
     -- 释放模块 Stage 保存的旧/新导出引用；Finish 不执行回滚。
     local finished = hotupgrade_module_patch.finish(batch.module_stage)
     close_batch(batch)
@@ -611,6 +636,7 @@ local function dispatch_upgrade_command(session, source, command, request)
         end
     end
 
+    -- 控制命令的状态清理完成后，只向真实请求会话返回结果。
     if session ~= 0 then
         skynet.retpack(control_result)
     end
@@ -681,6 +707,8 @@ function M.register_service(registration)
     for name in pairs(module_state.declared_modules) do
         names[#names + 1] = name
     end
+
+    -- 模块名集合收集完成后排序，保证登记快照顺序稳定。
     table.sort(names)
     ---@type FlyWowHotUpgradeTargetMetadata
     -- 发给 Controller 的登记快照；业务状态、函数和回调不跨 Lua State 传递。
@@ -700,6 +728,8 @@ function M.register_service(registration)
     for _, thread in ipairs(module_state.registration_waiters) do
         skynet.wakeup(thread)
     end
+
+    -- 登记 RPC 已返回且等待协程均已唤醒，释放本轮 waiter 集合。
     module_state.registration_waiters = {}
     -- RPC 失败可能意味着 Controller 已登记；保持本 State 配置，要求宿主终止未 READY 的启动。
     if not registration_call_succeeded or not response_is_result then
@@ -729,6 +759,8 @@ local function load_module_exports(name, module_identity, module_load_attempt)
         return flywow_result.failure("HU_DUPLICATE_MODULE",
             "模块名称已被 package.preload 占用: " .. canonical_name)
     end
+
+    -- 排除缓存占用冲突后，核对规范别名是否仍指向已登记文件。
     local cached_alias = module_load_attempt.cache_snapshot.canonical_alias
     if cached_alias ~= nil and (not rawequal(cached_alias, module_load_attempt.cache_snapshot.module)
         or module_state.module_sources[cached_alias] ~= resolved_path) then
@@ -849,7 +881,8 @@ local function load_and_register_module(name, module_identity, new_module_contex
 
         local command
         local request
-        if attempt.permit_id then
+        -- 本地登记状态恢复后，尽力通知 Controller 取消未消费的首次加载许可。
+    if attempt.permit_id then
             command = "register_module"
             request = {name = canonical_name, permit_id = attempt.permit_id}
         elseif register_new_module and attempt.module_declaration_added then
@@ -879,12 +912,18 @@ local function load_and_register_module(name, module_identity, new_module_contex
         package.loaded[name] = attempt.cache_snapshot.module
         package.loaded[canonical_name] = attempt.cache_snapshot.canonical_alias
     end
+
+    -- 缓存恢复后，逐项撤销本次加载新增的来源映射与模块声明。
     if attempt.source_mapping_added then
         module_state.module_sources[attempt.module_exports] = nil
     end
+
+    -- 来源映射恢复后，再移除本次添加的本地模块声明。
     if attempt.module_declaration_added then
         module_state.declared_modules[canonical_name] = nil
     end
+
+    -- 本地登记状态恢复后，尽力通知 Controller 取消未消费的首次加载许可。
     if attempt.permit_id then
         pcall(skynet.call, get_hotupgrade_handle(), "hotupgrade",
             "cancel_module_load", {name = canonical_name, permit_id = attempt.permit_id})
@@ -950,13 +989,18 @@ end
 ---@param name string 调用方原有的 require 模块名；本函数用 package.path 定位文件，再向 Controller 登记统一模块名。
 ---@return table module_exports 成功返回稳定模块表；失败抛错，可能 yield。
 function M.require(name)
+    -- 保持原生 require 的参数错误行为，随后确认模块名对应的真实文件身份。
     if type(name) ~= "string" or name == "" then
         error("HU_INVALID_REQUEST: 模块名无效", 2)
     end
+
+    -- 参数形状通过后解析模块真实路径与统一身份，再进入受控加载和登记。
     local identity_result = resolve_module_identity(name)
     if not identity_result.ok then
         error(identity_result.code .. ": " .. identity_result.message, 2)
     end
+
+    -- 身份校验通过后才加载并登记模块；失败仍按原生 require 抛错。
     local require_result = require_module(name, identity_result.value)
     if not require_result.ok then
         error(tostring(require_result.code or "HU_MODULE_LOAD_FAILED") .. ": " .. tostring(require_result.message), 2)

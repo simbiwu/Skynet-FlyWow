@@ -85,6 +85,57 @@ class CheckWorkflowTests(unittest.TestCase):
             self.assertEqual(4, len(errors))
             self.assertTrue(any("基线" in error or "提交差异" in error for error in errors))
 
+class HotUpgradeControllerTypeGateTests(unittest.TestCase):
+    """防止 Controller 模块类型与 controller 参数的方法声明脱节。"""
+
+    def test_requires_load_patch_on_the_controller_module_type(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "hotupgrade/lualib/flywow_hotupgrade_controller.lua"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(
+                "---@class FlyWowHotUpgradeController\n"
+                "---@field handle_command fun(self: FlyWowHotUpgradeController)\n"
+                "local M = {}\n",
+                encoding="utf-8",
+            )
+
+            errors = CHECKER.check_hotupgrade_controller_type_contract(root)
+
+            self.assertTrue(any("未声明 load_patch" in error for error in errors))
+
+
+class HotUpgradeFullSourceGateTests(unittest.TestCase):
+    """确保 HotUpgrade 生产模块即使未改动也执行函数合同和阶段门禁。"""
+
+    def test_scans_short_multiphase_production_function_without_git_diff(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "hotupgrade/lualib/controller.lua"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(
+                "--- 准备本批发布状态。\n"
+                "---@param batch table 本批记录。\n"
+                "---@return table 阶段结果。\n"
+                "local function prepare(batch)\n"
+                "    local result = load_patch(batch)\n"
+                "    if not result.ok then\n"
+                "        return result\n"
+                "    end\n"
+                "    for _, file in ipairs(batch.files) do\n"
+                "        snapshot(file)\n"
+                "    end\n"
+                "    return success()\n"
+                "end\n",
+                encoding="utf-8",
+            )
+
+            errors = CHECKER.check_hotupgrade_lua_function_contracts(root)
+
+            self.assertTrue(any("阶段边界没有空行" in error for error in errors))
+            self.assertTrue(any("缺少紧邻该阶段的中文目的说明" in error for error in errors))
+
+
 class LuaCommentGateTests(unittest.TestCase):
     """验证变更函数的合同注释、逻辑排版和范围定位门禁。"""
 
@@ -102,9 +153,8 @@ class LuaCommentGateTests(unittest.TestCase):
             "end\n"
         )
         errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {3, 4, 5, 6})
-        self.assertEqual(1, len(errors))
-        self.assertIn("缺少紧邻的职责说明", errors[0])
-        self.assertIn("demo.lua:3", errors[0])
+        self.assertTrue(any("缺少紧邻的职责说明" in error for error in errors))
+        self.assertTrue(any("demo.lua:3" in error for error in errors))
 
     def test_accepts_changed_nontrivial_function_with_summary(self) -> None:
         source = (
@@ -116,6 +166,8 @@ class LuaCommentGateTests(unittest.TestCase):
             "    if not paths then\n"
             "        return nil\n"
             "    end\n"
+            "\n"
+            "    -- 保存后续阶段要填充的文件记录。\n"
             "    batch.files = {}\n"
             "    return true\n"
             "end\n"
@@ -171,27 +223,129 @@ class LuaCommentGateTests(unittest.TestCase):
         errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {2})
         self.assertTrue(any("缺少紧邻的 @return" in error for error in errors))
 
-    def test_rejects_long_function_without_logical_spacing(self) -> None:
-        statements = "".join(f"    local value_{index} = {index}\n" for index in range(18))
+    def test_rejects_short_multiphase_function_without_spacing_or_phase_comment(self) -> None:
         source = (
-            "--- 生成需要多步处理的候选记录。\n"
-            "---@return table 候选记录。\n"
-            "local function build_candidate()\n"
-            + statements
-            + "    -- 第二阶段返回所有校验通过的候选字段。\n"
-            + "    return {}\nend\n"
+            "--- 固定本批文件后保存部署前快照。\n"
+            "---@param batch table 本批发布记录。\n"
+            "---@return table 本阶段结果。\n"
+            "local function prepare_batch(batch)\n"
+            "    local result = load_patch(batch)\n"
+            "    if not result.ok then\n"
+            "        return result\n"
+            "    end\n"
+            "    for _, file in ipairs(batch.files) do\n"
+            "        snapshot(file)\n"
+            "    end\n"
+            "    return success()\n"
+            "end\n"
         )
-        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {4})
-        self.assertTrue(any("代码段之间没有空行" in error for error in errors))
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {8})
+        self.assertTrue(any("阶段边界没有空行" in error for error in errors))
+        self.assertTrue(any("缺少紧邻该阶段的中文目的说明" in error for error in errors))
 
-    def test_accepts_long_function_with_logical_spacing(self) -> None:
-        statements = "".join(f"    local value_{index} = {index}\n" for index in range(9))
+    def test_accepts_short_multiphase_function_with_spacing_and_phase_comment(self) -> None:
         source = (
-            "--- 生成需要多步处理的候选记录。\n"
-            "---@return table 候选记录。\n"
-            "local function build_candidate()\n"
-            + statements + "\n" + statements
-            + "    -- 第二阶段返回完整候选记录。\n"
+            "--- 固定本批文件后保存部署前快照。\n"
+            "---@param batch table 本批发布记录。\n"
+            "---@return table 本阶段结果。\n"
+            "local function prepare_batch(batch)\n"
+            "    local result = load_patch(batch)\n"
+            "    if not result.ok then\n"
+            "        return result\n"
+            "    end\n"
+            "\n"
+            "    -- 逐个保存正式文件内容，供后续部署失败时恢复。\n"
+            "    for _, file in ipairs(batch.files) do\n"
+            "        snapshot(file)\n"
+            "    end\n"
+            "    return success()\n"
+            "end\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {10})
+        self.assertEqual([], errors)
+
+    def test_does_not_skip_business_if_as_a_new_phase(self) -> None:
+        source = (
+            "--- 执行候选模块更新。\n"
+            "---@return table 更新结果。\n"
+            "local function update_module()\n"
+            "    prepare()\n"
+            "    if candidate.enabled then\n"
+            "        activate()\n"
+            "    end\n"
+            "    persist()\n"
+            "    return success()\n"
+            "end\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {5})
+        self.assertTrue(any("阶段边界没有空行" in error for error in errors))
+        self.assertTrue(any("缺少紧邻该阶段的中文目的说明" in error for error in errors))
+
+    def test_skips_immediate_return_guard_between_phases(self) -> None:
+        source = (
+            "--- 准备并构造结果。\n"
+            "---@return table 结果。\n"
+            "local function build_result()\n"
+            "    prepare()\n"
+            "    if not ready() then\n"
+            "        return failure()\n"
+            "    end\n"
+            "    return success()\n"
+            "end\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {5})
+        self.assertEqual([], errors)
+
+    def test_phase_comment_can_precede_lua_type_annotation(self) -> None:
+        source_lines = [
+            "    if not valid then",
+            "        return failure()",
+            "    end",
+            "",
+            "    -- 校验通过后构造并登记本地记录。",
+            "    ---@type table",
+            "    local record = {}",
+        ]
+        self.assertTrue(CHECKER._has_lua_phase_comment(source_lines, 2, 6))
+
+    def test_checks_repeat_loop_as_a_phase_boundary(self) -> None:
+        source = (
+            "--- 等待状态稳定后生成结果。\n"
+            "---@return table 稳定结果。\n"
+            "local function wait_until_ready()\n"
+            "    repeat\n"
+            "        poll()\n"
+            "    until ready()\n"
+            "    local result = build_result()\n"
+            "    return result\n"
+            "end\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {5})
+        self.assertTrue(any("阶段边界没有空行" in error for error in errors))
+        self.assertTrue(any("缺少紧邻该阶段的中文目的说明" in error for error in errors))
+
+    def test_ignores_end_and_phase_text_inside_long_string(self) -> None:
+        source = (
+            "--- 返回固定的多行文本。\\n"
+            "---@return string 示例文本。\\n"
+            "local function get_text()\\n"
+            "    local text = [[\\n"
+            "    end\\n"
+            "    local hidden = true\\n"
+            "    ]]\\n"
+            "    return text\\n"
+            "end\\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {5})
+        self.assertEqual([], errors)
+
+    def test_accepts_long_single_phase_function_without_artificial_comment(self) -> None:
+        statements = "".join(f"    local value_{index} = {index}\n" for index in range(20))
+        source = (
+            "--- 生成一组连续计算结果。\n"
+            "---@return table 结果列表。\n"
+            "local function build_values()\n"
+            + statements
             + "    return {}\nend\n"
         )
         errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {4})

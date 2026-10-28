@@ -45,7 +45,7 @@ local function copy_state_graph(source_graph, target_graph)
             return flywow_result.failure("HU_STATE_COPY_FAILED", "状态快照嵌套超过限制")
         end
 
-        -- 先登记目标表，递归遇到共享子表或环时就能复用同一目标引用。
+        -- 根层复用调用方提供的目标表，嵌套层按需创建新的普通表。
         local target_table = nesting_depth == 1 and target_graph or nil
         if not target_table then
             target_table = {}
@@ -53,6 +53,8 @@ local function copy_state_graph(source_graph, target_graph)
         if target_table == source_value or getmetatable(target_table) ~= nil then
             return flywow_result.failure("HU_STATE_COPY_FAILED", "快照必须与线上根表隔离")
         end
+
+        -- 目标表创建后登记源到目标的映射，递归遇到该表时复用同一引用。
         copied_tables[source_value] = target_table
 
         -- 暂存并验证所有字段；确认整张图有效后才改写目标表，避免失败留下半份快照。
@@ -73,10 +75,12 @@ local function copy_state_graph(source_graph, target_graph)
             fields[#fields + 1] = {key = key, value = child_result.value}
         end
 
-        -- 完整验证成功后再原地替换目标表字段，保留调用方传入的根表身份。
+        -- 所有字段复制和限制检查均已通过；此时才开始改写现存目标表。
         for key in pairs(target_table) do
             rawset(target_table, key, nil)
         end
+
+        -- 旧字段清除后安装已验证的新字段，保留调用方传入的根表身份。
         for _, field in ipairs(fields) do
             rawset(target_table, field.key, field.value)
         end
@@ -100,10 +104,13 @@ function M.restore_state(source_graph, target_graph)
     if type(source_graph) ~= "table" or type(target_graph) ~= "table" then
         return flywow_result.failure("HU_STATE_COPY_FAILED", "状态必须为表")
     end
+
+    -- 两个根表类型确认后再复制；复制失败时不把半成品作为成功结果返回。
     local restored = copy_state_graph(source_graph, target_graph)
     if not restored.ok then
         return restored
     end
+
     return flywow_result.success()
 end
 
@@ -138,6 +145,7 @@ local function check_exports(module_exports, module_name)
     if type(module_exports) ~= "table" or getmetatable(module_exports) ~= nil then
         return invalid("必须导出无元表根表")
     end
+
     -- 每张嵌套表只入栈一次，允许数据共享引用或形成循环。
     local pending = {module_exports}
     local seen = {[module_exports] = true}
@@ -173,6 +181,7 @@ local function check_exports(module_exports, module_name)
     if (module_exports.export_state == nil) ~= (module_exports.import_state == nil) then
         return invalid("状态钩子须成对")
     end
+    -- 钩子成对存在后，分别验证它们确实可调用。
     if module_exports.export_state ~= nil and
         (type(module_exports.export_state) ~= "function" or type(module_exports.import_state) ~= "function") then
         return invalid("状态钩子必须是函数")
@@ -283,6 +292,7 @@ function M.stage(module_patches, module_loaders)
         entry.chunk = nil
     end
 
+    -- 候选编译、执行和导出校验成功后，发布暂存记录供 Commit 或 Abort 使用。
     module_state.active_module_stage = module_stage
     return flywow_result.success({stage = module_stage})
 end
@@ -361,6 +371,7 @@ function M.finish(module_stage)
         return flywow_result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
     end
 
+    -- 暂存身份确认有效后释放新旧导出引用并结束模块 Stage。
     module_stage.entries = {}
     module_state.active_module_stage = nil
     return flywow_result.success()

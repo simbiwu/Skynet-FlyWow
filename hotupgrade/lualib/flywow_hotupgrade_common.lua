@@ -15,6 +15,8 @@ function M.normalize_source(source)
     if source:sub(1, 3) == "\239\187\191" then
         source = source:sub(4)
     end
+
+    -- BOM 清理后再移除首行 shebang，同时保留原源码行号。
     if source:sub(1, 1) == "#" then
         -- 源码中第一个换行位置；用于检查并移除文件开头的 UTF-8 BOM。
         local newline = source:find("\n", 1, true)

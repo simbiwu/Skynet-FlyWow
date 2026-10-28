@@ -381,26 +381,107 @@ def _inline_lua_control_body_lines(source_lines: list[str], start_line: int, end
     return sorted(violations)
 
 
-def _has_lua_blank_line_between_statements(source_lines: list[str], start_line: int, end_line: int) -> bool:
-    """判断长函数中至少有一处空行真正分隔两段代码。"""
+def _lua_phase_boundaries(source_lines: list[str], start_line: int, end_line: int) -> list[tuple[int, int]]:
+    """定位同级控制块结束后继续执行的阶段边界，不依赖函数行数。"""
 
-    statement_lines = [
-        index for index in range(start_line, end_line - 1)
-        if source_lines[index].strip() and not source_lines[index].lstrip().startswith("--")
-    ]
-    return any(
-        any(not source_lines[line_index].strip() for line_index in range(previous + 1, current))
-        for previous, current in zip(statement_lines, statement_lines[1:])
-    )
+    body_indent = None
+    for line_number in range(start_line, end_line - 1):
+        line = source_lines[line_number]
+        if line.strip() and not line.lstrip().startswith("--"):
+            body_indent = len(line) - len(line.lstrip())
+            break
+    if body_indent is None:
+        return []
+
+    function_source = "\n".join(source_lines[start_line - 1:end_line])
+    closing_control_lines = {
+        start_line + token_line - 1
+        for value, token_line in _tokenize_lua(function_source)
+        if value in {"end", "until"}
+    }
+
+    boundaries: list[tuple[int, int]] = []
+    for index in range(start_line, end_line - 1):
+        line = source_lines[index]
+        line_number = index + 1
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip())
+        closes_block = stripped == "end" or stripped.startswith("until ")
+        if indent != body_indent or not closes_block or line_number not in closing_control_lines:
+            continue
+
+        next_statement = None
+        for next_index in range(index + 1, end_line - 1):
+            next_line = source_lines[next_index]
+            next_stripped = next_line.strip()
+            if not next_stripped or next_line.lstrip().startswith("--"):
+                continue
+            next_indent = len(next_line) - len(next_line.lstrip())
+            if next_indent < body_indent:
+                break
+            if next_indent == body_indent:
+                next_statement = next_index
+                break
+        if next_statement is None:
+            continue
+
+        next_text = source_lines[next_statement].strip()
+        if next_text.startswith("return"):
+            continue
+        if next_text.startswith(("elseif ", "else")):
+            continue
+        if _is_lua_guard_statement(source_lines, next_statement, body_indent):
+            # 只有立即返回的顶层 guard 属于连续校验；业务 if 仍是独立处理阶段。
+            continue
+
+        boundaries.append((index, next_statement))
+
+    return boundaries
 
 
-def _has_lua_internal_comment(source_lines: list[str], start_line: int, end_line: int) -> bool:
-    """判断长函数体是否至少解释一项非显然处理阶段。"""
+def _is_lua_guard_statement(source_lines: list[str], statement_index: int, body_indent: int) -> bool:
+    """只识别 if 主体首句立即 return 的校验 guard，不把业务分支当作 guard 跳过。"""
 
-    return any(
-        line.lstrip().startswith("--") and CHINESE_PATTERN.search(line)
-        for line in source_lines[start_line:end_line - 1]
-    )
+    statement_line = source_lines[statement_index]
+    statement_indent = len(statement_line) - len(statement_line.lstrip())
+    if statement_indent != body_indent or not statement_line.strip().startswith("if "):
+        return False
+
+    condition_ended = False
+    for line in source_lines[statement_index:]:
+        stripped = line.strip()
+        if not stripped or line.lstrip().startswith("--"):
+            continue
+        if not condition_ended:
+            if re.search(r"\bthen\b", stripped):
+                condition_ended = True
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= statement_indent:
+            return False
+        return indent == statement_indent + 4 and stripped.startswith("return")
+    return False
+
+
+def _has_lua_phase_spacing(source_lines: list[str], previous_line: int, next_line: int) -> bool:
+    """要求阶段结束与下一段代码之间存在空行。"""
+
+    return any(not source_lines[index].strip() for index in range(previous_line + 1, next_line))
+
+
+def _has_lua_phase_comment(source_lines: list[str], previous_line: int, next_line: int) -> bool:
+    """只接受紧邻下一阶段、且能被中文读者理解的阶段说明。"""
+
+    for index in range(next_line - 1, previous_line, -1):
+        line = source_lines[index].strip()
+        if not line:
+            continue
+        if line.startswith("---@"):
+            continue
+        if not line.startswith("--"):
+            return False
+        return bool(CHINESE_PATTERN.search(line))
+    return False
 
 
 def _lua_function_comment_start_line(source_lines: list[str], start_line: int) -> int:
@@ -449,20 +530,16 @@ def check_lua_function_comments(path: Path, source: str, changed_lines: set[int]
                     f"{path}:{start_line}: 非平凡 Lua 函数缺少紧邻的职责说明；"
                     "请说明函数职责及关键约束"
                 )
-            statement_lines = [
-                line for line in source_lines[start_line:end_line - 1]
-                if line.strip() and not line.lstrip().startswith("--")
-            ]
-            if len(statement_lines) >= 18:
-                if not _has_lua_blank_line_between_statements(source_lines, start_line, end_line):
+            for previous_line, next_line in _lua_phase_boundaries(source_lines, start_line, end_line):
+                if not _has_lua_phase_spacing(source_lines, previous_line, next_line):
                     errors.append(
-                        f"{path}:{start_line}: 长 Lua 函数的代码段之间没有空行；"
-                        "请按真实逻辑阶段分段，不要把连续步骤机械拆开"
+                        f"{path}:{previous_line + 1}: 多阶段 Lua 函数的阶段边界没有空行；"
+                        "请按真实流程分段，不要把连续步骤机械拆开"
                     )
-                if not _has_lua_internal_comment(source_lines, start_line, end_line):
+                if not _has_lua_phase_comment(source_lines, previous_line, next_line):
                     errors.append(
-                        f"{path}:{start_line}: 长 Lua 函数没有阶段说明注释；"
-                        "请解释非显然处理阶段，不要逐行翻译代码"
+                        f"{path}:{next_line + 1}: 多阶段 Lua 函数缺少紧邻该阶段的中文目的说明；"
+                        "请解释阶段目标或约束，不要逐行翻译代码"
                     )
     return errors
 
@@ -564,6 +641,48 @@ def check_changed_lua_function_comments(root: Path, base_ref: str | None = None)
     return errors
 
 
+def check_hotupgrade_controller_type_contract(root: Path) -> list[str]:
+    """确认 Controller 模块类型公开其方法，避免 helper 参数丢失 IDE 补全。"""
+
+    path = root / "hotupgrade/lualib/flywow_hotupgrade_controller.lua"
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exception:
+        return [f"{path.relative_to(root)}: 无法读取 Controller 类型声明：{exception}"]
+
+    class_match = re.search(
+        r"---@class FlyWowHotUpgradeController\n(?P<fields>(?:---@field .*\n)+)local M\s*=",
+        source,
+    )
+    if not class_match:
+        return [f"{path.relative_to(root)}: Controller 类型没有绑定到模块表 M"]
+    if not re.search(
+        r"---@field load_patch fun\(self: FlyWowHotUpgradeController,",
+        class_match.group("fields"),
+    ):
+        return [f"{path.relative_to(root)}: Controller 类型未声明 load_patch，helper 无法获得 IDE 成员提示"]
+    return []
+
+
+def check_hotupgrade_lua_function_contracts(root: Path) -> list[str]:
+    """全量检查 HotUpgrade 生产 Lua 的函数合同、阶段分段和压缩控制体。"""
+
+    source_paths = sorted(
+        list((root / "hotupgrade/lualib").rglob("*.lua"))
+        + list((root / "hotupgrade/service").rglob("*.lua"))
+    )
+    errors = check_hotupgrade_controller_type_contract(root)
+    for path in source_paths:
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exception:
+            errors.append(f"{path.relative_to(root)}: 无法读取 HotUpgrade Lua 源码：{exception}")
+            continue
+        changed_lines = set(range(1, len(source.splitlines()) + 1))
+        errors.extend(check_lua_function_comments(path.relative_to(root), source, changed_lines))
+    return errors
+
+
 def check_repository(root: Path, base_ref: str | None = None) -> list[str]:
     """汇总执行不会启动业务运行时的仓库级静态检查。"""
 
@@ -585,6 +704,7 @@ def check_repository(root: Path, base_ref: str | None = None) -> list[str]:
     errors.extend(check_skill(root))
     errors.extend(check_quality_workflow(root))
     errors.extend(check_changed_lua_function_comments(root, base_ref))
+    errors.extend(check_hotupgrade_lua_function_contracts(root))
     return errors
 
 
