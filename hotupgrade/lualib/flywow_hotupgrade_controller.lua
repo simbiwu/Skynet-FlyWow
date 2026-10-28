@@ -6,7 +6,7 @@ require "skynet.manager"
 local hotupgrade_native = require "flywow_hotupgrade_native"
 -- 构造 Controller 向宿主和目标 Service 返回的统一结果表。
 local flywow_result = require "flywow_result"
--- 提供跨 Service 协议号、路径环境变量名和快照边界。
+-- 提供跨 Service 协议号、路径环境变量名及状态快照的深度和字段数上限。
 local hotupgrade_common = require "flywow_hotupgrade_common"
 
 -- Controller 对外提供初始化、Service 生命周期协调和热更批次管理操作。
@@ -49,13 +49,13 @@ local hotupgrade_common = require "flywow_hotupgrade_common"
 local M =
 {
     initialized                    = nil,                 -- initialize 完整成功后设为 true；此前管理命令不可用。
-    root_path                      = nil,                 -- 已解析的宿主根目录；正式文件读取、替换和恢复共用此边界。
+    root_path                      = nil,                 -- 已解析的宿主根目录；正式文件读取、替换和恢复都以它为根目录。
     patch_root                     = nil,                 -- 已解析的受信 Patch 根目录；每个批次从此目录读取冻结源码。
     service_path                   = nil,                 -- Patch 内按 Service 脚本分类的相对目录。
     service_registrations          = nil,                 -- 按真实 Service handle 保存登记记录；供许可校验、Patch 匹配和批次快照读取。
     pending_creations              = nil,                 -- 尚未完成创建或首次登记的记录；完成后由 finish_creation 移除。
     service_creations              = nil,                 -- Service handle 到创建记录的索引；用于匹配早到的 register。
-    early_exit_handles             = nil,                 -- 原生创建尚未返回时收到的退出 handle；创建调用收敛后立即清空。
+    early_exit_handles             = nil,                 -- skynet.newservice 返回前收到的退出 handle；创建调用返回或失败后立即清空。
     service_registration_waiters   = nil,                 -- 等待原生 Service handle 建立映射的登记协程；映射完成后唤醒。
     module_load_permits            = nil,                 -- 许可 ID 到来源 Service/模块名的映射；登记或取消时移除。
     module_permit_sequence         = nil,                 -- 本 Controller 内递增的许可序号，用于生成不重复的许可 ID。
@@ -110,7 +110,7 @@ local function valid_service_name(service_name)
         return false
     end
 
-    -- 整体路径边界通过后，再逐段拒绝点段和 Skynet 不接受的字符。
+    -- 路径格式通过首轮检查后，再拒绝每个路径段为 .、.. 或含 Skynet 不接受字符的名称。
     for segment in service_name:gmatch("[^/]+") do
         if segment == "." or segment == ".." or not segment:match("^[%w_.%-]+$") then
             return false
@@ -264,7 +264,7 @@ function M.initialize(controller_config)
         service_registrations         = {},                                             -- 按真实 Service handle 保存登记信息；用于加载许可、Patch 匹配和控制 RPC。
         pending_creations             = {},                                             -- 保存已受理但尚未登记或取消的创建记录；完成后从集合移除。
         service_creations             = {},                                             -- 按 Service handle 索引创建记录；用于匹配早到的 register。
-        early_exit_handles            = {},                                             -- 记录原生创建返回前收到的退出 handle；对应创建结果收敛后清除。
+        early_exit_handles            = {},                                             -- 保存 skynet.newservice 返回 handle 前收到的退出通知；创建调用返回或失败后清空。
         service_registration_waiters  = {},                                             -- 保存等待 register 来源与原生 handle 匹配的协程；映射变化时唤醒重查。
         module_load_permits           = {},                                             -- 按许可 ID 保存 Service handle 与模块名；登记、取消或 Service 退出时消费。
         module_permit_sequence        = 0,                                              -- 本 Controller 内递增的许可序号；生成不复用的首次加载许可 ID。
@@ -433,7 +433,7 @@ end
 --- 只有通过校验后，调用方才能建立创建记录并调用原生 newservice。
 ---@param request FlyWowHotUpgradeServiceCreationRequest newservice/uniqueservice 收到的请求；本函数检查入口名 service_name、启动参数 arguments 和可选的 global 标记。
 ---@param source integer Skynet 消息头中的调用方 Service handle；本函数将它记为创建者，之后只有它能取消未登记的 Service。
----@return boolean 请求字段与来源是否满足 Controller 创建合同。
+---@return boolean 请求字段是否完整且 source 是否为有效的创建者 handle。
 local function valid_service_creation_request(request, source)
     return math.type(source) == "integer" and source > 0 and valid_service_name(request.service_name)
         and type(request.arguments) == "table"
@@ -499,10 +499,10 @@ end
 --- 已有 handle 直接返回；同名创建在途时等待其结果；创建失败释放预留供后续重试。
 ---@param request FlyWowHotUpgradeServiceCreationRequest uniqueservice 传入的入口名、启动参数和唯一性选项；本函数按 service_name 查找或建立本地唯一创建记录。
 ---@param source integer Skynet 消息头中的真实请求者 handle；首次创建时保存为创建者，后续重复调用只等待结果。
----@return FlyWowResult<{service_handle:integer}> 成功载荷包含 service_handle；全局和特殊启动合同明确拒绝
+---@return FlyWowResult<{service_handle:integer}> 成功载荷包含 service_handle；global=true 和不支持的特殊入口返回明确失败。
 function M:uniqueservice(request, source)
     -- unique_service_entries 按逻辑入口名合并请求；其中 handle 表示可复用实例，waiters 表示首次创建仍在途。
-    -- 先验证唯一创建合同，再决定复用现有实例、等待在途创建或发起新创建。
+    -- 先检查 Service 名、调用者 handle 和启动参数，再决定复用实例、等待创建或发起创建。
     if request.global == true then
         return flywow_result.failure("HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED", "受管理唯一服务只支持本 Controller 内的本地唯一")
     end
@@ -512,14 +512,14 @@ function M:uniqueservice(request, source)
     end
 
     if request.service_name == "snaxd" then
-        return flywow_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "snaxd 不满足受管理 Service 自行调用 register_service 的登记合同")
+        return flywow_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "snaxd 不会自行调用 register_service，不能纳入受管理 Service 创建流程")
     end
 
     -- 该逻辑名对应的唯一 Service 记录；可能保存现有 handle 或首次创建的等待者。
     local unique_service_entry = self.unique_service_entries[request.service_name]
     if not (unique_service_entry and unique_service_entry.service_handle) then
         self:wait_lifecycle()
-        -- 等待门禁会 yield；恢复后重查唯一名，再决定等待、复用或预留。
+        -- 这里会等到当前热更批次结束；恢复后重新查询名字，避免等待期间已有同名 Service 创建完成。
         unique_service_entry = self.unique_service_entries[request.service_name]
     end
 
@@ -571,10 +571,10 @@ function M:newservice(request, source, unique_name)
         return flywow_result.failure("HU_INVALID_REQUEST", "需要创建者、Service 名和启动参数")
     end
     if request.service_name == "snaxd" then
-        return flywow_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "snaxd 不满足受管理 Service 自行调用 register_service 的登记合同")
+        return flywow_result.failure("HU_SPECIAL_SERVICE_UNSUPPORTED", "snaxd 不会自行调用 register_service，不能纳入受管理 Service 创建流程")
     end
 
-    -- 请求校验完成后等待已有发布门禁收敛，再创建并登记新 Service。
+    -- 请求检查通过后，等当前热更批次结束，再创建并登记新 Service。
     self:wait_lifecycle()
     return start_service(self, request, source, unique_name)
 end
@@ -1020,7 +1020,7 @@ function M:step(batch, service_target, command)
         return flywow_result.failure("HU_RPC_FAILED", tostring(service_result), {step = command})
     end
 
-    -- RPC 合同确认后，为失败结果补上对应 Service Patch 文件上下文。
+    -- 确认目标返回合法 FlyWowResult 后，为失败消息加上对应的 Service .patch 路径。
     if not service_result.ok and service_target.service_patch then
         service_result.message = service_target.service_patch.patch_relative_path .. ": " .. (service_result.message or service_result.code)
     end
@@ -1066,7 +1066,7 @@ end
 --- 逐轮向尚未准备的目标发送 Prepare，并在新目标加入前等待创建和许可排空。
 ---@param controller FlyWowHotUpgradeController 负责发送目标 RPC 和记录 Service 退出的 Controller。
 ---@param batch FlyWowHotUpgradeBatch 保存本批目标及其 Prepare 进度的记录。
----@return FlyWowResult<nil> 所有目标均已准备；目标、异步生命周期或匹配失败返回所属错误。
+---@return FlyWowResult<nil> 所有目标都已 Prepare；目标返回失败、创建/加载等待失败或目标匹配失败时返回具体失败结果。
 local function prepare_batch_targets(controller, batch)
     batch.phase = "PREPARE"
 
@@ -1087,7 +1087,7 @@ local function prepare_batch_targets(controller, batch)
             end
         end
 
-        -- Prepare 回调可能让出；等待创建和首次加载收敛后，再把新登记目标并入本批。
+        -- Prepare RPC 可能让出协程；等已受理的创建和模块首次加载结束后，重新读取登记表并匹配新 Service。
         wait_for_batch_work(controller, batch)
         if batch.error then
             return batch.error
@@ -1310,7 +1310,7 @@ end
 ---@param batch FlyWowHotUpgradeBatch begin 创建并放入 active_batch 的记录；本函数读取 path 并持续更新 phase、error 和结果。
 ---@return nil 等待和 RPC 可 yield；错误保存在 batch.error/phase，终态由 complete_batch 保存。
 function M:run_batch(batch)
-    -- 批次开始前已接纳的创建和首次加载必须先收敛，再关闭入口准备目标。
+    -- 先等本批开始前已受理的 Service 创建和模块首次加载结束，再部署文件并 Prepare 目标。
     wait_for_batch_work(self, batch)
     batch.phase = "DEPLOYING"
 
@@ -1495,7 +1495,7 @@ local function handle_status_request(controller, request)
 end
 
 --- 按管理命令名称把请求交给对应 Controller 方法，并统一返回 FlyWowResult。
---- 消息来源和各命令字段由对应方法按本地合同检查。
+--- 各命令方法分别检查消息来源和该命令实际读取的请求字段。
 ---@param command FlyWowHotUpgradeManagementCommand 管理端或业务 Service 发送的命令名，例如 begin、status、register。
 ---@param request FlyWowHotUpgradeManagementRequest|FlyWowHotUpgradeTargetMetadata|FlyWowHotUpgradeServiceCreationRequest|FlyWowHotUpgradeModuleLoadRequest|FlyWowHotUpgradeNewModuleRequest 随命令解包得到的请求表；具体字段由对应命令方法读取。
 ---@param source integer Skynet 消息头中的真实发送方 handle；用于确认登记、创建和模块许可的归属。

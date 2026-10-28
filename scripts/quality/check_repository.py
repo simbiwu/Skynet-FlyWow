@@ -37,6 +37,14 @@ TEXT_SUFFIXES = {
 TEXT_NAMES = {".editorconfig", ".gitattributes", ".gitignore", "CMakeLists.txt", "Makefile"}
 CHINESE_PATTERN = re.compile(r"[\u3400-\u9fff]")
 LUA_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_]\w*$")
+UNCLEAR_HOTUPGRADE_COMMENT_PHRASES = {
+    "收敛": "请写明具体等待、转换或清理动作。",
+    "状态钩子边界": "请点名 export_state/import_state 等实际回调及异常转换结果。",
+    "边界捕获异常": "请说明哪段代码可能抛错，以及捕获后返回什么。",
+    "结果合同传播": "请说明调用方收到的具体结果或错误码。",
+    "所属错误": "请说明错误来自哪个调用或阶段。",
+    "稳定外层错误码": "请写出实际返回的错误码和保留的原因信息。",
+}
 LUA_KEYWORDS = {
     "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
     "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return",
@@ -780,6 +788,19 @@ def check_lua_multiline_record_field_comments(path: Path, source: str) -> list[s
     return errors
 
 
+def check_hotupgrade_comment_clarity(path: Path, source: str) -> list[str]:
+    """拒绝已知会掩盖具体操作的 HotUpgrade 注释套话。"""
+
+    errors: list[str] = []
+    for line_number, line in enumerate(source.splitlines(), start=1):
+        if "--" not in line:
+            continue
+        for phrase, instruction in UNCLEAR_HOTUPGRADE_COMMENT_PHRASES.items():
+            if phrase in line:
+                errors.append(f"{path}:{line_number}: 注释含模糊短语“{phrase}”；{instruction}")
+    return errors
+
+
 def check_hotupgrade_lua_function_contracts(root: Path) -> list[str]:
     """全量检查 HotUpgrade 生产 Lua 的函数合同、阶段分段和压缩控制体。"""
 
@@ -807,6 +828,7 @@ def check_hotupgrade_lua_function_contracts(root: Path) -> list[str]:
             errors.append(f"{path.relative_to(root)}: 无法读取 HotUpgrade record 源码：{exception}")
             continue
         errors.extend(check_lua_multiline_record_field_comments(path.relative_to(root), source))
+        errors.extend(check_hotupgrade_comment_clarity(path.relative_to(root), source))
     return errors
 
 

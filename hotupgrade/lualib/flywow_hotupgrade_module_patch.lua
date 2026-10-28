@@ -134,13 +134,13 @@ local function replace_exports(module_exports, export_fields)
     end
 end
 
---- 检查普通模块根表及嵌套字段；不符合导出合同就返回失败，不安装候选字段。
+--- 检查普通模块返回的根表和嵌套字段；键或值类型不受支持时返回失败。
 ---@param module_exports table 候选代码 return 的根表；本函数遍历其字段和嵌套值。
 ---@param module_name string Controller 提供的统一模块名；用于定位错误来自哪个模块。
 ---@return FlyWowResult<nil> 校验成功或带模块名的 HU_MODULE_EXPORTS_INVALID 失败结果。
 local function check_exports(module_exports, module_name)
-    --- 为当前模块构造统一的导出校验失败结果。
-    ---@param message string 当前字段或导出表违反的合同。
+    --- 把模块名和具体失败原因写入 HU_MODULE_EXPORTS_INVALID 结果。
+    ---@param message string 当前字段的键/值类型或导出表结构违反 HotUpgrade 要求的具体原因。
     ---@return FlyWowResult<nil> HU_MODULE_EXPORTS_INVALID 结果，含模块名和具体原因。
     local function invalid(message)
         return flywow_result.failure("HU_MODULE_EXPORTS_INVALID", module_name .. ": " .. message)
@@ -196,21 +196,21 @@ end
 --- 所有候选准备成功后才返回 Stage；此时线上模块导出表还没有被替换。
 ---@param module_patches table[] Controller 按模块名排序的候选数组；每项含 name 和 source，本函数逐项编译并准备。
 ---@param module_loaders? table<string, {name:string, path:string}> 本 State 首次声明时使用的加载名和路径；独立调用省略时使用统一模块名，路径为 nil。
----@return FlyWowResult<{stage:FlyWowHotUpgradeModuleStage}> 成功载荷含 stage；失败不安装线上导出。候选顶层代码和状态钩子必须同步执行。
+---@return FlyWowResult<{stage:FlyWowHotUpgradeModuleStage}> 成功载荷含 stage；失败不安装线上导出。候选 chunk、export_state 和 import_state 均在本调用中同步执行，不得 yield。
 function M.stage(module_patches, module_loaders)
     -- module_patches 提供本轮新源码，module_loaders 提供首次 require 的原名/路径；package.loaded 保存当前线上根表。
     if module_state.active_module_stage then
         return flywow_result.failure("HU_UPGRADE_BUSY", "模块 Stage 尚未结束")
     end
 
-    -- Stage 持有到 Finish/Abort；每项保存候选和恢复所需的旧字段。
+    -- 保存本批各模块的线上表和旧字段；Commit 安装新字段，Abort 恢复旧字段，Finish 释放记录。
     local module_stage =
     {
         entries   = {},     -- 每个候选模块的线上表、旧字段、编译结果和候选导出；Commit/Abort 使用，Finish 清空。
         committed = false, -- Commit 开始改写线上导出后置为 true；Abort 据此恢复旧字段。
     }
-    -- 将结构检查产生的错误收敛为 Stage 的稳定外层错误码，并保留原始原因。
-    --- 将候选结构校验错误转为 Stage 外层错误，并保留原始错误码。
+    -- 导出检查或状态复制失败时，统一返回 HU_MODULE_STAGE_FAILED，并把原始错误码写入 details.cause_code。
+    --- 导出检查或状态复制失败时，保留原始错误码并返回 HU_MODULE_STAGE_FAILED。
     ---@param result FlyWowResult<nil> 导出检查或快照复制产生的失败结果。
     ---@return FlyWowResult<nil> HU_MODULE_STAGE_FAILED；原始错误码写入 details.cause_code。
     local function reject_stage(result)
@@ -249,7 +249,7 @@ function M.stage(module_patches, module_loaders)
         }
     end
 
-    -- 仅在候选模块顶层和状态钩子边界捕获异常；其余内部错误由明确结果合同传播。
+    -- 运行更新包里的模块代码；如果文件顶层代码抛错，就转换成 HU_MODULE_STAGE_FAILED 返回。
     for _, entry in ipairs(module_stage.entries) do
         local candidate_succeeded, candidate = pcall(entry.chunk, entry.loader_name, entry.loader_path)
         if not candidate_succeeded then
@@ -267,6 +267,7 @@ function M.stage(module_patches, module_loaders)
         end
 
         if entry.live.export_state and candidate.import_state then
+            -- 运行线上模块的 export_state 保存旧状态；回调抛错时停止本批并返回 HU_MODULE_STAGE_FAILED。
             local export_called, exported_state = pcall(entry.live.export_state)
             if not export_called then
                 return flywow_result.failure("HU_MODULE_STAGE_FAILED",
@@ -277,6 +278,7 @@ function M.stage(module_patches, module_loaders)
                 return reject_stage(snapshot_result)
             end
 
+            -- 运行新模块的 import_state 写入旧状态快照；回调抛错时返回 HU_MODULE_IMPORT_FAILED。
             local import_called, import_result = pcall(candidate.import_state, snapshot_result.value)
             if not import_called then
                 return flywow_result.failure("HU_MODULE_IMPORT_FAILED",

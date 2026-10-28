@@ -441,7 +441,7 @@ end)
         service_registrations         = {},                                             -- 按真实 Service handle 保存登记信息；用于加载许可、Patch 匹配和控制 RPC。
         pending_creations             = {},                                             -- 保存已受理但尚未登记或取消的创建记录；完成后从集合移除。
         service_creations             = {},                                             -- 按 Service handle 索引创建记录；用于匹配早到的 register。
-        early_exit_handles            = {},                                             -- 记录原生创建返回前收到的退出 handle；对应创建结果收敛后清除。
+        early_exit_handles            = {},                                             -- 记录原生创建返回前收到的退出 handle；对应创建调用返回或失败后清空。
         service_registration_waiters  = {},                                             -- 保存等待 register 来源与原生 handle 匹配的协程；映射变化时唤醒重查。
         module_load_permits           = {},                                             -- 按许可 ID 保存 Service handle 与模块名；登记、取消或 Service 退出时消费。
         module_permit_sequence        = 0,                                              -- 本 Controller 内递增的许可序号；生成不复用的首次加载许可 ID。
@@ -830,7 +830,7 @@ end
 1. `new_modules` 是声明清单，**不是**让你在构建函数里先执行 `hotupgrade.require("combat_rules")`。Controller 必须先知道清单，目标再按照本批新模块协议加载它。
 2. `update_state` 在这个文件执行并返回 Patch 结果时**还没有运行**；它只是一个捕获原 `state` 的函数，留待 Activate。
 3. `replace_functions.attack` 同样捕获原 `state`。新函数写入 `operations.attack`，而不是把整个 `operations` table 换掉。
-4. V2 新实例通过完整 `player_service.lua` 初始化；V1 旧实例通过当前这个 `.patch` 迁移。这是两条不同但应收敛到相同业务结果的路径。
+4. V2 新实例通过完整 `player_service.lua` 初始化；V1 旧实例通过当前这个 `.patch` 迁移。这是两条不同的路径，最终都应得到相同的玩家状态和业务函数。
 
 ## 第 6 章：让教学管理端正式发布、观察结果
 
@@ -1464,7 +1464,7 @@ local function update_batch(batch, request)
     -- 捕获 Service 状态、函数及 after_upgrade 提交异常，交由 Controller 统一 Abort。
     local activation_succeeded, activation_failure = pcall(function()
         if service_patch then
-            local service_update = module_state.registration_config.service_update -- register_service 提供的私有状态/函数更新合同。
+            local service_update = module_state.registration_config.service_update -- register_service 保存的本地接口；其中 state 是现存状态表，functions 是现存业务函数表。
             service_patch.touched = true
             if service_patch.update_state then
                 service_patch.update_state()
@@ -1718,7 +1718,7 @@ end
 
 ```lua
 if service_patch then
-    local service_update = module_state.registration_config.service_update -- register_service 提供的私有状态/函数更新合同。
+    local service_update = module_state.registration_config.service_update -- register_service 保存的本地接口；其中 state 是现存状态表，functions 是现存业务函数表。
     service_patch.touched = true
     if service_patch.update_state then
         service_patch.update_state()

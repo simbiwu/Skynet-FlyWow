@@ -105,6 +105,29 @@ class HotUpgradeControllerTypeGateTests(unittest.TestCase):
             self.assertTrue(any("未声明 load_patch" in error for error in errors))
 
 
+class HotUpgradeCommentClarityGateTests(unittest.TestCase):
+    """拒绝已知含糊的异常边界和错误传播套话。"""
+
+    def test_rejects_boundary_and_result_contract_jargon(self) -> None:
+        source = (
+            "-- 仅在候选模块顶层和状态钩子边界捕获异常；其余内部错误由明确结果合同传播。\n"
+        )
+
+        errors = CHECKER.check_hotupgrade_comment_clarity(Path("hotupgrade.lua"), source)
+
+        self.assertEqual(3, len(errors))
+        self.assertTrue(any("边界捕获异常" in error for error in errors))
+        self.assertTrue(any("状态钩子边界" in error for error in errors))
+        self.assertTrue(any("结果合同传播" in error for error in errors))
+
+    def test_accepts_specific_operation_and_error_result(self) -> None:
+        source = "-- 执行 export_state；回调抛错时停止 Stage 并返回 HU_MODULE_STAGE_FAILED。\n"
+
+        errors = CHECKER.check_hotupgrade_comment_clarity(Path("hotupgrade.lua"), source)
+
+        self.assertEqual([], errors)
+
+
 class HotUpgradeRecordFieldGateTests(unittest.TestCase):
     """确保多行 HotUpgrade record 的每个具名字段都有就近说明。"""
 

@@ -2,7 +2,7 @@
 local skynet = require "skynet" -- 提供 Service 内协程、消息分发和跨 Service 调用。
 local skynet_require = require "skynet.require" -- 用于识别 Skynet 自己的协程 require 加载器。
 local flywow_result = require "flywow_result" -- 构造本模块对外和内部统一使用的 FlyWowResult。
-local hotupgrade_common = require "flywow_hotupgrade_common" -- 提供协议号、路径环境变量和状态快照边界。
+local hotupgrade_common = require "flywow_hotupgrade_common" -- 提供协议号、路径环境变量以及状态快照的深度和字段数上限。
 local hotupgrade_native = require "flywow_hotupgrade_native" -- 解析模块真实路径，核对来源位于宿主根目录内。
 local hotupgrade_module_patch = require "flywow_hotupgrade_module_patch" -- 在当前 Lua State 中暂存、提交和恢复模块导出。
 -- 对宿主公开的受管理 Service 创建、登记与模块 require 入口。
@@ -75,7 +75,7 @@ local function resolve_module_identity(name)
         return flywow_result.failure("HU_INVALID_PATH", "可更新模块不支持 package.preload: " .. name)
     end
 
-    -- Native 解析符号链接后的路径；后续边界和登记身份都以此真实路径为准。
+    -- Native 跟随符号链接得到文件真实路径；后续确认文件在 root_path 内并登记模块名时都使用它。
     local resolved_path, resolve_failure = hotupgrade_native.resolve(source_path)
     if not resolved_path then
         local code = type(resolve_failure) == "table" and resolve_failure.code or "HU_INVALID_PATH"
@@ -83,7 +83,7 @@ local function resolve_module_identity(name)
         return flywow_result.failure(code, message)
     end
 
-    -- 真实文件路径已确认在宿主根目录内，再准备前缀完成逐级边界校验。
+    -- 拼出宿主根目录前缀并确认真实文件位于该目录内，拒绝通过符号链接越出 root_path 的文件。
     local root_prefix = root_path == "/" and "/" or root_path .. "/"
     if resolved_path:sub(1, #root_prefix) ~= root_prefix then
         return flywow_result.failure("HU_INVALID_PATH", "模块文件不在 root_path 内: " .. resolved_path)
@@ -95,7 +95,7 @@ local function resolve_module_identity(name)
         return flywow_result.failure("HU_INVALID_PATH", "模块必须对应宿主目录中的 Lua 文件: " .. relative_path)
     end
 
-    -- 路径边界通过后，从相对文件路径生成统一模块名。
+    -- 从已确认位于 root_path 内的相对 Lua 路径生成统一模块名。
     local canonical_name = relative_path:sub(1, -5):gsub("/", ".")
     if canonical_name == "" then
         return flywow_result.failure("HU_INVALID_PATH", "模块文件路径无效")
@@ -139,7 +139,7 @@ function M.uniqueservice(name_or_global, ...)
         arguments = table.pack(table.unpack(arguments, 2, arguments.n))
     end
 
-    -- 调用 Controller 查询或创建唯一 Service，并保留原生 handle/抛错合同。
+    -- 调用 Controller 查询或创建唯一 Service；返回原生 handle，Skynet RPC 抛错时继续向调用方抛出。
     -- Controller 返回的 FlyWowResult；成功值里包含唯一 Service 的 handle。
     local answer = skynet.call(get_hotupgrade_handle(), "hotupgrade", "uniqueservice",
         {
@@ -255,7 +255,7 @@ end
 
 --- 执行 Service .patch 构建回调，校验更新定义并保存恢复快照。
 ---@param service_patch_source string Controller 固定读取并发送的 Service .patch 源码。
----@return FlyWowResult<FlyWowHotUpgradeServicePatchState> 成功载荷为提交记录；构建代码异常或合同无效时返回 HU_SERVICE_STAGE_FAILED。
+---@return FlyWowResult<FlyWowHotUpgradeServicePatchState> 成功载荷为提交记录；构建代码抛错或返回字段类型无效时返回 HU_SERVICE_STAGE_FAILED。
 local function stage_service_patch(service_patch_source)
     -- 编译并执行受信 Patch 构建代码；这里只生成定义，不改动线上状态。
     local chunk, compile_failure = load(
@@ -371,7 +371,7 @@ end
 --- 构建 Service Patch、校验 new_modules 清单并执行对应首次加载登记。
 ---@param batch FlyWowHotUpgradeServiceBatch Controller 为本次 Update 建立的本地记录；本函数把 batch_id 绑定到新模块登记。
 ---@param service_patch_source? string 当前目标的 Service .patch 源码；nil 表示本批不更新 Service 状态或函数。
----@return FlyWowResult<FlyWowHotUpgradeServicePatchState|nil> 成功载荷为提交记录或 nil；失败保留所属阶段错误码。
+---@return FlyWowResult<FlyWowHotUpgradeServicePatchState|nil> 没有 Service Patch 时成功载荷为 nil；否则返回恢复记录，失败时保留具体错误码。
 local function stage_service_patch_and_new_modules(batch, service_patch_source)
     -- 保存本批允许首次加载的新模块；hotupgrade.require 用这三项限制当前协程和模块清单。
     local new_module_context =
@@ -654,7 +654,7 @@ end
 function M.register_service(registration)
     -- 固定本 State 的登记回调后，Controller RPC 会 yield。
     -- 期间到达的并发 require 暂停在 registration_waiters，等待登记结果后继续或失败返回。
-    -- 先验证回调与可选更新入口合同；检查完成前不安装 dispatch 或登记状态。
+    -- 先检查必需回调、可选 Service Patch 接口及其类型；检查全部通过后才注册消息处理器和保存配置。
     if module_state.registration_config then
         return flywow_result.failure("HU_DUPLICATE_SERVICE", "当前 State 已登记")
     end
@@ -693,7 +693,7 @@ function M.register_service(registration)
         return flywow_result.failure("HU_LIFECYCLE_PENDING", "本 State 仍有模块首次加载，完成后再登记 Service")
     end
 
-    -- 合同有效后固定本地登记配置并安装接收器，再向 Controller 登记元数据。
+    -- 回调和 Service Patch 配置检查通过后，保存配置、注册消息处理器，再向 Controller 登记模块清单。
     module_state.registration_config = registration
     skynet.dispatch("hotupgrade", dispatch_upgrade_command)
     -- 收集完整模块声明并排序，形成跨 Service 传递的稳定元数据快照。
@@ -765,7 +765,7 @@ local function load_module_exports(name, module_identity, module_load_attempt)
             "模块路径登记名已被其他模块占用: " .. canonical_name)
     end
 
-    -- 缓存为空时才调用原生 require；加载、返回值和真实文件来源均在此边界校验。
+    -- package.loaded 没有该模块时才调用原生 require；随后检查返回值是 table，且真实文件位于 root_path。
     if module_load_attempt.module_exports == nil then
         local require_succeeded, module_exports, loader_path = pcall(require, name)
         if not require_succeeded then
