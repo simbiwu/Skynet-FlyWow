@@ -38,14 +38,20 @@ local function wait_for(check, description)
     for _ = 1, 3000 do
         -- 当前轮询动作的返回值；truthy 表示等待条件已满足。
         local answer = check()
-        if answer then return answer end
+        if answer then
+            return answer
+        end
+
+        -- 条件尚未满足时让出一个 tick，避免轮询占满当前 Service。
         skynet.sleep(1)
     end
+
+    -- 轮询次数用尽仍未满足条件，作为课程实验失败抛出具体等待阶段。
     error("等待超时: " .. description)
 end
 
 --- 发起一次发布并轮询到终态；BEGIN 与 status RPC/等待都会 yield。
----@param controller integer HotUpgrade Controller Service handle
+---@param controller integer initialize_controller 返回的 Controller handle；本函数用它开始批次并查询同一批次进度。
 ---@param patch_name string 相对 patch_root 的本批目录名；本函数把它传给 Controller 的 begin 请求。
 ---@return table terminal_record status 返回的终态记录，包含 phase/error/各目标结果；失败批次也由场景自行断言
 local function publish(controller, patch_name)
@@ -109,7 +115,7 @@ local function run_v1(_controller, hot, player)
 end
 
 --- 执行正常 V1→V2 发布，检查旧实例原地更新及新实例从 V2 启动。
----@param controller integer HotUpgrade Controller Service handle
+---@param controller integer initialize_controller 返回的 Controller handle；本函数通过它发布 V2 并检查批次完成结果。
 ---@param hot table flywow_hotupgrade 模块，用于创建第二个 PlayerService
 ---@param player integer create_player 创建的 V1 PlayerService handle；本场景用它检查原实例是否更新。
 ---@return nil 断言失败时抛错；成功时打印 MASTER_NORMAL_OK
@@ -139,7 +145,7 @@ local function run_normal(controller, hot, player)
 end
 
 --- 构造 A 占用 queue、B 排队、Prepare 入队、C 被门禁拒绝的并发时序。
----@param controller integer HotUpgrade Controller Service handle
+---@param controller integer initialize_controller 返回的 Controller handle；本函数通过它与玩家 Service 并发执行 V2 发布。
 ---@param _hot table 为共享场景签名保留，本场景不调用热更模块 API
 ---@param player integer 已登记的 PlayerService handle
 ---@return nil 断言 A/B 在 V1 完成、发布后 C 收到 HU_UPGRADING
@@ -211,7 +217,7 @@ local function run_queue(controller, _hot, player)
 end
 
 --- 演示恢复失败只报告、后续 V3 发布以当前真实状态为基准继续修复。
----@param controller integer HotUpgrade Controller Service handle
+---@param controller integer initialize_controller 返回的 Controller handle；本函数用它发布故障批次和后续 V3 修复批次。
 ---@param hot table flywow_hotupgrade 模块，用于最后创建 V3 新实例
 ---@param player integer 已登记的 PlayerService handle
 ---@return nil 断言故障结果、V3 修复状态和新实例结果

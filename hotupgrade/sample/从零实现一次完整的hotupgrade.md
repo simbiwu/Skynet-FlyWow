@@ -80,14 +80,14 @@ FlyWow 内部可失败的操作统一使用公共 FlyWowResult<T>。先检查 ok
 在 FlyWow 仓库根目录下创建教学目录：
 
 ```bash
-mkdir -p hotupgrade/newsample/master_course/host_v1/lualib
-mkdir -p hotupgrade/newsample/master_course/host_v1/service
+mkdir -p hotupgrade/sample/master_course/host_v1/lualib
+mkdir -p hotupgrade/sample/master_course/host_v1/service
 ```
 
 最终目录会逐步生长为：
 
 ```text
-hotupgrade/newsample/master_course/
+hotupgrade/sample/master_course/
 ├── main.lua                          # 教学管理端：由你写；运行多个场景
 ├── skynet_config.lua                 # 真实 Skynet 配置
 ├── run.sh                            # 生成独立运行目录并启动 Skynet
@@ -116,7 +116,7 @@ hotupgrade/newsample/master_course/
 
 ## 第 2 章：亲手编写 V1 普通模块
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/host_v1/lualib/player_logic.lua`。由 PlayerService 在 `init` 时调用 `hotupgrade.require("player_logic")`，最终加载并在本 Lua State 保存这张表。
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/host_v1/lualib/player_logic.lua`。由 PlayerService 在 `init` 时调用 `hotupgrade.require("player_logic")`，最终加载并在本 Lua State 保存这张表。
 
 ```lua
 -- player_logic.lua：V1 完整业务模块。
@@ -149,7 +149,7 @@ local old_attack = player_logic.make_attack(state) -- 预先缓存的 V1 闭包�
 
 这里先给你完整可运行文件。代码中的 `hold`、`spend` 是后面 Queue 实验的真实业务入口；暂时只需知道它们共享同一条业务 queue，等运行到并发章节再深入解释等待过程。
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/host_v1/service/player_service.lua`：
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/host_v1/service/player_service.lua`：
 
 ```lua
 -- V1 PlayerService：业务状态留在本 Service，所有受控业务共用一条 queue。
@@ -299,13 +299,16 @@ skynet.start(function()
             if hotupgrade.patching then
                 answer = {ok = false, code = "HU_UPGRADING"}
             else
-                assert(type(request.amount) == "number" and request.amount > 0)
-                waiting_spends = waiting_spends + 1
-                answer = business_queue(function()
-                    waiting_spends = waiting_spends - 1
-                    state.gold = state.gold - request.amount
-                    return {ok = true, gold = state.gold, version = logic.version()}
-                end)
+                if type(request.amount) ~= "number" or request.amount <= 0 then
+                    answer = {ok = false, code = "INVALID_AMOUNT", message = "amount 必须是正数"}
+                else
+                    waiting_spends = waiting_spends + 1
+                    answer = business_queue(function()
+                        waiting_spends = waiting_spends - 1
+                        state.gold = state.gold - request.amount
+                        return {ok = true, gold = state.gold, version = logic.version()}
+                    end)
+                end
             end
         elseif command == "inject_restore_failure" then
             -- 课堂故障开关；不作为框架或实际业务管理 API。
@@ -343,7 +346,7 @@ end)
 
 ### 第 4.1 节：编写 Skynet 配置
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/skynet_config.lua`：
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/skynet_config.lua`：
 
 ```lua
 -- 配置只引用运行脚本导出的绝对路径，不依赖某个固定的 Server 目录布局。
@@ -384,7 +387,7 @@ cpath = skynet_root .. "/cservice/?.so"
 
 ### 第 4.2 节：编写最小 V1 管理端
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/main.lua`。这是第一版；第二部分你将**完整替换**为带正常发布与故障实验的管理端。
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/main.lua`。这是第一版；第二部分你将**完整替换**为带正常发布与故障实验的管理端。
 
 ```lua
 -- V1 入口：只初始化控制面、创建业务 Service，暂不发布 Patch。
@@ -464,7 +467,7 @@ end)
 
 ### 第 4.3 节：编写独立运行脚本
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/run.sh`：
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/run.sh`：
 
 ```bash
 #!/usr/bin/env bash
@@ -525,7 +528,7 @@ fi
 # 若尚未构建 Skynet，先在自己的 Skynet 目录按其构建说明构建。
 # 以下 ../skynet 只是示例参数，按实际目录替换。
 bash scripts/build_flywow.sh ../skynet hotupgrade
-bash hotupgrade/newsample/master_course/run.sh ../skynet v1
+bash hotupgrade/sample/master_course/run.sh ../skynet v1
 ```
 
 如果成功，应看到类似（handle 每次运行可能不同）：
@@ -571,13 +574,13 @@ MASTER_V1_OK
 ### 第 5.1 节：创建 V2 目录
 
 ```bash
-mkdir -p hotupgrade/newsample/master_course/patches/v2/lualib
-mkdir -p hotupgrade/newsample/master_course/patches/v2/service
+mkdir -p hotupgrade/sample/master_course/patches/v2/lualib
+mkdir -p hotupgrade/sample/master_course/patches/v2/service
 ```
 
 ### 第 5.2 节：新增规则模块
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/patches/v2/lualib/combat_rules.lua`。在 V1 中它尚不存在；未来由目标 PlayerService 的更新流程第一次加载。
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/patches/v2/lualib/combat_rules.lua`。在 V1 中它尚不存在；未来由目标 PlayerService 的更新流程第一次加载。
 
 ```lua
 -- 新增战斗规则：V1 运行时尚未存在。
@@ -594,7 +597,7 @@ return M
 
 ### 第 5.3 节：完整的 V2 普通模块
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/patches/v2/lualib/player_logic.lua`。
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/patches/v2/lualib/player_logic.lua`。
 
 ```lua
 -- V2 普通模块：新的攻击闭包通过首次声明的战斗规则模块计算加成。
@@ -619,7 +622,7 @@ return M
 
 ### 第 5.4 节：为新实例准备完整 V2 Service 入口
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/patches/v2/service/player_service.lua`。
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/patches/v2/service/player_service.lua`。
 
 为什么还要有这个文件？因为 `.patch` 只作用于**现存实例**，不会变成未来创建 Service 时的入口源码。如果只提供一次性 `.patch`，新建 PlayerService 仍按正式目录里的 V1 入口初始化。
 
@@ -773,13 +776,16 @@ skynet.start(function()
             if hotupgrade.patching then
                 answer = {ok = false, code = "HU_UPGRADING"}
             else
-                assert(type(request.amount) == "number" and request.amount > 0)
-                waiting_spends = waiting_spends + 1
-                answer = business_queue(function()
-                    waiting_spends = waiting_spends - 1
-                    state.gold = state.gold - request.amount
-                    return {ok = true, gold = state.gold, version = logic.version()}
-                end)
+                if type(request.amount) ~= "number" or request.amount <= 0 then
+                    answer = {ok = false, code = "INVALID_AMOUNT", message = "amount 必须是正数"}
+                else
+                    waiting_spends = waiting_spends + 1
+                    answer = business_queue(function()
+                        waiting_spends = waiting_spends - 1
+                        state.gold = state.gold - request.amount
+                        return {ok = true, gold = state.gold, version = logic.version()}
+                    end)
+                end
             end
         elseif command == "inject_restore_failure" then
             -- 课堂故障开关；不作为框架或实际业务管理 API。
@@ -800,7 +806,7 @@ end)
 
 ### 第 5.5 节：编写只作用于现存实例的 Service Patch
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/patches/v2/service/player_service.patch`。
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/patches/v2/service/player_service.patch`。
 
 这个文件并不是由 Skynet 当作新的 Service 入口来 `require`。它被 Controller 读取并冻结成字符串，在对应目标的 `handle_upgrade("update")` 内通过 `stage_service_patch()` 执行。`build_patch(state)` 接收到的是**现存 PlayerService 的 `state` 根表**，因此它能够为后续 Activate 准备修改原状态的闭包。
 
@@ -836,7 +842,7 @@ end
 
 现在有了完整的 V2 发布包。下一步由管理端调用 Controller 的 `begin`，再通过 `status` 获取异步批次终态。为了在后面继续做 Queue 和失败实验，我们这次将 `main.lua` **完整替换**成最终教学管理端；先只运行 `normal`，其余两个场景在对应章节再解释和执行。
 
-**【你要修改：完整替换文件】** `hotupgrade/newsample/master_course/main.lua`：
+**【你要修改：完整替换文件】** `hotupgrade/sample/master_course/main.lua`：
 
 ```lua
 -- 本课程管理端：v1 / normal / queue / forward 四个相互独立的场景。
@@ -1058,7 +1064,7 @@ end)
 
 ```bash
 # 在 FlyWow 根目录执行；每次运行脚本会复制一份干净 V1 和发布包。
-bash hotupgrade/newsample/master_course/run.sh ../skynet normal
+bash hotupgrade/sample/master_course/run.sh ../skynet normal
 ```
 
 预期重要现象（handle 和批次 ID 不固定）：
@@ -2077,13 +2083,16 @@ elseif command == "spend" then
     if hotupgrade.patching then
         answer = {ok = false, code = "HU_UPGRADING"}
     else
-        assert(type(request.amount) == "number" and request.amount > 0)
-        waiting_spends = waiting_spends + 1
-        answer = business_queue(function()
-            waiting_spends = waiting_spends - 1
-            state.gold = state.gold - request.amount
-            return {ok = true, gold = state.gold, version = logic.version()}
-        end)
+        if type(request.amount) ~= "number" or request.amount <= 0 then
+            answer = {ok = false, code = "INVALID_AMOUNT", message = "amount 必须是正数"}
+        else
+            waiting_spends = waiting_spends + 1
+            answer = business_queue(function()
+                waiting_spends = waiting_spends - 1
+                state.gold = state.gold - request.amount
+                return {ok = true, gold = state.gold, version = logic.version()}
+            end)
+        end
     end
 ```
 
@@ -2132,7 +2141,7 @@ Controller：Finish → patching=false → 业务恢复接纳
 运行：
 
 ```bash
-bash hotupgrade/newsample/master_course/run.sh ../skynet queue
+bash hotupgrade/sample/master_course/run.sh ../skynet queue
 ```
 
 由于每次 `run.sh` 都从 V1 重建正式运行目录，不会继承上一次 `normal` 场景的已部署 V2 文件或已经更新的 Lua State。
@@ -2299,10 +2308,10 @@ operations.attack(100) = 120
 创建目录：
 
 ```bash
-mkdir -p hotupgrade/newsample/master_course/patches/faulty/service
+mkdir -p hotupgrade/sample/master_course/patches/faulty/service
 ```
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/patches/faulty/service/player_service.patch`：
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/patches/faulty/service/player_service.patch`：
 
 ```lua
 -- 课堂故障：故意提交不合法 schema，使 after_upgrade 返回 false。
@@ -2363,13 +2372,13 @@ attack(100) = 125
 创建目录：
 
 ```bash
-mkdir -p hotupgrade/newsample/master_course/patches/v3/lualib
-mkdir -p hotupgrade/newsample/master_course/patches/v3/service
+mkdir -p hotupgrade/sample/master_course/patches/v3/lualib
+mkdir -p hotupgrade/sample/master_course/patches/v3/service
 ```
 
 ### 第 20.1 节：完整 V3 普通模块
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/patches/v3/lualib/player_logic.lua`：
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/patches/v3/lualib/player_logic.lua`：
 
 ```lua
 -- V3：完整普通模块；本版“霜剑”给予 25 点加成。
@@ -2392,7 +2401,7 @@ return M
 
 ### 第 20.2 节：给未来新实例准备完整 V3 Service 文件
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/patches/v3/service/player_service.lua`：
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/patches/v3/service/player_service.lua`：
 
 ```lua
 -- V3 PlayerService：新实例通过正式部署的 V3 入口初始化。
@@ -2542,13 +2551,16 @@ skynet.start(function()
             if hotupgrade.patching then
                 answer = {ok = false, code = "HU_UPGRADING"}
             else
-                assert(type(request.amount) == "number" and request.amount > 0)
-                waiting_spends = waiting_spends + 1
-                answer = business_queue(function()
-                    waiting_spends = waiting_spends - 1
-                    state.gold = state.gold - request.amount
-                    return {ok = true, gold = state.gold, version = logic.version()}
-                end)
+                if type(request.amount) ~= "number" or request.amount <= 0 then
+                    answer = {ok = false, code = "INVALID_AMOUNT", message = "amount 必须是正数"}
+                else
+                    waiting_spends = waiting_spends + 1
+                    answer = business_queue(function()
+                        waiting_spends = waiting_spends - 1
+                        state.gold = state.gold - request.amount
+                        return {ok = true, gold = state.gold, version = logic.version()}
+                    end)
+                end
             end
         elseif command == "inject_restore_failure" then
             -- 课堂故障开关；不作为框架或实际业务管理 API。
@@ -2569,7 +2581,7 @@ end)
 
 ### 第 20.3 节：一次性 V3 修复 Patch
 
-**【你要编写：完整文件】** `hotupgrade/newsample/master_course/patches/v3/service/player_service.patch`：
+**【你要编写：完整文件】** `hotupgrade/sample/master_course/patches/v3/service/player_service.patch`：
 
 ```lua
 -- V3 前向修复：显式接纳已损坏的当前状态，推进到健康版本。
@@ -2577,9 +2589,7 @@ return function(state)
     return
     {
         update_state = function()
-            -- 不假设上一批已完整回滚到 schema 1 或 schema 2。
-            assert(type(state.schema_version) == "number",
-                "当前玩家状态缺少可识别的 schema_version")
+            -- V2 与本课程故障现场都保留数字型 schema_version；V3 按当前状态直接迁移到新字段值。
             state.weapon = "霜剑"
             state.schema_version = 3
             state.gold = 88
@@ -2601,7 +2611,7 @@ end
 现在你已经写完 `faulty` 和 `v3`，不需要再改 `main.lua`；最终版管理端的 `run_forward()` 已按真实场景顺序实现了所有操作。
 
 ```bash
-bash hotupgrade/newsample/master_course/run.sh ../skynet forward
+bash hotupgrade/sample/master_course/run.sh ../skynet forward
 ```
 
 预期关键输出（批次 ID 与 handle 不固定）：
@@ -2829,10 +2839,10 @@ root_path：.../build/hotupgrade-master-course/host
 我们没有给你一个不可拆分的巨大脚本，而是按阶段完成了一套独立工程。现在从 FlyWow 仓库根目录执行以下四次，每次脚本会重置独立的运行目录：
 
 ```bash
-bash hotupgrade/newsample/master_course/run.sh ../skynet v1
-bash hotupgrade/newsample/master_course/run.sh ../skynet normal
-bash hotupgrade/newsample/master_course/run.sh ../skynet queue
-bash hotupgrade/newsample/master_course/run.sh ../skynet forward
+bash hotupgrade/sample/master_course/run.sh ../skynet v1
+bash hotupgrade/sample/master_course/run.sh ../skynet normal
+bash hotupgrade/sample/master_course/run.sh ../skynet queue
+bash hotupgrade/sample/master_course/run.sh ../skynet forward
 ```
 
 | 实验      | 成功标记            | 必须亲自确认的现象                                                   |
@@ -2928,16 +2938,16 @@ bash hotupgrade/scripts/run_hotupgrade_tests.sh ../skynet
 
 | 角色                                                                       | 真实文件与定位                                                                                                                                                                                                                                                                                                                                                   |
 | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 控制 Service、协议 dispatch、初始化                                        | [`hotupgrade/service/flywow_hotupgrade_service.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/5c5c930626d0e59ca785a7da2711cbfc899301ec/hotupgrade/service/flywow_hotupgrade_service.lua)                                                                                                                                                                    |
-| Controller 生命周期、批次、门禁、目标 RPC、部署、恢复                      | [`hotupgrade/lualib/flywow_hotupgrade_controller.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/5c5c930626d0e59ca785a7da2711cbfc899301ec/hotupgrade/lualib/flywow_hotupgrade_controller.lua)                                                                                                                                                                |
-| 业务入口、`hotupgrade.require`、Service Patch、Prepare/Update/Abort/Finish | [`hotupgrade/lualib/flywow_hotupgrade.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/5c5c930626d0e59ca785a7da2711cbfc899301ec/hotupgrade/lualib/flywow_hotupgrade.lua)                                                                                                                                                                                      |
-| 模块 Stage、Commit、Abort、Finish、快照与根表覆盖                          | [`hotupgrade/lualib/flywow_hotupgrade_module_patch.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/5c5c930626d0e59ca785a7da2711cbfc899301ec/hotupgrade/lualib/flywow_hotupgrade_module_patch.lua)                                                                                                                                                            |
-| 路径、扫描、同步文件部署/恢复 Native                                       | [`hotupgrade/native/hotupgrade_native.cpp`](https://github.com/simbiwu/Skynet-FlyWow/blob/5c5c930626d0e59ca785a7da2711cbfc899301ec/hotupgrade/native/hotupgrade_native.cpp)                                                                                                                                                                                      |
-| 公共结果表和源码头处理                                                     | [`common/lualib/flywow_result.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/5c5c930626d0e59ca785a7da2711cbfc899301ec/common/lualib/flywow_result.lua)、[`flywow_hotupgrade_common.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/5c5c930626d0e59ca785a7da2711cbfc899301ec/hotupgrade/lualib/flywow_hotupgrade_common.lua) |
-| Controller 顺序、恢复和门禁单元测试                                        | [`hotupgrade/tests/test_controller.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/5c5c930626d0e59ca785a7da2711cbfc899301ec/hotupgrade/tests/test_controller.lua)                                                                                                                                                                                            |
-| 真实 Skynet 集成测试                                                       | [`hotupgrade/tests/skynet_hotupgrade.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/5c5c930626d0e59ca785a7da2711cbfc899301ec/hotupgrade/tests/skynet_hotupgrade.lua)                                                                                                                                                                                        |
-| 不锁定、后续发布继续的测试                                                 | [`hotupgrade/tests/test_failure_continuation.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/5c5c930626d0e59ca785a7da2711cbfc899301ec/hotupgrade/tests/test_failure_continuation.lua)                                                                                                                                                                        |
-| 当前完整模块合同                                                           | [`docs/hotupgrade/README.md`](https://github.com/simbiwu/Skynet-FlyWow/blob/5c5c930626d0e59ca785a7da2711cbfc899301ec/docs/hotupgrade/README.md)                                                                                                                                                                                                                  |
+| 控制 Service、协议 dispatch、初始化                                        | [`hotupgrade/service/flywow_hotupgrade_service.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/46b96eb23ee08f7088dda8d74bf6925bc06ba813/hotupgrade/service/flywow_hotupgrade_service.lua)                                                                                                                                                                    |
+| Controller 生命周期、批次、门禁、目标 RPC、部署、恢复                      | [`hotupgrade/lualib/flywow_hotupgrade_controller.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/46b96eb23ee08f7088dda8d74bf6925bc06ba813/hotupgrade/lualib/flywow_hotupgrade_controller.lua)                                                                                                                                                                |
+| 业务入口、`hotupgrade.require`、Service Patch、Prepare/Update/Abort/Finish | [`hotupgrade/lualib/flywow_hotupgrade.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/46b96eb23ee08f7088dda8d74bf6925bc06ba813/hotupgrade/lualib/flywow_hotupgrade.lua)                                                                                                                                                                                      |
+| 模块 Stage、Commit、Abort、Finish、快照与根表覆盖                          | [`hotupgrade/lualib/flywow_hotupgrade_module_patch.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/46b96eb23ee08f7088dda8d74bf6925bc06ba813/hotupgrade/lualib/flywow_hotupgrade_module_patch.lua)                                                                                                                                                            |
+| 路径、扫描、同步文件部署/恢复 Native                                       | [`hotupgrade/native/hotupgrade_native.cpp`](https://github.com/simbiwu/Skynet-FlyWow/blob/46b96eb23ee08f7088dda8d74bf6925bc06ba813/hotupgrade/native/hotupgrade_native.cpp)                                                                                                                                                                                      |
+| 公共结果表和源码头处理                                                     | [`common/lualib/flywow_result.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/46b96eb23ee08f7088dda8d74bf6925bc06ba813/common/lualib/flywow_result.lua)、[`flywow_hotupgrade_common.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/46b96eb23ee08f7088dda8d74bf6925bc06ba813/hotupgrade/lualib/flywow_hotupgrade_common.lua) |
+| Controller 顺序、恢复和门禁单元测试                                        | [`hotupgrade/tests/test_controller.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/46b96eb23ee08f7088dda8d74bf6925bc06ba813/hotupgrade/tests/test_controller.lua)                                                                                                                                                                                            |
+| 真实 Skynet 集成测试                                                       | [`hotupgrade/tests/skynet_hotupgrade.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/46b96eb23ee08f7088dda8d74bf6925bc06ba813/hotupgrade/tests/skynet_hotupgrade.lua)                                                                                                                                                                                        |
+| 不锁定、后续发布继续的测试                                                 | [`hotupgrade/tests/test_failure_continuation.lua`](https://github.com/simbiwu/Skynet-FlyWow/blob/46b96eb23ee08f7088dda8d74bf6925bc06ba813/hotupgrade/tests/test_failure_continuation.lua)                                                                                                                                                                        |
+| 当前完整模块合同                                                           | [`docs/hotupgrade/README.md`](https://github.com/simbiwu/Skynet-FlyWow/blob/46b96eb23ee08f7088dda8d74bf6925bc06ba813/docs/hotupgrade/README.md)                                                                                                                                                                                                                  |
 
 **附录用途**：它是当前课程内部阅读真实框架源码的索引，不是让你另找一门课程来补前置知识。所有完成这套 Sample 所需的教学文件、步骤、调用背景和核心机制已在正文给出。
 
@@ -2951,7 +2961,7 @@ bash hotupgrade/scripts/run_hotupgrade_tests.sh ../skynet
 
 如果 `forward` 没出现 RECOVERY_REQUIRED，首先确认 `faulty` 之前成功发布 V2、`inject_restore_failure` 确实在旧 PlayerService 生效、`after_upgrade` 在 schema 99 时确实返回 false，以及目标恢复是否走到自定义 `restore`。
 
-如果日志、接口或路径与本文不符，先比较真实提交与本文 `5c5c930` 基线，不要猜测旧课程中曾经存在的 `FAILED_LOCKED`、`resolve_deployment` 或管理端 `abort` 是否还有效：**当前基线不使用这些旧协议**。
+如果日志、接口或路径与本文不符，先比较真实提交与本文 `46b96eb` 基线，不要猜测旧课程中曾经存在的 `FAILED_LOCKED`、`resolve_deployment` 或管理端 `abort` 是否还有效：**当前基线不使用这些旧协议**。
 
 ---
 

@@ -1,0 +1,18 @@
+-- V3 前向修复：显式接纳已损坏的当前状态，推进到健康版本。
+return function(state)
+    return
+    {
+        update_state = function()
+            -- V2 与本课程故障现场都保留数字型 schema_version；V3 按当前状态直接迁移到新字段值。
+            state.weapon = "霜剑"
+            state.schema_version = 3
+            state.gold = 88
+        end,
+        replace_functions =
+        {
+            attack = function(base_attack)
+                return base_attack + (state.weapon == "霜剑" and 25 or 0)
+            end,
+        },
+    }
+end

@@ -223,7 +223,7 @@ class CommentClarityGateTests(unittest.TestCase):
                 "local M = {}\n",
                 encoding="utf-8",
             )
-            markdown_path = root / "hotupgrade/newsample/readme.md"
+            markdown_path = root / "hotupgrade/sample/readme.md"
             markdown_path.parent.mkdir(parents=True)
             markdown_path.write_text(
                 "~~~lua\n"

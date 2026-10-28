@@ -167,13 +167,16 @@ skynet.start(function()
             if hotupgrade.patching then
                 answer = {ok = false, code = "HU_UPGRADING"}
             else
-                assert(type(request.amount) == "number" and request.amount > 0)
-                waiting_spends = waiting_spends + 1
-                answer = business_queue(function()
-                    waiting_spends = waiting_spends - 1
-                    state.gold = state.gold - request.amount
-                    return {ok = true, gold = state.gold, version = logic.version()}
-                end)
+                if type(request.amount) ~= "number" or request.amount <= 0 then
+                    answer = {ok = false, code = "INVALID_AMOUNT", message = "amount 必须是正数"}
+                else
+                    waiting_spends = waiting_spends + 1
+                    answer = business_queue(function()
+                        waiting_spends = waiting_spends - 1
+                        state.gold = state.gold - request.amount
+                        return {ok = true, gold = state.gold, version = logic.version()}
+                    end)
+                end
             end
         elseif command == "inject_restore_failure" then
             -- 课堂故障开关；不作为框架或实际业务管理 API。

@@ -8,15 +8,15 @@ set -euo pipefail
 
 # COURSE_DIR 最终保存本 run.sh 所在的 master_course 目录的绝对路径，不是启动脚本时的当前目录。
 # $0 是 Bash 收到的脚本路径；若它是相对路径，dirname 的结果会相对于调用脚本时的当前目录解释。
-# 例：从 FlyWow 根目录运行 bash hotupgrade/newsample/master_course/run.sh ...，
-# $0 是相对路径，dirname 得到 hotupgrade/newsample/master_course，pwd 最终输出该目录的绝对路径。
+# 例：从 FlyWow 根目录运行 bash hotupgrade/sample/master_course/run.sh ...，
+# $0 是相对路径，dirname 得到 hotupgrade/sample/master_course，pwd 最终输出该目录的绝对路径。
 # 若从 /tmp 用 run.sh 的绝对路径调用，dirname 直接得到绝对目录，最终 COURSE_DIR 仍是同一个目录。
 # dirname -- 取出目录部分；-- 表示选项结束，避免以 - 开头的路径被误当成选项。
 # cd 和 pwd 在 $(...) 命令替换的子 Shell 中执行；这里的 cd 不会改变主脚本后续命令的当前目录。
 # && 是“前一个命令成功才继续”：只有 cd 成功，pwd 才执行，避免 cd 失败后输出错误目录。
 COURSE_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 
-# master_course 位于 FlyWow/hotupgrade/newsample/master_course；向上三级得到 FlyWow 根目录。
+# master_course 位于 FlyWow/hotupgrade/sample/master_course；向上三级得到 FlyWow 根目录。
 # cd 后执行 pwd，后续路径就不依赖从哪个目录调用 run.sh。
 FRAMEWORK_DIR="$(cd -- "$COURSE_DIR/../../.." && pwd)"
 

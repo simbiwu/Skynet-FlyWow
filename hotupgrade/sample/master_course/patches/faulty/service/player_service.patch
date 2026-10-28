@@ -1,0 +1,16 @@
+-- 课堂故障：故意提交不合法 schema，使 after_upgrade 返回 false。
+return function(state)
+    return
+    {
+        update_state = function()
+            state.gold = 0
+            state.schema_version = 99
+        end,
+        replace_functions =
+        {
+            attack = function(base_attack)
+                return base_attack
+            end,
+        },
+    }
+end

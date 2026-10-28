@@ -885,7 +885,7 @@ def check_hotupgrade_lua_function_contracts(root: Path) -> list[str]:
     )
     record_paths = source_paths + sorted(
         list((root / "hotupgrade/sample").rglob("*.lua"))
-        + list((root / "hotupgrade/newsample").rglob("*.lua"))
+        + list((root / "hotupgrade/sample").rglob("*.lua"))
     )
     errors = check_hotupgrade_controller_type_contract(root)
     for path in source_paths:
