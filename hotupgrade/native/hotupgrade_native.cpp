@@ -41,6 +41,7 @@ int pushNativeException(lua_State *state)
 
 struct FileList
 {
+    // 接收整个发布目录扫描出的相对文件路径。
     std::vector<std::string> paths; ///< 发布包中的相对 .lua/.patch 路径，供 Controller 分类并冻结源码。
 };
 
@@ -74,10 +75,12 @@ int scanDirectory(const std::string &directory,
     {
         return -1;
     }
+    // 当前递归目录扫描结果；发现读取错误或不支持的文件时改为 -1。
     int status = 0;
     while (true)
     {
         errno         = 0;
+        // 当前目录项；名称用于构造子路径并判断是否为 Lua/Patch 文件。
         dirent *entry = readdir(handle);
         if (entry == nullptr)
         {
@@ -91,7 +94,9 @@ int scanDirectory(const std::string &directory,
         {
             continue;
         }
+        // 当前子项的绝对路径，供 lstat 和递归扫描使用。
         const std::string absolute = directory + "/" + entry->d_name;
+        // 当前子项相对发布目录的路径，最终返回给 Lua Controller。
         const std::string child_relative =
             relative.empty() ? entry->d_name : relative + "/" + entry->d_name;
         if (absolute.size() >= PATH_MAX || child_relative.size() >= PATH_MAX)
@@ -100,6 +105,7 @@ int scanDirectory(const std::string &directory,
             break;
         }
         // lstat 检查链接本身，不跟随链接目标；递归和源码读取只接受普通目录/文件。
+        // lstat 读取的文件属性；用于拒绝符号链接和非普通文件。
         struct stat attributes;
         if (lstat(absolute.c_str(), &attributes) != 0 || S_ISLNK(attributes.st_mode))
         {
@@ -120,14 +126,18 @@ int scanDirectory(const std::string &directory,
             status = -1;
             break;
         }
+        // 当前目录项的文件名部分，用于检查 .lua 或 .patch 后缀。
         const std::string name = entry->d_name;
+        // 当前文件是否以 .lua 结尾；普通 Lua 文件才进入发布清单。
         const bool lua_file = name.size() >= 4 && name.compare(name.size() - 4, 4, ".lua") == 0;
+        // 当前文件是否以 .patch 结尾；Service Patch 由 Controller 再做目录校验。
         const bool patch_file = name.size() >= 6 && name.compare(name.size() - 6, 6, ".patch") == 0;
         if (!lua_file && !patch_file)
         {
             continue;
         }
         // 只登记 .lua/.patch；相对路径交由 Controller 检查和分类。
+        // files 由所有递归层共用；保存相对发布目录的路径，不能把本机绝对路径交给 Controller。
         files.paths.push_back(child_relative);
     }
     return status;
@@ -144,11 +154,15 @@ bool resolveDirectory(const std::string &root_argument, const std::string &relat
         return false;
     }
 
+    // root 是已解析的信任边界；directory 逐段构建目标，最后再次核验规范路径的包含关系。
     directory = root;
+    // relative 中下一个目录分量的起始位置。
     std::size_t offset = 0;
     while (offset < relative.size())
     {
+        // 当前分量后面的斜杠位置；找不到表示已到路径末尾。
         const std::size_t separator = relative.find('/', offset);
+        // 从相对路径取出的单个目录名，逐段拒绝空名、点和上级跳转。
         const std::string component = relative.substr(offset, separator - offset);
         if (component.empty() || component == "." || component == "..")
         {
@@ -172,6 +186,7 @@ bool resolveDirectory(const std::string &root_argument, const std::string &relat
         }
     }
 
+    // realpath 解析后的目录路径，用于确认最终目录仍在 root 下。
     std::string canonical;
     if (!resolvePath(directory, canonical) ||
         (root != "/" && (canonical.size() <= root.size() ||
@@ -188,14 +203,17 @@ bool resolveDirectory(const std::string &root_argument, const std::string &relat
 int listLuaFiles(const std::string &patch_root, const std::string &relative_patch_dir,
                  std::vector<std::string> &output)
 {
-    std::string root;
-    std::string directory;
+    // 第二参数模式下解析后的信任根目录。
+    std::string root;      // 解析后的 Patch 根目录，用来核对发布目录仍在根内。
+    std::string directory; // 本次要递归枚举的绝对目录；返回数组仍使用相对路径。
     if (!resolveDirectory(patch_root, relative_patch_dir, root, directory))
     {
         return -1;
     }
 
+    // 收集递归扫描发现的 Lua/Patch 相对路径。
     FileList  files;
+    // 递归扫描结果；-1 表示无效路径或文件结构，1 表示目录没有发布文件。
     const int status = scanDirectory(directory, "", files);
     if (status != 0)
     {
@@ -233,11 +251,16 @@ bool resolveFile(const std::string &root_argument, const std::string &relative,
     {
         return false;
     }
+    // relative 来自 Lua 的根目录相对路径；先拆出并校验全部分量，再允许 create_parents 创建中间目录。
+    // 校验后的相对路径各目录名；后续只按这些分量逐级检查或创建目录。
     std::vector<std::string> components;
+    // contents 中尚未写入临时文件的字节偏移。
     std::size_t offset = 0;
     while (offset <= relative.size())
     {
+        // 当前目录分量结束位置；无斜杠时当前分量就是文件名。
         const auto separator = relative.find('/', offset);
+        // 当前路径分量；先拒绝空名、点和上级目录，再加入安全路径。
         const auto component = relative.substr(offset, separator - offset);
         if (component.empty() || component == "." || component == "..")
         {
@@ -251,6 +274,7 @@ bool resolveFile(const std::string &root_argument, const std::string &relative,
         offset = separator + 1;
     }
 
+    // index 指向正在校验的路径分量；只有非末尾分量才可能创建为目录。
     for (std::size_t index = 0; index < components.size(); ++index)
     {
         path += "/" + components[index];
@@ -290,7 +314,7 @@ bool resolveFile(const std::string &root_argument, const std::string &relative,
 }
 
 /// 读取正式目录中的文件，供 Controller 保存部署前内容。
-/// @param state Lua 状态；参数依次为正式根目录和根目录相对文件路径。
+/// @param state Lua 虚拟机状态；Lua 参数 1 是正式文件根目录，参数 2 是根目录内的相对文件路径。
 /// @return 成功返回完整文件内容；文件不存在返回 false；失败返回 nil 和错误对象。
 int read_file(lua_State *state)
 {
@@ -298,6 +322,7 @@ int read_file(lua_State *state)
     {
         LuaBinding  binding(state);
         std::string root;     // Controller 配置的正式文件根目录。
+        // 可选的根目录相对目录；用于限制解析范围。
         std::string relative; // 本次完整 .lua 的根目录相对路径。
         std::string path;     // 逐级校验后用于同步文件操作的绝对路径。
         // 先读取正式文件根目录和目标文件相对路径，再按根目录边界校验文件路径。
@@ -327,6 +352,7 @@ int read_file(lua_State *state)
             return binding.pushError("HU_INVALID_PATH", relative);
         }
 
+        // 接收从正式文件读出的全部旧源码；读取完成后复制给 Lua。
         std::string contents;
         char buffer[8192]; // 每次读取 8 KiB；只限制读取块，不限制文件总大小。
         for (;;)
@@ -357,12 +383,12 @@ int read_file(lua_State *state)
 }
 
 /// 将源码完整写入正式文件；nil 内容用于删除本批新增文件。
-/// @param state Lua 状态；参数依次为正式根目录、相对文件路径和可选源码。
+/// @param state Lua 虚拟机状态；Lua 参数 1 是正式文件根目录，参数 2 是目标相对路径，参数 3 是要写入的源码；参数 3 缺失或 nil 时删除目标文件。
 /// @return 成功返回 true；失败返回 nil 和错误对象。
 /// @note 先写同目录临时文件，再 rename 替换，避免写入未完成的内容成为正式文件。
 int replace_file(lua_State *state)
 {
-    std::string temporary;
+    std::string temporary; // 记录实际创建的临时路径，异常分支也用它删除未发布文件。
     try
     {
         LuaBinding  binding(state);
@@ -371,6 +397,7 @@ int replace_file(lua_State *state)
         std::string path;     // 逐级校验后用于同步文件操作的绝对路径。
         std::string contents; // Controller 已冻结的新版源码，或恢复时传回的完整旧内容。
         // lua_isnoneornil/readValue 均只读参数槽；returnValues 在原栈顶追加唯一结果。
+        // 第三个参数是否缺失或为 nil；是则删除本批新增文件而非写入源码。
         const bool removing = lua_isnoneornil(state, 3);
         if (!binding.readValue(1, root) || !binding.readValue(2, relative) ||
             (!removing && !binding.readValue(3, contents)))
@@ -400,6 +427,7 @@ int replace_file(lua_State *state)
             mode = attributes.st_mode & 0777;
         }
         temporary = path.substr(0, path.find_last_of('/')) + "/.flywow-hotupgrade-XXXXXX";
+        // mkstemp 需要可写且以空字符结尾的同目录临时路径缓冲区。
         std::vector<char> pattern(temporary.begin(), temporary.end());
         pattern.push_back('\0');
         FileHandle file{mkstemp(pattern.data())};
@@ -408,6 +436,7 @@ int replace_file(lua_State *state)
             return binding.pushError("HU_FILE_DEPLOY_FAILED", relative);
         }
         temporary.assign(pattern.data());
+        // 临时文件权限设置和后续写入是否持续成功；失败时不替换正式文件。
         bool written = fchmod(file.descriptor, mode) == 0;
         std::size_t offset = 0;
         while (written && offset < contents.size())
@@ -425,6 +454,7 @@ int replace_file(lua_State *state)
             offset += static_cast<std::size_t>(count);
         }
 
+        // 临时文件描述符是否成功关闭；只有写入并关闭成功才执行 rename。
         const bool closed = close(file.descriptor) == 0;
         file.descriptor = -1;
         if (!written || !closed || rename(temporary.c_str(), path.c_str()) != 0)
@@ -445,7 +475,7 @@ int replace_file(lua_State *state)
 }
 
 /// 解析已存在路径；提供相对目录时，校验其在根目录内并逐级拒绝链接。
-/// @param state Lua 状态；参数为待解析路径，可选第二参数为其下相对目录。
+/// @param state Lua 虚拟机状态；Lua 参数 1 是待解析的路径；提供参数 2 时，参数 1 是根目录、参数 2 是根目录内待校验的相对目录。
 /// @return 成功返回规范化绝对路径；失败返回 nil 和错误对象。
 int resolve(lua_State *state)
 {
@@ -454,13 +484,16 @@ int resolve(lua_State *state)
         // 参数读取不改变原栈槽；成功压入路径，失败追加 nil/error 两个结果。
         // [S, input, relative?] -> [..., canonical_path] 或 [..., nil, error]；VM 取回调返回数。
         LuaBinding  binding(state);
+        // 从 Lua 第一个参数读取的待解析根路径或文件路径。
         std::string input;
         if (!binding.readValue(1, input))
         {
             return binding.pushError();
         }
 
+        // 交给 Lua 的规范化绝对路径；有第二参数时是校验后的目录。
         std::string output;
+        // 选择的路径解析分支是否成功。
         bool resolved = false;
         if (lua_gettop(state) >= 2)
         {
@@ -494,7 +527,7 @@ int resolve(lua_State *state)
 }
 
 /// 枚举发布目录中的 Lua 文件和 Service Patch。
-/// @param state Lua 状态；参数依次为 Patch 根目录和相对发布目录。
+/// @param state Lua 虚拟机状态；Lua 参数 1 是 Patch 根目录，参数 2 是相对该根目录的本批发布目录。
 /// @return 成功返回相对路径数组；失败或目录为空时返回 nil 和错误对象。
 ///
 /// readValue 不改变参数栈。LuaTable 用 registry 引用暂存结果；returnValues
@@ -508,6 +541,7 @@ int list_lua(lua_State *state)
         // 返回 1 时 VM 保留最顶层 table，LuaTable 析构 unref 不弹栈或移除它。
         LuaBinding  binding(state);
         std::string patch_root;
+        // Lua 传入的 Patch 根目录相对发布目录。
         std::string relative_patch_dir;
         if (!binding.readValue(1, patch_root) || !binding.readValue(2, relative_patch_dir))
         {
@@ -515,6 +549,7 @@ int list_lua(lua_State *state)
         }
 
         std::vector<std::string> paths;
+        // 扫描发布目录的结果码；成功为 0，空目录为 1，其他情况为路径错误。
         const int                status = listLuaFiles(patch_root, relative_patch_dir, paths);
         if (status != 0)
         {

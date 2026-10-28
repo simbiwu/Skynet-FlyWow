@@ -1,7 +1,8 @@
 --- 排空依赖夹具：使用真实 queue、创建和模块许可，由测试消息控制正常操作继续执行。
 local skynet = require "skynet"
-local business_queue = require "skynet.queue"()
+local business_queue = require "skynet.queue"() -- 测试用业务队列；运行中的任务可 yield，以验证热更是否等待队列排空。
 
+-- 本集成测试 Worker 的运行配置、队列观测值和待验证模块加载结果。
 local module_state =
 {
     hotupgrade     = nil, -- 当前 State 的公开热更 API；start 内加载。
@@ -28,7 +29,10 @@ function module_state.functions.load(item)
     return item.base_attack
 end
 
+--- 暂停指定测试操作，inspect 显示暂停点，release 命令唤醒同一业务协程。
+---@param operation string worker 当前暂停的操作名；管理测试用它选择并释放对应等待点。
 local function wait_for_release(operation)
+    -- waiting 是观察标签，waiter 才是等待中的协程；它们不属于 HotUpgrade 的生产状态。
     module_state.waiting = operation
     module_state.waiter = coroutine.running()
     skynet.wait(module_state.waiter)
@@ -36,8 +40,12 @@ local function wait_for_release(operation)
     module_state.waiting = nil
 end
 
+--- 通过公开热更入口创建并登记子 Service，保留 handle 供管理测试遍历创建树。
+---@param config table 传给子 Service init 的配置；本函数用它设置后续创建深度和故障注入。
+---@param unique? boolean 是否走本 Controller 的唯一 Service 创建入口
 local function create_child(config, unique)
-    local hotupgrade = module_state.hotupgrade
+    local hotupgrade = module_state.hotupgrade -- 父测试 Service 保存的 HotUpgrade API，用它创建受管理子 Service。
+    -- 通过逻辑唯一名创建或复用排空 Worker 的 Service handle。
     local service_handle = unique and hotupgrade.uniqueservice("skynet_hotupgrade_drain")
         or hotupgrade.newservice("skynet_hotupgrade_drain")
     assert(skynet.call(service_handle, "lua", "init", config).ok)
@@ -45,7 +53,10 @@ local function create_child(config, unique)
     return service_handle
 end
 
+--- 按场景配置初始化及 Prepare 中的依赖创建，再登记当前排空测试 Service。
+---@param config table init_depth 控制初始化创建链，prepare_depth 控制 Prepare 内创建链
 local function initialize(config)
+    -- config 被 before_upgrade 闭包保留；每个子实例收到递减的深度，父实例的配置不被改写。
     if config.wait_init then
         wait_for_release("init")
     end
@@ -81,10 +92,12 @@ skynet.start(function()
     module_state.born_value = module_state.logic.value()
     skynet.dispatch("lua", function(session, _source, command, request)
         request = request or {}
+        -- 当前 Worker 消息处理结果，返回给测试驱动协程。
         local answer
         if command == "init" then
             answer = initialize(request)
         elseif command == "inspect" then
+            -- children 保存本实例创建的直接子 handle，born_value 固定记录启动时版本，value 则读取当前模块版本。
             answer = {
                 waiting = module_state.waiting,
                 paused = module_state.hotupgrade.patching,
@@ -120,7 +133,7 @@ skynet.start(function()
             answer = business_queue(function()
                 -- 只在测试加载器中暂停外层许可；恢复后通过公开入口申请内层许可。
                 local original_require = _G.require
-                local source_path = assert(package.searchpath("hotupgrade_extra", package.path))
+                local source_path = assert(package.searchpath("hotupgrade_extra", package.path)) -- 原生 require 搜索到的额外模块路径，测试在此处控制加载时机。
                 _G.require = function(name)
                     if name == "hotupgrade_extra" then
                         wait_for_release("module")
@@ -129,6 +142,7 @@ skynet.start(function()
                     end
                     return original_require(name), package.searchpath(name, package.path)
                 end
+                -- 模块加载调用是否成功及其返回表；用于验证排空期间首次加载的结果。
                 local ok, loaded = pcall(module_state.hotupgrade.require, "hotupgrade_extra")
                 _G.require = original_require
                 assert(ok, loaded)

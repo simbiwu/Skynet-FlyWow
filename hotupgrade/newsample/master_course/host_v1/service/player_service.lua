@@ -1,7 +1,7 @@
 -- V1 PlayerService：业务状态留在本 Service，所有受控业务共用一条 queue。
-local skynet = require "skynet"
-local business_queue = require "skynet.queue"()
-local hotupgrade = require "flywow_hotupgrade"
+local skynet = require "skynet" -- 当前 PlayerService 的消息分发、协程等待和 handle 查询接口。
+local business_queue = require "skynet.queue"() -- 串行执行玩家业务，并作为 Prepare 安全点使用。
+local hotupgrade = require "flywow_hotupgrade" -- 声明热更模块、登记 Service 并控制业务门禁。
 
 local logic                 -- 首次 init 后的普通模块根表；热更保持表身份。
 local state                 -- 玩家私有数据根表；由 Service Patch 原地修改。
@@ -41,18 +41,24 @@ local function initialize_player()
         return {ok = false, code = "ALREADY_INITIALIZED"}
     end
 
+    -- 当前 Service 的稳定模块根表；hotupgrade.require 同时把模块声明给 Controller。
     logic = hotupgrade.require("player_logic")
+    -- 当前玩家的长期私有状态根表；Service Patch 原地改字段，保持该表身份。
     state =
     {
-        weapon = "刀",
-        level = 50,
-        gold = 100,
-        schema_version = 1,
+        weapon = "刀", -- 玩家当前装备；V2 Patch 会把 V1 装备迁移为新装备。
+        level = 50, -- 当前玩家等级，两个版本都保留。
+        gold = 100, -- 当前玩家金币，热更后应保留。
+        schema_version = 1, -- 当前私有状态结构版本；Service Patch 据此迁移或验证状态。
     }
+    -- 现有业务函数表；攻击闭包捕获 state，热更通过替换 attack 字段更新逻辑。
     operations = {attack = logic.make_attack(state)}
+    -- 保存最初的状态根表引用，Sample 用它验证热更没有替换对象。
     state_identity = state
+    -- 保存当前旧攻击函数引用，Sample 用它展示缓存的闭包不会自动变更。
     old_attack = operations.attack
 
+    -- Controller 登记结果；只有成功后 registered 才允许业务命令通过。
     local answer = hotupgrade.register_service(
     {
         service_update =
@@ -108,8 +114,9 @@ end
 
 skynet.start(function()
     skynet.dispatch("lua", function(session, _source, command, request)
+        -- 管理消息可能没有载荷；后续命令字段统一从空表读取。
         request = request or {}
-        local answer
+        local answer -- 当前业务命令最终返回给调用方的结果。
 
         if command == "init" then
             answer = initialize_player()
@@ -147,7 +154,7 @@ skynet.start(function()
         elseif command == "release" then
             -- 教学控制消息必须独立于业务 queue，否则无法唤醒被占用的 queue。
             if holding_thread then
-                local thread = holding_thread
+                local thread = holding_thread -- 保存仍在运行的阻塞协程，用于测试取消或队列排空时机。
                 holding_thread = nil
                 skynet.wakeup(thread)
                 answer = {ok = true}

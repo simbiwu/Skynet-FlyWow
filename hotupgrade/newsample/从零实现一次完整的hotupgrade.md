@@ -112,7 +112,7 @@ hotupgrade/newsample/master_course/
 
 ```lua
 -- player_logic.lua：V1 完整业务模块。
-local M = {}
+local M = {} -- 候选模块的导出根表，return 后用于本次候选提交。
 
 function M.version()
     return "v1"
@@ -130,7 +130,7 @@ return M
 先别急着想热更。这里的 `M` 是普通 Lua table；`M.make_attack(state)` 返回一个闭包，闭包持有 `state` 引用。假设你保存：
 
 ```lua
-local old_attack = player_logic.make_attack(state)
+local old_attack = player_logic.make_attack(state) -- 预先缓存的 V1 闭包；替换模块字段不会自动更新这个局部引用。
 ```
 
 未来 `player_logic.make_attack` 字段被替换，也不会自动把 `old_attack` 变量改成新函数。这是后面最重要的实验观察之一。
@@ -145,9 +145,9 @@ local old_attack = player_logic.make_attack(state)
 
 ```lua
 -- V1 PlayerService：业务状态留在本 Service，所有受控业务共用一条 queue。
-local skynet = require "skynet"
-local business_queue = require "skynet.queue"()
-local hotupgrade = require "flywow_hotupgrade"
+local skynet = require "skynet" -- 当前 Service 使用的 Skynet API。
+local business_queue = require "skynet.queue"() -- 业务串行队列；业务处理和热更安全点都经过它。
+local hotupgrade = require "flywow_hotupgrade" -- 当前 Service 的受控模块加载、登记和生命周期 API。
 
 local logic                 -- 首次 init 后的普通模块根表；热更保持表身份。
 local state                 -- 玩家私有数据根表；由 Service Patch 原地修改。
@@ -159,6 +159,7 @@ local holding_thread        -- hold 占用 queue 时正在 wait 的业务协程�
 local waiting_spends = 0    -- 已通过入口但尚未拿到 queue 的 spend 请求数量。
 local fail_restore = false  -- 只用于故障实验，正常运行恒为 false。
 
+--- 返回 PlayerService 当前版本、私有状态和函数引用的观测快照。
 local function inspect_state()
     return
     {
@@ -178,6 +179,7 @@ local function inspect_state()
     }
 end
 
+--- 声明业务模块和私有状态，最后登记当前 PlayerService。
 local function initialize_player()
     if registered then
         return {ok = false, code = "ALREADY_INITIALIZED"}
@@ -195,7 +197,7 @@ local function initialize_player()
     state_identity = state
     old_attack = operations.attack
 
-    local answer = hotupgrade.register_service(
+    local answer = hotupgrade.register_service( -- 管理命令的调用结果。
     {
         service_update =
         {
@@ -240,7 +242,7 @@ end
 skynet.start(function()
     skynet.dispatch("lua", function(session, _source, command, request)
         request = request or {}
-        local answer
+        local answer -- 管理命令的调用结果。
 
         if command == "init" then
             answer = initialize_player()
@@ -278,7 +280,7 @@ skynet.start(function()
         elseif command == "release" then
             -- 教学控制消息必须独立于业务 queue，否则无法唤醒被占用的 queue。
             if holding_thread then
-                local thread = holding_thread
+                local thread = holding_thread -- 从 holding_thread 取出的协程句柄，交给 skynet.wakeup 唤醒。
                 holding_thread = nil
                 skynet.wakeup(thread)
                 answer = {ok = true}
@@ -338,10 +340,10 @@ end)
 ```lua
 -- 配置只引用运行脚本导出的绝对路径，不依赖某个固定的 Server 目录布局。
 -- Skynet 配置加载器先展开字符串中的 $变量名；配置运行环境没有 os，因此这里不能调用 os.getenv。
-local skynet_root = "$FLYWOW_MASTER_SKYNET_ROOT"
-local framework_root = "$FLYWOW_MASTER_FRAMEWORK_ROOT"
-local course_root = "$FLYWOW_MASTER_COURSE_ROOT"
-local runtime_root = "$FLYWOW_MASTER_RUNTIME_ROOT"
+local skynet_root = "$FLYWOW_MASTER_SKYNET_ROOT" -- Skynet 安装目录，配置文件据此定位 loader 与原生服务。
+local framework_root = "$FLYWOW_MASTER_FRAMEWORK_ROOT" -- 命令行环境提供的 FlyWow 根目录。
+local course_root = "$FLYWOW_MASTER_COURSE_ROOT" -- 本课程源码目录的绝对路径。
+local runtime_root = "$FLYWOW_MASTER_RUNTIME_ROOT" -- 当前启动环境中由 run.sh 传入的宿主运行目录。
 
 thread = 4
 harbor = 0
@@ -378,14 +380,14 @@ cpath = skynet_root .. "/cservice/?.so"
 
 ```lua
 -- V1 入口：只初始化控制面、创建业务 Service，暂不发布 Patch。
-local skynet = require "skynet"
+local skynet = require "skynet" -- 当前 Service 使用的 Skynet API。
 
 skynet.start(function()
-    local ok, failure = xpcall(function()
-        local hot = require "flywow_hotupgrade"
-        local controller = skynet.uniqueservice("flywow_hotupgrade_service")
-        local runtime_root = assert(os.getenv("FLYWOW_MASTER_RUNTIME_ROOT"))
-        local initialized = skynet.call(controller, "lua", "init",
+    local ok, failure = xpcall(function() -- xpcall 的执行成功标志，用于最终决定进程退出码。
+        local hot = require "flywow_hotupgrade" -- 管理端持有的 HotUpgrade API。
+        local controller = skynet.uniqueservice("flywow_hotupgrade_service") -- 当前管理端要发送命令的控制 Service handle。
+        local runtime_root = assert(os.getenv("FLYWOW_MASTER_RUNTIME_ROOT")) -- 当前启动环境中由 run.sh 传入的宿主运行目录。
+        local initialized = skynet.call(controller, "lua", "init", -- Controller init 的结果；成功后才允许创建业务目标。
         {
             root_path = runtime_root .. "/host",
             patch_path = runtime_root .. "/patches",
@@ -393,10 +395,10 @@ skynet.start(function()
         })
         assert(initialized.ok, initialized.message)
 
-        local player = hot.newservice("player_service")
-        local started = skynet.call(player, "lua", "init")
+        local player = hot.newservice("player_service") -- 本轮受管理创建的 PlayerService handle。
+        local started = skynet.call(player, "lua", "init") -- PlayerService init/register_service 的结果。
         assert(started.ok, started.message)
-        local snapshot = skynet.call(player, "lua", "inspect")
+        local snapshot = skynet.call(player, "lua", "inspect") -- Service 返回的观测快照，用于断言热更前后版本、状态和身份。
         assert(snapshot.ok, snapshot.code)
         assert(snapshot.version == "v1" and snapshot.attack == 105)
         assert(snapshot.gold == 100 and snapshot.state_same and snapshot.module_alias_same)
@@ -423,7 +425,7 @@ end)
 **【真实源码摘录】** `hotupgrade/lualib/flywow_hotupgrade_controller.lua` → `M.initialize()`：
 
 ```lua
-    local controller_initial_state =
+    local controller_initial_state = -- 所有配置已校验后的候选状态字段；全部准备好后一次性赋给 Controller。
     {
         root_path                     = root_path,                                      -- 已解析的宿主根目录；Controller 的正式文件读取、部署和恢复共用此根。
         patch_root                    = patch_root,                                     -- 已解析的受信 Patch 根目录；每批从此处读取并冻结发布源码。
@@ -571,7 +573,7 @@ mkdir -p hotupgrade/newsample/master_course/patches/v2/service
 
 ```lua
 -- 新增战斗规则：V1 运行时尚未存在。
-local M = {}
+local M = {} -- 候选模块的导出根表，return 后用于本次候选提交。
 
 function M.weapon_bonus(weapon)
     return weapon == "剑" and 20 or 0
@@ -588,9 +590,9 @@ return M
 
 ```lua
 -- V2 普通模块：新的攻击闭包通过首次声明的战斗规则模块计算加成。
-local hotupgrade = require "flywow_hotupgrade"
-local combat_rules = hotupgrade.require("combat_rules")
-local M = {}
+local hotupgrade = require "flywow_hotupgrade" -- 当前 Service 的受控模块加载、登记和生命周期 API。
+local combat_rules = hotupgrade.require("combat_rules") -- 通过 hotupgrade.require 声明的新增依赖；普通候选执行时从该模块读取规则。
+local M = {} -- 候选模块的导出根表，return 后用于本次候选提交。
 
 function M.version()
     return "v2"
@@ -617,9 +619,9 @@ return M
 
 ```lua
 -- V2 PlayerService：新实例通过正式部署的 V2 入口初始化。
-local skynet = require "skynet"
-local business_queue = require "skynet.queue"()
-local hotupgrade = require "flywow_hotupgrade"
+local skynet = require "skynet" -- 当前 Service 使用的 Skynet API。
+local business_queue = require "skynet.queue"() -- 业务串行队列；业务处理和热更安全点都经过它。
+local hotupgrade = require "flywow_hotupgrade" -- 当前 Service 的受控模块加载、登记和生命周期 API。
 
 local logic                 -- 首次 init 后的普通模块根表；热更保持表身份。
 local state                 -- 玩家私有数据根表；由 Service Patch 原地修改。
@@ -631,6 +633,7 @@ local holding_thread        -- hold 占用 queue 时正在 wait 的业务协程�
 local waiting_spends = 0    -- 已通过入口但尚未拿到 queue 的 spend 请求数量。
 local fail_restore = false  -- 只用于故障实验，正常运行恒为 false。
 
+--- 返回 PlayerService 当前版本、私有状态和函数引用的观测快照。
 local function inspect_state()
     return
     {
@@ -650,6 +653,7 @@ local function inspect_state()
     }
 end
 
+--- 声明业务模块和私有状态，最后登记当前 PlayerService。
 local function initialize_player()
     if registered then
         return {ok = false, code = "ALREADY_INITIALIZED"}
@@ -667,7 +671,7 @@ local function initialize_player()
     state_identity = state
     old_attack = operations.attack
 
-    local answer = hotupgrade.register_service(
+    local answer = hotupgrade.register_service( -- 管理命令的调用结果。
     {
         service_update =
         {
@@ -712,7 +716,7 @@ end
 skynet.start(function()
     skynet.dispatch("lua", function(session, _source, command, request)
         request = request or {}
-        local answer
+        local answer -- 管理命令的调用结果。
 
         if command == "init" then
             answer = initialize_player()
@@ -750,7 +754,7 @@ skynet.start(function()
         elseif command == "release" then
             -- 教学控制消息必须独立于业务 queue，否则无法唤醒被占用的 queue。
             if holding_thread then
-                local thread = holding_thread
+                local thread = holding_thread -- 从 holding_thread 取出的协程句柄，交给 skynet.wakeup 唤醒。
                 holding_thread = nil
                 skynet.wakeup(thread)
                 answer = {ok = true}
@@ -832,41 +836,46 @@ end
 
 ```lua
 -- 本课程管理端：v1 / normal / queue / forward 四个相互独立的场景。
-local skynet = require "skynet"
-local SCENARIO = os.getenv("FLYWOW_MASTER_SCENARIO") or "v1"
+local skynet = require "skynet" -- 当前 Service 使用的 Skynet API。
+local SCENARIO = os.getenv("FLYWOW_MASTER_SCENARIO") or "v1" -- 环境变量选择的教学运行模式；未设置时使用 v1。
 
+--- 断言 Skynet RPC 成功，并把统一结果表返回给调用方。
 local function expect(answer)
     assert(type(answer) == "table" and answer.ok,
         type(answer) == "table" and (answer.message or answer.code) or tostring(answer))
     return answer
 end
 
+--- 向 PlayerService 查询当前业务快照，RPC 失败时直接报错。
 local function get_player_snapshot(player)
     return expect(skynet.call(player, "lua", "inspect"))
 end
 
+--- 输出一个快照中的版本、状态和函数观察值。
 local function print_player(label, snapshot)
     print(string.format("%s handle=%d version=%s weapon=%s gold=%d schema=%d attack=%d old_attack=%d",
         label, snapshot.handle, snapshot.version, snapshot.weapon,
         snapshot.gold, snapshot.schema_version, snapshot.attack, snapshot.old_attack))
 end
 
+--- 每个 Skynet tick 重新检查条件，超过上限后报告等待超时。
 local function wait_for(check, description)
     for _ = 1, 3000 do
-        local answer = check()
+        local answer = check() -- 管理命令的调用结果。
         if answer then return answer end
         skynet.sleep(1)
     end
     error("等待超时: " .. description)
 end
 
+--- 提交发布请求并轮询直到该批进入终态。
 local function publish(controller, patch_name)
-    local begun = expect(skynet.call(controller, "hotupgrade", "begin", {path = patch_name}))
+    local begun = expect(skynet.call(controller, "hotupgrade", "begin", {path = patch_name})) -- 当前发布 begin 的受理结果，提供后续轮询身份。
     print("BEGIN " .. patch_name .. " batch=" .. begun.value.batch_id)
     return wait_for(function()
-        local status = expect(skynet.call(controller, "hotupgrade", "status",
+        local status = expect(skynet.call(controller, "hotupgrade", "status", -- 指定批次的当前状态查询结果。
             {batch_id = begun.value.batch_id}))
-        local record = status.value.record
+        local record = status.value.record -- 当前轮询读取的批次状态记录。
         if record.phase == "COMPLETED" or record.phase == "ABORTED"
             or record.phase == "RECOVERY_REQUIRED" then
             print("END " .. patch_name .. " phase=" .. record.phase
@@ -876,9 +885,10 @@ local function publish(controller, patch_name)
     end, "发布 " .. patch_name)
 end
 
+--- 创建或复用控制 Service，并完成一次性目录配置。
 local function initialize_controller()
-    local controller = skynet.uniqueservice("flywow_hotupgrade_service")
-    local runtime_root = assert(os.getenv("FLYWOW_MASTER_RUNTIME_ROOT"))
+    local controller = skynet.uniqueservice("flywow_hotupgrade_service") -- 当前管理端要发送命令的控制 Service handle。
+    local runtime_root = assert(os.getenv("FLYWOW_MASTER_RUNTIME_ROOT")) -- 当前启动环境中由 run.sh 传入的宿主运行目录。
     expect(skynet.call(controller, "lua", "init",
     {
         root_path = runtime_root .. "/host",
@@ -888,52 +898,56 @@ local function initialize_controller()
     return controller
 end
 
+--- 创建受管理 PlayerService 并等待它完成初始化登记。
 local function create_player(hot)
-    local handle = hot.newservice("player_service")
+    local handle = hot.newservice("player_service") -- 新建业务 Service 的 Skynet handle。
     expect(skynet.call(handle, "lua", "init"))
     return handle
 end
 
+--- 检查初始 V1 Service 的版本、状态和对象身份。
 local function run_v1(_controller, hot, player)
-    local before = get_player_snapshot(player)
+    local before = get_player_snapshot(player) -- 热更前从玩家 Service 读取的状态快照。
     print_player("V1", before)
     assert(before.version == "v1" and before.gold == 100 and before.attack == 105)
     assert(before.state_same and before.module_alias_same)
     print("MASTER_V1_OK")
 end
 
+--- 发布 V2，检查现存实例和新建实例都使用新代码。
 local function run_normal(controller, hot, player)
-    local before = get_player_snapshot(player)
+    local before = get_player_snapshot(player) -- 热更前从玩家 Service 读取的状态快照。
     print_player("BEFORE", before)
-    local first = publish(controller, "v2")
+    local first = publish(controller, "v2") -- 第一次发布 v2 的终态记录。
     assert(first.phase == "COMPLETED")
 
-    local after = get_player_snapshot(player)
+    local after = get_player_snapshot(player) -- 热更后从现存 PlayerService 读取的状态快照。
     print_player("EXISTING", after)
     assert(after.handle == player and after.version == "v2")
     assert(after.weapon == "剑" and after.schema_version == 2 and after.gold == 100)
     assert(after.attack == 120 and after.old_attack == 100)
     assert(after.state_same and after.module_alias_same and after.combat_loaded)
 
-    local another = create_player(hot)
-    local second = get_player_snapshot(another)
+    local another = create_player(hot) -- 热更后新创建的 PlayerService handle，用来验证正式入口也是 V2。
+    local second = get_player_snapshot(another) -- 新 Service 返回的状态快照。
     print_player("NEW", second)
     assert(another ~= player and second.version == "v2" and second.attack == 120)
     print("MASTER_NORMAL_OK")
 end
 
+--- 保持业务请求排队时发布，检查 Prepare 等待同一业务队列。
 local function run_queue(controller, _hot, player)
-    local first_done = false
-    local second_done = false
-    local a_result
-    local b_result
+    local first_done = false -- hold 请求是否已经完成。
+    local second_done = false -- 排队的 spend 请求是否已经完成。
+    local a_result -- 第一个 hold 请求的业务结果。
+    local b_result -- 第二个 spend 请求的业务结果。
 
     skynet.fork(function()
         a_result = expect(skynet.call(player, "lua", "hold"))
         first_done = true
     end)
     wait_for(function()
-        local peek = expect(skynet.call(player, "lua", "peek"))
+        local peek = expect(skynet.call(player, "lua", "peek")) -- PlayerService 的只读观测结果，不进入业务 queue。
         return peek.holding
     end, "请求 A 占有业务 queue")
 
@@ -942,67 +956,68 @@ local function run_queue(controller, _hot, player)
         second_done = true
     end)
     wait_for(function()
-        local peek = expect(skynet.call(player, "lua", "peek"))
+        local peek = expect(skynet.call(player, "lua", "peek")) -- PlayerService 的只读观测结果，不进入业务 queue。
         return peek.waiting_spends == 1
     end, "请求 B 已排入业务 queue")
 
     -- A 占着 queue，B 排队；现在开始发布，Prepare 也排在 B 后面。
-    local begun = expect(skynet.call(controller, "hotupgrade", "begin", {path = "v2"}))
+    local begun = expect(skynet.call(controller, "hotupgrade", "begin", {path = "v2"})) -- 当前发布 begin 的受理结果，提供后续轮询身份。
     wait_for(function()
-        local peek = expect(skynet.call(player, "lua", "peek"))
+        local peek = expect(skynet.call(player, "lua", "peek")) -- PlayerService 的只读观测结果，不进入业务 queue。
         return peek.patching
     end, "Prepare 已关闭新业务入口")
 
-    local c_result = skynet.call(player, "lua", "spend", {amount = 30})
+    local c_result = skynet.call(player, "lua", "spend", {amount = 30}) -- 当前 spend 请求的业务响应；后续与 hold 响应一起验证 queue 顺序。
     assert(not c_result.ok and c_result.code == "HU_UPGRADING")
     expect(skynet.call(player, "lua", "release"))
     wait_for(function() return first_done and second_done end, "A/B 完成")
     assert(a_result.version == "v1" and a_result.gold == 90)
     assert(b_result.version == "v1" and b_result.gold == 70)
 
-    local finished = wait_for(function()
-        local status = expect(skynet.call(controller, "hotupgrade", "status", {batch_id = begun.value.batch_id}))
-        local phase = status.value.record.phase
+    local finished = wait_for(function() -- 等待本批排队业务和热更完成的终态记录。
+        local status = expect(skynet.call(controller, "hotupgrade", "status", {batch_id = begun.value.batch_id})) -- 指定批次的当前状态查询结果。
+        local phase = status.value.record.phase -- 轮询得到的批次阶段，用于判断是否已进入 UPDATE。
         if phase == "COMPLETED" or phase == "ABORTED" or phase == "RECOVERY_REQUIRED" then
             return status.value.record
         end
     end, "并发热更批次")
     assert(finished.phase == "COMPLETED")
-    local after = get_player_snapshot(player)
+    local after = get_player_snapshot(player) -- 热更后从现存 PlayerService 读取的状态快照。
     print_player("QUEUE_AFTER", after)
     assert(after.version == "v2" and after.gold == 70 and after.attack == 120)
     print("A V1 gold=90, B V1 gold=70, C HU_UPGRADING")
     print("MASTER_QUEUE_OK")
 end
 
+--- 演示失败报告后继续发布修复版本。
 local function run_forward(controller, hot, player)
     assert(publish(controller, "v2").phase == "COMPLETED")
-    local healthy = get_player_snapshot(player)
+    local healthy = get_player_snapshot(player) -- 故障发布前的健康状态快照，修复后要与它对照。
     assert(healthy.version == "v2" and healthy.gold == 100)
 
     -- 教学故障：只让本次 Abort 的自定义 Service 状态恢复失败。
     expect(skynet.call(player, "lua", "inject_restore_failure", {enabled = true}))
-    local faulty = publish(controller, "faulty")
+    local faulty = publish(controller, "faulty") -- 故障 Patch 的终态记录，验证 Update 失败会报告错误。
     assert(faulty.phase == "RECOVERY_REQUIRED")
     assert(faulty.error and faulty.error.details.original_error and faulty.error.details.recovery_error)
 
-    local damaged = get_player_snapshot(player)
+    local damaged = get_player_snapshot(player) -- 故障批次后现存 Service 的实际状态快照。
     print_player("DAMAGED", damaged)
     assert(damaged.schema_version == 99 and damaged.gold == 0)
     assert(damaged.version == "v2" and damaged.state_same)
 
     -- 不需要管理端解锁 Controller；解除课堂注入，下一次普通发布直接修复。
     expect(skynet.call(player, "lua", "inject_restore_failure", {enabled = false}))
-    local repaired = publish(controller, "v3")
+    local repaired = publish(controller, "v3") -- 后续修复批次的终态记录；上一批错误不阻止它开始。
     assert(repaired.phase == "COMPLETED")
-    local fixed = get_player_snapshot(player)
+    local fixed = get_player_snapshot(player) -- 修复完成后现存 Service 返回的状态。
     print_player("REPAIRED", fixed)
     assert(fixed.version == "v3" and fixed.weapon == "霜剑")
     assert(fixed.schema_version == 3 and fixed.gold == 88 and fixed.attack == 125)
     assert(fixed.state_same and fixed.module_alias_same)
 
-    local another = create_player(hot)
-    local newcomer = get_player_snapshot(another)
+    local another = create_player(hot) -- 热更后新创建的 PlayerService handle，用来验证正式入口也是 V2。
+    local newcomer = get_player_snapshot(another) -- 修复后新建 Service 的状态，用于验证正式文件入口也已更新。
     print_player("NEW_V3", newcomer)
     assert(newcomer.version == "v3" and newcomer.schema_version == 3)
     assert(newcomer.attack == 125)
@@ -1010,10 +1025,10 @@ local function run_forward(controller, hot, player)
 end
 
 skynet.start(function()
-    local ok, failure = xpcall(function()
-        local hot = require "flywow_hotupgrade"
-        local controller = initialize_controller()
-        local player = create_player(hot)
+    local ok, failure = xpcall(function() -- xpcall 的执行成功标志，用于最终决定进程退出码。
+        local hot = require "flywow_hotupgrade" -- 管理端持有的 HotUpgrade API。
+        local controller = initialize_controller() -- 当前管理端要发送命令的控制 Service handle。
+        local player = create_player(hot) -- 本轮受管理创建的 PlayerService handle。
         if SCENARIO == "v1" then
             run_v1(controller, hot, player)
         elseif SCENARIO == "normal" then
@@ -1069,11 +1084,11 @@ MASTER_NORMAL_OK
 
 ```lua
 skynet.dispatch("hotupgrade", function(session, source, command, request)
-    local answer
+    local answer -- 管理命令的调用结果。
     if not controller_initialized then
         answer = flywow_result.failure("HU_NOT_INITIALIZED", "宿主尚未完成 init")
     else
-        local ok
+        local ok -- xpcall 的执行成功标志，用于最终决定进程退出码。
         ok, answer = pcall(hotupgrade_controller.handle_command,
             hotupgrade_controller, command, request, source)
         if not ok then
@@ -1101,14 +1116,14 @@ function M:begin(request)
     end
     self.batch_sequence = self.batch_sequence + 1
     ---@type FlyWowHotUpgradeBatch
-    local batch =
+    local batch = -- Controller 当前协调的发布批次，携带冻结文件、目标和终态信息。
     {
-        batch_id             = tostring(skynet.self()) .. ":" .. self.batch_sequence, -- begin 返回给管理端，并作为 status 查询本批的身份。
+        batch_id             = tostring(skynet.self()) .. ":" .. self.batch_sequence, -- 管理端用它查询这次发布；迟到命令也用它确认批次身份。
         sequence             = self.batch_sequence,                                   -- 本 Controller 内递增；控制 RPC 用它拒绝迟到的旧批消息。
         patch_dir            = request.path,                                          -- 相对 patch_root 的发布目录；begin 接受时固定并从此冻结源码。
         phase                = "WAITING_CREATIONS",                                   -- run_batch 推进；生命周期门禁和 status 视图据此生成。
-        service_results      = {},                                                    -- run_batch 终态汇总参与控制的 Service 结果，供 status 返回。
-        service_targets      = {},                                                    -- 目标 Service 记录；Prepare 重匹配时补齐，Update 前固定，终态后释放。
+        service_results      = {},                                                    -- 保存每个目标 Service 的最终结果，供 status 返回成功/失败明细。
+        service_targets      = {},                                                    -- 保存本批实际需要执行控制命令的 Service；Update 前确定，终态后释放。
     }
     self.active_batch = batch
     skynet.fork(function()
@@ -1132,7 +1147,9 @@ end
 **【真实源码摘录】** `flywow_hotupgrade_controller.lua` → `wait_for_batch_work()`：
 
 ```lua
+--- 等待目标创建和首次模块加载都结束，确保批次目标集合稳定。
 local function wait_for_batch_work(controller, batch)
+    -- 两张事实表分别记录尚未登记的创建与尚未消费的模块许可；batch.waiter 只保存本批等待协程。
     while next(controller.pending_creations) ~= nil or next(controller.module_load_permits) ~= nil do
         batch.waiter = coroutine.running()
         skynet.wait(batch.waiter)
@@ -1145,12 +1162,12 @@ end
 
 `status` 仍对外报告 `pending_service_count` 和 `pending_module_count`，但它们是查询时根据 `pending_creations` 和 `module_load_permits` 统计出来的值，不是 Controller 内部状态字段。
 
-**返回调用主线**：在 `M:run_batch()` 中，这次等待返回后先把批次标为 `DEPLOYING`，再进入冻结 Patch 和旧文件快照流程：
+**返回调用主线**：在 `M:run_batch()` 中，这次等待返回后先把批次标为 `DEPLOYING`，再把 Patch 源码和正式文件旧内容读入本批记录：
 
 ```lua
 wait_for_batch_work(self, batch)
 batch.phase = "DEPLOYING"
-local control_succeeded, control_failure = pcall(prepare_and_update_batch, self, batch)
+local control_succeeded, control_failure = pcall(prepare_and_update_batch, self, batch) -- Prepare/Update 协调函数是否正常返回。
 ```
 
 `prepare_and_update_batch()` 完成每轮 Prepare 后也会复用同一个等待函数；因此等待结束后继续重新匹配目标，全部目标准备好后才部署正式文件并执行 Update。
@@ -1164,7 +1181,9 @@ local control_succeeded, control_failure = pcall(prepare_and_update_batch, self,
 **【真实源码摘录】** `M:run_batch()` 通过 `pcall` 调用 `prepare_and_update_batch()`。下面先展示四阶段编排，再进入第一个阶段 `load_and_snapshot_batch_files()`：
 
 ```lua
+--- 依次准备所有目标并执行 Update，任一步失败交给批次恢复。
 local function prepare_and_update_batch(controller, batch)
+    -- 各阶段共用 batch.error 传递首个失败；这里据此停止推进，恢复由外层 run_batch 统一执行。
     load_and_snapshot_batch_files(controller, batch)
     if batch.error then
         return
@@ -1183,7 +1202,9 @@ local function prepare_and_update_batch(controller, batch)
     update_batch_targets(controller, batch)
 end
 
+--- 读取本批源码并保存正式文件旧内容，供部署失败时恢复。
 local function load_and_snapshot_batch_files(controller, batch)
+    -- load_patch 填充的 files 只含正式 .lua；此处补齐 old_source，false 表示部署前没有该文件。
     -- DEPLOYING 阶段只读取一次发布包，并保存所有正式文件的旧内容。
     local load_result = controller:load_patch(batch)
     if not load_result.ok then
@@ -1192,7 +1213,7 @@ local function load_and_snapshot_batch_files(controller, batch)
     end
 
     for _, file in ipairs(batch.files) do
-        local old_source, read_failure = hotupgrade_native.read_file(controller.root_path, file.entry_file)
+        local old_source, read_failure = hotupgrade_native.read_file(controller.root_path, file.entry_file) -- 正式目录中替换前的文件内容；失败时写回它恢复旧版本。
         if old_source == nil then
             batch.error = flywow_result.failure(native_code(read_failure), "文件准备失败: " .. file.entry_file)
             return
@@ -1204,11 +1225,11 @@ end
 
 四阶段共用同一个 batch。第一个阶段失败会写入 batch.error 并返回；编排函数立即停止后续阶段，回到 run_batch() 后进入恢复，不会跳过批次收尾。
 
-`load_patch(batch)` 先调用 `freeze_patch_files(controller,batch)` 扫描、读取、检查语法并分类源码，将结果写入 `batch.files`、`batch.modules`、`batch.service_patches`，再完成初次匹配，写入 `batch.service_targets`；活动目标数由该列表长度计算，终态释放列表前才保存 `batch.target_service_count`。`service_targets` 的每一项是一个目标 Service 的本批记录，包含真实 handle、匹配到的模块及 Prepare/Abort 所需参与状态；它不是另一种批次或发布包。返回的 `frozen` 仅是冻结操作结果；它不再携带另一层 patch/targets 包装。普通模块源码记录与文件恢复记录分别用于目标 RPC 和正式文件恢复，旧文件快照不发送给目标 Service。
+`load_patch(batch)` 先调用 `freeze_patch_files(controller,batch)` 扫描、读取、检查语法并分类源码，将结果写入 `batch.files`、`batch.modules`、`batch.service_patches`，再完成初次匹配，写入 `batch.service_targets`；活动目标数由该列表长度计算，终态释放列表前才保存 `batch.target_service_count`。`service_targets` 的每一项是一个目标 Service 的本批记录，包含真实 handle、匹配到的模块及 Prepare/Abort 所需参与状态；它不是另一种批次或发布包。返回的 `frozen` 仅是冻结操作结果；它不再携带另一层 patch/targets 包装。普通模块源码记录与文件恢复记录分别用于目标 RPC 和正式文件恢复，旧文件快照不发送给目标 Service。本批的三个发布集合各有用途：batch.files 保存所有正式 Lua 文件路径和新源码，供部署及失败恢复；batch.modules 只保存普通 Lua 模块候选，供目标按已登记模块名筛选；batch.service_patches 按 Service 入口名保存对应更新脚本。模块名按路径把斜杠改成点，所以 a/b.lua 和 a.b.lua 都会得到 a.b，不能在同一批重复发布。
 
 这里的 `read_file` 能区分“旧文件本来不存在”与“读取操作失败”：新增 `combat_rules.lua` 在 V1 宿主里不存在，其 `old_source` 表示不存在，而不是因为没有旧文件就拒绝新模块发布。回滚时对本批新创建的文件执行删除。
 
-**这时只是在内存里冻结 Patch 源码和旧文件快照，还没有复制正式 V2 文件。** 随后 `batch.phase` 进入 `PREPARE`，Controller 用初次匹配结果逐个向目标发送 Prepare。我们的 `player_service` 因为已经通过受管理入口创建、登记了 `lualib.player_logic`，且提供 Service 更新入口，因此是本批参与目标。
+**这时只把 Patch 源码和旧文件快照读入内存，还没有复制正式 V2 文件。** 随后 `batch.phase` 进入 `PREPARE`，Controller 用初次匹配结果逐个向目标发送 Prepare。我们的 `player_service` 因为已经通过受管理入口创建、登记了 `lualib.player_logic`，且提供 Service 更新入口，因此是本批参与目标。
 
 ### 第 7.5 节：第二跳——Controller 发送 Prepare 到目标 Service
 
@@ -1218,8 +1239,9 @@ end
 
 ```lua
 function M:step(batch, service_target, command)
+    -- service_target 是本批复用的目标记录；modules 是筛选后的候选，service_patch 保存匹配到的 .patch 源码。
     ---@type FlyWowHotUpgradeControlRequest
-    local request =
+    local request = -- 本批固定的管理请求，后续执行始终使用同一发布目录。
     {
         batch_id = batch.batch_id,
         sequence = batch.sequence,
@@ -1235,7 +1257,7 @@ function M:step(batch, service_target, command)
     end
 
     batch.control_started = true
-    local call_succeeded, service_result = pcall(skynet.call,
+    local call_succeeded, service_result = pcall(skynet.call, -- 向目标 Service 发送控制 RPC 是否正常返回。
         service_target.service_handle, "hotupgrade", command, request)
     if service_target.exited then
         return service_target.hotupgrade_result
@@ -1258,7 +1280,9 @@ Prepare 只需要 `batch_id`、`sequence` 等批次身份，不发送完整模�
 **【真实源码摘录】** `flywow_hotupgrade.lua` → `prepare_batch(request)`：
 
 ```lua
+--- 向匹配到的 Service 发送 Prepare，并等待业务安全点。
 local function prepare_batch(request)
+    -- active_batch 是当前 Service 的本地记录；request 的身份来自 Controller，回调与业务对象仍只留在此 Lua State。
     if module_state.active_batch then
         return flywow_result.failure("HU_UPGRADE_BUSY", "当前批次已在处理中")
     end
@@ -1271,7 +1295,7 @@ local function prepare_batch(request)
     }
     M.patching = true
 
-    local prepare_succeeded, prepare_result = pcall(module_state.registration_config.before_upgrade)
+    local prepare_succeeded, prepare_result = pcall(module_state.registration_config.before_upgrade) -- 业务 before_upgrade 是否正常返回。
 
     if not prepare_succeeded then
         return flywow_result.failure("HU_PREPARE_FAILED", tostring(prepare_result))
@@ -1303,7 +1327,7 @@ end
 **【真实源码摘录】** `prepare_batch_targets()` 循环尾部，展示当前逻辑块的关键连续段：
 
 ```lua
-local matched = match_service_targets(batch, controller.service_registrations)
+local matched = match_service_targets(batch, controller.service_registrations) -- 本批按 Service 入口名匹配后的目标列表和是否需要 Prepare 的结果。
 if not matched.ok then
     batch.error = matched
     return
@@ -1323,11 +1347,13 @@ end
 **【真实源码摘录】** `flywow_hotupgrade_controller.lua` → `deploy_batch_files()` 和紧接着调用的 `update_batch_targets()`，分别关闭门禁并部署、清缓存，再串行 Update：
 
 ```lua
+--- 把本批固定读取的文件写入正式目录并清理 Lua 缓存。
 local function deploy_batch_files(controller, batch)
+    -- files 保存本批源码和旧文件快照；只有替换成功才设 touched，失败恢复据此选择实际写过的文件。
     -- PREPARE 收口后无 yield 地关闭入口；先部署本批完整 Lua 文件并清缓存。
     batch.phase = "UPDATE"
     for _, file in ipairs(batch.files) do
-        local file_written, write_failure = hotupgrade_native.replace_file(
+        local file_written, write_failure = hotupgrade_native.replace_file( -- 当前正式文件替换是否成功。
             controller.root_path, file.entry_file, file.source)
         if not file_written then
             batch.error = flywow_result.failure(native_code(write_failure), "部署失败: " .. file.entry_file)
@@ -1336,7 +1362,7 @@ local function deploy_batch_files(controller, batch)
         file.touched = true
     end
     if #batch.files > 0 then
-        local cache_cleared, cache_failure = pcall(skynet.cache.clear)
+        local cache_cleared, cache_failure = pcall(skynet.cache.clear) -- 正式文件全部替换后缓存清理是否成功。
         if not cache_cleared then
             batch.error = flywow_result.failure("HU_CACHE_CLEAR_FAILED", tostring(cache_failure))
             return
@@ -1344,11 +1370,13 @@ local function deploy_batch_files(controller, batch)
     end
 end
 
+--- 按目标顺序执行 Update，首个失败交由恢复流程处理。
 local function update_batch_targets(controller, batch)
+    -- service_targets 已在 Prepare 收口时固定；current_service_handle 还用于允许当前目标登记 new_modules。
     -- 全部文件就绪后才向目标发送 Update；新生命周期请求继续等待批次终态。
     for _, service_target in ipairs(batch.service_targets) do
         batch.current_service_handle = service_target.service_handle
-        local service_result = controller:step(batch, service_target, "update")
+        local service_result = controller:step(batch, service_target, "update") -- 目标 Service 对本次 Prepare 或 Update 的结构化答复。
         if batch.error then
             return
         end
@@ -1369,8 +1397,9 @@ end
 **【真实源码摘录】** `flywow_hotupgrade_controller.lua` → `lifecycle_closed(controller)`：
 
 ```lua
+--- 从活动批次阶段判断创建和模块首次加载入口是否关闭。
 local function lifecycle_closed(controller)
-    local batch = controller.active_batch
+    local batch = controller.active_batch -- Controller 当前协调的发布批次，携带冻结文件、目标和终态信息。
     return batch ~= nil and batch.phase ~= "WAITING_CREATIONS" and batch.phase ~= "PREPARE"
 end
 ```
@@ -1398,23 +1427,29 @@ end
 **【真实源码摘录】** `hotupgrade/lualib/flywow_hotupgrade.lua` → `update_batch()`，从准备到提交的连续逻辑：
 
 ```lua
+--- 在目标 Lua State 加载本批新增模块并 Stage、Commit 普通模块。
 local function update_batch(batch, request)
+    -- batch.phase 标识本地 Update 是否已开始；request.modules 和 service_patch_source 是 Controller 为本批固定读取的输入。
     if batch.phase ~= nil then
         return flywow_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
     batch.phase = "UPDATING"
     -- Controller 在 Prepare 收口时已固定普通候选；new_modules 在这里才首次加载并登记，从下一批 Stage 起才会匹配。
+    -- Service Patch 构建和 new_modules 登记结果；成功后才能执行普通候选 Stage。
     local service_patch_result = stage_service_patch_and_new_modules(batch, request.service_patch_source)
     if not service_patch_result.ok then
         return service_patch_result
     end
+    -- 当前 Service 的提交定义和恢复材料；本批没有匹配的 Service Patch 时为 nil。
     local service_patch = service_patch_result.value
 
     -- 保留同一声明上下文直到候选模块执行结束，漏列的新依赖须立即失败，不能在 UPDATE 等许可。
+    -- 普通模块候选 Stage 的执行状态和结果；失败时需清除临时新模块加载权限。
     local stage_succeeded, module_result = pcall(hotupgrade_module_patch.stage,
         request.modules, module_state.declared_modules)
     batch.new_module_context = nil
     if not stage_succeeded then
+        -- 内部若已返回 FlyWowResult 则保留其错误码，普通 Lua 异常由本阶段错误码包装。
         local cause = type(module_result) == "table" and module_result.ok == false and module_result or nil
         return flywow_result.failure("HU_MODULE_STAGE_FAILED",
             cause and cause.message or tostring(module_result), cause and {cause_code = cause.code} or nil)
@@ -1427,13 +1462,15 @@ local function update_batch(batch, request)
     batch.service_patch = service_patch
 
     -- Activate 同步提交；失败先报告，再由 Controller 串行 Abort 整批目标。
+    -- 原地安装候选模块导出的结果；失败后由 Controller 调用 Abort 恢复。
     local commit_result = hotupgrade_module_patch.commit(batch.module_stage)
     if not commit_result.ok then
         return flywow_result.failure("HU_ACTIVATE_FAILED", commit_result.message)
     end
+    -- 捕获 Service 状态、函数及 after_upgrade 提交异常，交由 Controller 统一 Abort。
     local activation_succeeded, activation_failure = pcall(function()
         if service_patch then
-            local service_update = module_state.registration_config.service_update
+            local service_update = module_state.registration_config.service_update -- register_service 提供的私有状态/函数更新合同。
             service_patch.touched = true
             if service_patch.update_state then
                 service_patch.update_state()
@@ -1515,17 +1552,17 @@ local stage_succeeded, module_result = pcall(hotupgrade_module_patch.stage,
 
 ```lua
 for _, module_patch in ipairs(module_patches) do
-    local live = package.loaded[module_patch.name]
+    local live = package.loaded[module_patch.name] -- package.loaded 中当前线上模块的导出表，Commit 原地写它。
     check_exports(live, module_patch.name)
-    local fields = {}
+    local fields = {} -- 候选导出表的完整字段集合，Stage 后由 Commit 安装到 live。
     for key, value in pairs(live) do
         fields[key] = value
     end
 
-    local chunk = assert(load(
+    local chunk = assert(load( -- 编译后的候选模块代码；编译阶段不执行模块顶层代码。
         hotupgrade_common.normalize_source(module_patch.source),
         "@" .. module_patch.name, "t"))
-    local loader = module_loaders and module_loaders[module_patch.name]
+    local loader = module_loaders and module_loaders[module_patch.name] -- 普通 require 返回的加载器；Skynet loader 会另行确认其来源。
     module_stage.entries[#module_stage.entries + 1] =
     {
         name = module_patch.name,
@@ -1557,12 +1594,12 @@ end
 
 ```lua
 for _, entry in ipairs(module_stage.entries) do
-    local candidate = entry.chunk(entry.loader_name, entry.loader_path)
+    local candidate = entry.chunk(entry.loader_name, entry.loader_path) -- 执行候选 chunk 得到的新模块根表。
     check_exports(candidate, entry.name)
     assert(candidate ~= entry.live, "候选须返回新的导出表")
     -- 只有旧版提供快照且新版提供导入钩子时才迁移；缺少任一方就使用新版初始化状态。
     if entry.live.export_state and candidate.import_state then
-        local snapshot = M.snapshot_state(entry.live.export_state())
+        local snapshot = M.snapshot_state(entry.live.export_state()) -- Service 返回的观测快照，用于断言热更前后版本、状态和身份。
         assert(candidate.import_state(snapshot) ~= false, "模块拒绝状态导入")
         -- 导入钩子可能改变候选导出；只在执行过该钩子后重新检查。
         check_exports(candidate, entry.name)
@@ -1587,7 +1624,7 @@ end
 ```lua
 -- 【原理示意：旧版模块的局部状态，不是我们 V1 Sample 的实际文件】
 local hit_count = 7
-local M = {}
+local M = {} -- 候选模块的导出根表，return 后用于本次候选提交。
 function M.hit() hit_count = hit_count + 1 end
 function M.export_state() return {hit_count = hit_count} end
 function M.import_state(snapshot)
@@ -1686,7 +1723,7 @@ end
 
 ```lua
 if service_patch then
-    local service_update = module_state.registration_config.service_update
+    local service_update = module_state.registration_config.service_update -- register_service 提供的私有状态/函数更新合同。
     service_patch.touched = true
     if service_patch.update_state then
         service_patch.update_state()
@@ -1728,6 +1765,7 @@ end
 
 ```lua
 local function finish_batch(controller, batch)
+    -- 目标的 hotupgrade_result 在此记录 Finish 或退出结果；发布决定已作出，错误只影响收尾报告。
     batch.phase = "PUBLISH_DECIDED"
     for _, service_target in ipairs(batch.service_targets) do
         batch.current_service_handle = service_target.service_handle
@@ -1751,10 +1789,11 @@ end
 
 ```lua
 local function finish_batch(batch)
+    -- module_stage 保留旧导出和候选引用；到 Finish 才释放，Service 业务入口随后由 close_batch 打开。
     if batch.phase ~= "ACTIVATED" then
         return flywow_result.failure("HU_PHASE_INVALID", "当前阶段不能执行 finish")
     end
-    local finished = hotupgrade_module_patch.finish(batch.module_stage)
+    local finished = hotupgrade_module_patch.finish(batch.module_stage) -- 等待本批排队业务和热更完成的终态记录。
     close_batch(batch)
     return finished
 end
@@ -1766,6 +1805,7 @@ Finish 中调用的 `close_batch(batch)` 定义在同一个 `flywow_hotupgrade.l
 
 ```lua
 local function close_batch(batch)
+    -- 本地完成序号和批次身份用于识别迟到或重复控制消息；释放 active_batch 后才重新接纳业务。
     module_state.completed_sequence = batch.sequence
     module_state.last_batch_id = batch.batch_id
     module_state.active_batch = nil
@@ -1784,7 +1824,7 @@ main/publish (管理 Service)
   └─ RPC begin → hotupgrade_service/dispatch → Controller/begin
        └─ fork run_batch
             ├─ 等在途创建与加载
-            ├─ 冻结完整 Patch、保存旧文件、匹配目标
+            ├─ 读取并固定本批 Patch 内容、保存旧文件、匹配目标
             ├─ RPC prepare → dispatch_upgrade_command → handle_upgrade → prepare_batch → before_upgrade → queue 安全点
             ├─ 等在途依赖、最终重匹配
             ├─ batch.phase=UPDATE（关闭普通生命周期门禁）
@@ -1817,14 +1857,19 @@ Controller 只有发布终态才放开门禁，而发布终态又依赖这个 Up
 1. Controller 先把本批完整 `.lua` 放入正式宿主目录并清理缓存，使 `combat_rules.lua` 确实能被搜索和加载。
 2. PlayerService 在 Update 期间通过 Service Patch 的 `new_modules` 声明获得受控的新模块登记通道；这条通道不申请普通首次加载许可。
 
-**实际调用者**：`flywow_hotupgrade.lua/handle_upgrade("update")` 分派到 `update_batch()`，再调用 `stage_service_patch_and_new_modules(batch,request.service_patch_source)`。后者先调用 stage_service_patch() 执行 Service Patch 构建函数，取得 `new_modules={"combat_rules"}`。清单中的每项在准备时解析身份，规范名直接填入 new_module_context.names，解析结果按声明顺序保存到 new_module_identities；随后调用私有 `require_module(identity.name, identity)` 复用这些已确认的身份。公共 `M.require(name)` 仍负责检查新调用的模块名、解析身份，再进入同一个加载流程。
+**实际调用者**：`flywow_hotupgrade.lua/handle_upgrade("update")` 分派到 `update_batch()`，再调用 `stage_service_patch_and_new_modules(batch,request.service_patch_source)`。后者先调用 stage_service_patch() 执行 Service Patch 构建函数，取得 `new_modules={"combat_rules"}`。清单中的每项在准备时解析身份，统一模块名直接填入 new_module_context.names，例如 a/b.lua 对应 a.b，解析结果按声明顺序保存到 new_module_identities；随后调用私有 `require_module(identity.name, identity)` 复用这些已确认的身份。公共 `M.require(name)` 仍负责检查新调用的模块名、解析身份，再进入同一个加载流程。
 
 **【真实源码摘录】** `flywow_hotupgrade.lua` → `stage_service_patch_and_new_modules()` 中新模块清单处理逻辑：
 
 ```lua
 local function stage_service_patch_and_new_modules(batch, service_patch_source)
     -- 清单保留到普通候选 Stage 结束；未声明的新依赖立即失败，不能申请普通许可后与本批 Update 互等。
-    local new_module_context = {owner = coroutine.running(), batch_id = batch.batch_id, names = {}}
+    local new_module_context =
+    {
+        owner = coroutine.running(), -- 允许本批声明新模块加载的 Update 协程。
+        batch_id = batch.batch_id,   -- Controller 当前发布批次身份，新模块登记时原样带回。
+        names = {},                  -- 本批允许首次加载的模块统一名称集合。
+    }
     batch.new_module_context = new_module_context
     local failure_code = "HU_SERVICE_STAGE_FAILED"
     local stage_succeeded, service_patch_or_error = pcall(function()
@@ -1833,9 +1878,12 @@ local function stage_service_patch_and_new_modules(batch, service_patch_source)
         end
 
         -- 先构建并核验完整声明清单，再加载模块，避免边加载边发现重复路径。
+        -- 当前 Service 的更新定义；其中 new_modules 指定本批首次加载的模块。
         local service_patch = stage_service_patch(service_patch_source)
-        local new_module_identities = {} -- 保存已验证身份，首次加载直接复用，不再解析同一路径。
+        -- 解析完成的模块文件身份；校验重复路径后直接用于加载，不再重新查找文件。
+        local new_module_identities = {}
         for _, name in ipairs(service_patch.new_modules or {}) do
+            -- 清单名称对应的真实文件身份；例如 a/b.lua 与 a.b.lua 都转换成 a.b，重复声明会被拒绝。
             local identity = resolve_module_identity(name)
             assert(not new_module_context.names[identity.canonical_name],
                 "HU_DUPLICATE_MODULE: new_modules 重复指向同一文件: " .. identity.canonical_name)
@@ -1866,13 +1914,13 @@ end
 
 ```lua
 elseif register_new_module and module_load_attempt.module_declaration_added then
-    local answer = skynet.call(get_hotupgrade_handle(), "hotupgrade", "register_new_module",
+    local answer = skynet.call(get_hotupgrade_handle(), "hotupgrade", "register_new_module", -- 管理命令的调用结果。
         {batch_id = new_module_context.batch_id, name = canonical_name})
     assert(answer.ok, "新模块登记失败: " .. tostring(answer.message))
 end
 ```
 
-**接收方**：`flywow_hotupgrade_controller.lua/M:register_new_module(request,source)`。它只允许当前活跃批次处于 UPDATE、`batch_id` 匹配，而且**消息来源是正在 Update 的目标 Service**；它把规范模块名记录到该 Service 的注册元数据中。由于普通 Stage 目标集合早已冻结，新增模块不会在当前批次被二次 Stage；下一批重新匹配后才能作为已有模块更新。
+**接收方**：`flywow_hotupgrade_controller.lua/M:register_new_module(request,source)`。它只允许当前活跃批次处于 UPDATE、`batch_id` 匹配，而且**消息来源是正在 Update 的目标 Service**；它把统一模块名（例如 a/b.lua 对应的 a.b）记录到该 Service 的注册元数据中。由于普通 Stage 目标集合在 Update 前已经确定，新增模块不会在当前批次被二次 Stage；下一批重新匹配后才能作为已有模块更新。
 
 **真实限制**：若新增模块在本 State 同时被另一个普通首次加载协程占用，Update 不等待它走完可能被门禁阻断的路径，而是快速失败 `HU_MODULE_LOADING`。若候选尝试 `hotupgrade.require` 一个未声明、未登记的新依赖，则快速报 `HU_NEW_MODULE_NOT_DECLARED`，阶段错误保留在 `code`，根因码位于 `details.cause_code`。
 
@@ -1893,7 +1941,7 @@ Module Patch Engine 的候选 chunk 使用 Lua State 的默认全局环境，因
 ```lua
 local errors = {}
 for _, entry in ipairs(module_stage.entries) do
-    local ok, message = pcall(function()
+    local ok, message = pcall(function() -- xpcall 的执行成功标志，用于最终决定进程退出码。
         assert(package.loaded[entry.name] == entry.live
             and getmetatable(entry.live) == nil,
             "模块缓存身份或元表变化: " .. entry.name)
@@ -1905,7 +1953,7 @@ for _, entry in ipairs(module_stage.entries) do
         errors[#errors + 1] = tostring(message)
     end
 end
-local finished = M.finish(module_stage)
+local finished = M.finish(module_stage) -- 等待本批排队业务和热更完成的终态记录。
 if #errors > 0 then
     return flywow_result.failure(
         "HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
@@ -1919,6 +1967,7 @@ Abort 试图恢复**旧根表上的旧字段引用**，不是把整个 `package.
 
 ```lua
 function M.finish(module_stage)
+    -- active_module_stage 是本 State 的唯一在途暂存；清空 entries 释放旧导出与候选引用，不修改线上模块。
     if module_state.active_module_stage ~= module_stage then
         return flywow_result.failure(
             "HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
@@ -1989,7 +2038,7 @@ function skynet.queue()
     end
 
     return function(f, ...)
-        local thread = coroutine.running()
+        local thread = coroutine.running() -- 从 holding_thread 取出的协程句柄，交给 skynet.wakeup 唤醒。
         if current_thread and current_thread ~= thread then
             table.insert(thread_queue, thread)
             skynet.wait()
@@ -2140,6 +2189,7 @@ MASTER_QUEUE_OK
 
 ```lua
 local function recover_batch(controller, batch)
+    -- batch.files 的 touched/old_source 决定文件恢复；目标列表的 participated/exited 决定哪些实例仍需 Abort。
     local recovery_errors = {}    -- 汇总所有恢复失败；单项失败不停止其余文件或目标恢复。
     local recovery_failure        -- 保留第一份结构化恢复错误，供最终结果携带诊断。
     local files_touched   = false -- 只有正式文件被替换后才需要清理文件缓存。
@@ -2160,7 +2210,7 @@ local function recover_batch(controller, batch)
         end
     end
     if files_touched then
-        local cache_cleared, cache_failure = pcall(skynet.cache.clear)
+        local cache_cleared, cache_failure = pcall(skynet.cache.clear) -- 正式文件全部替换后缓存清理是否成功。
         if not cache_cleared then
             recovery_failure = recovery_failure or flywow_result.failure("HU_CACHE_CLEAR_FAILED", tostring(cache_failure))
             recovery_errors[#recovery_errors + 1] = tostring(cache_failure)
@@ -2169,7 +2219,7 @@ local function recover_batch(controller, batch)
 
     -- 再逆序撤销已参与且仍存活的目标；失败目标也不能跳过其余 Abort。
     for index = #batch.service_targets, 1, -1 do
-        local service_target = batch.service_targets[index]
+        local service_target = batch.service_targets[index] -- 当前正在执行 Update 的目标 Service 记录。
         if service_target.participated and not service_target.exited then
             local restored = controller:step(batch, service_target, "abort")
             if not restored.ok and not service_target.exited then
@@ -2211,7 +2261,7 @@ end
 local function abort(batch)
     -- 先尝试恢复 Service 私有状态，再恢复模块导出；一个失败也继续另一项。
     local errors = {}
-    local ok, message = pcall(restore_service, batch)
+    local ok, message = pcall(restore_service, batch) -- xpcall 的执行成功标志，用于最终决定进程退出码。
     if not ok then
         errors[#errors + 1] = tostring(message)
     end
@@ -2332,7 +2382,7 @@ mkdir -p hotupgrade/newsample/master_course/patches/v3/service
 
 ```lua
 -- V3：完整普通模块；本版“霜剑”给予 25 点加成。
-local M = {}
+local M = {} -- 候选模块的导出根表，return 后用于本次候选提交。
 
 function M.version()
     return "v3"
@@ -2355,9 +2405,9 @@ return M
 
 ```lua
 -- V3 PlayerService：新实例通过正式部署的 V3 入口初始化。
-local skynet = require "skynet"
-local business_queue = require "skynet.queue"()
-local hotupgrade = require "flywow_hotupgrade"
+local skynet = require "skynet" -- 当前 Service 使用的 Skynet API。
+local business_queue = require "skynet.queue"() -- 业务串行队列；业务处理和热更安全点都经过它。
+local hotupgrade = require "flywow_hotupgrade" -- 当前 Service 的受控模块加载、登记和生命周期 API。
 
 local logic                 -- 首次 init 后的普通模块根表；热更保持表身份。
 local state                 -- 玩家私有数据根表；由 Service Patch 原地修改。
@@ -2369,6 +2419,7 @@ local holding_thread        -- hold 占用 queue 时正在 wait 的业务协程�
 local waiting_spends = 0    -- 已通过入口但尚未拿到 queue 的 spend 请求数量。
 local fail_restore = false  -- 只用于故障实验，正常运行恒为 false。
 
+--- 返回 PlayerService 当前版本、私有状态和函数引用的观测快照。
 local function inspect_state()
     return
     {
@@ -2388,6 +2439,7 @@ local function inspect_state()
     }
 end
 
+--- 声明业务模块和私有状态，最后登记当前 PlayerService。
 local function initialize_player()
     if registered then
         return {ok = false, code = "ALREADY_INITIALIZED"}
@@ -2405,7 +2457,7 @@ local function initialize_player()
     state_identity = state
     old_attack = operations.attack
 
-    local answer = hotupgrade.register_service(
+    local answer = hotupgrade.register_service( -- 管理命令的调用结果。
     {
         service_update =
         {
@@ -2450,7 +2502,7 @@ end
 skynet.start(function()
     skynet.dispatch("lua", function(session, _source, command, request)
         request = request or {}
-        local answer
+        local answer -- 管理命令的调用结果。
 
         if command == "init" then
             answer = initialize_player()
@@ -2488,7 +2540,7 @@ skynet.start(function()
         elseif command == "release" then
             -- 教学控制消息必须独立于业务 queue，否则无法唤醒被占用的 queue。
             if holding_thread then
-                local thread = holding_thread
+                local thread = holding_thread -- 从 holding_thread 取出的协程句柄，交给 skynet.wakeup 唤醒。
                 holding_thread = nil
                 skynet.wakeup(thread)
                 answer = {ok = true}

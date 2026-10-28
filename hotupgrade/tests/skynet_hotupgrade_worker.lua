@@ -1,6 +1,6 @@
 --- 现存 Service 夹具：所有业务状态和函数保持在自己的 Lua State。
 local startup_arguments = table.pack(...)
-local startup_mode = ...
+local startup_mode = ... -- Skynet 启动参数选择 worker 的特殊测试行为。
 assert(SERVICE_NAME == "skynet_hotupgrade_worker" or SERVICE_NAME:match("^skynet_hotupgrade_unique_[ab]$"))
 assert(SERVICE_PATH:sub(-#"hotupgrade/tests/") == "hotupgrade/tests/")
 if startup_mode == "auto" then
@@ -8,30 +8,30 @@ if startup_mode == "auto" then
 elseif not startup_mode then
     assert(startup_arguments.n == 0)
 end
-local skynet = require "skynet"
+local skynet = require "skynet" -- 当前 worker 的 RPC、调度与日志接口。
 require "skynet.manager"
-local business_queue = require "skynet.queue"()
+local business_queue = require "skynet.queue"() -- 模拟排队中的业务协程，验证热更等待期间是否仍在运行。
 local holding = false -- 仅测试观察 queue 中可 yield 业务是否仍未退出。
-local hotupgrade = require "flywow_hotupgrade"
-local logic = hotupgrade.require("test_worker_logic")
-local runtime
-local package_logic
-local settings
-local cached
-local module_identity
-local service_nested = {count = 7, retained = 23}
-local service_state =
+local hotupgrade = require "flywow_hotupgrade" -- 当前 State 的受管理热更 API。
+local logic = hotupgrade.require("test_worker_logic") -- 本 worker 登记并使用的业务逻辑模块。
+local runtime -- 供命令处理器观察的业务运行状态。
+local package_logic -- 保存模块根表中的既有函数引用，用于验证热更不会改写旧引用。
+local settings -- 由普通 require 加载的配置模块，验证原生加载路径。
+local cached -- 测试前缓存的模块字段，热更后仍指向旧函数或旧值。
+local module_identity -- 热更前的模块表身份，提交后确认根表未被替换。
+local service_nested = {count = 7, retained = 23} -- Service 私有状态中的嵌套表，验证快照保留表内字段。
+local service_state = -- 本 worker 的私有状态图；Service Update 在此迁移可迁移的数据。
 {
     equip = "刀", level = 50, schema_version = 1, obsolete = true,
     a = {keep_a = 1}, b = {keep_b = 2},
     nested = service_nested, nested_alias = service_nested, ranks = {1, 2, 3}, mode = "legacy", replaced = {old = true},
 }
 service_state.self = service_state
-local nested_identity = service_state.nested
-local service_state_identity = service_state
+local nested_identity = service_state.nested -- 保存嵌套表身份，确认状态恢复原地复用该对象。
+local service_state_identity = service_state -- 保存业务状态根表身份，热更前后都应保持不变。
 local marker = {} -- 仅此 Lua State 中创建的身份标记，用于更新前后比对。
-local original_marker = marker
-local business = {}
+local original_marker = marker -- 保存本 State 的身份标记，确认迁移不会复制或替换该对象。
+local business = {} -- 注册给热更合同的业务函数集合。
 local worker_test_config -- 本 State 的故障注入配置。
 local startup_registration -- 独立启动登记协程的结果；业务观察等待它完成。
 local extra_logic  -- 登记后才声明的模块，用于验证 register_module 真实链路。
@@ -43,12 +43,14 @@ end
 function business.save()
     return "saved"
 end
-local original_save = business.save
+local original_save = business.save -- 缓存 V1 函数引用，验证热更不会重绑定调用方的旧引用。
 
 --- 按场景配置 Service 更新回调与故障注入，再登记本测试 Service。
+---@param request table 管理测试发来的 Worker 初始化配置；本函数把其中的故障开关保存给本 State 的更新回调读取。
 local function initialize(request)
+    -- service_update 绑定现存 state/functions；自定义 snapshot/restore 只改变恢复方式，不替换这两个根表。
     worker_test_config = request
-    local service_update = {state = service_state, functions = business}
+    local service_update = {state = service_state, functions = business} -- 交给 register_service 的私有状态和函数更新对象。
     if worker_test_config.custom then
         service_update.snapshot = function(source_state)
             return require("flywow_hotupgrade_module_patch").snapshot_state(source_state)
@@ -68,6 +70,7 @@ local function initialize(request)
                 schema_version = source_state.schema_version, nested = {count = source_state.nested.count}}
         end
         service_update.restore = function(value, next_state)
+            -- value 是仍在线的业务状态，next_state 是 snapshot 返回的恢复数据；这里只回填已约定字段。
             value.equip = next_state.equip
             value.level = next_state.level
             value.schema_version = next_state.schema_version
@@ -76,7 +79,7 @@ local function initialize(request)
     end
     -- 在接收真实热更控制消息时退出，验证 Controller 对原生退出与 RPC 失败交错的处理。
     if worker_test_config.exit_command then
-        local dispatch = skynet.dispatch
+        local dispatch = skynet.dispatch -- 保存协议分发函数，以测试配置控制消息处理。
         skynet.dispatch = function(protocol, callback)
             if protocol == "hotupgrade" then
                 dispatch(protocol, function(session, source, command, request)
@@ -139,7 +142,7 @@ skynet.start(function()
     end
     skynet.dispatch("lua", function(session, _source, command, request)
         request = request or {}
-        local answer
+        local answer -- 当前收到的 worker 命令最终返回结果。
         if command == "preload_seen" then
             answer = hotupgrade_preload_seen == true
         elseif command == "init" then
@@ -149,6 +152,7 @@ skynet.start(function()
                 answer = initialize(request)
             end
         elseif command == "read" then
+            -- 诊断字段先在本 State 比较原始引用，再把布尔结果发给管理测试；跨 State 复制表本身不能验证身份。
             while startup_mode and not startup_registration do skynet.sleep(1) end
             assert(not startup_registration or startup_registration.ok)
             -- 仅测试诊断用的只读观察，不是生产业务入口。
@@ -191,17 +195,17 @@ skynet.start(function()
             assert(hotupgrade.require("test_worker_logic") == logic)
             assert(hotupgrade.require("config.settings") == settings)
 
-            -- 原名就是规范名时，未知缓存仍须拒绝，不能凭名称相同认定文件来源。
+            -- 原始 require 名已等于统一模块名时，未知缓存仍须拒绝，不能仅凭名称相同认定文件来源。
             local original_settings = package.loaded["config.settings"] -- 本测试结束后恢复已登记模块缓存。
             local conflicting       = {}                                -- 模拟来源不明的占位表，不得被覆盖或登记。
             package.loaded["config.settings"] = conflicting
-            local ok, message = pcall(hotupgrade.require, "config.settings")
+            local ok, message = pcall(hotupgrade.require, "config.settings") -- 并发冲突测试中 hotupgrade.require 是否正常返回。
             assert(not ok and tostring(message):find("HU_INVALID_PATH", 1, true))
             assert(package.loaded["config.settings"] == conflicting)
             package.loaded["config.settings"] = original_settings
             assert(hotupgrade.require("config.settings") == settings)
 
-            -- 规范名被缓存或 preload 占用时，连原名缓存也不能新增。
+            -- 统一模块名已被缓存或 preload 占用时，连原始 require 名缓存也不能新增。
             package.loaded["lualib.hotupgrade_extra"] = conflicting
             ok, message = pcall(hotupgrade.require, "hotupgrade_extra")
             assert(not ok and tostring(message):find("HU_DUPLICATE_MODULE", 1, true))
@@ -209,7 +213,7 @@ skynet.start(function()
             assert(package.loaded.hotupgrade_extra == nil)
             package.loaded["lualib.hotupgrade_extra"] = nil
 
-            local preload_loader = function() return conflicting end
+            local preload_loader = function() return conflicting end -- 临时注入 package.preload 的冲突加载器，验证缓存身份检查。
             package.preload["lualib.hotupgrade_extra"] = preload_loader
             ok, message = pcall(hotupgrade.require, "hotupgrade_extra")
             assert(not ok and tostring(message):find("HU_DUPLICATE_MODULE", 1, true))
@@ -232,7 +236,7 @@ skynet.start(function()
             package.loaded.hotupgrade_extra = nil
 
             -- 未知加载器省略来源或返回其他文件时，恢复它刚建立的原名缓存，不留下别名。
-            local original_require = _G.require
+            local original_require = _G.require -- 被暂时替换的全局 require，测试后必须恢复。
             for _, loader_path in ipairs({false, assert(package.searchpath("test_worker_logic", package.path))}) do
                 _G.require = function(name)
                     assert(name == "hotupgrade_extra")
@@ -251,7 +255,7 @@ skynet.start(function()
             end
 
             -- 动态登记失败必须清理本次别名；随后 declare 仍能沿真实 RPC 重试。
-            local original_call = skynet.call
+            local original_call = skynet.call -- 被暂时替换的 Skynet RPC 函数，测试后必须恢复。
             skynet.call = function(target, protocol, operation, declaration)
                 if operation == "register_module" then
                     return {ok = false, message = "injected declaration failure"}
@@ -275,23 +279,23 @@ skynet.start(function()
             answer = hotupgrade.cancel_service_creation(request.service_handle)
         elseif command == "declare_slow" then
             -- 仅测试暂停实际模块执行，形成可观察的许可窗口；生产模块顶层仍须同步。
-            local original_require = _G.require
-            local path = assert(package.searchpath("hotupgrade_extra", package.path))
+            local original_require = _G.require -- 被暂时替换的全局 require，测试后必须恢复。
+            local path = assert(package.searchpath("hotupgrade_extra", package.path)) -- Native require 解析出的模块文件路径。
             _G.require = function(name)
                 if name == "hotupgrade_extra" then
                     skynet.sleep(10)
-                    local value = original_require(name)
+                    local value = original_require(name) -- 原生 require 返回的模块导出值。
                     return value, path
                 end
                 return original_require(name)
             end
-            local loaded_ok, loaded_value = pcall(hotupgrade.require, "hotupgrade_extra")
+            local loaded_ok, loaded_value = pcall(hotupgrade.require, "hotupgrade_extra") -- 受控 require 是否成功完成。
             _G.require = original_require
             assert(loaded_ok, loaded_value)
             extra_logic = loaded_value
             answer = extra_logic.value()
         elseif command == "declare_failure" then
-            local original_require = _G.require
+            local original_require = _G.require -- 被暂时替换的全局 require，测试后必须恢复。
             _G.require = function(name)
                 if name == "hotupgrade_extra" then
                     package.loaded[name] = {}
@@ -299,19 +303,19 @@ skynet.start(function()
                 end
                 return original_require(name)
             end
-            local loaded_ok = pcall(hotupgrade.require, "hotupgrade_extra")
+            local loaded_ok = pcall(hotupgrade.require, "hotupgrade_extra") -- 受控 require 是否成功完成。
             _G.require = original_require
             assert(not loaded_ok and package.loaded.hotupgrade_extra == nil
                 and package.loaded["lualib.hotupgrade_extra"] == nil)
             answer = true
         elseif command == "start_new_module_conflict" then
-            local original_call = skynet.call
-            local dependency_registration_started = false
-            local ordinary_load_waiting = false
+            local original_call = skynet.call -- 被暂时替换的 Skynet RPC 函数，测试后必须恢复。
+            local dependency_registration_started = false -- 测试用同步标志；新模块登记 RPC 启动后设为 true。
+            local ordinary_load_waiting = false -- 普通模块首次加载是否已进入等待，用于验证冲突会立即失败而非互等。
             new_module_conflict_result = nil
             skynet.fork(function()
                 while not dependency_registration_started do skynet.sleep(1) end
-                local ok, message = pcall(hotupgrade.require, "hotupgrade_new_rules")
+                local ok, message = pcall(hotupgrade.require, "hotupgrade_new_rules") -- 并发冲突测试中 hotupgrade.require 是否正常返回。
                 new_module_conflict_result = {ok = ok, message = tostring(message)}
                 skynet.call = original_call
             end)

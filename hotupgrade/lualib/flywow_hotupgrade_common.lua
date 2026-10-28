@@ -7,15 +7,16 @@ local M =
     MAX_STATE_FIELDS   = 10000,                         -- 默认状态恢复快照的字段数上限。
 }
 
---- 将 Lua 文件头转换为字符串 load 可接受的源码；只影响编译输入，部署仍使用原始字节。
---- 与 Lua loadfile 一致：跳过开头的 UTF-8 BOM，再跳过首行 # 注释；保留换行以维持报错行号。
----@param source string 已读取的文本源码
+--- 移除 Lua 文件开头的 UTF-8 BOM 和首行 shebang，返回可交给 load 编译的文本。
+--- 保留首行换行位置，确保编译错误行号仍对应原文件。
+---@param source string 从正式文件或发布包读取的 Lua 源码文本；本函数只清理交给 load 的编译文本，不改磁盘文件。
 ---@return string source 可直接交给 load 的源码
 function M.normalize_source(source)
     if source:sub(1, 3) == "\239\187\191" then
         source = source:sub(4)
     end
     if source:sub(1, 1) == "#" then
+        -- 源码中第一个换行位置；用于检查并移除文件开头的 UTF-8 BOM。
         local newline = source:find("\n", 1, true)
         source = newline and source:sub(newline) or "\n"
     end

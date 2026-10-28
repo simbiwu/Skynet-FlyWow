@@ -10,9 +10,9 @@ HotUpgrade 在现存 Skynet Service、现存 Lua State 内更新受信 Lua 代�
 
 ```lua
 skynet.start(function()
-    local hotupgrade_handle = skynet.uniqueservice("flywow_hotupgrade_service")
-    local hotupgrade = require "flywow_hotupgrade"
-    local initialized = skynet.call(hotupgrade_handle, "lua", "init",
+    local hotupgrade_handle = skynet.uniqueservice("flywow_hotupgrade_service") -- 宿主启动的控制 Service handle；随后用它完成一次性 init。
+    local hotupgrade = require "flywow_hotupgrade" -- 宿主管理端使用的公开 API；newservice 和管理消息都从这里进入。
+    local initialized = skynet.call(hotupgrade_handle, "lua", "init", -- Controller 的初始化结果；只有成功后才创建受管理业务 Service。
     {
         patch_path = "./config/hotupgrade",
         root_path = ".",
@@ -44,7 +44,7 @@ init 失败可修正后重试，成功后重复 init 返回 HU_ALREADY_INITIALIZ
 纳入 HotUpgrade 管理的 Service 必须由创建者使用受管理入口启动；Controller 自身和非受管理 Service 继续使用原生入口。宿主可通过原生 uniqueservice 获取相同 handle，用于 begin/status 等管理命令；业务 Service 的 HotUpgrade API 不再接收 handle：
 
 ```lua
-local service_handle = hotupgrade.newservice("player_service", "原有启动参数")
+local service_handle = hotupgrade.newservice("player_service", "原有启动参数") -- 由 HotUpgrade 创建并返回的业务 Service handle。
 -- newservice 仅转交原生启动参数，返回后不额外等待业务 init 或 register_service。
 local called, initialized = pcall(skynet.call, service_handle, "lua", "init", player_config)
 if not called or type(initialized) ~= "table" or not initialized.ok then
@@ -66,7 +66,7 @@ register_service 只发送原有元数据，Controller 仅按消息头真实 sou
 ### 受管理本地唯一服务
 
 ```lua
-local service_handle = hotupgrade.uniqueservice("player", zone_id)
+local service_handle = hotupgrade.uniqueservice("player", zone_id) -- 由 HotUpgrade 创建并返回的业务 Service handle。
 -- 明确拒绝：抛出含 HU_GLOBAL_UNIQUESERVICE_UNSUPPORTED 的异常，不启动 Service。
 local global_service_handle = hotupgrade.uniqueservice(true, "player", zone_id)
 ```
@@ -81,11 +81,11 @@ local global_service_handle = hotupgrade.uniqueservice(true, "player", zone_id)
 
 ```lua
 skynet.start(function()
-local hotupgrade = require "flywow_hotupgrade"
-local business_queue = require "skynet.queue"()
-local logic = hotupgrade.require("player_logic")
-local state = {equip = "刀", level = 50, schema_version = 1}
-local M = {}
+local hotupgrade = require "flywow_hotupgrade" -- 宿主管理端使用的公开 API；newservice 和管理消息都从这里进入。
+local business_queue = require "skynet.queue"() -- 本 Service 串行化业务请求的队列，Prepare 安全点也进入同一队列。
+local logic = hotupgrade.require("player_logic") -- 通过受控入口声明并加载的业务模块表。
+local state = {equip = "刀", level = 50, schema_version = 1} -- 由 Service 自己持有、可由 service_update 迁移的私有状态根表。
+local M = {} -- 对业务函数表的引用，Service Patch 按已登记函数名替换其字段。
 
 function M.load(item)
     return item.base_attack
@@ -95,7 +95,7 @@ function M.save(item)
     -- 此处保留业务现有保存实现。
 end
 
-local registered = hotupgrade.register_service(
+local registered = hotupgrade.register_service( -- register_service 的统一结果；调用者根据 ok 决定是否继续启动。
 {
     service_update = {state = state, functions = M},
     before_upgrade = function()
@@ -186,7 +186,7 @@ Service Patch 返回表中的 `new_modules` 是普通 require 名称数组。框
 保留模块根表身份，只保证通过该表重新读取字段能看到已安装版本。已经缓存的旧函数和旧嵌套对象继续保留原引用，这是允许的 Lua 行为；框架不会扫描业务变量、定时器或回调并替换其中的函数。
 
 ```lua
-local logic = hotupgrade.require("player_logic")
+local logic = hotupgrade.require("player_logic") -- 通过受控入口声明并加载的业务模块表。
 local saved_attack = logic.attack -- 更新前保存的函数。
 -- 完成热更后：
 logic.attack(player)              -- 从稳定根表读取新版 attack。
@@ -196,7 +196,7 @@ saved_attack(player)             -- 继续执行保存的旧函数。
 候选代码创建的根表与线上根表是两张表。提交只把候选字段安装到线上表，不修改函数捕获的 upvalue。下面是不能依赖的根表身份假设，用于说明边界：
 
 ```lua
-local M = {version = 2}
+local M = {version = 2} -- 对业务函数表的引用，Service Patch 按已登记函数名替换其字段。
 function M:is_same_table()
     return self == M
 end
@@ -206,7 +206,7 @@ return M
 提交后调用 `logic:is_same_table()`，self 是原有线上表，闭包中的 M 仍是候选表，因此返回 false。导出检查不扫描函数 upvalue，也不自动重绑定这个 M。模块函数不能把捕获的候选根表当作提交后的线上根表；需要访问线上导出字段的方法通过 self 访问，并使用冒号调用：
 
 ```lua
-local M = {version = 2}
+local M = {version = 2} -- 对业务函数表的引用，Service Patch 按已登记函数名替换其字段。
 function M:read_version()
     return self.version
 end
@@ -221,8 +221,8 @@ return M
 需要跨版本保留或转换的闭包状态使用成对 export_state/import_state：
 
 ```lua
-local count = 0
-local M = {}
+local count = 0 -- 当前候选闭包捕获的私有计数，不会因导出表原地更新而自动变成旧闭包的状态。
+local M = {} -- 对业务函数表的引用，Service Patch 按已登记函数名替换其字段。
 
 function M.export_state()
     return {count = count}

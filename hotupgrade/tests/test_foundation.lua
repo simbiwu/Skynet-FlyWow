@@ -1,24 +1,24 @@
 --- 普通 Lua 状态图、模块身份、状态迁移与安全点失败合同。
 local patch = require "flywow_hotupgrade_module_patch"
-local flywow_result = require "flywow_result"
-local common = require "flywow_hotupgrade_common"
-local success = flywow_result.success({service_handle = 42})
+local flywow_result = require "flywow_result" -- 统一结果表模块；本测试先核对它的 success/failure 结构。
+local common = require "flywow_hotupgrade_common" -- HotUpgrade 公共常量与源码规范化函数。
+local success = flywow_result.success({service_handle = 42}) -- success 构造的 FlyWowResult，用于断言 value 与错误字段的形状。
 assert(success.ok and success.value.service_handle == 42 and success.code == nil and success.details == nil)
-local failure = flywow_result.failure("HU_FIXTURE_FAILED", "fixture failed", {cause_code = "HU_FIXTURE_CAUSE"})
+local failure = flywow_result.failure("HU_FIXTURE_FAILED", "fixture failed", {cause_code = "HU_FIXTURE_CAUSE"}) -- 隔离 require 失败时捕获的错误值。
 assert(not failure.ok and failure.code == "HU_FIXTURE_FAILED" and failure.message == "fixture failed")
 assert(failure.value == nil and failure.details.cause_code == "HU_FIXTURE_CAUSE")
 for _, prefix in ipairs({"", "\239\187\191", "#!/usr/bin/env lua\n", "\239\187\191#!/usr/bin/env lua\r\n"}) do
     assert(assert(load(common.normalize_source(prefix .. "return 42"), "@header.lua", "t"))() == 42)
-    local _, message = load(common.normalize_source(prefix .. "\nlocal ="), "@header.lua", "t")
-    local expected_line = prefix:find("\n", 1, true) and 3 or 2
+    local _, message = load(common.normalize_source(prefix .. "\nlocal ="), "@header.lua", "t") -- 语法错误文本，用于确认源码前缀规范化后的行号。
+    local expected_line = prefix:find("\n", 1, true) and 3 or 2 -- 当前输入前缀对应的实际错误行号。
     assert(message and message:find("header.lua:" .. expected_line .. ":", 1, true), message)
 end
 assert(load(common.normalize_source("\239\187\191#only comment"), "@header.lua", "t"))
 assert(not load(common.normalize_source("\239\187xreturn {}"), "@header.lua", "t"))
-local graph = {nested = {count = 7}}
+local graph = {nested = {count = 7}} -- 含共享子表的数据图，snapshot 必须保留其引用关系。
 graph.self = graph
 graph.shared = graph.nested
-local snapshot = patch.snapshot_state(graph)
+local snapshot = patch.snapshot_state(graph) -- 从 graph 生成的独立状态快照。
 assert(snapshot ~= graph and snapshot.self == snapshot and snapshot.shared == snapshot.nested)
 snapshot.nested.count = 8
 assert(graph.nested.count == 7)
@@ -28,14 +28,14 @@ assert(not pcall(patch.snapshot_state, {resource = io.stdout}))
 assert(not pcall(patch.snapshot_state, setmetatable({}, {})))
 
 local old_state = {count = 7} -- 故意导出私有表本身，验证框架额外隔离。
-local live =
+local live = -- package.loaded 中当前模块的线上导出表，候选提交只能原地替换字段。
 {
     value = function() return old_state.count end,
     export_state = function() return old_state end,
     import_state = function(state) old_state = state end,
     removed = true,
 }
-local cached = live.value
+local cached = live.value -- 提交前缓存的 live.value 函数引用，验证更新不会重绑旧引用。
 package.loaded.logic = live
 local source = [[
 local count = 0
@@ -49,7 +49,7 @@ return {
     added = 42,
 }
 ]]
-local staged = patch.stage({{name = "logic", source = source}})
+local staged = patch.stage({{name = "logic", source = source}}) -- logic 模块的候选暂存结果，后续依次提交并完成。
 assert(staged.ok, staged.message)
 assert(live.value() == 7 and old_state.count == 7)
 assert(patch.commit(staged.value.stage).ok)
@@ -58,8 +58,8 @@ assert(live.added == 42 and live.removed == nil)
 assert(patch.abort(staged.value.stage).ok)
 assert(live.value == cached and live.removed and live.added == nil)
 
-local dependency_name = "hotupgrade_stage_dependency_fixture"
-local loaded_dependency = {ready = true}
+local dependency_name = "hotupgrade_stage_dependency_fixture" -- 普通候选源码通过原生 require 引用的依赖名。
+local loaded_dependency = {ready = true} -- 模拟依赖模块导出值，检查候选加载期间是否保留其初始化结果。
 package.loaded[dependency_name] = nil
 package.preload[dependency_name] = function()
     return loaded_dependency
@@ -73,7 +73,7 @@ assert(package.loaded[dependency_name] == loaded_dependency)
 package.loaded[dependency_name] = nil
 package.preload[dependency_name] = nil
 
-local failed = patch.stage({{name = "logic", source = "error('stage failed')"}})
+local failed = patch.stage({{name = "logic", source = "error('stage failed')"}}) -- 候选执行抛错时得到的 Stage 失败结果。
 assert(not failed.ok and live.value() == 7)
 failed = patch.stage({{name = "logic", source = "return {value=function() return 3 end, export_state=function() return {} end}"}})
 assert(not failed.ok and live.value() == 7)
@@ -87,16 +87,16 @@ assert(patch.abort(staged.value.stage).code == "HU_PHASE_INVALID")
 local simple = {value = function() return 1 end}
 package.loaded.a = simple
 package.loaded.b = {value = function() return 1 end}
-local rejected = patch.stage({
+local rejected = patch.stage({ -- 输入不合法时 Stage 返回的失败结果。
     {name = "a", source = "return {value = function() return 2 end}"},
     {name = "b", source = "error('second module failed')"},
 })
 assert(not rejected.ok and simple.value() == 1)
 -- 多模块提交与恢复都使用同一批记录，保留各模块根表和旧字段引用。
 local second = package.loaded.b
-local old_first_value = simple.value
-local old_second_value = second.value
-local combined = patch.stage({
+local old_first_value = simple.value -- Stage 前第一个线上模块的字段快照。
+local old_second_value = second.value -- Stage 前第二个线上模块的字段快照。
+local combined = patch.stage({ -- 同时暂存多个模块的候选结果，用于验证批次整体提交和恢复。
     {name = "b", source = "return {value = function() return 20 end, added = true}"},
     {name = "a", source = "return {value = function() return 10 end}"},
 })
@@ -106,7 +106,7 @@ assert(simple.value() == 10 and second.value() == 20 and second.added)
 assert(patch.abort(combined.value.stage).ok)
 assert(simple.value == old_first_value and second.value == old_second_value and second.added == nil)
 package.loaded.a = {export_state = function() return {old = true} end, import_state = function() end}
-local reset_state = patch.stage({{name = "a", source = "return {}"}})
+local reset_state = patch.stage({{name = "a", source = "return {}"}}) -- 不提供可迁移状态钩子的候选 Stage 结果。
 assert(reset_state.ok and patch.abort(reset_state.value.stage).ok)
 package.loaded.a = {
     value = function() return 1 end,
@@ -118,7 +118,7 @@ assert(not patch.stage({{name = "a", source = [[return {
     export_state = function() return {} end,
     import_state = function() error("import failed") end,
 }]]}}).ok)
-local before_corrupt_import = package.loaded.a
+local before_corrupt_import = package.loaded.a -- 导入失败前 package.loaded 中的模块表身份。
 local corrupt_candidate = patch.stage({{name = "a", source = [[
 local M = {config = {}}
 M.export_state = function() return {} end
@@ -137,9 +137,9 @@ local retried = patch.stage({{name = "a", source = [[return {
 assert(retried.ok and patch.abort(retried.value.stage).ok)
 -- 嵌套配置、辅助函数、共享与循环图均按完整新版本安装；回滚必须找回原引用。
 local old_config = {max_level = 50, items = {sword = {attack = 10}}}
-local old_helper = {calculate = function(value) return value end}
-local nested_live = {config = old_config, helper = old_helper, removed = true}
-local nested_name = "hotupgrade_nested_fixture"
+local old_helper = {calculate = function(value) return value end} -- 线上状态中保存的辅助函数对象，默认数据快照不支持时应显式处理。
+local nested_live = {config = old_config, helper = old_helper, removed = true} -- 包含共享配置和辅助函数的线上模块根表。
+local nested_name = "hotupgrade_nested_fixture" -- 复杂嵌套状态 fixture 对应的模块名。
 assert(package.loaded[nested_name] == nil)
 package.loaded[nested_name] = nested_live
 local nested_source = [[
@@ -151,7 +151,7 @@ M.helper = {calculate = function(value) return value * 2 end}
 function M.get_max_level() return M.config.max_level end
 return M
 ]]
-local nested_stage = patch.stage({{name = nested_name, source = nested_source}})
+local nested_stage = patch.stage({{name = nested_name, source = nested_source}}) -- 嵌套配置候选的 Stage 结果。
 assert(nested_stage.ok, nested_stage.message)
 assert(nested_live.config == old_config and old_config.max_level == 50)
 assert(patch.commit(nested_stage.value.stage).ok)
@@ -176,22 +176,22 @@ for _, invalid_source in ipairs({
     "return {config = {worker = coroutine.create(function() end)}}",
     "local M = {}; M.config = {deep = {root = M}}; return M",
 }) do
-    local invalid = patch.stage({{name = nested_name, source = invalid_source}})
+    local invalid = patch.stage({{name = nested_name, source = invalid_source}}) -- 导入状态不合法的候选结果。
     assert(not invalid.ok)
     assert(package.loaded[nested_name] == nested_live and nested_live.config == old_config)
     assert(nested_live.helper == old_helper and nested_live.removed)
 end
-local scalar_stage = patch.stage({{name = nested_name, source = "return {config = 100}"}})
+local scalar_stage = patch.stage({{name = nested_name, source = "return {config = 100}"}}) -- 导出字段类型不匹配时的候选 Stage 结果。
 assert(scalar_stage.ok and patch.commit(scalar_stage.value.stage).ok and nested_live.config == 100)
 assert(patch.abort(scalar_stage.value.stage).ok and nested_live.config == old_config)
-local root_reference = patch.stage({{name = nested_name,
+local root_reference = patch.stage({{name = nested_name, -- 候选对模块根表身份的直接引用，用于验证候选隔离规则。
     source = "local M = {}; M.config = {root = M}; return M"}})
 assert(not root_reference.ok and root_reference.message:find("根导出表", 1, true))
 -- 成功 finish 后，下一次 Stage 也能够校验并回滚已经在线的嵌套循环图。
 nested_stage = patch.stage({{name = nested_name, source = nested_source}})
 assert(nested_stage.ok and patch.commit(nested_stage.value.stage).ok)
 assert(patch.finish(nested_stage.value.stage).ok)
-local installed_config = nested_live.config
+local installed_config = nested_live.config -- Commit 后安装到 live 上的配置字段引用。
 nested_stage = patch.stage({{name = nested_name, source = "return {config = {max_level = 200}}"}})
 assert(nested_stage.ok and patch.commit(nested_stage.value.stage).ok)
 assert(nested_live.helper == nil and nested_live.config.max_level == 200)
@@ -202,23 +202,23 @@ package.loaded[nested_name] = nil
 -- 独立 Lua 验证首次模块声明的本地加载记录：许可先于模块执行，失败回退缓存/来源/声明并释放许可。
 local original_path = package.path
 package.path = "build/hotupgrade-tests/host/lualib/?.lua;" .. package.path
-local original_require = require
-local permits = {}
-local permit_sequence = 0
-local begin_count = 0
-local fail_registration = false
-local unique_calls = 0
-local last_loaded_value
-local new_module_registrations = {}
-local active_new_module_batch
+local original_require = require -- 替换前的 Lua 全局 require 函数。
+local permits = {} -- 测试 RPC 层已发放的模块许可记录。
+local permit_sequence = 0 -- 模拟 Controller 逐次递增的许可编号。
+local begin_count = 0 -- 测试中 begin_module_load 被调用的次数。
+local fail_registration = false -- 控制登记 RPC 是否注入失败的测试开关。
+local unique_calls = 0 -- 模拟 uniqueservice 被调用次数，验证并发创建只启动一次。
+local last_loaded_value -- 最近一次原生 require 返回的依赖导出表。
+local new_module_registrations = {} -- 模拟 Controller 收到的新模块登记请求记录。
+local active_new_module_batch -- 测试当前开放的新模块登记批次身份。
 local fail_new_module_registration  = false -- 模拟本批新模块登记失败，验证缓存和来源回退。
 local pause_new_module_registration = false -- 暂停顶层新模块登记，制造同批重复 Update 的窗口。
 local pause_service_registration    = false -- 暂停 Service 登记 RPC，制造其他协程并发 require 的窗口。
 local fail_service_registration     = false -- 模拟 Service 登记失败，验证等待者醒来后拒绝加载。
 local registration_wake_results     = {}    -- 测试调度器唤醒登记等待协程后的执行结果。
-local forwarded = {}
-local control_dispatch
-local control_answer
+local forwarded = {} -- 跨 Service 转发到 Controller 的请求参数记录。
+local control_dispatch -- 模拟 Service 注册后安装的热更协议回调。
+local control_answer -- retpack 替身捕获的控制命令结果。
 package.loaded.skynet =
 {
     uniqueservice = function(name)
@@ -264,7 +264,7 @@ package.loaded.skynet =
             end
             begin_count = begin_count + 1
             permit_sequence = permit_sequence + 1
-            local id = tostring(permit_sequence)
+            local id = tostring(permit_sequence) -- 模拟许可 RPC 生成的唯一 permit_id。
             permits[id] = request.name
             return {ok = true, value = {permit_id = id}}
         elseif command == "register_module" then
@@ -301,7 +301,7 @@ package.loaded.skynet =
 }
 package.loaded["skynet.require"] = {require = original_require}
 package.loaded.flywow_hotupgrade_native = {resolve = function(path) return path end}
-local hotupgrade = require "flywow_hotupgrade"
+local hotupgrade = require "flywow_hotupgrade" -- 当前独立 Lua State 的受控模块加载和登记 API。
 assert(unique_calls == 0, "文件顶部加载公开入口不能查询 Controller")
 assert(hotupgrade.newservice("fixture_service", "first", nil, "last") == 101)
 assert(unique_calls == 1)
@@ -316,34 +316,34 @@ assert(forwarded.uniqueservice.global and forwarded.uniqueservice.service_name =
 assert(forwarded.uniqueservice.arguments.n == 1 and forwarded.uniqueservice.arguments[1] == "arg")
 assert(hotupgrade.cancel_service_creation(101).ok and forwarded.cancel.service_handle == 101)
 assert(unique_calls == 1, "controller lookup happens exactly once per Lua State")
-local registration = {}
-local missing_before_upgrade = hotupgrade.register_service(registration)
+local registration = {} -- 本次提交给 register_service 的配置对象。
+local missing_before_upgrade = hotupgrade.register_service(registration) -- 缺少必需回调时 register_service 的拒绝结果。
 assert(not missing_before_upgrade.ok and missing_before_upgrade.code == "HU_INVALID_OPTIONS")
 registration.before_upgrade = function() return true end
 registration.service_update = false
-local invalid_service_update = hotupgrade.register_service(registration)
+local invalid_service_update = hotupgrade.register_service(registration) -- service_update 配置不合法时的登记拒绝结果。
 assert(not invalid_service_update.ok and invalid_service_update.code == "HU_INVALID_OPTIONS")
 registration.service_update = nil
-local registration_module_path = "build/hotupgrade-tests/host/lualib/hotupgrade_registration_waiter.lua"
-local registration_module_file = assert(io.open(registration_module_path, "wb"))
+local registration_module_path = "build/hotupgrade-tests/host/lualib/hotupgrade_registration_waiter.lua" -- 跨协程登记测试生成的 Lua 文件路径。
+local registration_module_file = assert(io.open(registration_module_path, "wb")) -- 写入该测试模块源码的文件句柄。
 assert(registration_module_file:write("return {value = function() return 7 end}"))
 assert(registration_module_file:close())
 pause_service_registration = true
-local registered
-local registration_thread = coroutine.create(function()
+local registered -- 首次 register_service 的返回结果。
+local registration_thread = coroutine.create(function() -- 执行首次 require/Service 登记的主协程。
     registered = hotupgrade.register_service(registration)
 end)
 assert(coroutine.resume(registration_thread) and coroutine.status(registration_thread) == "suspended")
 pause_service_registration = false
-local registration_module
-local registration_waiter = coroutine.create(function()
+local registration_module -- 首次登记成功后加载得到的模块导出表。
+local registration_waiter = coroutine.create(function() -- 在登记 RPC 未完成时并发 require 的等待协程。
     registration_module = hotupgrade.require("hotupgrade_registration_waiter")
 end)
 assert(coroutine.resume(registration_waiter) and coroutine.status(registration_waiter) == "suspended")
 assert(begin_count == 0, "登记结果未确定前 require 不应申请普通模块许可")
 assert(coroutine.resume(registration_thread) and coroutine.status(registration_thread) == "dead")
 assert(registered.ok, tostring(registered.code) .. ": " .. tostring(registered.message))
-local registration_wake_result = registration_wake_results[registration_waiter]
+local registration_wake_result = registration_wake_results[registration_waiter] -- 登记完成后唤醒等待协程得到的结果。
 assert(registration_wake_result and registration_wake_result[1]
     and coroutine.status(registration_waiter) == "dead")
 assert(registration_module.value() == 7 and begin_count == 1)
@@ -351,8 +351,12 @@ print("HOTUPGRADE_SERVICE_REGISTRATION_WAIT_OK")
 assert(os.remove(registration_module_path))
 package.loaded.hotupgrade_registration_waiter = nil
 package.loaded["lualib.hotupgrade_registration_waiter"] = nil
+--- 通过 register_service 安装的协议回调发送控制请求，并返回 retpack 捕获的结果。
+---@param command string prepare、update、abort 或 finish；本函数把它发送给测试 Service 接收器。
+---@param sequence integer 本批控制序号；接收器用它校验批次进度。
+---@param extra? table 本场景附加的控制内容；本函数合并到基础请求后发送。
 local function target_control(command, sequence, extra)
-    local request = {batch_id = "fixture:" .. sequence, sequence = sequence, modules = {}}
+    local request = {batch_id = "fixture:" .. sequence, sequence = sequence, modules = {}} -- 发送给模拟 Controller 的控制请求，带批次身份、序号和模块列表。
     for name, value in pairs(extra or {}) do
         request[name] = value
     end
@@ -370,13 +374,13 @@ registration.before_upgrade = function()
     coroutine.yield()
     return {ok = true}
 end
-local preparing = coroutine.create(function() assert(target_control("prepare", 3).ok) end)
+local preparing = coroutine.create(function() assert(target_control("prepare", 3).ok) end) -- 执行 prepare 控制命令的协程，用于验证协议状态推进。
 assert(coroutine.resume(preparing) and hotupgrade.patching)
 assert(coroutine.status(preparing) == "suspended")
 assert(coroutine.resume(preparing) and coroutine.status(preparing) == "dead")
-local update_steps = {}
-local original_stage = patch.stage
-local original_commit = patch.commit
+local update_steps = {} -- 按顺序记录候选 stage、commit 和 finish 调用。
+local original_stage = patch.stage -- 替换前的模块 Stage 函数，测试后恢复。
+local original_commit = patch.commit -- 替换前的模块 Commit 函数，测试后恢复。
 patch.stage = function(entries)
     update_steps[#update_steps + 1] = "stage"
     return original_stage(entries)
@@ -399,7 +403,7 @@ assert(target_control("finish", 3).ok and not hotupgrade.patching)
 assert(target_control("abort", 3).ok and not hotupgrade.patching)
 registration.before_upgrade = function() return true end
 assert(target_control("prepare", 5).ok and target_control("update", 5).ok)
-local original_finish = patch.finish
+local original_finish = patch.finish -- 替换前的模块 Finish 函数，测试后恢复。
 patch.finish = function(stage) original_finish(stage); return {ok = false, code = "HU_FIXTURE_FINISH_FAILED"} end
 assert(target_control("finish", 5).code == "HU_FIXTURE_FINISH_FAILED" and not hotupgrade.patching)
 assert(target_control("update", 5).code == "HU_STALE_BATCH")
@@ -414,18 +418,18 @@ for _, failure in ipairs({"execute", "path", "register", "rpc"}) do
             package.loaded[name] = {}
             error("injected module failure")
         end
-        local value, path = original_require(name)
+        local value, path = original_require(name) -- 原生 require 返回的模块导出值。
         return value, failure == "path" and "other.lua" or path
     end
     fail_registration = failure
-    local loaded_ok = pcall(hotupgrade.require, "hotupgrade_extra")
+    local loaded_ok = pcall(hotupgrade.require, "hotupgrade_extra") -- 首次受控加载的 pcall 成功标志。
     _G.require = original_require
     assert(not loaded_ok and next(permits) == nil)
     assert(package.loaded.hotupgrade_extra == nil and package.loaded["lualib.hotupgrade_extra"] == nil)
 end
 -- 许可拒绝发生在缓存快照之前，两个缓存槽都必须保留原值。
 fail_registration = "permit"
-local permit_rejected_cache = {}
+local permit_rejected_cache = {} -- 许可拒绝场景下的预存 package.loaded 值快照。
 package.loaded.hotupgrade_extra = permit_rejected_cache
 package.loaded["lualib.hotupgrade_extra"] = permit_rejected_cache
 assert(not pcall(hotupgrade.require, "hotupgrade_extra"))
@@ -436,17 +440,17 @@ package.loaded["lualib.hotupgrade_extra"] = nil
 fail_registration = false
 -- 登记失败后新增的来源记录也必须撤销；不能把留下的表当成合法既有缓存。
 package.loaded.hotupgrade_extra = last_loaded_value
-local loaded_ok, load_error = pcall(hotupgrade.require, "hotupgrade_extra")
+local loaded_ok, load_error = pcall(hotupgrade.require, "hotupgrade_extra") -- 首次受控加载的 pcall 成功标志。
 assert(not loaded_ok and tostring(load_error):find("HU_INVALID_PATH", 1, true), tostring(loaded_ok) .. ": " .. tostring(load_error))
 assert(package.loaded.hotupgrade_extra == last_loaded_value and next(permits) == nil)
 package.loaded.hotupgrade_extra = nil
 fail_registration = false
-local declarations_before = begin_count
-local extra = hotupgrade.require("hotupgrade_extra")
+local declarations_before = begin_count -- 加载额外模块之前 Controller 已登记模块的数量。
+local extra = hotupgrade.require("hotupgrade_extra") -- 通过受控 require 加载的额外模块。
 assert(extra.value() == 1 and begin_count == declarations_before + 1 and next(permits) == nil)
 assert(hotupgrade.require("hotupgrade_extra") == extra and begin_count == declarations_before + 1)
 assert(package.loaded["lualib.hotupgrade_extra"] == extra)
-local original_value = extra.value
+local original_value = extra.value -- extra 模块加载前保存的业务字段值。
 assert(target_control("prepare", 7).ok)
 control_dispatch(1, 99, "update", {
     batch_id = "fixture:7", sequence = 7,
@@ -462,9 +466,11 @@ assert(extra.value() == 2 and package.loaded.hotupgrade_extra == extra)
 assert(package.loaded["lualib.hotupgrade_extra"] == extra)
 assert(target_control("abort", 7).ok and extra.value == original_value)
 
--- 仅声明新模块的 Service Patch 可递归登记清单内依赖，不申请普通首次加载许可。
+--- 把测试用 Lua 依赖写入正式目录，供 new_modules 加载场景使用。
+---@param name string 测试模块名；本函数在 lualib 下创建同名 Lua 文件。
+---@param source string 测试模块源码；本函数完整写入新文件。
 local function write_new_module_fixture(name, source)
-    local output = assert(io.open("build/hotupgrade-tests/host/lualib/" .. name .. ".lua", "wb"))
+    local output = assert(io.open("build/hotupgrade-tests/host/lualib/" .. name .. ".lua", "wb")) -- 生成新模块 fixture 时打开的输出文件句柄。
     assert(output:write(source) and output:close())
 end
 write_new_module_fixture("hotupgrade_new_dependency", "return {value = function() return 40 end}")
@@ -480,7 +486,7 @@ local hotupgrade = require "flywow_hotupgrade"
 return hotupgrade.require("hotupgrade_unlisted_dependency")
 ]])
 registration.service_update = {state = {}, functions = {}}
-local declarations_before_new_modules = begin_count
+local declarations_before_new_modules = begin_count -- 登记新增依赖前已声明模块数量，验证新增模块不会混入普通登记。
 active_new_module_batch = "fixture:8"
 assert(target_control("prepare", 8).ok)
 local new_module_service_patch_source = [[return function()
@@ -501,7 +507,7 @@ patch.stage = function(...)
     return original_stage(...)
 end
 pause_new_module_registration = true
-local updating = coroutine.create(function()
+local updating = coroutine.create(function() -- 执行 Update 的协程；测试在它等待新模块登记时推进并发调用。
     new_module_update = target_control("update", 8, {service_patch_source = new_module_service_patch_source})
 end)
 local update_resumed -- 首次 Update 协程是否正常执行到暂停点。
@@ -526,13 +532,13 @@ local early_service_patch_source = [[return function()
     hotupgrade.require("hotupgrade_early_module")
     return {new_modules = {"hotupgrade_early_module"}}
 end]]
-local early_result = target_control("update", 9, {service_patch_source = early_service_patch_source})
+local early_result = target_control("update", 9, {service_patch_source = early_service_patch_source}) -- 新模块登记窗口开放前发送 Update 的失败结果。
 assert(not early_result.ok and early_result.code == "HU_SERVICE_STAGE_FAILED")
 assert(early_result.details.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
 assert(target_control("abort", 9).ok)
 active_new_module_batch = "fixture:10"
 assert(target_control("prepare", 10).ok)
-local undeclared_result = target_control("update", 10,
+local undeclared_result = target_control("update", 10, -- 候选尝试加载未声明模块时的失败结果。
     {service_patch_source = [[return function() return {new_modules = {"hotupgrade_bad_new_parent"}} end]]})
 assert(not undeclared_result.ok and undeclared_result.code == "HU_NEW_MODULE_FAILED")
 assert(undeclared_result.details.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
@@ -542,7 +548,7 @@ assert(target_control("abort", 10).ok)
 active_new_module_batch = "fixture:11"
 assert(target_control("prepare", 11).ok)
 fail_new_module_registration = true
-local rejected_new_module = target_control("update", 11,
+local rejected_new_module = target_control("update", 11, -- 新模块登记 RPC 被注入失败后的 Update 结果。
     {service_patch_source = [[return function() return {new_modules = {"hotupgrade_early_module"}} end]]})
 fail_new_module_registration = false
 assert(rejected_new_module.code == "HU_NEW_MODULE_FAILED")
@@ -562,29 +568,29 @@ end
 registration.service_update = nil
 
 -- 新 Lua State 的登记 RPC 失败后，已等待的首次 require 必须醒来并拒绝加载。
-local registration_module_file = assert(io.open(registration_module_path, "wb"))
+local registration_module_file = assert(io.open(registration_module_path, "wb")) -- 写入该测试模块源码的文件句柄。
 assert(registration_module_file:write("return {value = function() return 7 end}"))
 assert(registration_module_file:close())
-local isolated_hotupgrade = assert(loadfile("hotupgrade/lualib/flywow_hotupgrade.lua", "t", _ENV))()
+local isolated_hotupgrade = assert(loadfile("hotupgrade/lualib/flywow_hotupgrade.lua", "t", _ENV))() -- 用独立环境重新加载的 HotUpgrade API，避免污染已运行的测试 State。
 fail_service_registration = true
 pause_service_registration = true
-local failed_registration
-local failed_registration_thread = coroutine.create(function()
+local failed_registration -- 被暂停或注入失败的 Service 登记 RPC 结果。
+local failed_registration_thread = coroutine.create(function() -- 执行失败登记的 require 协程。
     failed_registration = isolated_hotupgrade.register_service({before_upgrade = function() return true end})
 end)
 assert(coroutine.resume(failed_registration_thread) and coroutine.status(failed_registration_thread) == "suspended")
 pause_service_registration = false
-local failed_require_error
-local failed_require_thread = coroutine.create(function()
-    local loaded, failure = pcall(isolated_hotupgrade.require, "hotupgrade_registration_waiter")
+local failed_require_error -- 等待登记失败的普通 require 协程捕获的错误。
+local failed_require_thread = coroutine.create(function() -- 执行上述失败 require 的协程句柄。
+    local loaded, failure = pcall(isolated_hotupgrade.require, "hotupgrade_registration_waiter") -- 隔离 HotUpgrade 实例的 require 是否成功。
     assert(not loaded)
     failed_require_error = failure
 end)
-local begin_count_before_failed_registration = begin_count
+local begin_count_before_failed_registration = begin_count -- 失败登记发生前 Controller 许可请求计数，用于验证清理。
 assert(coroutine.resume(failed_require_thread) and coroutine.status(failed_require_thread) == "suspended")
 assert(coroutine.resume(failed_registration_thread) and coroutine.status(failed_registration_thread) == "dead")
 assert(failed_registration.code == "HU_RPC_FAILED")
-local failed_wake_result = registration_wake_results[failed_require_thread]
+local failed_wake_result = registration_wake_results[failed_require_thread] -- 登记失败后被唤醒协程拿到的错误结果。
 assert(failed_wake_result and failed_wake_result[1] and coroutine.status(failed_require_thread) == "dead")
 assert(tostring(failed_require_error):find("HU_SERVICE_NOT_REGISTERED", 1, true))
 assert(begin_count == begin_count_before_failed_registration)

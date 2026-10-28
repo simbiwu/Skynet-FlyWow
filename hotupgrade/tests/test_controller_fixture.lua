@@ -1,6 +1,6 @@
 --- 只模拟控制面消息编排；目标 State 的真实提交由 Skynet 集成覆盖。
 local hotupgrade_common = require "flywow_hotupgrade_common"
-local module_state =
+local module_state = -- 集中保存 Controller 替身的注入开关、模拟正式文件和调用顺序；只供单元测试使用。
 {
     pending_control_coroutines     = {},    -- 测试替身排队的 Controller 控制面协程。
     last_control_command_by_service_handle = {},    -- 各目标最近收到的控制步骤。
@@ -43,8 +43,10 @@ package.loaded.skynet =
     wakeup = function(co) assert(coroutine.resume(co)) end,
     kill = function(service_handle) module_state.killed[service_handle] = true end,
     fork = function(fn)
+        -- 测试替身创建的后台控制协程；外层函数在测试推进时恢复它。
         local co = coroutine.create(fn)
         module_state.pending_control_coroutines[#module_state.pending_control_coroutines + 1] = function()
+            -- 控制协程是否正常恢复，以及它抛出的错误；失败立即终止当前测试步骤。
             local ok, message = coroutine.resume(co)
             assert(ok, message)
         end
@@ -79,8 +81,10 @@ package.loaded.flywow_hotupgrade_native =
             elseif module_state.injected_patch_read_failure == "error" then
                 return nil, {code = "HU_FILE_READ_FAILED"}
             end
+            -- 当前 Patch 文件的二进制读取句柄；文件不存在时模拟原生返回 false。
             local file = io.open(_root .. "/" .. path, "rb")
             if not file then return false end
+            -- 当前 Patch 文件的完整源码，返回给 Controller 的扫描替身。
             local source = file:read("*a")
             file:close()
             return source
@@ -100,6 +104,7 @@ package.loaded.flywow_hotupgrade_native =
         return true
     end,
     list_lua = function(_root, path)
+        -- 各测试发布目录对应的相对 Lua/Patch 文件清单。
         local files =
         {
             module = {"lualib/test_worker_logic.lua"},
@@ -119,8 +124,12 @@ package.loaded.flywow_hotupgrade_native =
         return files[path], {code = "HU_PATCH_EMPTY"}
     end,
 }
+-- 被测试的 Controller 单例；测试通过替身注入其 Skynet/Native 依赖。
 local controller = require "flywow_hotupgrade_controller"
+--- 初始化共享测试 Controller；可指定夹具里的 Service 入口目录。
+---@param service_path? string 测试用 Service 目录；省略时使用标准 service 目录。
 local function initialize_controller(service_path)
+    -- Controller 初始化结果；失败时测试不能继续创建批次。
     local initialized = controller.initialize(
     {
         patch_path = "build/hotupgrade-tests/patches",
@@ -130,24 +139,40 @@ local function initialize_controller(service_path)
     assert(initialized.ok, initialized.message)
     return controller
 end
+--- 让测试 Controller 接受指定发布目录，并返回这批发布的 ID。
+---@param instance table initialize_controller 返回的测试 Controller；本函数调用它的 begin 命令。
+---@param path string 测试替身登记的发布目录名；本函数将它放进 begin 请求。
 local function begin_deployment(instance, path)
+    -- 测试发布的受理结果；返回其中的 batch_id 用于后续断言。
     local begun = instance:handle_command("begin", {path = path}, 1)
     assert(begun.ok)
     return begun.value.batch_id
 end
 
+--- 把测试发布请求交给 Controller 的 begin 命令并返回受理结果。
+---@param instance table initialize_controller 返回的测试 Controller；本函数通过它启动发布。
+---@param request table 测试发布请求；本函数读取 request.path 作为发布目录。
 local function publish(instance, request)
     return instance:handle_command("begin", {path = request.path}, 1)
 end
 
+--- 模拟受管理创建后由目标来源登记；沿用生产消息入口建立测试目标。
+---@param instance table initialize_controller 创建的测试 Controller；本函数通过它完成受管理创建和目标登记。
+---@param metadata table 测试目标提交的登记内容；包含 modules 模块名数组和 has_service_update 更新能力标记。
+---@param service_handle integer 测试替身分配给目标 Service 的 handle；本函数用它作为 register 的消息来源。
+---@param service_name? string 测试 Service 的入口名；省略时按 worker 入口登记目标。
+---@return table Controller 的创建失败或登记结果
 local function managed_register(instance, metadata, service_handle, service_name)
+    -- launch_service_handle 控制创建替身的返回值；metadata 模拟目标 State 通过 register 提交的模块声明与更新能力。
     service_name = service_name or "skynet_hotupgrade_worker"
     module_state.launch_service_handle = service_handle
+    -- Controller 的受管理创建结果；成功后才能模拟真实来源登记。
     local created = instance:handle_command("newservice", {service_name = service_name, arguments = {n = 0}}, 1)
     if not created.ok then
         return created
     end
     assert(instance.service_creations[service_handle].service_name == service_name)
+    -- 目标登记结果；成功后断言 Controller 已按该 handle 保存实例。
     local registered = instance:handle_command("register", metadata, service_handle)
     if registered.ok then
         assert(instance.service_registrations[service_handle].service_name == service_name)
@@ -155,7 +180,13 @@ local function managed_register(instance, metadata, service_handle, service_name
     return registered
 end
 
+--- 为已登记测试目标完成一次模块许可申请与登记，返回实际协议结果。
+---@param instance table initialize_controller 创建的测试 Controller；本函数通过它完成受管理创建和目标登记。
+---@param name string 测试模块的统一名；本函数为它申请加载许可并登记到指定目标。
+---@param service_handle integer managed_register 已登记目标的 handle；本函数以它作为模块登记 RPC 来源。
+---@return table 许可失败结果或登记结果
 local function register_module(instance, name, service_handle)
+    -- 同一 Service 先取得 permit_id，再携带该 ID 登记；夹具沿用生产许可协议，避免直接改登记集合。
     local allowed = instance:handle_command("begin_module_load", {name = name}, service_handle)
     if not allowed.ok then
         return allowed
@@ -163,6 +194,7 @@ local function register_module(instance, name, service_handle)
     return instance:handle_command("register_module", {name = name, permit_id = allowed.value.permit_id}, service_handle)
 end
 
+-- 模拟目标 State 发送给 Controller 的初始模块声明和 Service 更新能力。
 local metadata = {modules = {"lualib.test_worker_logic"}, has_service_update = false}
 
 return

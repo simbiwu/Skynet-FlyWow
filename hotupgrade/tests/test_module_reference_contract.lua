@@ -1,8 +1,11 @@
 --- 验证稳定根表、候选闭包根表及缓存旧函数的边界，不对 upvalue 做自动重绑定。
 local module_patch = require "flywow_hotupgrade_module_patch"
-local module_name = "hotupgrade_reference_contract"
+local module_name = "hotupgrade_reference_contract" -- package.loaded 中用于验证旧函数引用行为的测试模块名。
+-- V1/V2 候选共用的测试源码模板；format 参数填入版本和初始计数。
 local module_source = [[
+-- 候选闭包捕获的私有计数初值，由测试模板参数提供。
 local count = %d
+-- 候选模块导出根表；版本值由测试模板参数提供。
 local M = {version = %d}
 
 function M:read_version()
@@ -29,14 +32,19 @@ end
 
 return M
 ]]
+-- 执行 V1 模板得到的当前线上模块根表。
 local live = assert(load(module_source:format(7, 1), "@reference_v1.lua", "t"))()
 package.loaded[module_name] = live
+-- 测试预先缓存的 V1 函数引用，Commit 后仍应指向原闭包。
 local cached_next = live.next_count
+-- 测试预先缓存的 V1 状态导出函数引用。
 local cached_export = live.export_state
+-- 测试预先缓存的 V1 根表身份检查函数引用。
 local cached_identity = live.is_same_table
 assert(live:read_version() == 1 and live:is_same_table())
 assert(live.next_count() == 8 and live.next_count() == 9)
 
+-- 以当前 live 为线上模块创建 V2 候选 Stage，后续验证旧引用保留语义。
 local staged = module_patch.stage({{name = module_name, source = module_source:format(0, 2)}})
 assert(staged.ok, staged.message)
 assert(live.version == 1 and cached_export().count == 9)

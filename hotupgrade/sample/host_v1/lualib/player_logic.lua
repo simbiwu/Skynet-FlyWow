@@ -8,7 +8,7 @@ function M.version()
 end
 
 --- 创建读取共享玩家状态的攻击计算闭包；闭包保留传入的 state 引用。
----@param state table 当前 Service 的玩家状态；后续字段更新会被闭包读取
+---@param state table PlayerService 传入的玩家状态表；本函数创建的闭包以后会读取其中更新后的字段。
 ---@return fun(base_attack:number):number load_calculator 输入基础攻击并返回装备加成后的攻击值
 function M.make_load(state)
     return function(base_attack)

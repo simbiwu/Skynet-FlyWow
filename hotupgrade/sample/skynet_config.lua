@@ -1,6 +1,6 @@
 --- 从 Server 工作目录启动示例；运行根目录由脚本传入，Skynet 搜索路径沿用集成测试合同。
 local sample_root = "./third_party/skynet-flywow/build/hotupgrade-sample"
-local framework_root = "./third_party/skynet-flywow"
+local framework_root = "./third_party/skynet-flywow" -- Skynet 配置相对宿主仓库根的 FlyWow 子模块目录。
 
 thread = 4
 harbor = 0
