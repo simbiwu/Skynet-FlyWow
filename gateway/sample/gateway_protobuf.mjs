@@ -1,9 +1,11 @@
 // 只编码/解码 sample 使用的 varint 与 bytes/string 字段；字段号来自 Lesson 3 schema。
+// 按调用顺序拼接样例字节数组，返回独立 Buffer，不修改输入。
 export function join(...parts)
 {
     return Buffer.concat(parts.map(part => Buffer.from(part)));
 }
 
+// 把样例使用的 uint32 数值编码成 Protobuf varint，返回新 Buffer。
 export function varint(value)
 {
     const bytes = [];
@@ -16,6 +18,7 @@ export function varint(value)
     return Buffer.from(bytes);
 }
 
+// 按字段号与 wire type 编码一个字段；wire=2 时 value 是完整字节串。
 export function field(number, wire, value)
 {
     const key = varint(number * 8 + wire);
@@ -24,6 +27,7 @@ export function field(number, wire, value)
         : join(key, varint(value));
 }
 
+// 解码样例所需的 wire=0/2 字段；返回字段号到值的 Map，截断或未知类型抛错。
 export function fields(bytes)
 {
     const result = new Map();
@@ -67,12 +71,14 @@ export function fields(bytes)
     return result;
 }
 
+// 构造协议版本 4、命令 1101 的 FrameJoin Envelope，字段来自样例 schema。
 export function frame_join()
 {
     const body = join(field(1, 0, 1), field(2, 0, 0), field(3, 0, 1));
     return join(field(1, 0, 4), field(2, 0, 1101), field(3, 2, body));
 }
 
+// 校验 FrameJoin 响应或 FramePush 的固定样例值，返回 response/push；不匹配时抛错。
 export function verify(bytes)
 {
     const envelope = fields(bytes);

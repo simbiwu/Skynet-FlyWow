@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# 从脚本目录定位宿主 Server；参数为模式及固定 Skynet 根目录。
+# 运行会重建 build/gateway-sample/<模式> 日志目录，启动一个 Skynet 子进程并在退出时回收。
+# 缺少 Native 时调用统一构建入口；本脚本自身不生成宿主协议产物。
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 FRAMEWORK_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
@@ -42,6 +45,7 @@ export FLYWOW_GATEWAY_SAMPLE_MODE="$mode"
 cd "$SERVER_ROOT"
 "$SKYNET_ROOT/skynet" "$SCRIPT_DIR/skynet_config.lua" >"$LOG" 2>&1 &
 pid=$!
+# EXIT trap 只回收本次启动的 Skynet PID；保留日志供失败诊断。
 cleanup()
 {
     if kill -0 "$pid" 2>/dev/null; then

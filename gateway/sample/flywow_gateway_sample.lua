@@ -1,3 +1,4 @@
+--- 宿主样例：启动 Gateway，按同一连接发送 FrameJoin 响应与 FramePush，收到断开后停止进程。
 local skynet = require "skynet"
 require "skynet.manager"
 
@@ -25,18 +26,28 @@ skynet.start(function()
             -- 同一连接先收到 FrameJoin 响应，再收到服务端主动 FramePush。
             skynet.send(module_state.gateway_service_handle, "lua", "send_data",
             {
-                gateway_epoch = message.gateway_epoch,
-                connection_id = message.connection_id,
-                command_id = 1101,
-                data = {code = "OK", battle_id = 42, seat_id = 1},
+                gateway_epoch = message.gateway_epoch, -- 沿用请求的 Gateway 实例身份，拒绝旧实例消息。
+                connection_id = message.connection_id, -- 沿用来源连接号，定向投递给同一客户端。
+                command_id = 1101, -- 选择样例 schema 中的响应或 Push 消息类型。
+                data = -- FrameJoin 的固定样例成功响应。
+                {
+                    code = "OK", -- 样例业务接纳结果。
+                    battle_id = 42, -- 后续 Push 沿用的样例战斗编号。
+                    seat_id = 1, -- 本连接分配的样例座位。
+                },
             })
 
             skynet.send(module_state.gateway_service_handle, "lua", "send_data",
             {
-                gateway_epoch = message.gateway_epoch,
-                connection_id = message.connection_id,
-                command_id = 1103,
-                data = {battle_id = 42, generation = 1, code = "OK"},
+                gateway_epoch = message.gateway_epoch, -- 沿用请求的 Gateway 实例身份，拒绝旧实例消息。
+                connection_id = message.connection_id, -- 沿用来源连接号，定向投递给同一客户端。
+                command_id = 1103, -- 选择样例 schema 中的响应或 Push 消息类型。
+                data = -- 请求响应后主动下发的样例状态。
+                {
+                    battle_id = 42, -- 与 FrameJoin 响应对应的战斗编号。
+                    generation = 1, -- 当前样例的战斗代次。
+                    code = "OK", -- 样例状态成功标记。
+                },
             })
             skynet.error("FLYWOW_GATEWAY_SAMPLE_PUSH_SENT mode=" .. SAMPLE_MODE)
         elseif command == "gateway_disconnect" then

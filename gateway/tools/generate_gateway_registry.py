@@ -51,8 +51,8 @@ def parse_protos(sources: list[str]) -> tuple[str, list[dict[str, str | int | No
     if not sources:
         raise ValueError("at least one proto file is required")
 
-    structural_sources = []
-    packages = set()
+    structural_sources = []  # 去掉注释的各文件正文，随后共同解析消息与命令。
+    packages = set()  # 各输入声明的 package；只允许一个，避免跨域误配消息。
     for source in sources:
         structural = _without_comments(source)
         if not re.search(r'^\s*syntax\s*=\s*"proto3"\s*;', source, re.MULTILINE):
@@ -81,8 +81,8 @@ def parse_protos(sources: list[str]) -> tuple[str, list[dict[str, str | int | No
     enum_match = enum_matches[0]
 
     commands: list[dict[str, str | int | None]] = []
-    seen_ids: set[int] = set()
-    seen_names: set[str] = set()
+    seen_ids: set[int] = set()  # 已扫描的数字命令号，拒绝 Protobuf 枚举别名。
+    seen_names: set[str] = set()  # 已接受的消息前缀，拒绝转换后同名的枚举项。
 
     for match in ENUM_VALUE_RE.finditer(enum_match.group("body")):
         enum_name = match.group("name")
@@ -114,8 +114,7 @@ def parse_protos(sources: list[str]) -> tuple[str, list[dict[str, str | int | No
             else None
         )
         if request_type is None and response_type is None:
-            # Common CommandId lists the stable global IDs; a profile registry only
-            # includes the messages supplied by that profile's schema inputs.
+            # 共享枚举可列出全部命令；当前 registry 只包含本次输入 schema 提供的消息。
             continue
         if method_name in seen_names:
             raise ValueError(f"duplicate command method name: {method_name}")

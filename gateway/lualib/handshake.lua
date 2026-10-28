@@ -36,33 +36,38 @@ function M.new(handshake_config)
     local manager = {}
 
     --- 释放当前握手占用；幂等，清理native对象；context由Gateway独占，不执行I/O/yield。
-    ---@param context HandshakeContext 当前连接的握手上下文；manager 独占。
+    ---@param context HandshakeContext|nil Gateway 为连接持有的上下文；本方法释放其名额及 Native 对象。
     ---@return nil 幂等释放 pending 名额和 native crypto。
     function manager.close(context)
         if not context or not context.held then
             return
         end
 
+        -- 先归还本连接占用的名额，重复 close 此后不会再次递减计数。
         context.held = false
         pending = pending - 1
 
+        -- Native 对象可能在 hello 解析前尚未创建；已创建时立即擦除其密钥。
         if context.crypto then
             context.crypto:close()
             context.crypto = nil
         end
 
+        -- 完成握手的连接保留 ready 标记，其他关闭路径禁止继续处理输入。
         if context.phase ~= "ready" then
             context.phase = "closed"
         end
     end
 
     --- 接纳一个待握手连接；返回context或nil/容量错误，不分配密钥，不执行I/O/yield。
-    ---@return HandshakeContext|nil context 或容量错误；成功时占用一个 pending 名额。
+    ---@return HandshakeContext|nil context；容量耗尽时为 nil。
+    ---@return string|nil error_code；成功时为 nil。
     function manager.accept()
         if pending >= max_pending then
             return nil, "HANDSHAKE_CAPACITY"
         end
 
+        -- 通过容量检查后才占用名额，并把新连接放入 hello 阶段。
         pending = pending + 1
         return
         {
@@ -77,7 +82,7 @@ function M.new(handshake_config)
     ---@param context HandshakeContext|nil 要检查的握手上下文。
     ---@return boolean 是否超过绝对握手期限。
     function manager.expired(context)
-        return context and context.held and
+        return context ~= nil and context.held and
             (read_tick() - context.started) % 0x100000000 >= timeout_ticks
     end
 
@@ -85,10 +90,12 @@ function M.new(handshake_config)
     ---@param context HandshakeContext 当前握手阶段。
     ---@return integer 当前阶段允许读取的精确帧长度；未知阶段返回0。
     function manager.expected_size(context)
+        -- CLIENT_HELLO 包含类型与版本各 1 字节，以及 65 字节非压缩 P-256 公钥。
         if context.phase == "hello" then
             return 67
         end
 
+        -- CLIENT_PROOF 包含 1 字节类型和 32 字节 HMAC；这里只报告长度，不验证证明。
         if context.phase == "proof" then
             return 33
         end
@@ -100,21 +107,25 @@ function M.new(handshake_config)
     --- 处理一条完整握手消息；成功返回bytes/nil/是否待确认，失败返回nil/错误并释放context。
     --- Native错误只映射稳定码，不暴露EVP详情；不I/O/yield，不缓存提前业务包。
     ---@param handshake_input table 包含 context 与当前完整 frame bytes；调用方拥有 bytes。
-    ---@return string|nil, string|nil, boolean|nil 响应帧、稳定错误码、是否等待确认。
+    ---@return string|nil response_bytes；成功时的握手响应。
+    ---@return string|nil error_code；失败时的稳定错误码。
+    ---@return boolean|nil needs_confirmation；仅最后一条响应需要确认时为 true。
     function manager.receive(handshake_input)
-        local context = handshake_input.context
-        local bytes   = handshake_input.bytes
+        local context = handshake_input.context -- Gateway 为来源连接保存的独占状态，本次按 phase 推进。
+        local bytes   = handshake_input.bytes   -- 当前完整握手帧；仅在本次同步处理期间借用。
 
         if manager.expired(context) then
             manager.close(context)
             return nil, "HANDSHAKE_TIMEOUT"
         end
 
+        -- 按当前握手阶段的固定长度拒绝异常帧，避免继续处理错位消息。
         if type(bytes) ~= "string" or #bytes ~= manager.expected_size(context) then
             manager.close(context)
             return nil, "HANDSHAKE_FRAME"
         end
 
+        -- hello 阶段解析客户端公钥并派生临时挑战状态，随后进入 proof。
         if context.phase == "hello" then
             if bytes:byte(1) ~= 1 or bytes:byte(2) ~= 1 then
                 manager.close(context)
@@ -131,6 +142,7 @@ function M.new(handshake_config)
             return response
         end
 
+        -- proof 阶段验证客户端证明；SERVER_READY 仍须由 Gateway 成功写出后确认。
         if context.phase == "proof" then
             local ok, response = pcall(context.crypto.verify, context.crypto, bytes)
             if not ok then
@@ -141,6 +153,7 @@ function M.new(handshake_config)
             return response, nil, true
         end
 
+        -- 不属于已支持阶段的输入不能推进状态，释放资源并返回稳定错误码。
         manager.close(context)
         return nil, "HANDSHAKE_STATE"
     end

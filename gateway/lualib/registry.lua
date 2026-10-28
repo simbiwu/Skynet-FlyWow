@@ -15,10 +15,11 @@ local function assert_command_id(value)
            "gateway command id must be an integer in [1, 0xffffffff]")
 end
 
---- 校验构建期生成的 registry 并建立索引；拒绝重复 command、缺失类型名和非法 Envelope 配置。
+--- 校验构建期生成的 registry 并建立索引；拒绝缺失类型名和非法 Envelope 配置。
 --- definitions.envelope_type 是完整 Protobuf 类型名；commands 以 uint32 command id 为键，值含 name/request_type/可选 response_type；输入归调用方且只读。
 --- request_type/response_type 可分别为空；两者都存在是请求-响应，只有 request_type 是单向请求，只有 response_type 是主动下发。
---- 返回独立索引，调用方拥有并应视为只读；空 commands、重复 id、字段缺失或格式错误时抛异常。
+--- 返回独立索引，调用方拥有并应视为只读；空 commands、字段缺失或格式错误时抛异常。
+--- commands 以命令号为唯一键；源协议的重复命令号由生成工具拒绝，运行时不重复检查。
 --- 仅分配与 command 数量成正比的 Lua table；不执行 I/O、yield 或外部资源分配。
 ---@param definitions table 构建阶段生成的 registry；调用方拥有且只读。
 ---@return table 经过校验的只读 numeric command 索引；函数分配与 command 数量成正比的 table。
@@ -45,13 +46,12 @@ function M.build_index(definitions)
             assert(type(definition.response_type) == "string" and definition.response_type ~= "",
                    "gateway response_type must be a non-empty string for " .. definition.name)
         end
-        assert(by_id[command_id] == nil, "duplicate gateway command id: " .. command_id)
         by_id[command_id] =
         {
-            id              = command_id,
-            name            = definition.name,
-            request_type    = definition.request_type,
-            response_type   = definition.response_type,
+            id              = command_id, -- 用于 Envelope 路由的唯一命令号。
+            name            = definition.name, -- 生成工具保留的命令名称，供错误诊断使用。
+            request_type    = definition.request_type, -- 入站解码类型；nil 表示仅允许服务端下发。
+            response_type   = definition.response_type, -- 出站编码类型；nil 表示单向客户端请求。
         }
         count = count + 1
     end
@@ -61,9 +61,9 @@ function M.build_index(definitions)
 
     return
     {
-        envelope_type = definitions.envelope_type,
-        by_id         = by_id,
-        count         = count,
+        envelope_type = definitions.envelope_type, -- codec 共用的完整 Envelope Protobuf 类型名。
+        by_id         = by_id, -- Gateway 按入站或出站命令号查询的独立索引。
+        count         = count, -- 启动时报告的有效命令数量。
     }
 end
 

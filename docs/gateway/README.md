@@ -41,11 +41,13 @@ handler Service 接收 send_data：
     {
         gateway_epoch = "...",
         connection_id = 123,
+        peer = "127.0.0.1:52000",
+        transport = "tcp",
         command_id = 1001,
         data = {...},
     }
 
-Gateway 解码客户端请求后发送 send_data。宿主处理完成后，也通过同一个 send_data 把数据发回 Gateway。Gateway 不区分请求响应和服务端主动下发。
+Gateway 解码客户端请求后发送 send_data；peer 与 transport 是连接上下文，供宿主诊断使用。宿主处理完成后，也通过同一个 send_data 把数据发回 Gateway。Gateway 不区分请求响应和服务端主动下发。
 
 连接控制使用 close：
 
@@ -81,7 +83,11 @@ Gateway 只处理本地传输结果：
 - 未知连接、旧 gateway_epoch 或未握手连接：丢弃
 - 编码失败：记录错误并拒绝本次发送
 - Socket 写失败：摘除连接并关闭 transport
+- 单连接或 Gateway 实例每秒接纳请求数超限：拒绝当前帧并关闭触发超限的连接
 - Battle 业务失败、业务超时、重试和顺序：由业务 Service 负责
+
+入口速率分别由 `max_requests_per_second` 和 `max_total_requests_per_second` 限制，
+默认每连接 200 个、每实例 10000 个请求/秒；两项可按部署容量调低或调高。
 
 ## Transport
 

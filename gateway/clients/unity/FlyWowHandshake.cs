@@ -16,12 +16,12 @@ namespace FlyWow.Gateway
 {
     public sealed class HandshakeClient : IDisposable
     {
-        private AsymmetricCipherKeyPair      pair      ; // 独占临时密钥对，不写日志或网络。
-        private readonly ECDomainParameters  domain    ; // 固定P-256公开参数。
-        private byte[]                     hello; // 公开CLIENT_HELLO，用于精确transcript。
-        private byte[]                     key; // 派生HMAC密钥；握手完成/失败后擦除。
-        private byte[]                     transcript; // 公开消息摘要。
-        private int                          phase     ; // 0=新建，1=等待challenge，2=等待ready，3=ready，4=关闭。
+        private AsymmetricCipherKeyPair pair;       // 当前连接独占的临时密钥对；派生完成后释放引用。
+        private readonly ECDomainParameters domain; // 固定 P-256 参数，用于校验并导入服务端公钥。
+        private byte[] hello;                       // 已发出的完整 HELLO，参与 transcript 摘要。
+        private byte[] key;                         // HKDF 派生的证明密钥；成功或失败时擦除。
+        private byte[] transcript;                  // HELLO 与 CHALLENGE 的 SHA-256，参与双向证明。
+        private int phase;                          // 0 新建、1 等挑战、2 等证明、3 ready、4 已关闭。
 
         /// <summary>创建本连接的P-256临时密钥；执行随机生成，不进行I/O。</summary>
         public HandshakeClient()
@@ -43,10 +43,14 @@ namespace FlyWow.Gateway
         }
 
         /// <summary>验证challenge并返回33字节PROOF；失败释放本实例，消息只读借用。</summary>
+        /// <param name="challenge">transport 收到的完整 SERVER_CHALLENGE；本函数只读。</param>
+        /// <returns>新分配的 CLIENT_PROOF；格式或密码校验失败时抛出异常。</returns>
         public byte[] Respond(byte[] challenge)
         {
             if (phase != 1) throw new InvalidOperationException("HANDSHAKE_STATE");
-            byte[] raw = null, z = null, prk = null;
+            byte[] raw = null; // BC 输出的无符号 ECDH 整数；可能不足 32 字节。
+            byte[] z = null;   // 左侧补零后的固定 32 字节 ECDH 秘密，供 HKDF Extract 使用。
+            byte[] prk = null; // Extract 产生的中间密钥；finally 与原始秘密一起擦除。
             try
             {
                 if (challenge == null || challenge.Length != 99 || challenge[0] != 2 || challenge[1] != 1 || challenge[2] != 4)
@@ -74,11 +78,14 @@ namespace FlyWow.Gateway
             }
             finally
             {
-                Erase(raw); Erase(z); Erase(prk);
+                Erase(raw);
+                Erase(z);
+                Erase(prk);
             }
         }
 
         /// <summary>验证33字节服务端证明；成功后Ready=true，失败释放并抛出异常。</summary>
+        /// <param name="ready">transport 收到的完整 SERVER_READY；本函数校验其证明。</param>
         public void Complete(byte[] ready)
         {
             if (phase != 2) throw new InvalidOperationException("HANDSHAKE_STATE");
@@ -90,7 +97,8 @@ namespace FlyWow.Gateway
                 int difference = 0;
                 for (int i = 0; i < 32; ++i) difference |= expected[i] ^ ready[i + 1];
                 if (difference != 0) throw new InvalidOperationException("HANDSHAKE_READY");
-                Erase(key); key = null;
+                Erase(key);
+                key = null;
                 phase = 3;
             }
             catch
@@ -113,7 +121,8 @@ namespace FlyWow.Gateway
         /// <summary>幂等释放连接握手状态；不执行I/O，托管私钥引用交给GC。</summary>
         public void Dispose()
         {
-            Erase(key); key = null;
+            Erase(key);
+            key = null;
             pair = null;
             phase = 4;
         }

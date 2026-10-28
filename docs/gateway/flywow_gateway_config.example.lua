@@ -53,7 +53,6 @@ return
     -- 传输类型；只能是 tcp 或 websocket；一个 Gateway Service 生命周期内固定一种类型。
     transport                     = "tcp",
     -- WebSocket 子协议；当前只支持 ws。TLS/WSS 必须由宿主前置终止。
-    websocket_protocol            = "ws",
 
     -- protoc 生成的 FileDescriptorSet；Gateway 用它加载 Envelope/request/response 类型。
     -- 它不是 .proto 源文件，也不是 registry；文件必须在 start 时可读。
@@ -75,9 +74,9 @@ return
     idle_timeout_ticks            = 30000,
     -- 单个业务 Envelope 最大字节数；TCP uint16 framing 上限为 65535。
     max_frame_bytes               = 65535,
-    -- 单连接业务帧速率上限；固定一秒窗口，超限关闭来源连接。
+    -- 每连接一秒最多接纳 200 个业务请求；超限关闭该来源连接。
     max_requests_per_second       = 200,
-    -- 当前 Gateway 实例所有连接的业务帧速率上限；固定一秒窗口，超限关闭来源连接。
+    -- 整个 Gateway 一秒最多接纳 10000 个请求；超限关闭触发上限的连接。
     max_total_requests_per_second = 10000,
     -- 写缓冲告警关闭阈值，单位 KB；慢连接达到阈值后关闭，限制内存增长。
     write_warning_close_kb        = 1024,

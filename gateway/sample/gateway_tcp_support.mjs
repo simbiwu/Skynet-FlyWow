@@ -2,6 +2,7 @@
 import net from "node:net";
 import { HandshakeClient } from "../clients/h5/handshake.mjs";
 
+// 连接本机指定端口并串行完成握手；返回读帧、写帧和关闭接口，失败拒绝 Promise。
 export async function connectTcp(port)
 {
     const socket = net.createConnection({host: "127.0.0.1", port});
@@ -13,10 +14,10 @@ export async function connectTcp(port)
         socket.once("error", reject);
     });
 
-    let buffer = Buffer.alloc(0);
-    let failure;
-    const frames = [];
-    const waiters = [];
+    let buffer = Buffer.alloc(0); // 尚未拼成完整 TCP 帧的输入尾部，data 回调消费后保留余量。
+    let failure; // 首次观察到的传输错误；后续读操作据此拒绝 Promise。
+    const frames = []; // 已拼好的完整帧，等待样例顺序读取。
+    const waiters = []; // 等待下一帧的读操作；关闭或出错时全部唤醒并拒绝。
     socket.on("data", chunk =>
     {
         buffer = Buffer.concat([buffer, chunk]);

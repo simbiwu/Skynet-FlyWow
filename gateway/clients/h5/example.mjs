@@ -40,7 +40,8 @@ function validEnvelope(bytes)
 // 使用公开SDK接入；URL由调用者注入，不将开发绝对路径写入Runtime。
 export async function queryExample(url)
 {
-    let done, fail;
+    let done; // 收到有效样例响应时完成等待。
+    let fail; // 格式错误或响应超时时拒绝等待。
     const result = new Promise((resolve, reject) =>
     {
         done = resolve;
