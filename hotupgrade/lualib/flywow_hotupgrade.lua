@@ -322,12 +322,12 @@ local function stage_service_patch(service_patch_source)
     -- 定义字段和函数全部通过校验后，保存供 Update 与 Abort 使用的恢复记录。
     local service_patch =
     {
-        update_state = patch_definition.update_state,
-        replace_functions = patch_definition.replace_functions,
-        new_modules = patch_definition.new_modules,
-        old_functions = {},
-        has_old_state = false,
-        touched = false,
+        update_state      = patch_definition.update_state,      -- Update 时执行的状态迁移函数；Abort 用旧快照恢复它修改的状态。
+        replace_functions = patch_definition.replace_functions, -- Update 时安装的新业务函数；原函数由 old_functions 保存以供 Abort 恢复。
+        new_modules       = patch_definition.new_modules,       -- 本批首次加载并登记的模块名；加载成功后从下一批起参与匹配。
+        old_functions     = {},                                  -- 保存将被替换的原函数引用，Abort 时逐项装回原 functions 表。
+        has_old_state     = false,                               -- 标记旧状态快照是否存在；快照值为 nil 或 false 时仍能正确区分。
+        touched           = false,                               -- Activate 开始应用 Service Patch 前为 false；Abort 据此判断是否要恢复。
     }
     for name, replacement_function in pairs(patch_definition.replace_functions or {}) do
         if type(name) ~= "string" or type(replacement_function) ~= "function"
