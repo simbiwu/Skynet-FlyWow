@@ -16,7 +16,8 @@ local module_state =
     hotupgrade_handle = nil, -- 首次跨 Service RPC 时取得；宿主必须先完成控制面初始化。
     registration_config  = nil,                              -- 本 Lua State 的回调配置；登记结果单独保存在 registration_result。
     registration_result  = nil,                              -- nil 表示无最终结果；配置存在时为 RPC 在途，true/false 表示登记成功/失败。
-    registration_waiters  = {},                               -- 登记 RPC 期间等待最终结果的首次 require 协程。
+    -- Controller 登记 RPC 会 yield；期间到达的并发 require 协程在这里等待最终登记结果。
+    registration_waiters  = {},
     active_batch          = nil,                              -- 当前批次的恢复数据保留至 finish/abort 确认完成。
     completed_sequence    = 0,                                -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
     last_batch_id         = nil,                              -- 最近完成的批次，用于 finish/abort 幂等响应。
@@ -658,7 +659,8 @@ end
 ---@param registration FlyWowHotUpgradeRegistration 当前 Service 启动代码准备的登记表；Controller 用 before_upgrade 排空业务，并保存可选的 service_update、after_upgrade。
 ---@return FlyWowResult<nil> 登记结果
 function M.register_service(registration)
-    -- registration_config 保存本 State 的回调，registration_result 保存登记 RPC 的最终成败，等待首次 require 的协程据后者继续。
+    -- 固定本 State 的登记回调后，Controller RPC 会 yield。
+    -- 期间到达的并发 require 暂停在 registration_waiters，等待登记结果后继续或失败返回。
     -- 先验证回调与可选更新入口合同；检查完成前不安装 dispatch 或登记状态。
     if module_state.registration_config then
         return flywow_result.failure("HU_DUPLICATE_SERVICE", "当前 State 已登记")
@@ -720,16 +722,18 @@ function M.register_service(registration)
     -- Controller 登记 RPC 是否正常返回，以及它对本 State 登记请求的答复。
     local registration_call_succeeded, registration_response = pcall(
         skynet.call, get_hotupgrade_handle(), "hotupgrade", "register", metadata)
-    -- 发布登记 RPC 的最终结果，再唤醒等待首次 require 的协程。
+    -- 先保存 Controller 的最终答复；等待中的 require 恢复后会据此决定是否继续加载。
     local response_is_result = type(registration_response) == "table"
         and type(registration_response.ok) == "boolean"
     module_state.registration_result = registration_call_succeeded and response_is_result
         and registration_response.ok == true
-    for _, thread in ipairs(module_state.registration_waiters) do
-        skynet.wakeup(thread)
+    -- Controller 答复已固定；唤醒所有因本次登记尚未完成而暂停的 require 协程。
+    for _, waiting_require_thread in ipairs(module_state.registration_waiters) do
+        skynet.wakeup(waiting_require_thread)
     end
 
-    -- 登记 RPC 已返回且等待协程均已唤醒，释放本轮 waiter 集合。
+    -- 等待者已收到唤醒信号，释放本轮协程引用。
+    -- RPC 成功时它们继续加载；失败时它们返回 HU_SERVICE_NOT_REGISTERED。
     module_state.registration_waiters = {}
     -- RPC 失败可能意味着 Controller 已登记；保持本 State 配置，要求宿主终止未 READY 的启动。
     if not registration_call_succeeded or not response_is_result then
@@ -951,9 +955,11 @@ require_module = function(name, module_identity)
 
     if module_state.registration_config then
         if module_state.registration_result == nil then
-            local thread = coroutine.running()
-            module_state.registration_waiters[#module_state.registration_waiters + 1] = thread
-            skynet.wait(thread)
+            -- register_service 的 skynet.call 尚未返回，登记成败仍未知。
+            -- 暂停当前 require，避免在 Controller 确认登记前加载并暴露模块。
+            local waiting_require_thread = coroutine.running()
+            module_state.registration_waiters[#module_state.registration_waiters + 1] = waiting_require_thread
+            skynet.wait(waiting_require_thread)
         end
         if module_state.registration_result ~= true then
             return flywow_result.failure("HU_SERVICE_NOT_REGISTERED", "首次登记失败，须终止本次启动")
