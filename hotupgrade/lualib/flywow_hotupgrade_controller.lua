@@ -1,5 +1,6 @@
 --- 唯一控制面：读取并固定本批 Patch 内容，再串行协调现存目标；只保存进程内状态。
 local skynet = require "skynet"
+-- 为取消尚未完成登记的 Service 提供 skynet.kill 管理接口。
 require "skynet.manager"
 -- 负责受信目录解析、Patch 文件读取和正式 Lua 文件部署的 Native 接口。
 local hotupgrade_native = require "flywow_hotupgrade_native"
@@ -1072,18 +1073,25 @@ end
 ---@param batch FlyWowHotUpgradeBatch begin 建立的活动批次；本函数按发布顺序处理各阶段。
 ---@return FlyWowResult<nil> 各阶段均成功；失败直接返回所属阶段结果，可能 yield。
 local function prepare_and_update_batch(controller, batch)
+    -- 先固定当前批次的 Patch 源码和旧文件快照，失败恢复使用同一份基线。
     local result = load_and_snapshot_batch_files(controller, batch)
     if not result.ok then
         return result
     end
+
+    -- 所有目标进入安全点后，才允许替换宿主上的正式文件。
     result = prepare_batch_targets(controller, batch)
     if not result.ok then
         return result
     end
+
+    -- 部署本批已固定的 Patch 文件；任一写入失败后由上层恢复已替换项。
     result = deploy_batch_files(controller, batch)
     if not result.ok then
         return result
     end
+
+    -- 文件部署完成后再通知目标执行 Update。
     return update_batch_targets(controller, batch)
 end
 
