@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
+from unittest.mock import patch
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
@@ -19,6 +20,58 @@ if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"无法加载仓库自检工具：{CHECKER_PATH}")
 CHECKER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECKER)
+
+
+class FlyWowCodingSkillGateTests(unittest.TestCase):
+    """确保给 AI 的合同变更约束仍保留在编码 Skill 中。"""
+
+    def test_requires_pre_and_post_contract_audit_rules(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            skill_path = root / ".agents/skills/skynet-flywow-coding-standard/SKILL.md"
+            skill_path.parent.mkdir(parents=True)
+            skill_path.write_text(
+                "---\n"
+                "name: skynet-flywow-coding-standard\n"
+                "description: FlyWow 编码规范。\n"
+                "---\n"
+                "### AI 实施前后合同门禁（强制）\n"
+                "不得擅自改变上述合同。\n"
+                "逐项对照基线与工作区差异。\n",
+                encoding="utf-8",
+            )
+
+            errors = CHECKER.check_skill(root)
+
+            self.assertEqual([], errors)
+
+            skill_path.write_text(
+                "---\n"
+                "name: skynet-flywow-coding-standard\n"
+                "description: FlyWow 编码规范。\n"
+                "---\n",
+                encoding="utf-8",
+            )
+
+            errors = CHECKER.check_skill(root)
+
+            self.assertEqual(3, len(errors))
+
+
+class QualityGateCompositionTests(unittest.TestCase):
+    """仓库入口必须同时执行全仓通用门禁与模块专项门禁。"""
+
+    def test_runs_general_and_module_specific_gates(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with (
+                patch.object(CHECKER, "check_changed_lua_function_comments", return_value=[]) as general_gate,
+                patch.object(CHECKER, "check_module_specific_quality_gates", return_value=[]) as module_gates,
+            ):
+                CHECKER.check_repository(root)
+
+            general_gate.assert_called_once_with(root, None)
+            module_gates.assert_called_once_with(root)
 
 
 class CheckTextContentTests(unittest.TestCase):
@@ -105,7 +158,7 @@ class HotUpgradeControllerTypeGateTests(unittest.TestCase):
             self.assertTrue(any("未声明 load_patch" in error for error in errors))
 
 
-class HotUpgradeCommentClarityGateTests(unittest.TestCase):
+class CommentClarityGateTests(unittest.TestCase):
     """拒绝已知含糊的异常边界和错误传播套话。"""
 
     def test_rejects_boundary_and_result_contract_jargon(self) -> None:
@@ -127,14 +180,111 @@ class HotUpgradeCommentClarityGateTests(unittest.TestCase):
 
         self.assertEqual([], errors)
 
+    def test_generic_comment_gate_rejects_phrases_in_any_flywow_module(self) -> None:
+        source = "-- 内部错误由明确结果合同传播。\n"
 
-class HotUpgradeRecordFieldGateTests(unittest.TestCase):
-    """确保多行 HotUpgrade record 的每个具名字段都有就近说明。"""
+        errors = CHECKER.check_flywow_comment_clarity(Path("navigation/lualib/route.lua"), source)
+
+        self.assertEqual(1, len(errors))
+        self.assertIn("navigation/lualib/route.lua", errors[0])
+
+    def test_generic_gate_rejects_abstract_stage_headings(self) -> None:
+        source = (
+            "-- 参数/状态检查：先处理输入。\n"
+            "-- 数据准备：继续处理。\n"
+            "-- 状态修改：更新状态。\n"
+            "-- 持久化/消息发送：发送数据。\n"
+            "-- 核心计算：完成计算。\n"
+            "-- 收尾：返回。\n"
+        )
+
+        errors = CHECKER.check_flywow_comment_clarity(Path("gateway.lua"), source)
+
+        self.assertEqual(6, len(errors))
+
+    def test_hotupgrade_gate_adds_module_specific_comment_phrases(self) -> None:
+        source = (
+            "-- 当前 register 协程；身份集合核验完成后继续。\n"
+            "-- 保存执行状态和结果到结果槽。\n"
+        )
+
+        errors = CHECKER.check_hotupgrade_comment_clarity(Path("hotupgrade.lua"), source)
+
+        self.assertEqual(4, len(errors))
+
+    def test_markdown_scans_comment_clarity_without_treating_snippets_as_full_records(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            controller_path = root / "hotupgrade/lualib/flywow_hotupgrade_controller.lua"
+            controller_path.parent.mkdir(parents=True)
+            controller_path.write_text(
+                "---@class FlyWowHotUpgradeController\n"
+                "---@field load_patch fun(self: FlyWowHotUpgradeController, batch: any)\n"
+                "local M = {}\n",
+                encoding="utf-8",
+            )
+            markdown_path = root / "hotupgrade/newsample/readme.md"
+            markdown_path.parent.mkdir(parents=True)
+            markdown_path.write_text(
+                "~~~lua\n"
+                "local record = {\n"
+                "    first = 1,\n"
+                "}\n"
+                "~~~\n",
+                encoding="utf-8",
+            )
+
+            errors = CHECKER.check_hotupgrade_lua_function_contracts(root)
+
+            self.assertEqual([], errors)
+
+            markdown_path.write_text(
+                "~~~lua\n"
+                "-- 保存执行状态和结果到结果槽。\n"
+                "local record = {\n"
+                "    first = 1,\n"
+                "}\n"
+                "~~~\n",
+                encoding="utf-8",
+            )
+
+            errors = CHECKER.check_hotupgrade_lua_function_contracts(root)
+
+            self.assertEqual(2, len(errors))
+
+    def test_extracts_lua_comments_from_tutorial_fences(self) -> None:
+        fence = chr(96) * 3
+        markdown = (
+            "# 教程\n"
+            "\n"
+            + fence + "lua\n"
+            + "-- 当前 register 协程；等待结果。\n"
+            + "local value = 1\n"
+            + fence + "\n"
+        )
+
+        blocks = list(CHECKER.iter_lua_markdown_blocks(markdown))
+
+        self.assertEqual([(4, "-- 当前 register 协程；等待结果。\nlocal value = 1")], blocks)
+
+
+class LuaRecordFieldGateTests(unittest.TestCase):
+    """确保多行 FlyWow record 的每个具名字段都有就近说明。"""
 
     def test_rejects_uncommented_record_field(self) -> None:
         source = "local record = {\n    first = 1, -- 已说明。\n    second = 2,\n}\n"
 
         errors = CHECKER.check_lua_multiline_record_field_comments(Path("sample.lua"), source)
+
+        self.assertEqual(1, len(errors))
+        self.assertIn(":3:", errors[0])
+
+    def test_generic_changed_field_gate_only_reports_changed_fields(self) -> None:
+        source = "local record = {\n    first = 1,\n    second = 2,\n}\n"
+
+        errors = CHECKER.check_lua_multiline_record_field_comments(
+            Path("navigation/lualib/route.lua"), source, {3}
+        )
 
         self.assertEqual(1, len(errors))
         self.assertIn(":3:", errors[0])

@@ -37,13 +37,29 @@ TEXT_SUFFIXES = {
 TEXT_NAMES = {".editorconfig", ".gitattributes", ".gitignore", "CMakeLists.txt", "Makefile"}
 CHINESE_PATTERN = re.compile(r"[\u3400-\u9fff]")
 LUA_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_]\w*$")
-UNCLEAR_HOTUPGRADE_COMMENT_PHRASES = {
+UNCLEAR_FLYWOW_COMMENT_PHRASES = {
+    "参数/状态检查": "请直接说明拒绝什么输入或当前状态，以及通过后进入什么操作。",
+    "数据准备": "请写出准备的具体数据或资源，以及后续由哪一步使用。",
+    "状态修改": "请写出修改哪个对象、何时修改，以及这次修改让后续流程如何变化。",
+    "持久化/消息发送": "请点名写入的对象或发送的消息及接收方。",
+    "核心计算": "请说明本段输入如何转换成什么结果，避免只给阶段标签。",
+    "收尾：": "请写明清理或返回的具体对象与结果。",
     "收敛": "请写明具体等待、转换或清理动作。",
-    "状态钩子边界": "请点名 export_state/import_state 等实际回调及异常转换结果。",
     "边界捕获异常": "请说明哪段代码可能抛错，以及捕获后返回什么。",
     "结果合同传播": "请说明调用方收到的具体结果或错误码。",
     "所属错误": "请说明错误来自哪个调用或阶段。",
     "稳定外层错误码": "请写出实际返回的错误码和保留的原因信息。",
+    "执行状态和结果": "请说明具体执行了什么、得到什么返回值。",
+    "统一结构化结果": "请写出调用方实际收到的字段或失败行为。",
+}
+UNCLEAR_HOTUPGRADE_COMMENT_PHRASES = {
+    "状态钩子边界": "请点名 export_state/import_state 等实际回调及异常转换结果。",
+    "控制阶段的执行状态": "请点名被调用的阶段函数及失败后的处理。",
+    "当前 register 协程": "请说明该协程具体在等什么事件，以及醒来后会做什么。",
+    "结果槽": "请说明记录的结果是什么、哪些调用方读取它。",
+    "身份集合核验": "请说明核对哪些模块路径或名称，以及不匹配时会发生什么。",
+    "新模块名单": "请说明这是哪个清单、谁可以读取、何时失效。",
+    "本地登记状态恢复后": "请点明恢复了哪些表项，以及之后调用哪个接口。",
 }
 LUA_KEYWORDS = {
     "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
@@ -148,6 +164,14 @@ def check_skill(root: Path) -> list[str]:
     )
     if not description or not CHINESE_PATTERN.search(description):
         errors.append(f"{path}: Skill description 必须提供中文触发说明")
+    required_ai_gate_text = (
+        "### AI 实施前后合同门禁（强制）",
+        "不得擅自改变上述合同",
+        "逐项对照基线与工作区差异",
+    )
+    for required_text in required_ai_gate_text:
+        if required_text not in text:
+            errors.append(f"{path}: AI 合同变更门禁缺少要求：{required_text}")
     return errors
 
 
@@ -589,7 +613,7 @@ def check_changed_lua_function_comments(root: Path, base_ref: str | None = None)
 
     默认检查相对 HEAD 的工作区变更；给定 base_ref 时检查 base_ref...HEAD，供 CI 验证已提交差异。
     不回溯未变更历史函数；无 Git 元数据的源码快照会跳过此门禁。
-    该门禁只验证职责注释是否存在，不判断注释语义是否充分。
+    除函数合同外，也检查全仓通用的变更字段注释和含糊表达门禁；不回溯未变更 Lua。
     """
 
     if not (root / ".git").exists():
@@ -644,7 +668,10 @@ def check_changed_lua_function_comments(root: Path, base_ref: str | None = None)
         except (OSError, UnicodeDecodeError) as exception:
             errors.append(f"{relative_path}: 无法读取变更 Lua 文件：{exception}")
             continue
-        errors.extend(check_lua_function_comments(Path(relative_path), source, changed_lines))
+        relative = Path(relative_path)
+        errors.extend(check_lua_function_comments(relative, source, changed_lines))
+        errors.extend(check_lua_multiline_record_field_comments(relative, source, changed_lines))
+        errors.extend(check_flywow_comment_clarity(relative, source, changed_lines))
 
     return errors
 
@@ -703,8 +730,10 @@ def _has_lua_line_comment(line: str) -> bool:
     return False
 
 
-def check_lua_multiline_record_field_comments(path: Path, source: str) -> list[str]:
-    """要求 HotUpgrade 多行具名 table/record 的每个字段单独书写并紧邻有说明。"""
+def check_lua_multiline_record_field_comments(
+    path: Path, source: str, changed_lines: set[int] | None = None
+) -> list[str]:
+    """要求多行具名 record 的字段分别书写并就近说明，可只检查本次变更字段。"""
 
     tokens = _tokenize_lua(source)
     source_lines = source.splitlines()
@@ -771,6 +800,10 @@ def check_lua_multiline_record_field_comments(path: Path, source: str) -> list[s
             index += 1
 
         for field_line in sorted(set(fields)):
+            if changed_lines is not None and not (
+                field_line in changed_lines or field_line - 1 in changed_lines
+            ):
+                continue
             if fields.count(field_line) > 1:
                 errors.append(
                     f"{path}:{field_line}: 多行 record 的多个具名字段不能挤在同一行"
@@ -782,27 +815,69 @@ def check_lua_multiline_record_field_comments(path: Path, source: str) -> list[s
             )
             if not has_inline_comment and not previous_line_is_comment:
                 errors.append(
-                    f"{path}:{field_line}: HotUpgrade table 字段缺少就近注释"
+                    f"{path}:{field_line}: FlyWow record 字段缺少就近注释"
                 )
 
     return errors
 
 
-def check_hotupgrade_comment_clarity(path: Path, source: str) -> list[str]:
-    """拒绝已知会掩盖具体操作的 HotUpgrade 注释套话。"""
+def _check_comment_phrases(
+    path: Path, source: str, phrases: dict[str, str], checked_lines: set[int] | None = None
+) -> list[str]:
+    """在指定行检查真实 Lua 注释是否包含已知含糊表达。"""
 
     errors: list[str] = []
     for line_number, line in enumerate(source.splitlines(), start=1):
-        if "--" not in line:
+        if checked_lines is not None and line_number not in checked_lines:
             continue
-        for phrase, instruction in UNCLEAR_HOTUPGRADE_COMMENT_PHRASES.items():
+        if not _has_lua_line_comment(line):
+            continue
+        for phrase, instruction in phrases.items():
             if phrase in line:
                 errors.append(f"{path}:{line_number}: 注释含模糊短语“{phrase}”；{instruction}")
     return errors
 
 
+def check_flywow_comment_clarity(
+    path: Path, source: str, checked_lines: set[int] | None = None
+) -> list[str]:
+    """检查 FlyWow 所有模块通用的 Lua 注释表达；通过词表检查不代表语义审查完成。"""
+
+    return _check_comment_phrases(path, source, UNCLEAR_FLYWOW_COMMENT_PHRASES, checked_lines)
+
+
+def check_hotupgrade_comment_clarity(path: Path, source: str) -> list[str]:
+    """叠加检查 HotUpgrade 专用含糊表达；通过词表检查不代表语义审查完成。"""
+
+    return check_flywow_comment_clarity(path, source) + _check_comment_phrases(
+        path, source, UNCLEAR_HOTUPGRADE_COMMENT_PHRASES
+    )
+
+
+def iter_lua_markdown_blocks(source: str) -> Iterable[tuple[int, str]]:
+    """提取 Markdown 中标记为 lua 的围栏代码及其起始行。"""
+
+    lines = source.splitlines()
+    index = 0
+    while index < len(lines):
+        opening = re.match(r"^(" + re.escape(chr(96)) + r"{3,}|~{3,})\s*lua\s*$", lines[index], re.IGNORECASE)
+        if not opening:
+            index += 1
+            continue
+        fence = opening.group(1)
+        start_line = index + 2
+        index += 1
+        body: list[str] = []
+        closing_pattern = r"^" + re.escape(fence) + r"\s*$"
+        while index < len(lines) and not re.match(closing_pattern, lines[index]):
+            body.append(lines[index])
+            index += 1
+        yield start_line, "\n".join(body)
+        index += 1
+
+
 def check_hotupgrade_lua_function_contracts(root: Path) -> list[str]:
-    """全量检查 HotUpgrade 生产 Lua 的函数合同、阶段分段和压缩控制体。"""
+    """全量检查 HotUpgrade 的函数合同、record 字段、专用注释和阶段排版。"""
 
     source_paths = sorted(
         list((root / "hotupgrade/lualib").rglob("*.lua"))
@@ -829,6 +904,36 @@ def check_hotupgrade_lua_function_contracts(root: Path) -> list[str]:
             continue
         errors.extend(check_lua_multiline_record_field_comments(path.relative_to(root), source))
         errors.extend(check_hotupgrade_comment_clarity(path.relative_to(root), source))
+
+    # 课程和 README 的 Lua 代码会被复制到教学文档，注释规则也要扫描这些副本。
+    markdown_paths = sorted((root / "hotupgrade").rglob("*.md"))
+    for path in markdown_paths:
+        try:
+            markdown = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exception:
+            errors.append(f"{path.relative_to(root)}: 无法读取 HotUpgrade Markdown：{exception}")
+            continue
+        for start_line, block in iter_lua_markdown_blocks(markdown):
+            for message in check_hotupgrade_comment_clarity(path.relative_to(root), block):
+                match = re.match(r"[^:]+:(\d+):(.*)", message)
+                if match:
+                    errors.append(
+                        f"{path.relative_to(root)}:{start_line + int(match.group(1)) - 1}:{match.group(2)}"
+                    )
+                else:
+                    errors.append(f"{path.relative_to(root)}:{start_line}:{message}")
+    return errors
+
+
+def check_module_specific_quality_gates(root: Path) -> list[str]:
+    """在全仓通用门禁通过之外，叠加各模块自己的专项检查。"""
+
+    errors: list[str] = []
+    module_gates = (
+        check_hotupgrade_lua_function_contracts,
+    )
+    for module_gate in module_gates:
+        errors.extend(module_gate(root))
     return errors
 
 
@@ -852,9 +957,10 @@ def check_repository(root: Path, base_ref: str | None = None) -> list[str]:
 
     errors.extend(check_skill(root))
     errors.extend(check_quality_workflow(root))
+    # 通用门禁检查全仓变更 Lua；模块专项门禁在通用检查之外叠加执行。
     errors.extend(check_changed_lua_function_comments(root, base_ref))
-    errors.extend(check_hotupgrade_lua_function_contracts(root))
-    return errors
+    errors.extend(check_module_specific_quality_gates(root))
+    return list(dict.fromkeys(errors))
 
 
 def parse_args() -> argparse.Namespace:

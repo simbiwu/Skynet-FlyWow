@@ -69,12 +69,14 @@ end
 --- 校验并复制宿主完整传入的课程配置，避免运行期间读取可变配置 table。
 --- 参数 startup_config：必需的完整 Gateway 配置，包含 handler、descriptor、registry 和监听参数。
 --- 返回值：当前 Service 私有的规范化配置；失败抛错，不执行 I/O、yield 或启动资源。
+---@param startup_config GatewayStartConfig 宿主传入的 Gateway 启动配置；本函数读取传输、监听、协议和资源上限字段。
+---@return GatewayStartConfig 仅含已校验值的配置副本；缺少必需字段或字段越界时抛错。
 local function normalize_config(startup_config)
     assert(type(startup_config) == "table", "gateway start config must be a table")
     -- Gateway 不 require 宿主业务配置；默认值只用于可选的通用传输参数。
     local merged_config = merge_config({}, startup_config)
 
-    -- 参数/状态检查：先校验传输类型，再校验网络和资源上限。
+    -- 先确认传输类型受支持，再校验端口、帧长和各项连接上限。
     local transport = merged_config.transport or "tcp"
     assert(
         transport == "tcp" or transport == "websocket",
@@ -92,6 +94,7 @@ local function normalize_config(startup_config)
         )
     end
 
+    -- 传输选项通过后，校验帧长、连接数、写缓冲阈值、端口和协议版本的整数范围。
     local max_frame_bytes = require_integer(
         merged_config.max_frame_bytes or 65535,
         "max_frame_bytes",
@@ -139,6 +142,7 @@ local function normalize_config(startup_config)
         )
     end
 
+    -- 在返回配置副本前，确认后续启动要读取的 descriptor 文件和生成 registry 模块都已指定。
     assert(
         type(merged_config.descriptor_path) == "string" and
         merged_config.descriptor_path ~= "",
@@ -150,7 +154,7 @@ local function normalize_config(startup_config)
         "registry_module is required"
     )
 
-    -- 收尾：返回当前 Gateway Lua State 独占的规范化配置。
+    -- 返回只包含已校验值的配置副本；运行期不再读取宿主传入的可变 table。
     return
     {
         host                          = merged_config.host or "127.0.0.1", -- 监听地址；只影响当前 Gateway。
@@ -241,7 +245,7 @@ end
 ---@param transport GatewayTransport 当前 TCP/WebSocket 传输。
 ---@return GatewayConnection|nil connection，或容量/身份/握手资源不足。
 local function create_connection(fd, peer, transport)
-    -- 参数/状态检查：容量、连接身份和握手名额必须可用。
+    -- 连接数达到上限、连接编号耗尽或无法取得握手名额时，不接管 fd。
     if module_state.client_count >= module_state.gateway_config.max_clients then
         emit_event(
         {
@@ -256,6 +260,7 @@ local function create_connection(fd, peer, transport)
         return nil
     end
 
+    -- 连接编号只增不复用；达到 Lua 整数上限时拒绝接入，避免身份与旧连接冲突。
     if module_state.next_connection_id == math.maxinteger then
         emit_event(
         {
@@ -268,6 +273,7 @@ local function create_connection(fd, peer, transport)
         return nil
     end
 
+    -- 每个连接在登记前先占用握手名额；容量不足时不会把 fd 加入连接索引。
     local handshake, handshake_error = module_state.handshake.accept()
     if not handshake then
         emit_event(
@@ -281,7 +287,7 @@ local function create_connection(fd, peer, transport)
         return nil
     end
 
-    -- 数据准备：创建当前连接独占的上下文。
+    -- 为新连接建立私有上下文，并把刚取得的握手名额交给它持有。
     module_state.next_connection_id = module_state.next_connection_id + 1
 
     local connection =
@@ -300,12 +306,12 @@ local function create_connection(fd, peer, transport)
         request_count   = 0, -- 已完成 dispatch 次数；诊断统计字段。
     }
 
-    -- 状态修改：连接同时登记到两个索引，再增加在线计数。
+    -- 两个索引都登记成功后再增加在线计数，确保按 id 和 fd 都能找到该连接。
     module_state.connections[connection.id] = connection
     module_state.connections_by_fd[fd] = connection
     module_state.client_count = module_state.client_count + 1
 
-    -- 持久化/消息发送：通知观测方连接已建立。
+    -- 连接进入索引后再发送 open 事件；观测 Service 故障不影响接入。
     emit_event(
     {
         kind          = "open",
@@ -388,7 +394,7 @@ end
 ---@param payload string 一条完整业务 Envelope bytes；当前调用借用，不跨 yield 保存。
 ---@return boolean 是否成功投递给 handler；失败由 transport 层关闭连接。
 local function dispatch_payload(connection, payload)
-    -- 参数/状态检查：拒绝关闭连接、空帧和超限帧。
+    -- 连接已关闭、帧为空或超过配置上限时停止解码。
     if connection.closed or #payload == 0 or #payload > module_state.gateway_config.max_frame_bytes then
         emit_event(
         {
@@ -402,7 +408,7 @@ local function dispatch_payload(connection, payload)
         return false
     end
 
-    -- 核心计算：解码 Envelope、校验协议版本；业务关联由消息 body 定义。
+    -- 将完整帧解码成 Envelope，并拒绝与本 Gateway 协议版本不符的消息。
     --- pcall 把不可信网络字节导致的解码异常限制在当前请求，便于统一发事件并关闭连接。
     local envelope_ok, envelope = pcall(module_state.codec.decode_envelope, payload)
     if not envelope_ok then
@@ -418,6 +424,7 @@ local function dispatch_payload(connection, payload)
         return false
     end
 
+    -- Envelope 已能解码后再比较协议版本；不匹配时不查命令表或调用业务 Service。
     if envelope.protocol_version ~= module_state.gateway_config.protocol_version then
         emit_event(
         {
@@ -431,7 +438,8 @@ local function dispatch_payload(connection, payload)
         return false
     end
 
-    -- 核心计算：根据 CommandId 查找定义并解码 Request。
+    -- 用 Envelope.command_id 查 registry 定义，再按该定义解码 body。
+    -- 只按生成 registry 中的 command 定义解释 body，不从客户端输入推导消息类型。
     local definition = registry_loader.find_command(module_state.registry, envelope.command)
     if definition == nil then
         emit_event(
@@ -446,6 +454,7 @@ local function dispatch_payload(connection, payload)
         return false
     end
 
+    -- 已找到命令后才解码其 request body；Protobuf 错误在当前网络消息边界转成拒绝投递。
     local request_ok, request = pcall(
         module_state.codec.decode_request,
         definition,
@@ -464,17 +473,19 @@ local function dispatch_payload(connection, payload)
         return false
     end
 
-    -- 参数/状态检查：更新并检查当前连接和实例的限流窗口。
+    -- 按当前 tick 更新连接级和实例级一秒窗口；任一上限已满就拒绝本帧。
     local now = skynet.now()
 
     if (now - connection.rate_started) % 0x100000000 >= 100 then
         connection.rate_started, connection.rate_count = now, 0
     end
 
+    -- 实例级窗口与连接窗口各自独立计时，避免单个连接超限判断影响其他连接的总量统计。
     if (now - module_state.rate_started) % 0x100000000 >= 100 then
         module_state.rate_started, module_state.rate_count = now, 0
     end
 
+    -- 两级速率上限任一达到就拒绝该请求，且不更新接纳计数。
     if connection.rate_count >= module_state.gateway_config.max_requests_per_second or
         module_state.rate_count >= module_state.gateway_config.max_total_requests_per_second then
         emit_event(
@@ -489,13 +500,14 @@ local function dispatch_payload(connection, payload)
         return false
     end
 
-    -- 状态修改：记录本次已接纳的请求。
+    -- 仅在限流通过后计入连接和实例请求数，计数只代表已接纳的投递。
     connection.rate_count = connection.rate_count + 1
     module_state.rate_count = module_state.rate_count + 1
     connection.request_count = connection.request_count + 1
     connection.last_message = now
 
-    -- 持久化/消息发送：把已解码请求和路由元数据投递给业务层。
+    -- 速率检查通过后再投递；发送失败时记录事件并让 TCP/WS 调用方关闭连接。
+    -- 将 request、command 和连接身份异步发送给宿主指定的 handler Service。
     --- 只传递连接身份、command_id 和已解码数据；Gateway 不缓存业务请求。
     local sent, err = pcall(
         skynet.send,
@@ -530,12 +542,11 @@ local function dispatch_payload(connection, payload)
 end
 
 
---- 发送入口：编码后发送给指定连接，或发送给当前所有已握手连接。
---- source 必须是配置的 handler；message 包含 epoch/connection_id/command_id/data。
---- connection_id=0 表示广播；Gateway 不保存业务请求状态，也不判断业务结果。
----@param source ServiceHandle 发送 data 的已配置 handler handle。
----@param message GatewayDataMessage 带有目标连接和响应数据。
----@return boolean 是否至少接纳了一次传输写入。
+--- 将完整 Envelope 写入一个连接；TCP 前置 uint16 长度头，WebSocket 发送 binary message。
+--- 写入异常或底层明确拒绝时会摘除连接并异步关闭；成功只表示本地传输接受写入。
+---@param connection GatewayConnection Gateway 独占的目标连接；本函数读取 transport、fd 和 id。
+---@param encoded string 已编码的完整 Envelope bytes；由调用方创建，本函数不保存。
+---@return boolean 是否被底层传输接受；失败时连接已安排关闭。
 local function write_connection(connection, encoded)
     local sent, err
 
@@ -555,6 +566,7 @@ local function write_connection(connection, encoded)
         )
     end
 
+    -- 底层写失败时先报告并摘除连接，再异步关闭可能仍在写缓冲中的传输。
     if not sent then
         emit_event(
         {
@@ -572,6 +584,7 @@ local function write_connection(connection, encoded)
         return false
     end
 
+    -- 仅在传输库接受本次写入后计数；该指标不代表远端客户端已收到数据。
     module_state.responses_sent = module_state.responses_sent + 1
     return true
 end
@@ -581,9 +594,12 @@ end
 ---@field connection_id integer 当前实例的连接编号；0 表示广播给所有已就绪连接。
 ---@field command_id integer registry 中声明 response_type 的正整数命令 ID。
 ---@field data table 已构造的业务 response 或主动 Push message；Gateway 只负责编码。
----@param outbound_message GatewayOutboundMessage 当前 handler 发来的业务响应或 Push。
+--- 处理 handler 发来的业务响应或主动 Push；校验实例/连接身份后编码并写入传输。
+--- 无效消息、未知命令、编码失败或目标连接已关闭时返回 false；至少一次写入被接受时返回 true。
+---@param outbound_message GatewayOutboundMessage handler 发来的记录；读取 gateway_epoch、connection_id、command_id 和 data。
+---@return boolean 是否至少有一个目标连接接受了写入；广播没有可写连接时返回 false。
 local function deliver_outbound_message(outbound_message)
-    -- 参数/状态检查：只接受当前 Gateway 实例的有效消息；发送方由宿主信任边界管理。
+    -- 校验响应记录和 connection_id；发送方身份由宿主 Service 注册边界保证。
     if not module_state.gateway_config or type(outbound_message) ~= "table" or
         outbound_message.gateway_epoch ~= module_state.epoch or
         module_state.phase ~= "running" then
@@ -591,6 +607,7 @@ local function deliver_outbound_message(outbound_message)
         return false
     end
 
+    -- 实例身份通过后再校验目标、命令和业务响应类型，避免访问不完整记录。
     if math.type(outbound_message.connection_id) ~= "integer" or
         outbound_message.connection_id < 0 or
         math.type(outbound_message.command_id) ~= "integer" or
@@ -600,13 +617,15 @@ local function deliver_outbound_message(outbound_message)
         return false
     end
 
-    -- 数据准备：根据 command_id 找到 response 类型并完成一次编码。
+    -- 从 registry 取得该命令的 response 类型，并把业务 table 编码成完整 Envelope。
+    -- 消息字段有效后查找响应类型；单向命令没有 response_type，不能用于此入口。
     local definition = registry_loader.find_command(module_state.registry, outbound_message.command_id)
     if not definition or definition.response_type == nil then
         module_state.responses_dropped = module_state.responses_dropped + 1
         return false
     end
 
+    -- 编码器可能因业务 table 不符合 Protobuf schema 而抛错；在消息入口转换为失败并记录事件。
     local ok, encoded = pcall(
         module_state.codec.encode_response,
         definition,
@@ -626,7 +645,7 @@ local function deliver_outbound_message(outbound_message)
         return false
     end
 
-    -- 持久化/消息发送：指定连接或广播到当前已握手连接。
+    -- 把编码后的响应写给指定 ready 连接，或写给当前全部 ready 连接。
     if outbound_message.connection_id == 0 then
         local sent_any = false
 
@@ -640,6 +659,7 @@ local function deliver_outbound_message(outbound_message)
         return sent_any
     end
 
+    -- 单播只查当前连接索引；连接已关闭或握手未完成时不能写入。
     local connection = module_state.connections[outbound_message.connection_id]
     if not connection or connection.closed or
         not module_state.handshake.ready(connection.handshake) then
@@ -661,13 +681,14 @@ end
 ---@param close_request GatewayCloseRequest 当前 handler 请求关闭的连接身份。
 ---@return boolean 首次成功接纳关闭时为 true；旧实例、失效连接或重复请求为 false。
 local function request_close(close_request)
-    -- 参数/状态检查：只接受当前 Gateway 实例和有效连接的关闭请求。
+    -- 校验关闭请求属于当前实例，并确认目标连接仍在连接索引中。
     if not module_state.gateway_config or module_state.phase ~= "running" or
         type(close_request) ~= "table" or close_request.gateway_epoch ~= module_state.epoch or
         math.type(close_request.connection_id) ~= "integer" then
         return false
     end
 
+    -- 请求身份有效后再查当前连接索引，迟到命令不会按复用的 fd 关闭新连接。
     local connection = module_state.connections[close_request.connection_id]
     if not connection or not detach_connection(connection, "closed by handler") then
         return false
@@ -718,7 +739,7 @@ end
 ---@param bytes string 一条完整握手消息；不跨调用保存。
 ---@return boolean 是否成功写出 response 并在最后阶段提交 ready。
 local function process_handshake(connection, bytes)
-    -- 核心计算：把完整握手帧交给握手模块。
+    -- 由握手模块校验当前阶段的消息并生成响应；Gateway 不读取握手字段。
     local response, code, confirm = module_state.handshake.receive(
     {
         context = connection.handshake, -- 本连接独占的握手状态。
@@ -739,7 +760,7 @@ local function process_handshake(connection, bytes)
         return false
     end
 
-    -- 持久化/消息发送：把握手响应写回 TCP 或 WebSocket。
+    -- 将握手模块生成的响应写回原传输；只有发送成功后才提交 ready。
     local ok, result
     if connection.transport == "tcp" then
         ok, result = pcall(
@@ -760,6 +781,7 @@ local function process_handshake(connection, bytes)
         return false
     end
 
+    -- 最后一条握手响应已成功写出后才提交 ready；失败时连接仍不能收发业务消息。
     if confirm then
         if not module_state.handshake.confirm(connection.handshake) then
             return false
@@ -785,12 +807,12 @@ end
 ---@param connection GatewayConnection Gateway 独占的 TCP 连接。
 ---@return nil 直到 EOF、协议错误、超时或 Server 停止后退出并清理连接。
 local function run_tcp(connection)
-    -- 参数/状态检查：关闭中的连接不再启动 Socket。
+    -- 已 detach 的连接不能再启动读取协程，避免关闭后重新使用 fd。
     if connection.closed then
         return
     end
 
-    -- 数据准备：启动 Socket 并配置帧上限和背压回调。
+    -- 启动 TCP fd，限制 Skynet 写缓冲，并在缓冲过大时关闭连接。
     local fd = connection.fd
     local opened, open_error = socket.start(fd)
 
@@ -819,7 +841,7 @@ local function run_tcp(connection)
         end
     end)
 
-    -- 核心计算：循环读取帧头、读取帧体，再按握手状态分发。
+    -- 每轮先读满长度头并校验上限，再读完整帧体；未完成握手的帧交给握手流程，其余帧进入业务解码。
     while not connection.closed and module_state.phase == "running" do
         local header, err = read_exact(connection, 2)
         if not header then
@@ -844,6 +866,7 @@ local function run_tcp(connection)
             break
         end
 
+        -- 长度已通过握手阶段或业务帧上限检查，现在才读取完整帧体。
         local payload = read_exact(connection, size)
         if not payload then
             break
@@ -858,7 +881,7 @@ local function run_tcp(connection)
         end
     end
 
-    -- 收尾：所有退出路径统一摘除连接并关闭传输。
+    -- 无论 EOF、协议错误还是 Service 停止，都从索引摘除连接并关闭 TCP fd。
     detach_connection(connection, "tcp session ended")
     close_transport(connection, 1001, "tcp session ended")
 end
@@ -965,7 +988,7 @@ end
 ---@param peer string 对端地址诊断字符串。
 ---@return nil 连接由 Gateway 协程接管或立即关闭。
 local function accept_client(fd, peer)
-    -- 参数/状态检查：按配置选择 WebSocket 或 TCP 接入路径。
+    -- 根据 transport 配置选择 WebSocket 监听回调或 TCP 连接协程。
     if module_state.gateway_config.transport == "websocket" then
         local accepted = create_connection(fd, peer, "websocket")
         if not accepted then
@@ -1004,6 +1027,7 @@ local function accept_client(fd, peer)
         return
     end
 
+    -- TCP 路径在接管 fd 后启动独立读取协程；创建失败的 fd 仍由 accept 回调关闭。
     local connection = create_connection(fd, peer, "tcp")
     if not connection then
         --- accepted fd 尚未进入 Lua socket_pool，必须用 close_fd 关闭。
@@ -1033,8 +1057,9 @@ end
 
 --- 一个扫描协程限制 TCP 半包/空闲读与 WS 握手/空闲占用；不按请求创建 timer。
 --- 无参数；最多扫描 max_clients 个连接，tick 回绕用模运算；detach 后关闭会 yield。
+---@return nil Service 停止后退出；运行期间每 100 ms 扫描并关闭超时连接。
 local function timeout_loop()
-    -- 核心计算：周期扫描正在握手或正在读数据的连接。
+    -- 定时检查握手期限、TCP 读超时和 WebSocket 空闲期限。
     while module_state.phase == "running" do
         skynet.sleep(10)
 
@@ -1053,7 +1078,7 @@ local function timeout_loop()
             end
         end
 
-        -- 状态修改：摘除并关闭本轮发现的超时连接。
+        -- 对本轮判定超时的连接先摘除索引，再关闭底层传输。
         for _, connection in ipairs(expired) do
             if detach_connection(connection, "network read timeout") then
                 close_transport(connection, 1001, "network timeout")
@@ -1096,10 +1121,11 @@ end
 ---@param startup_config GatewayStartConfig 宿主提交的完整启动配置。
 ---@return GatewayStartResult 实际监听信息；失败抛错，可能 yield。
 local function start(startup_config)
-    -- 参数/状态检查：Gateway 只能从 created 状态启动一次。
+    -- 拒绝重复 start；只有 created 实例可以进入配置加载和监听流程。
     assert(module_state.phase == "created", "gateway can only start once")
 
-    -- 数据准备：读取配置并加载生成的协议 registry。
+    -- 复制并校验宿主配置，读取 descriptor，再加载并校验生成的 registry。
+    -- normalize_config 不访问外部资源；后续文件加载失败由 start 调用向宿主抛错。
     local gateway_config = normalize_config(startup_config)
     local generated = assert(
         require(gateway_config.registry_module),
@@ -1107,7 +1133,7 @@ local function start(startup_config)
     )
     local registry = registry_loader.build_index(generated)
 
-    -- 状态修改：安装当前 Lua State 独占的运行时对象。
+    -- 将校验后的配置、registry、codec 和握手管理器保存到本 Service 状态。
     module_state.gateway_config = gateway_config
     module_state.registry = registry
     module_state.codec = codec_factory.new(
@@ -1127,11 +1153,12 @@ local function start(startup_config)
     }
     )
 
-    -- 状态修改：进入 starting，随后绑定监听 Socket。
+    -- 先记录 starting，再创建监听 fd；bind/listen 失败由启动调用报告。
     module_state.rate_started = skynet.now()
     module_state.rate_count = 0
     module_state.phase = "starting"
 
+    -- 配置与运行时对象准备完成后才绑定端口；listen 可能 yield，返回信息用于发布就绪结果。
     local listen_fd, address, port = socket.listen(
         gateway_config.host,
         gateway_config.port,
@@ -1139,7 +1166,7 @@ local function start(startup_config)
     )
     module_state.listen_fd = listen_fd
 
-    -- 持久化/消息发送：注册监听回调并发布 ready 日志。
+    -- 注册 accept 回调并开始超时扫描；全部准备完成后才发布 ready。
     socket.start(listen_fd, accept_client)
     module_state.phase = "running"
     skynet.fork(timeout_loop)
@@ -1174,7 +1201,7 @@ end
 --- 连接数受 max_clients 限制；先快照索引再 detach，避免遍历期间删 key 漏关或重复关闭。
 ---@return GatewayStopResult 停止结果；重复停止返回 0。
 local function stop()
-    -- 参数/状态检查：重复停止直接返回，不重复触碰监听和连接。
+    -- 已 stopped 的实例直接返回，避免重复关闭已经释放的 fd。
     if module_state.phase == "stopped" then
         return
         {
@@ -1182,16 +1209,16 @@ local function stop()
         }
     end
 
-    -- 状态修改：先进入 stopping，阻止新的业务读取。
+    -- 进入 stopping 后，读取循环会在下一次检查时退出。
     module_state.phase = "stopping"
 
-    -- 持久化/消息发送：关闭监听 Socket，不再接受新连接。
+    -- 关闭监听 fd，阻止 Skynet 再把新连接交给本实例。
     if module_state.listen_fd then
         socket.close(module_state.listen_fd)
         module_state.listen_fd = nil
     end
 
-    -- 数据准备：先复制连接快照，避免遍历时删除连接表。
+    -- 复制当前连接列表；后续 detach 会修改原索引，不能直接遍历它。
     local closed = 0
     local snapshot = {}
 
@@ -1199,7 +1226,7 @@ local function stop()
         snapshot[#snapshot + 1] = connection
     end
 
-    -- 状态修改：逐个摘除连接并关闭底层传输。
+    -- 逐个从两个连接索引摘除并关闭 fd；单个关闭会 yield。
     for index = 1, #snapshot do
         local connection = snapshot[index]
         if not connection.closed then
@@ -1209,7 +1236,7 @@ local function stop()
         end
     end
 
-    -- 收尾：所有连接处理完成后发布 stopped 状态。
+    -- 所有连接关闭后标记 stopped；后续 stop 调用只返回零个本次关闭连接。
     module_state.phase = "stopped"
 
     return

@@ -631,7 +631,7 @@ std::uint64_t SegmentLengthMm(const WorldPosition &a, const WorldPosition &b)
     return static_cast<std::uint64_t>(std::llround(std::sqrt(dx * dx + dz * dz)));
 }
 
-// 函数职责：把已经找到的 goal parent 链转换为最终 WorldPosition Path，并收敛业务端点。
+// 函数职责：沿 goal 的 parent 链生成 WorldPosition Path，并用业务起点及可选精确终点替换格子中心坐标。
 // context：当前查询的 NavigationContext；借用 NodeScratch，不转移所有权。
 // map：当前 immutable GridMap；借用，负责 node_index -> GridPos -> WorldPosition。
 // profile/policy/occupancy：与产生 parent 链的查询使用同一份规则和动态事实；只读借用。

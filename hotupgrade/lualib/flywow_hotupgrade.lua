@@ -1,28 +1,28 @@
 --- 现存 Service 的登记与原地更新；所有业务对象、快照和模块表仅留在本 Lua State。
-local skynet = require "skynet" -- 提供 Service 内协程、消息分发和跨 Service 调用。
-local skynet_require = require "skynet.require" -- 用于识别 Skynet 自己的协程 require 加载器。
-local flywow_result = require "flywow_result" -- 构造本模块对外和内部统一使用的 FlyWowResult。
-local hotupgrade_common = require "flywow_hotupgrade_common" -- 提供协议号、路径环境变量以及状态快照的深度和字段数上限。
-local hotupgrade_native = require "flywow_hotupgrade_native" -- 解析模块真实路径，核对来源位于宿主根目录内。
-local hotupgrade_module_patch = require "flywow_hotupgrade_module_patch" -- 在当前 Lua State 中暂存、提交和恢复模块导出。
+local skynet = require "skynet" -- 提供当前 Service 的 RPC、协议分发和协程等待接口。
+local skynet_require = require "skynet.require" -- 用于判断当前 require 是否由 Skynet 协程加载器执行。
+local flywow_result = require "flywow_result" -- 构造本模块统一返回的成功/失败结果表。
+local hotupgrade_common = require "flywow_hotupgrade_common" -- 提供协议号、root_path 环境变量和状态快照上限。
+local hotupgrade_native = require "flywow_hotupgrade_native" -- Native 返回跟随符号链接后的真实路径；本模块据此确认文件仍在宿主目录内。
+local hotupgrade_module_patch = require "flywow_hotupgrade_module_patch" -- 暂存、提交和恢复普通模块的导出字段。
 -- 对宿主公开的受管理 Service 创建、登记与模块 require 入口。
 local M =
 {
-    patching = false, -- prepare 起禁止新业务进入，本批 finish/abort 结束后解除。
+    patching = false, -- Prepare 到 Finish/Abort 期间为 true，业务入口据此拒绝新请求。
 }
 -- 模块级私有状态表保存本 Lua State 共用的登记、当前批次和模块加载记录。
 local module_state =
 {
     hotupgrade_handle    = nil,                              -- 首次跨 Service RPC 时取得；宿主必须先完成控制面初始化。
     registration_config  = nil,                              -- 本 Lua State 的回调配置；登记结果单独保存在 registration_result。
-    registration_result  = nil,                              -- nil 表示无最终结果；配置存在时为 RPC 在途，true/false 表示登记成功/失败。
-    registration_waiters = {},                              -- 登记 RPC yield 期间等待结果的 require 协程；答复后唤醒并清空。
+    registration_result  = nil,                              -- registration_config 设置后，nil 表示登记 RPC 在途；true/false 表示 Controller 接受/拒绝登记。
+    registration_waiters = {},                              -- register_service 的 RPC 等待期间暂停的 require 协程；收到答复后唤醒并清空。
     active_batch         = nil,                              -- 当前批次的恢复数据保留至 finish/abort 确认完成。
     completed_sequence   = 0,                                -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
     last_batch_id        = nil,                              -- 最近完成的批次，用于 finish/abort 幂等响应。
-    declared_modules     = {},                               -- 统一模块名到首次加载名/路径的记录；例如 a/b.lua 会登记为 a.b。
-    module_loads         = {},                               -- 同一规范模块的首次声明串行完成，等待者不能观察半完成的本地状态。
-    module_sources       = setmetatable({}, {__mode = "k"}), -- 仅保存本入口确认的模块表与文件路径；弱键不延长模块生命周期。
+    declared_modules     = {},                               -- 本 State 已登记模块的映射；例如 lualib/a.lua 以 a 为 require 名时记录 a。
+    module_loads         = {},                               -- 正在首次加载的模块；同名并发 require 等它完成后再检查模块结果。
+    module_sources       = setmetatable({}, {__mode = "k"}), -- 已确认模块导出表到真实文件路径的弱映射，不延长模块表生命周期。
 }
 
 ---@class FlyWowHotUpgradeNewModuleContext
@@ -33,7 +33,7 @@ local module_state =
 ---@class FlyWowHotUpgradeServiceBatch
 ---@field batch_id string Controller 为本次发布生成的身份；用于拒绝其他批次的控制命令。
 ---@field sequence integer Controller 单调递增的本地序号；finish/abort 后写入 completed_sequence。
----@field new_module_context? FlyWowHotUpgradeNewModuleContext 本批 Service Patch 声明的新模块名单和 Update 协程身份；hotupgrade.require 据此限制首次加载，候选检查结束后清除。
+---@field new_module_context? FlyWowHotUpgradeNewModuleContext 本批 Service Patch 允许首次加载的模块名及执行 Update 的协程；hotupgrade.require 用它拒绝其他新依赖，候选检查结束后清除。
 ---@field module_stage? FlyWowHotUpgradeModuleStage 候选模块的旧/新导出记录；保留至 Finish 或 Abort。
 ---@field service_patch? FlyWowHotUpgradeServicePatchState Service 私有状态与函数的提交/恢复记录。
 
@@ -114,8 +114,8 @@ skynet.register_protocol({name = "hotupgrade", id = hotupgrade_common.PROTOCOL_I
 ---@param ... any 传给新 Service 的入口参数；Controller 不解析，原样交给 skynet.newservice。
 ---@return integer service_handle 成功返回原生 handle；失败抛错，调用方可按原生 Skynet 入口使用 pcall。
 function M.newservice(service_name, ...)
-    -- 基础设施转发未知启动签名，固定 n 以保留参数个数和 nil。
-    -- Controller 返回的 FlyWowResult；成功值里包含新 Service 的 handle。
+    -- table.pack 保留参数总数和中间的 nil，Controller 会原样转给 skynet.newservice。
+    -- Controller 用 FlyWowResult 返回新 Service handle；本包装把失败转成 Skynet API 风格的异常。
     local answer = skynet.call(get_hotupgrade_handle(), "hotupgrade", "newservice",
         {service_name = service_name, arguments = table.pack(...)})
     assert(answer.ok, tostring(answer.code) .. ": " .. tostring(answer.message))
@@ -132,7 +132,7 @@ function M.uniqueservice(name_or_global, ...)
     local arguments = table.pack(...)
     -- true 重载表示 Skynet 全局唯一名；否则只按 Controller 内的逻辑名查找。
     local global = name_or_global == true
-    -- Controller 用来匹配唯一 Service 的名字；全局重载时改从首个参数取名。
+    -- Skynet 的全局唯一重载把 Service 名放在可变参数首位；本模块拒绝该重载，但仍按原生签名取出名字。
     local name = name_or_global
     if global then
         name = arguments[1]
@@ -140,7 +140,7 @@ function M.uniqueservice(name_or_global, ...)
     end
 
     -- 调用 Controller 查询或创建唯一 Service；返回原生 handle，Skynet RPC 抛错时继续向调用方抛出。
-    -- Controller 返回的 FlyWowResult；成功值里包含唯一 Service 的 handle。
+    -- Controller 用 FlyWowResult 返回唯一 Service handle；RPC 或创建失败仍按 Skynet 入口习惯抛错。
     local answer = skynet.call(get_hotupgrade_handle(), "hotupgrade", "uniqueservice",
         {
             service_name = name,     -- Controller 内复用或创建的 Service 逻辑名。
@@ -234,7 +234,8 @@ local function abort(batch)
         end
     end
 
-    -- 尽力恢复后清除本地批次并开放临时门禁；错误只通过结果报告。
+    -- 恢复尝试结束后清除本地批次并重新开放业务入口；即使部分恢复失败也要结束本次 Abort。
+    -- 每项恢复失败都保留在结果 details.errors 中，供 Controller 和宿主定位未恢复对象。
     close_batch(batch)
     if #errors > 0 then
         return flywow_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
@@ -411,7 +412,7 @@ local function stage_service_patch_and_new_modules(batch, service_patch_source)
         identities[#identities + 1] = identity
     end
 
-    -- 身份集合核验完成后才逐项加载并登记，避免部分加载后才发现清单重复。
+    -- 确认所有声明名都指向不同文件后才开始加载；这样重复声明不会留下已加载一部分的结果。
     for _, identity in ipairs(identities) do
         local load_result = require_module(identity.name, identity)
         if not load_result.ok then
@@ -480,30 +481,29 @@ local function update_batch(batch, request)
     -- 当前 Service 的提交定义和恢复材料；本批没有匹配的 Service Patch 时为 nil。
     local service_patch = service_patch_result.value
 
-    -- 普通候选代码可能依赖本批 Service Patch 声明的新模块；名单保留到候选执行结束，已登记模块可复用，其他未登记模块会被拒绝。
-    -- 普通模块检查会编译并运行候选代码，按 FlyWowResult 报告成功或失败；失败结果由本函数交给 Controller 处理。
+    -- 普通候选可能 require 本批 Service Patch 声明的新模块；Update 协程只能加载清单内模块，其他新依赖会被拒绝。
+    -- 先编译并运行普通模块候选；成功才返回 Stage，失败交给 Controller 决定是否 Abort。
     local module_result = hotupgrade_module_patch.stage(request.modules, module_state.declared_modules)
-    -- 候选检查结束，清除本批新模块名单；之后的首次加载不能再借用这份名单。
+    -- 普通候选执行结束后撤销本批 new_modules 的首次加载权限；之后的 require 走普通许可流程。
     batch.new_module_context = nil
     if not module_result.ok then
         return module_result
     end
 
-    -- 候选模块 Stage 成功后，记录模块暂存和 Service Patch 供提交或恢复。
+    -- 保存普通模块 Stage 和 Service Patch；后续 Commit 使用它们，Abort 用它们恢复。
     batch.module_stage = module_result.value.stage
     batch.service_patch = service_patch
 
-    -- Activate 同步提交；失败先报告，再由 Controller 串行 Abort 整批目标。
-    -- 原地安装候选模块导出的结果；失败后由 Controller 调用 Abort 恢复。
+    -- 先把候选模块字段安装到现有导出表；任一目标失败时 Controller 会对本批已参与目标执行 Abort。
     local commit_result = hotupgrade_module_patch.commit(batch.module_stage)
     if not commit_result.ok then
         return flywow_result.failure("HU_ACTIVATE_FAILED", commit_result.message)
     end
 
-    -- 捕获 Service 状态、函数及 after_upgrade 提交异常，交由 Controller 统一 Abort。
+    -- update_state、函数安装或 after_upgrade 可能抛错；捕获后返回 HU_ACTIVATE_FAILED，由 Controller 执行 Abort。
     local activation_succeeded, after_upgrade_result = pcall(function()
         if service_patch then
-            -- 当前 Service 原有状态表和函数表；更新只改字段，不替换根表。
+            -- Service Patch 只改 state/functions 的字段，保留业务代码已持有的两张根表。
             local service_update = module_state.registration_config.service_update
             service_patch.touched = true
             if service_patch.update_state then
@@ -601,11 +601,11 @@ end
 ---@param request FlyWowHotUpgradeControlRequest RPC 解包得到的批次请求；包含批次身份，Update 时还携带候选源码。
 ---@return nil 回复 FlyWowResult；异常转换沿用 HU_CONTROL_FAILED 和原有 Abort/Finish 清理
 local function dispatch_upgrade_command(session, source, command, request)
-    -- 控制阶段的执行状态和结果；异常在此转换并按发布阶段完成收尾。
+    -- handle_upgrade 或业务回调可能抛错；转换为 HU_CONTROL_FAILED 后按命令决定回滚或只清理已完成记录。
     local control_succeeded, control_result = pcall(handle_upgrade, command, request, source)
     if not control_succeeded then
         -- 异常也必须结束本批；Finish 已越过发布决定，只释放快照而不回滚。
-        -- 原始控制异常结果；Abort 也失败时会作为 details 返回给调用方。
+        -- 保存触发清理的原始异常；若 Abort 也失败，会把两项错误都放进回复 details。
         local original = flywow_result.failure("HU_CONTROL_FAILED", tostring(control_result))
         -- 当前仍未结束的本地批次；Finish 异常只能释放记录，不能回滚已发布更新。
         local batch = module_state.active_batch
@@ -721,12 +721,12 @@ function M.register_service(registration)
     module_state.registration_result = registration_call_succeeded and response_is_result
         and registration_response.ok == true
     -- Controller 答复已固定；唤醒所有因本次登记尚未完成而暂停的 require 协程。
+    -- 每个等待者会读取同一个 registration_result，再决定继续加载还是报告登记失败。
     for _, waiting_require_thread in ipairs(module_state.registration_waiters) do
         skynet.wakeup(waiting_require_thread)
     end
 
-    -- 等待者已收到唤醒信号，释放本轮协程引用。
-    -- RPC 成功时它们继续加载；失败时它们返回 HU_SERVICE_NOT_REGISTERED。
+    -- 全部等待者都已收到唤醒；清空数组，避免继续持有已经恢复的协程。
     module_state.registration_waiters = {}
     -- RPC 失败可能意味着 Controller 已登记；保持本 State 配置，要求宿主终止未 READY 的启动。
     if not registration_call_succeeded or not response_is_result then
@@ -867,7 +867,7 @@ local function load_and_register_module(name, module_identity, new_module_contex
         result = load_module_exports(name, module_identity, attempt)
     end
 
-    -- 本地缓存和声明建立后再向 Controller 登记，避免远端看到未完成的本地状态。
+    -- 先写好本地缓存和模块声明，再向 Controller 登记，避免远端先看到尚未完成的加载。
     if result.ok then
         package.loaded[canonical_name] = attempt.module_exports
         if not module_state.declared_modules[canonical_name] then
@@ -878,8 +878,8 @@ local function load_and_register_module(name, module_identity, new_module_contex
 
         local command
         local request
-        -- 本地登记状态恢复后，尽力通知 Controller 取消未消费的首次加载许可。
-    if attempt.permit_id then
+        -- 本地缓存、来源路径和模块声明已回退；若普通加载许可仍未使用，再通知 Controller 撤销它。
+        if attempt.permit_id then
             command = "register_module"
             request =
             {
@@ -928,7 +928,7 @@ local function load_and_register_module(name, module_identity, new_module_contex
         module_state.declared_modules[canonical_name] = nil
     end
 
-    -- 本地登记状态恢复后，尽力通知 Controller 取消未消费的首次加载许可。
+    -- package.loaded、来源映射和模块声明已回退；若许可尚未消费，再请求 Controller 删除它。
     if attempt.permit_id then
         pcall(skynet.call, get_hotupgrade_handle(), "hotupgrade",
             "cancel_module_load", {name = canonical_name, permit_id = attempt.permit_id})

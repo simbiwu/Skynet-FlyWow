@@ -1440,13 +1440,13 @@ local function update_batch(batch, request)
     if not service_patch_result.ok then
         return service_patch_result
     end
-    -- 当前 Service 的提交定义和恢复材料；本批没有匹配的 Service Patch 时为 nil。
+    -- 当前 Service 的状态迁移、函数替换定义和旧函数快照；本批未匹配 Service Patch 时为 nil。
     local service_patch = service_patch_result.value
 
-    -- 普通候选代码可能依赖本批 Service Patch 声明的新模块；名单保留到候选执行结束，已登记模块可复用，其他未登记模块会被拒绝。
-    -- 普通模块检查会编译并运行候选代码，按 FlyWowResult 报告成功或失败；失败结果由本函数交给 Controller 处理。
+    -- 普通候选可能 require 本批 Service Patch 声明的新模块；仅当前 Update 协程能加载清单内模块，其他新依赖会被拒绝。
+    -- 先编译并运行普通模块候选；成功才返回 Stage，失败结果交给 Controller 决定是否 Abort。
     local module_result = hotupgrade_module_patch.stage(request.modules, module_state.declared_modules)
-    -- 候选检查结束，清除本批新模块名单；之后的首次加载不能再借用这份名单。
+    -- 普通候选执行结束后，撤销本批 new_modules 的首次加载许可；后续 require 按普通流程申请许可。
     batch.new_module_context = nil
     if not module_result.ok then
         return module_result

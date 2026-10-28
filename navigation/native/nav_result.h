@@ -44,7 +44,7 @@ enum class NavError
     kQueryBudgetExceeded,  // 扫掠桶或候选测试预算耗尽。
     kCapacityExceeded,     // 动态资源容量不足；旧状态不变。
     kBlocked,              // 连续移动遭到阻挡。
-    kInternalError,        // Native 未预期异常在 C ABI 边界被收敛，不能继续传播。
+    kInternalError,        // Binding 用此码报告无法继续处理的内部错误，并转换为 Lua 的 INTERNAL_ERROR。
 };
 
 // 返回便于日志和 Lua 错误结果使用的稳定 ASCII 名称。

@@ -49,9 +49,9 @@ end
 --- 统一做 ASCII 小写、全角 ASCII 折叠和开头 BOM 去除。
 --- 原词库在成功创建后可由宿主修改，不影响此对象；更新词库需创建新对象。
 --- 容量和编码错误返回 nil,error；Lua 分配错误仍遵循 Lua 自身异常语义。
----@param word_filter_config flywow_word_filter_config
----@return flywow_word_filter? filter
----@return flywow_word_filter_error? error
+---@param word_filter_config flywow_word_filter_config 宿主提供的词库来源；从 keywords 数组或 file 路径读取，并按 compact 选项构建 Native 词库。
+---@return flywow_word_filter? 成功时返回持有只读词库的 Filter 对象。
+---@return flywow_word_filter_error? 选项、词库、文件或容量不合法时返回稳定错误码。
 function M.new(word_filter_config)
     if type(word_filter_config) ~= "table" then
         return nil, "invalid_options"
@@ -62,6 +62,7 @@ function M.new(word_filter_config)
         return nil, "invalid_options"
     end
 
+    -- 只接受这三个配置项；拼写错误不能被静默忽略后使用默认值。
     for key in pairs(word_filter_config) do
         if key ~= "keywords" and key ~= "file" and key ~= "compact" then
             return nil, "invalid_options"
@@ -101,6 +102,7 @@ function M.new(word_filter_config)
         end
     end
 
+    -- 统一取得最终词库数组后再检查总词数和每项类型，内存输入与文件输入走同一规则。
     local keyword_count = #keywords
     if keyword_count > MAX_KEYWORDS then
         return nil, "dictionary_limit"
@@ -129,14 +131,15 @@ end
 --- 返回全部命中，包括重叠项；按原文 byte 起点、词库 ID 排序，结果归调用者所有。
 --- 文本最多 65536 bytes、命中最多 4096 项；错误返回 nil,error，不返回部分结果。
 ---@param text string 原文，允许内嵌 NUL；不能包含非法 UTF-8
----@return flywow_word_filter_match[]? matches
----@return flywow_word_filter_error? error
+---@return flywow_word_filter_match[]? 成功时返回按原文 byte 起点和 keyword_id 排序的全部命中；未命中返回空数组。
+---@return flywow_word_filter_error? 非法 UTF-8、输入过长或结果超限时返回稳定错误码。
 function Filter:find(text)
     local matches, error_value = word_filter_native.find(self.native_handle, text)
     if not matches then
         return nil, native_error_code(error_value)
     end
 
+    -- Native 返回全部命中但不保证顺序；按公开合同排序后再交给调用方。
     table.sort(matches, function(left, right)
         if left.offset ~= right.offset then
             return left.offset < right.offset
@@ -148,10 +151,11 @@ end
 
 --- 检测是否命中；false 只表示未命中，nil,error 表示失败，业务必须区分。
 --- 复用完整 find，容量与分配行为相同，不是找到首项便提前退出的接口。
----@param text string
----@return boolean? matched
----@return flywow_word_filter_error? error
+---@param text string 待检查的 UTF-8 原文；允许内嵌 NUL，长度和编码限制与 find 相同。
+---@return boolean? 成功时 true 表示至少命中一项，false 是正常的未命中结果。
+---@return flywow_word_filter_error? 输入或命中数量超限时返回稳定错误码，不能把 nil 当作未命中。
 function Filter:contains(text)
+    -- 复用 find 的完整查询结果；只有查找成功后才能判断是否存在命中。
     local matches, error_code = self:find(text)
     if not matches then
         return nil, error_code
@@ -161,10 +165,10 @@ end
 
 --- 合并重叠命中后，每个合并区间替换一次；原文保持不变，新文本归调用者所有。
 --- 默认 replacement="*"；相邻但不重叠的命中分别替换，错误返回 nil,error。
----@param text string
----@param replacement? string 合法 UTF-8，允许空串，最多 256 bytes
----@return string? filtered
----@return flywow_word_filter_error? error
+---@param text string 需要过滤的 UTF-8 原文；允许内嵌 NUL，长度和编码限制与 find 相同。
+---@param replacement? string 每个合并命中区间写入的替换文本；缺省为星号，允许空串，最多 256 bytes。
+---@return string? 成功时返回新字符串；原文不变。
+---@return flywow_word_filter_error? 原文、替换文本或命中容量不合法时返回稳定错误码。
 function Filter:replace(text, replacement)
     if replacement == nil then
         replacement = "*"
@@ -174,11 +178,13 @@ function Filter:replace(text, replacement)
         return nil, "invalid_replacement"
     end
 
+    -- 替换文本已校验；再取得完整命中，查询失败时不生成部分过滤结果。
     local matches, error_code = self:find(text)
     if not matches then
         return nil, error_code
     end
 
+    -- 查询成功后按原文 byte 区间拼新字符串；原文及命中表均不修改。
     local parts = {}           -- 按原文顺序积累保留片段和替换文本，最后一次拼接。
     local next_source_byte = 1 -- 尚未输出的原文字节起点，区间写出后前移。
     local span_start_byte      -- 当前合并命中区间起点；nil 表示尚无待输出区间。
@@ -206,6 +212,8 @@ function Filter:replace(text, replacement)
         parts[#parts + 1] = replacement
         next_source_byte = span_end_byte + 1
     end
+
+    -- 已输出全部合并命中；保留最后一个命中之后的原文后再拼接结果。
     parts[#parts + 1] = text:sub(next_source_byte)
     return table.concat(parts)
 end

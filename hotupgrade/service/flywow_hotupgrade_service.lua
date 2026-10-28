@@ -1,37 +1,36 @@
 --- 唯一控制 Service；宿主通过一次性 lua/init 交付配置。
-local skynet = require "skynet" -- 注册协议和分发消息，提供当前 Service handle 与 RPC 返回。
-local hotupgrade_controller = require "flywow_hotupgrade_controller" -- 持有唯一控制面状态并执行管理命令。
-local flywow_result = require "flywow_result" -- 将入口校验和 Controller 异常转换为统一结果表。
+local skynet = require "skynet" -- 注册控制协议、分发 RPC，并向调用方回复处理结果。
+local hotupgrade_controller = require "flywow_hotupgrade_controller" -- 保存热更批次和 Service 登记记录。
+local flywow_result = require "flywow_result" -- 构造协议回复中的成功或失败结果。
 local hotupgrade_common = require "flywow_hotupgrade_common" -- 提供 HotUpgrade 原生消息协议号。
 local skynet_core = require "skynet.core" -- 查询并设置 Skynet 进程级退出监视器。
-local controller_initialized = false -- 成功 init 后锁定配置；失败时保持 false 以允许重试。
+local controller_initialized = false -- 只有初始化成功后才接收管理命令；失败时宿主可重试 init。
 
 skynet.register_protocol(
 {
-    name   = "hotupgrade",                    -- Controller 与目标 Service 共用的原生控制协议名。
-    id     = hotupgrade_common.PROTOCOL_ID,    -- 本框架固定的 Skynet 协议号。
-    pack   = skynet.pack,                      -- 沿用 Skynet 默认序列化器。
-    unpack = skynet.unpack,                    -- 沿用 Skynet 默认反序列化器。
+    name   = "hotupgrade",                 -- Controller 与目标 Service 用此协议传递控制命令。
+    id     = hotupgrade_common.PROTOCOL_ID, -- 双方共同注册的协议编号。
+    pack   = skynet.pack,                   -- 使用 Skynet 的原生序列化函数。
+    unpack = skynet.unpack,                 -- 使用 Skynet 的原生反序列化函数。
 })
 -- client 消息只用于通知 Service 退出，没有请求体，因此解包回调不返回参数。
 skynet.register_protocol(
 {
-    name   = "client",                    -- Skynet 原生客户端协议；这里仅接收 Service 退出通知。
-    id     = skynet.PTYPE_CLIENT,          -- 使用 Skynet 预定义的客户端消息类型。
-    unpack = function() end,               -- 退出通知没有请求体，不产生解包参数。
+    name   = "client",           -- 接收 Skynet 发来的进程退出通知。
+    id     = skynet.PTYPE_CLIENT, -- 使用 Skynet 预定义的 client 消息类型。
+    unpack = function() end,     -- MONITOR 退出通知没有请求体需要解包。
 })
 
 skynet.start(function()
     skynet.dispatch("lua", function(session, _source, command, controller_config)
-        -- 当前 init 请求最终回复给宿主的结果，所有分支都在这里形成它。
+        -- 该 init RPC 的唯一回复值；参数错误、重复初始化和初始化结果都在这里返回。
         local answer
         if command ~= "init" then
             answer = flywow_result.failure("HU_UNKNOWN_COMMAND", tostring(command))
         elseif controller_initialized then
             answer = flywow_result.failure("HU_ALREADY_INITIALIZED", "控制面已初始化")
         else
-            -- MONITOR 是进程级单例；先查询，已有宿主监视器时不能覆盖。
-            -- 进程当前的退出监视器；已被宿主占用时 HotUpgrade 不覆盖它。
+            -- MONITOR 是进程级单例；宿主已设置时不能用 HotUpgrade 的地址覆盖。
             local monitor = skynet_core.command("MONITOR")
             if monitor then
                 answer = flywow_result.failure("HU_MONITOR_OCCUPIED", "进程退出监视器已被占用: " .. monitor)
@@ -60,13 +59,13 @@ skynet.start(function()
     end)
 
     skynet.dispatch("hotupgrade", function(session, source, command, request)
-        -- request 是解包后的管理/许可请求；source 来自消息头，Controller 用它核对创建者、登记者和当前更新目标。
-        -- 当前管理请求最终返回给调用方的 FlyWowResult。
+        -- request 是解包后的管理/许可内容；source 是消息发送方 handle，Controller 用它核对请求权限。
+        -- Controller 返回 FlyWowResult；校验失败、命令失败和成功结果最终都通过它回复调用方。
         local answer
         if not controller_initialized then
             answer = flywow_result.failure("HU_NOT_INITIALIZED", "宿主尚未完成 init")
         else
-            -- Controller 命令调用是否正常返回，以及它产生的结果或异常。
+            -- Controller 命令可能抛出意外异常；协议入口将异常转换为失败回复。
             local command_succeeded, command_result = pcall(
                 hotupgrade_controller.handle_command, hotupgrade_controller, command, request, source)
             if not command_succeeded then

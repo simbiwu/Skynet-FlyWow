@@ -39,7 +39,7 @@ scenarios["interleaved"] = function()
         end)
         assert(coroutine.resume(waiter))
     end
-    -- 在创建仍未收敛时开始的批次受理结果。
+    -- Service 创建还未返回 handle 时启动批次；该批次应等待创建完成，再决定是否继续。
     local waiting_batch = interleaved:handle_command("begin", {path = "module"}, 1)
     assert(waiting_batch.ok and lifecycle_status(interleaved).phase == "WAITING_CREATIONS")
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
@@ -61,8 +61,8 @@ scenarios["creation_returned"] = function()
     local instance = initialize_controller()
     -- 原生创建请求最终结果；与业务 register 是否完成分开观察。
     local created -- 原生创建返回结果；与业务 register 的完成时间分开观察。
-    -- 不属于受管理创建的 register 结果；创建记录收敛后必须立即失败。
-    local unknown -- 未知来源的登记结果；原生创建收敛后必须立即返回。
+    -- 该来源没有对应的受管理创建记录；newservice 返回并完成 handle 索引后，register 必须立即以 HU_CREATION_MISSING 失败。
+    local unknown -- 未知来源 register 的结果；handle 索引完成后应返回 HU_CREATION_MISSING，不再等待业务登记。
     module_state.launch_hook = function() coroutine.yield() end
     -- 模拟原始创建者的协程句柄。
     local creator = coroutine.create(function()

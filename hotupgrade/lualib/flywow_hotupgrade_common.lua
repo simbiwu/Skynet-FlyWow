@@ -18,7 +18,7 @@ function M.normalize_source(source)
 
     -- BOM 清理后再移除首行 shebang，同时保留原源码行号。
     if source:sub(1, 1) == "#" then
-        -- 源码中第一个换行位置；用于检查并移除文件开头的 UTF-8 BOM。
+        -- 首行内容可能是 shebang；保留它原来的换行符，让 load 报告的行号与磁盘文件一致。
         local newline = source:find("\n", 1, true)
         source = newline and source:sub(newline) or "\n"
     end

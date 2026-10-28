@@ -1,4 +1,4 @@
---- 唯一控制面：读取并固定本批 Patch 内容，再串行协调现存目标；只保存进程内状态。
+--- Controller 固定本批发布文件，按顺序通知已登记 Service，并保存每个目标的结果。
 local skynet = require "skynet"
 -- 为取消尚未完成登记的 Service 提供 skynet.kill 管理接口。
 require "skynet.manager"
@@ -255,7 +255,7 @@ function M.initialize(controller_config)
         return flywow_result.failure("HU_ALREADY_INITIALIZED", "控制面已初始化")
     end
 
-    -- 校验成功后构造初始化候选；提交前模块表的长期状态字段保持 nil。
+    -- 先把初始字段放入临时表；路径检查全部通过后才写入 Controller。
     local controller_initial_state =
     {
         root_path                     = root_path,                                      -- 已解析的宿主根目录；Controller 的正式文件读取、部署和恢复共用此根。
@@ -279,7 +279,7 @@ function M.initialize(controller_config)
         skynet.setenv(hotupgrade_common.ROOT_PATH_ENV, root_path)
     end
 
-    -- 校验和路径解析全部成功后才发布运行状态，失败不会留下半初始化控制面。
+    -- 只有路径解析全部成功才发布运行字段；失败时 Controller 仍未初始化。
     for name, value in pairs(controller_initial_state) do
         M[name] = value
     end
@@ -341,7 +341,7 @@ function M:on_service_exit(service_handle)
         self:finish_creation(creation)
     end
 
-    -- 唯一创建索引清理完成后，撤销该 Service 尚未消费的模块许可。
+    -- 撤销此 Service 尚未完成的首次加载许可，避免退出的进程继续阻塞批次。
     for permit_id, permit in pairs(self.module_load_permits) do
         if permit.service_handle == service_handle then
             self.module_load_permits[permit_id] = nil
@@ -420,8 +420,8 @@ end
 function M:wait_lifecycle()
     -- lifecycle_gate_waiters 保存尚未受理的请求协程，不属于 pending_creations 或模块许可屏障。
     while lifecycle_closed(self) do
-        -- 当前调用方协程；唯一 Service 尚在创建时登记为同名创建的等待者。
-        -- 当前 register 协程；等待真实创建 handle 后再继续绑定 Service。
+        -- 这里可能是 newservice、uniqueservice 或首次 require 请求；它们都要等创建/更新门禁开放。
+        -- 保存当前 RPC 协程；入口开放后唤醒它，让请求重新检查唯一名、许可和批次条件。
         local waiter = coroutine.running()
         self.lifecycle_gate_waiters[waiter] = true
         skynet.wait(waiter)
@@ -528,7 +528,7 @@ function M:uniqueservice(request, source)
         if unique_service_entry.service_handle then
             return flywow_result.success({service_handle = unique_service_entry.service_handle})
         end
-        -- 当前 register 协程；等待原生创建返回后，再用真实 handle 查找记录。
+        -- 保存当前 uniqueservice RPC 协程；原生创建返回 handle 后唤醒它，并返回该 handle 或创建错误。
         local waiter = coroutine.running()
         unique_service_entry.waiters[waiter] = true
         skynet.wait(waiter)
@@ -536,14 +536,14 @@ function M:uniqueservice(request, source)
         return unique_service_entry.error or flywow_result.success({service_handle = unique_service_entry.service_handle})
     end
 
-    -- 没有可复用的在途或已创建记录时，建立同名创建的共享结果槽。
+    -- 没有同名实例或创建在途时，先建立一条共享记录，再启动一次 Service 创建。
     ---@type FlyWowHotUpgradeUniqueServiceEntry
     unique_service_entry =
     {
         waiters = {}, -- 同名创建尚未完成时暂存调用协程；创建结果确定后全部唤醒。
     }
     self.unique_service_entries[request.service_name] = unique_service_entry
-    -- 原生创建调用是否正常返回，以及创建成功的 handle 或失败信息。
+    -- 把创建结果写进共享记录；同名等待者醒来后从这条记录读取 handle 或错误。
     local creation_result = start_service(self, request, source, request.service_name)
     if creation_result.ok then
         unique_service_entry.service_handle = creation_result.value.service_handle
@@ -602,7 +602,7 @@ function M:cancel_service_creation(request, source)
         return flywow_result.failure("HU_UNAUTHORIZED", "只有创建者可以取消该 Service")
     end
 
-    -- Skynet 是否接受终止请求，以及异常时返回的原因。
+    -- skynet.kill 抛错时转换为取消失败结果，并保留原生错误内容。
     local kill_succeeded, kill_failure = pcall(skynet.kill, request.service_handle)
     if not kill_succeeded then
         return flywow_result.failure("HU_SERVICE_CANCEL_FAILED", tostring(kill_failure))
@@ -766,14 +766,14 @@ function M:register(request, service_handle)
         return flywow_result.failure("HU_INVALID_OPTIONS", "模块声明数组有空洞")
     end
 
-    -- 不猜测名称或创建顺序；原生调用返回前，登记必须让出执行权等待真实 handle。
+    -- register 可能先于 newservice 返回；这里 yield 等真实 handle 建好索引后再完成登记。
     local creation = self.service_creations[service_handle]
     while not creation do
         if not has_unreturned_native_creation(self) then
             return flywow_result.failure("HU_CREATION_MISSING", "来源不是受管理入口创建的待登记 Service")
         end
 
-        -- 当前 register 协程；等待原生创建返回后再用真实 handle 完成 Service 绑定。
+        -- 保存 register RPC 协程；newservice 返回真实 handle 后唤醒它继续绑定登记。
         local waiter = coroutine.running()
         self.service_registration_waiters[waiter] = true
         skynet.wait(waiter)
@@ -816,10 +816,10 @@ local function match_service_targets(batch, registered_services)
         service_targets_by_handle[service_target.service_handle] = service_target
     end
 
-    -- 旧目标索引准备完成后，建立本轮匹配结果及新目标计数。
-    local service_targets = {} -- 本轮完整匹配成功后才交回批次。
-    local matched_services = {} -- .patch 必须匹配至少一个已登记且支持更新的 Service。
-    local needs_prepare = false -- 返回是否有尚未 Prepare 的匹配目标，供 run_batch 决定是否再循环。
+    -- 暂存按最新登记表生成的目标；全部匹配成功后才替换批次原有列表。
+    local service_targets = {} -- 保存本轮匹配到的 Service 及它们将收到的候选模块。
+    local matched_services = {} -- 记录每个 .patch 是否匹配到支持更新的已登记 Service。
+    local needs_prepare = false -- 有新目标尚未 Prepare 时置 true，run_batch 会再匹配一轮。
     -- 以最新登记表重建目标清单，并在生成目标时同时计算是否需要再做一轮 Prepare。
     for _, service_registration in pairs(registered_services) do
         -- 登记记录的 modules 是名称集合；本地 modules 则保存本目标真正要收到的候选源码项。
@@ -978,7 +978,7 @@ end
 ---@param batch FlyWowHotUpgradeBatch begin 创建并固定了 patch_dir 的本批记录；本函数补充文件集合和 service_targets。
 ---@return FlyWowResult<{needs_prepare:boolean}> 成功时已读取并固定发布文件、完成目标匹配；失败时携带稳定错误码。
 function M:load_patch(batch)
-    -- 本批正式 Lua 文件和候选源码的读取结果；失败时直接返回错误，不进行目标匹配。
+    -- 读取并固定发布源码，建立文件清单；读取或语法检查失败时不开始目标匹配。
     local frozen = freeze_patch_files(self, batch)
     if not frozen.ok then
         return frozen
@@ -986,7 +986,7 @@ function M:load_patch(batch)
     return match_service_targets(batch, self.service_registrations)
 end
 
---- 向一个目标 Service 发送 prepare、update、abort 或 finish RPC，并记录发送和返回结果。
+--- 向一个目标 Service 发送 prepare、update、abort 或 finish RPC，并返回远端结果或 RPC 失败结果。
 --- Skynet call 可能 yield；RPC 异常转换为 FlyWowResult，不推断远端是否已执行。
 ---@param batch FlyWowHotUpgradeBatch 当前发布记录；本函数保存正在处理的 Service handle 和结果。
 ---@param service_target FlyWowHotUpgradeServiceTarget 本次要更新的 Service 及其匹配结果；本函数读取 handle、普通模块源码和可选 Service .patch。
@@ -1010,7 +1010,7 @@ function M:step(batch, service_target, command)
         return service_target.hotupgrade_result
     end
 
-    -- 目标 Service RPC 是否正常返回，以及它对本步控制命令的结果。
+    -- 捕获 skynet.call 的 RPC 异常并转换为 FlyWowResult；不猜测远端是否已执行。
     local call_succeeded, service_result = pcall(skynet.call,
         service_target.service_handle, "hotupgrade", command, request)
     if service_target.exited then
@@ -1020,7 +1020,7 @@ function M:step(batch, service_target, command)
         return flywow_result.failure("HU_RPC_FAILED", tostring(service_result), {step = command})
     end
 
-    -- 确认目标返回合法 FlyWowResult 后，为失败消息加上对应的 Service .patch 路径。
+    -- Service Patch 失败时附上脚本路径，便于定位发布包中的文件。
     if not service_result.ok and service_target.service_patch then
         service_result.message = service_target.service_patch.patch_relative_path .. ": " .. (service_result.message or service_result.code)
     end

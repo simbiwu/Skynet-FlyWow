@@ -1,7 +1,7 @@
 --- 本 Lua State 的完整模块更新；保留导出表身份，候选私有状态与旧版本隔离。
 --- 只替换导出字段，不重绑定函数 upvalue；旧函数引用和候选根表引用均保留原 Lua 语义。
-local flywow_result = require "flywow_result" -- 本模块向 HotUpgrade Service 返回统一结构化结果。
-local hotupgrade_common = require "flywow_hotupgrade_common" -- 提供状态图复制的深度和字段数量上限。
+local flywow_result = require "flywow_result" -- 为 Stage、Commit、Abort 和 Finish 返回统一的成功或失败结果。
+local hotupgrade_common = require "flywow_hotupgrade_common" -- 提供默认状态快照允许的最大嵌套层数和字段数。
 -- 对 Service 暴露普通状态快照、候选 Stage、Commit、Abort 和 Finish 操作。
 local M = {}
 -- 暂存记录在模块 API 间共享，直到同一批次 Finish 或 Abort 才释放。
@@ -17,11 +17,11 @@ local module_state =
 --- 复制普通 Lua 状态图；数据限制失败时返回结构化错误。
 ---@param source_graph any 业务状态根值；只接受 nil、string、boolean、number 和普通 table。
 ---@param target_graph? table 可选的现存目标根表；成功时原地更新。
----@return FlyWowResult<any> 成功载荷为复制结果；失败返回 HU_STATE_COPY_FAILED。
+---@return FlyWowResult<any> 成功载荷为复制后的值；失败返回 HU_STATE_COPY_FAILED。
 local function copy_state_graph(source_graph, target_graph)
     local copied_tables = {}
     local field_count = 0
-    --- 递归复制标量或子表，并保留共享引用和循环引用。
+    --- 递归复制状态值；子表保留共享引用和循环引用。
     ---@param source_value any 当前待复制的状态值；由父表遍历时传入。
     ---@param nesting_depth integer 当前值相对根表的层数；用于状态深度上限。
     ---@return FlyWowResult<any> 成功载荷为复制值；不支持的数据返回 HU_STATE_COPY_FAILED。
@@ -35,6 +35,7 @@ local function copy_state_graph(source_graph, target_graph)
             return flywow_result.failure("HU_STATE_COPY_FAILED", "状态快照只接受普通数据")
         end
 
+        -- 标量已在上面处理；接下来只接受无元表的普通 table。
         if getmetatable(source_value) ~= nil then
             return flywow_result.failure("HU_STATE_COPY_FAILED", "状态对象需要显式快照和恢复处理")
         end
@@ -45,7 +46,7 @@ local function copy_state_graph(source_graph, target_graph)
             return flywow_result.failure("HU_STATE_COPY_FAILED", "状态快照嵌套超过限制")
         end
 
-        -- 根层复用调用方提供的目标表，嵌套层按需创建新的普通表。
+        -- 根状态写回调用方传入的目标表，内部子表创建新表，避免共享线上对象。
         local target_table = nesting_depth == 1 and target_graph or nil
         if not target_table then
             target_table = {}
@@ -74,8 +75,8 @@ local function copy_state_graph(source_graph, target_graph)
             end
             fields[#fields + 1] =
             {
-                key   = key,                 -- 源状态表中的字段键，复制到目标表时保持不变。
-                value = child_result.value, -- 已完成校验的复制值；全部字段成功后才写入目标表。
+                key   = key,                 -- 源表字段名；复制到快照时保持原值。
+                value = child_result.value, -- 已完成递归校验的字段值；整张图通过后才写入目标表。
             }
         end
 
@@ -185,7 +186,7 @@ local function check_exports(module_exports, module_name)
     if (module_exports.export_state == nil) ~= (module_exports.import_state == nil) then
         return invalid("状态钩子须成对")
     end
-    -- 钩子成对存在后，分别验证它们确实可调用。
+    -- 两个状态迁移钩子必须同时存在，并且都必须是函数。
     if module_exports.export_state ~= nil and
         (type(module_exports.export_state) ~= "function" or type(module_exports.import_state) ~= "function") then
         return invalid("状态钩子必须是函数")
@@ -206,11 +207,11 @@ function M.stage(module_patches, module_loaders)
     -- 保存本批各模块的线上表和旧字段；Commit 安装新字段，Abort 恢复旧字段，Finish 释放记录。
     local module_stage =
     {
-        entries   = {},     -- 每个候选模块的线上表、旧字段、编译结果和候选导出；Commit/Abort 使用，Finish 清空。
-        committed = false, -- Commit 开始改写线上导出后置为 true；Abort 据此恢复旧字段。
+        entries   = {},     -- 每个模块的线上表、旧字段和候选导出；Commit 安装，Abort 恢复，Finish 释放。
+        committed = false, -- 只要开始替换线上导出就置 true；即使部分模块失败，Abort 也会恢复。
     }
-    -- 导出检查或状态复制失败时，统一返回 HU_MODULE_STAGE_FAILED，并把原始错误码写入 details.cause_code。
-    --- 导出检查或状态复制失败时，保留原始错误码并返回 HU_MODULE_STAGE_FAILED。
+    -- Stage 的公开失败码固定为 HU_MODULE_STAGE_FAILED；具体失败原因保留在 details.cause_code。
+    --- 将导出检查或状态快照的失败转换为 Stage 合同，同时保留原始错误码。
     ---@param result FlyWowResult<nil> 导出检查或快照复制产生的失败结果。
     ---@return FlyWowResult<nil> HU_MODULE_STAGE_FAILED；原始错误码写入 details.cause_code。
     local function reject_stage(result)
@@ -239,13 +240,13 @@ function M.stage(module_patches, module_loaders)
         local loader = module_loaders and module_loaders[module_patch.name]
         module_stage.entries[#module_stage.entries + 1] =
         {
-            name        = module_patch.name, -- package.loaded 中线上模块的名字，也是错误信息中的模块名。
-            live        = live,              -- 现有导出根表；Commit 原地改它，Abort 保留并恢复同一对象。
-            old         = fields,            -- Stage 前保存的导出字段；Abort 用它恢复线上模块。
-            chunk       = chunk,             -- 已编译的候选源码；下一阶段运行它并检查新导出表。
-            loader_name = loader and loader.name or module_patch.name, -- 候选 chunk 收到的原始 require 名。
-            loader_path = loader and loader.path, -- 候选 chunk 收到的来源路径；无首次加载元数据时为 nil。
-            candidate   = nil,               -- 候选 chunk 执行后保存的新导出表；Commit 从中安装字段。
+            name        = module_patch.name, -- package.loaded 中当前线上模块的名称。
+            live        = live,              -- 业务代码正在使用的导出表；Commit/Abort 都保留这张表本身。
+            old         = fields,            -- 更新前字段和值的引用；Abort 用它装回旧版本。
+            chunk       = chunk,             -- 编译后的候选代码；下一阶段执行并检查其返回表。
+            loader_name = loader and loader.name or module_patch.name, -- 保留首次 require 使用的名称，作为候选 chunk 的第一个参数。
+            loader_path = loader and loader.path, -- 保留首次加载文件路径，作为候选 chunk 的第二个参数；无记录时为 nil。
+            candidate   = nil,               -- 候选 chunk 返回的新表；Commit 从中复制字段到 live。
         }
     end
 
@@ -323,7 +324,7 @@ function M.commit(module_stage)
         end
     end
 
-    -- 整批候选是否成功安装，以及安装异常；失败后 Controller 会调用 Abort。
+    -- 捕获替换导出字段时的意外异常；Controller 收到失败结果后会调用 Abort。
     local commit_succeeded, commit_failure = pcall(function()
         -- 所有候选已在 Stage 完成检查，现在原地替换每个模块的完整导出字段。
         module_stage.committed = true
@@ -345,12 +346,12 @@ function M.abort(module_stage)
         return flywow_result.failure("HU_PHASE_INVALID", "模块 Stage 不属于当前更新")
     end
 
-    -- 尝试恢复每个模块并收集全部故障；单个模块失败不跳过其他模块。
-    -- 收集每个模块恢复失败的原因；单项失败不跳过其余模块。
+    -- 逐个尝试恢复线上表；单个模块失败不能阻止后面的模块恢复。
+    -- 每个失败原因都暂存到 errors，循环结束后合并到 HU_RECOVERY_REQUIRED。
     local errors = {}
     -- 当前需要恢复的模块记录，包含线上根表和 Stage 时保存的旧字段。
     for _, entry in ipairs(module_stage.entries) do
-        -- 缓存身份变化时记录失败，并继续尝试恢复其他模块。
+        -- package.loaded 若已指向别的表，就不能覆盖它；记录失败后继续恢复下一模块。
         if package.loaded[entry.name] ~= entry.live or getmetatable(entry.live) ~= nil then
             errors[#errors + 1] = "模块缓存身份或元表变化: " .. entry.name
         elseif module_stage.committed then
@@ -362,8 +363,8 @@ function M.abort(module_stage)
         end
     end
 
-    -- 所有恢复项都已尝试；失败仍报告，但本批快照不阻塞下一次 Stage。
-    -- 清理本批模块记录的结果；无论某项恢复失败都释放 Stage。
+    -- 恢复尝试结束后释放本批暂存记录，避免错误阻止下一次 Stage。
+    -- 即使某个模块恢复失败也已逐项尝试；失败原因会随 HU_RECOVERY_REQUIRED 返回。
     local finished = M.finish(module_stage)
     if #errors > 0 then
         return flywow_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
