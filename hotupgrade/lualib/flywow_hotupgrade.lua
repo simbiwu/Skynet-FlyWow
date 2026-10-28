@@ -34,7 +34,7 @@ local module_state =
 ---@class FlyWowHotUpgradeServiceBatch
 ---@field batch_id string Controller 为本次发布生成的身份；用于拒绝其他批次的控制命令。
 ---@field sequence integer Controller 单调递增的本地序号；finish/abort 后写入 completed_sequence。
----@field new_module_context? FlyWowHotUpgradeNewModuleContext Update 中的临时声明权限；候选 Stage 完成后立即清除。
+---@field new_module_context? FlyWowHotUpgradeNewModuleContext 本批 Service Patch 声明的新模块名单和 Update 协程身份；hotupgrade.require 据此限制首次加载，候选检查结束后清除。
 ---@field module_stage? FlyWowHotUpgradeModuleStage 候选模块的旧/新导出记录；保留至 Finish 或 Abort。
 ---@field service_patch? FlyWowHotUpgradeServicePatchState Service 私有状态与函数的提交/恢复记录。
 
@@ -477,9 +477,10 @@ local function update_batch(batch, request)
     -- 当前 Service 的提交定义和恢复材料；本批没有匹配的 Service Patch 时为 nil。
     local service_patch = service_patch_result.value
 
-    -- 保留同一声明上下文直到候选模块执行结束，漏列的新依赖须立即失败，不能在 UPDATE 等许可。
-    -- 普通模块候选 Stage 的执行状态和结果；失败时需清除临时新模块加载权限。
+    -- 普通候选代码可能依赖本批 Service Patch 声明的新模块；名单保留到候选执行结束，已登记模块可复用，其他未登记模块会被拒绝。
+    -- 普通模块检查会编译并运行候选代码，按 FlyWowResult 报告成功或失败；失败结果由本函数交给 Controller 处理。
     local module_result = hotupgrade_module_patch.stage(request.modules, module_state.declared_modules)
+    -- 候选检查结束，清除本批新模块名单；之后的首次加载不能再借用这份名单。
     batch.new_module_context = nil
     if not module_result.ok then
         return module_result

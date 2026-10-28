@@ -1446,17 +1446,11 @@ local function update_batch(batch, request)
     -- 当前 Service 的提交定义和恢复材料；本批没有匹配的 Service Patch 时为 nil。
     local service_patch = service_patch_result.value
 
-    -- 保留同一声明上下文直到候选模块执行结束，漏列的新依赖须立即失败，不能在 UPDATE 等许可。
-    -- 普通模块候选 Stage 的执行状态和结果；失败时需清除临时新模块加载权限。
-    local stage_succeeded, module_result = pcall(hotupgrade_module_patch.stage,
-        request.modules, module_state.declared_modules)
+    -- 普通候选代码可能依赖本批 Service Patch 声明的新模块；名单保留到候选执行结束，已登记模块可复用，其他未登记模块会被拒绝。
+    -- 普通模块检查会编译并运行候选代码，按 FlyWowResult 报告成功或失败；失败结果由本函数交给 Controller 处理。
+    local module_result = hotupgrade_module_patch.stage(request.modules, module_state.declared_modules)
+    -- 候选检查结束，清除本批新模块名单；之后的首次加载不能再借用这份名单。
     batch.new_module_context = nil
-    if not stage_succeeded then
-        -- 内部若已返回 FlyWowResult 则保留其错误码，普通 Lua 异常由本阶段错误码包装。
-        local cause = type(module_result) == "table" and module_result.ok == false and module_result or nil
-        return flywow_result.failure("HU_MODULE_STAGE_FAILED",
-            cause and cause.message or tostring(module_result), cause and {cause_code = cause.code} or nil)
-    end
     if not module_result.ok then
         return module_result
     end
@@ -1524,8 +1518,10 @@ Controller 在 `update_batch_targets()` 中按去重后的 Service handle 顺序
 
 ```lua
 -- 真实调用位置：flywow_hotupgrade.lua / update_batch(batch, request)。
-local stage_succeeded, module_result = pcall(hotupgrade_module_patch.stage,
-    request.modules, module_state.declared_modules)
+local module_result = hotupgrade_module_patch.stage(request.modules, module_state.declared_modules)
+if not module_result.ok then
+    return module_result
+end
 ```
 
 `request.modules` 不是“所有发布文件”，而是 **Controller 对这个 Service 匹配出来的已有模块更新清单**。在我们的实验里主要是 `lualib.player_logic`；新增 `lualib.combat_rules` 此前不存在，因此不参加本批普通模块的 Stage。
