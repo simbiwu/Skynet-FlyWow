@@ -165,7 +165,7 @@ end
 ---@field error? FlyWowResult 本批失败诊断
 
 ---@class FlyWowHotUpgradePatchFile
----@field entry_file string 宿主根目录下的 Lua 相对路径；部署和恢复均使用此路径
+---@field host_relative_path string 相对于 Controller.root_path 的 Lua 文件路径；例如 lualib/player_logic.lua；部署和恢复都使用该路径
 ---@field source string 从本批 Patch 读取并固定的 Lua 文件内容，作为正式部署内容
 ---@field old_source? string|false 部署前的正式文件内容；false 表示文件原先不存在，nil 表示尚未完成快照
 ---@field touched? boolean 仅在正式文件替换成功后设为 true，决定失败时是否恢复
@@ -175,7 +175,7 @@ end
 ---@field source string 本批读取并固定的模块源码，随 Update 发给匹配 Service
 
 ---@class FlyWowHotUpgradeServicePatchSource
----@field entry_file string 发布包内 Service .patch 的相对路径，用于错误诊断
+---@field patch_relative_path string 相对于本批 patch_dir 的 Service .patch 路径，例如 service/player_service.patch；用于目标匹配和错误诊断，不用于宿主部署
 ---@field service_patch_source string 本批读取并固定的 Service .patch 源码，随 Update 请求发送
 
 ---@class FlyWowHotUpgradeBatch
@@ -833,11 +833,11 @@ local function match_service_targets(batch, registered_services)
         -- 与当前 Service 入口名匹配的 .patch；没有对应文件时为 nil。
         local service_patch = batch.service_patches[service_registration.service_name]
         if service_patch and not service_registration.has_service_update then
-            return flywow_result.failure("HU_SERVICE_PATCH_UNSUPPORTED", batch.patch_dir .. "/" .. service_patch.entry_file
+            return flywow_result.failure("HU_SERVICE_PATCH_UNSUPPORTED", batch.patch_dir .. "/" .. service_patch.patch_relative_path
                 .. ": 目标 " .. service_registration.service_handle .. " 未提供 Service 内部更新入口")
         end
         if service_patch then
-            matched_services[service_patch.entry_file] = true
+            matched_services[service_patch.patch_relative_path] = true
         end
 
         if #modules > 0 or service_patch then
@@ -863,8 +863,8 @@ local function match_service_targets(batch, registered_services)
 
     -- 先确保每个 Service .patch 都有真实目标；验证完整后才替换批次目标快照。
     for service_name, service_patch in pairs(batch.service_patches) do
-        if not matched_services[service_patch.entry_file] then
-            return flywow_result.failure("HU_TARGET_MISSING", batch.patch_dir .. "/" .. service_patch.entry_file
+        if not matched_services[service_patch.patch_relative_path] then
+            return flywow_result.failure("HU_TARGET_MISSING", batch.patch_dir .. "/" .. service_patch.patch_relative_path
                 .. ": 没有已登记目标匹配 Service 名称 " .. service_name)
         end
     end
@@ -938,10 +938,10 @@ local function freeze_patch_files(controller, batch)
             if not valid_service_name(service_name) or batch.service_patches[service_name] then
                 return flywow_result.failure("HU_INVALID_PATCH", "Service 路径映射重复或无效: " .. relative_path)
             end
-            batch.service_patches[service_name] = {entry_file = relative_path, service_patch_source = source}
+            batch.service_patches[service_name] = {patch_relative_path = relative_path, service_patch_source = source}
         else
             -- 正式部署的一条文件记录；保留相对路径和新源码供后续部署与恢复使用。
-            local file = {entry_file = relative_path, source = source}
+            local file = {host_relative_path = relative_path, source = source}
             batch.files[#batch.files + 1] = file
             if not is_service then
                 -- 普通 Lua 文件对应的 require 名；按斜杠转点，例如 a/b.lua 得到 a.b。
@@ -1011,7 +1011,7 @@ function M:step(batch, service_target, command)
 
     -- RPC 合同确认后，为失败结果补上对应 Service Patch 文件上下文。
     if not service_result.ok and service_target.service_patch then
-        service_result.message = service_target.service_patch.entry_file .. ": " .. (service_result.message or service_result.code)
+        service_result.message = service_target.service_patch.patch_relative_path .. ": " .. (service_result.message or service_result.code)
     end
     return service_result
 end
@@ -1043,9 +1043,9 @@ local function load_and_snapshot_batch_files(controller, batch)
 
     -- 再为每个正式文件保存部署前内容，供部分部署失败时恢复。
     for _, file in ipairs(batch.files) do
-        local old_source, read_failure = hotupgrade_native.read_file(controller.root_path, file.entry_file)
+        local old_source, read_failure = hotupgrade_native.read_file(controller.root_path, file.host_relative_path)
         if old_source == nil then
-            return flywow_result.failure(native_code(read_failure), "文件准备失败: " .. file.entry_file)
+            return flywow_result.failure(native_code(read_failure), "文件准备失败: " .. file.host_relative_path)
         end
         file.old_source = old_source
     end
@@ -1102,9 +1102,9 @@ local function deploy_batch_files(controller, batch)
     -- 逐项安装已冻结的候选源码并标记成功替换项，供失败恢复定位。
     for _, file in ipairs(batch.files) do
         local file_written, write_failure = hotupgrade_native.replace_file(
-            controller.root_path, file.entry_file, file.source)
+            controller.root_path, file.host_relative_path, file.source)
         if not file_written then
-            return flywow_result.failure(native_code(write_failure), "部署失败: " .. file.entry_file)
+            return flywow_result.failure(native_code(write_failure), "部署失败: " .. file.host_relative_path)
         end
         file.touched = true
     end
@@ -1184,11 +1184,11 @@ local function recover_batch(controller, batch)
             files_touched = true
             -- 恢复旧文件的调用是否抛错、是否成功，以及失败时 Native 返回的原因。
             local restore_called, file_restored, restore_failure = pcall(hotupgrade_native.replace_file,
-                controller.root_path, file.entry_file, file.old_source or nil)
+                controller.root_path, file.host_relative_path, file.old_source or nil)
             if not restore_called or not file_restored then
                 recovery_failure = recovery_failure or flywow_result.failure(
-                    restore_called and native_code(restore_failure) or "HU_CONTROL_FAILED", file.entry_file)
-                recovery_errors[#recovery_errors + 1] = file.entry_file .. ": "
+                    restore_called and native_code(restore_failure) or "HU_CONTROL_FAILED", file.host_relative_path)
+                recovery_errors[#recovery_errors + 1] = file.host_relative_path .. ": "
                     .. tostring(restore_called and native_code(restore_failure) or file_restored)
             end
         end

@@ -217,7 +217,7 @@ local last_loaded_value -- 最近一次原生 require 返回的依赖导出表�
 local new_module_registrations = {} -- 模拟 Controller 收到的新模块登记请求记录。
 local active_new_module_batch -- 测试当前开放的新模块登记批次身份。
 local fail_new_module_registration  = false -- 模拟本批新模块登记失败，验证缓存和来源回退。
-local pause_new_module_registration = false -- 暂停顶层新模块登记，制造同批重复 Update 的窗口。
+local pause_new_module_registration = false -- 暂停顶层新模块登记，验证 Update 在登记完成前不会进入普通模块 Stage。
 local pause_service_registration    = false -- 暂停 Service 登记 RPC，制造其他协程并发 require 的窗口。
 local fail_service_registration     = false -- 模拟 Service 登记失败，验证等待者醒来后拒绝加载。
 local registration_wake_results     = {}    -- 测试调度器唤醒登记等待协程后的执行结果。
@@ -403,7 +403,6 @@ patch.stage = original_stage
 patch.commit = original_commit
 registration.after_upgrade = nil
 assert(table.concat(update_steps, ",") == "stage,commit,after_upgrade")
-assert(target_control("update", 3).code == "HU_PHASE_INVALID")
 assert(target_control("finish", 3).ok and not hotupgrade.patching)
 assert(target_control("abort", 3).ok and not hotupgrade.patching)
 registration.before_upgrade = function() return true end
@@ -498,10 +497,10 @@ local new_module_service_patch_source = [[return function()
     return {new_modules = {"hotupgrade_new_rules", "hotupgrade_new_dependency"}}
 end]]
 local new_module_update -- 首次 Update 协程返回的结果；恢复后由主测试协程检查。
-local staged_calls = 0   -- 统计首次 Update 的 Stage 次数，重复 Update 不得增加。
+local staged_calls = 0   -- 统计登记窗口前后的 Stage 次数，确认只在新模块登记成功后执行。
 patch.stage = function(...)
     staged_calls = staged_calls + 1
-    -- 重复请求结束后，首次 Update 的声明权限必须仍有效；清单外加载不能走普通许可。
+    -- 候选执行期间仍使用本批声明权限；清单外加载不能走普通许可。
     local permits_before_stage = begin_count
     local loaded           -- 清单外模块是否意外加载成功。
     local undeclared_error -- 首次 Update 上下文拒绝清单外模块的结构化错误。
@@ -511,14 +510,13 @@ patch.stage = function(...)
     return original_stage(...)
 end
 pause_new_module_registration = true
-local updating = coroutine.create(function() -- 执行 Update 的协程；测试在它等待新模块登记时推进并发调用。
+local updating = coroutine.create(function() -- 执行 Update 协程；新模块登记 yield 期间确认普通模块 Stage 尚未开始。
     new_module_update = target_control("update", 8, {service_patch_source = new_module_service_patch_source})
 end)
 local update_resumed -- 首次 Update 协程是否正常执行到暂停点。
 local update_failure -- 协程恢复失败时的诊断，供断言报告。
 update_resumed, update_failure = coroutine.resume(updating)
 assert(update_resumed and coroutine.status(updating) == "suspended", tostring(update_failure) .. ": " .. tostring(new_module_update and new_module_update.message))
-assert(target_control("update", 8, {service_patch_source = new_module_service_patch_source}).code == "HU_PHASE_INVALID")
 assert(staged_calls == 0)
 pause_new_module_registration = false
 assert(coroutine.resume(updating) and coroutine.status(updating) == "dead")

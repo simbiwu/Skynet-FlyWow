@@ -1220,9 +1220,9 @@ local function load_and_snapshot_batch_files(controller, batch)
     end
 
     for _, file in ipairs(batch.files) do
-        local old_source, read_failure = hotupgrade_native.read_file(controller.root_path, file.entry_file) -- 正式目录中替换前的文件内容；失败时写回它恢复旧版本。
+        local old_source, read_failure = hotupgrade_native.read_file(controller.root_path, file.host_relative_path) -- 正式目录中替换前的文件内容；失败时写回它恢复旧版本。
         if old_source == nil then
-            batch.error = flywow_result.failure(native_code(read_failure), "文件准备失败: " .. file.entry_file)
+            batch.error = flywow_result.failure(native_code(read_failure), "文件准备失败: " .. file.host_relative_path)
             return
         end
         file.old_source = old_source
@@ -1274,7 +1274,7 @@ function M:step(batch, service_target, command)
     end
 
     if not service_result.ok and service_target.service_patch then
-        service_result.message = service_target.service_patch.entry_file .. ": " .. (service_result.message or service_result.code)
+        service_result.message = service_target.service_patch.patch_relative_path .. ": " .. (service_result.message or service_result.code)
     end
     return service_result
 end
@@ -1361,9 +1361,9 @@ local function deploy_batch_files(controller, batch)
     batch.phase = "UPDATE"
     for _, file in ipairs(batch.files) do
         local file_written, write_failure = hotupgrade_native.replace_file( -- 当前正式文件替换是否成功。
-            controller.root_path, file.entry_file, file.source)
+            controller.root_path, file.host_relative_path, file.source)
         if not file_written then
-            batch.error = flywow_result.failure(native_code(write_failure), "部署失败: " .. file.entry_file)
+            batch.error = flywow_result.failure(native_code(write_failure), "部署失败: " .. file.host_relative_path)
             return
         end
         file.touched = true
@@ -1436,11 +1436,7 @@ end
 ```lua
 --- 在目标 Lua State 加载本批新增模块并 Stage、Commit 普通模块。
 local function update_batch(batch, request)
-    -- batch.phase 标识本地 Update 是否已开始；request.modules 和 service_patch_source 是 Controller 为本批固定读取的输入。
-    if batch.phase ~= nil then
-        return flywow_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
-    end
-    batch.phase = "UPDATING"
+    -- request.modules 和 service_patch_source 是 Controller 为本批固定读取的候选输入。
     -- Controller 在 Prepare 收口时已固定普通候选；new_modules 在这里才首次加载并登记，从下一批 Stage 起才会匹配。
     -- Service Patch 构建和 new_modules 登记结果；成功后才能执行普通候选 Stage。
     local service_patch_result = stage_service_patch_and_new_modules(batch, request.service_patch_source)
@@ -1498,14 +1494,13 @@ local function update_batch(batch, request)
         return flywow_result.failure("HU_ACTIVATE_FAILED", tostring(activation_failure))
     end
 
-    batch.phase = "ACTIVATED"
     return flywow_result.success()
 end
 ```
 
 这段看起来很长，但不能拆成毫无关系的 API 介绍。它属于**同一次目标 Update RPC**，严格按下面的发生顺序继续：
 
-阶段检查通过后先设置 `batch.phase = "UPDATING"`，使新模块登记 RPC 暂停期间的同批重复 Update 立即返回 `HU_PHASE_INVALID`。只有提交与检查全部成功，才进入 `ACTIVATED`。
+Controller 在 `update_batch_targets()` 中按去重后的 Service handle 顺序只派发一次 Update，并在所有目标成功后才发送 Finish。Service 本地批次只保留提交和恢复所需的记录；不重复保存 Controller 已保证的阶段状态。新模块登记 RPC 即使 yield，也不会使当前 Controller 调用链重发 Update。
 
 1. `stage_service_patch_and_new_modules()`：构建 Service Patch，解析 `new_modules`，加载并登记同批新增的依赖。
 2. `hotupgrade_module_patch.stage()`：加载本批**已有**受影响模块的候选源码，为原地更新准备旧导出和候选状态。
@@ -1762,7 +1757,7 @@ end
 
 这张表是**依据代码推导的阶段快照**，不是声称这些中间状态都能通过普通业务 RPC 直接读取。恰恰因为 `hot.patching=true`，此时业务入口不应该能随意观察和修改中间状态。
 
-`after_upgrade()` 返回 true 后，本地 `batch.phase="ACTIVATED"`，目标 RPC 成功返回 Controller。**Update 的成功不等于 Finish**，因为如果后面其他目标 Update 失败，Controller 仍需要使用旧快照向已经更新成功的目标发送 Abort。
+`after_upgrade()` 返回 true 后，目标 Update RPC 成功返回 Controller。**Update 的成功不等于 Finish**，因为如果后面其他目标 Update 失败，Controller 仍需要使用旧快照向已经更新成功的目标发送 Abort。
 
 ## 第 13 章：回到 Controller，了解 PUBLISH_DECIDED 与 Finish
 
@@ -1790,17 +1785,14 @@ end
 
 `PUBLISH_DECIDED` 的含义：正式文件和全部目标 Update 已经确认成功，Controller 作出发布决定。随后逐个 Finish，不再采取整批回滚，因为此前成功 Finish 的目标可能已释放旧快照并开放业务。
 
-再跟踪 Finish 的接收方。`M:step` 再次 `skynet.call` 目标 → PlayerService `dispatch_upgrade_command()` → `handle_upgrade("finish")` → `finish_batch(batch)`：
+全部目标 Update 均成功后，Controller 才进入 Finish；再跟踪接收方：`M:step` 通过 `skynet.call` 通知目标 → PlayerService `dispatch_upgrade_command()` → `handle_upgrade("finish")` → `finish_batch(batch)`：
 
 **【真实源码摘录】** `flywow_hotupgrade.lua/finish_batch()`：
 
 ```lua
 local function finish_batch(batch)
-    -- module_stage 保留旧导出和候选引用；到 Finish 才释放，Service 业务入口随后由 close_batch 打开。
-    if batch.phase ~= "ACTIVATED" then
-        return flywow_result.failure("HU_PHASE_INVALID", "当前阶段不能执行 finish")
-    end
-    local finished = hotupgrade_module_patch.finish(batch.module_stage) -- 等待本批排队业务和热更完成的终态记录。
+    -- Controller 仅在全部目标 Update 成功后发送 Finish；这里释放旧/新导出引用并开放业务入口。
+    local finished = hotupgrade_module_patch.finish(batch.module_stage)
     close_batch(batch)
     return finished
 end
@@ -2207,11 +2199,11 @@ local function recover_batch(controller, batch)
         if file.touched then
             files_touched = true
             local restore_called, file_restored, restore_failure = pcall(hotupgrade_native.replace_file,
-                controller.root_path, file.entry_file, file.old_source or nil)
+                controller.root_path, file.host_relative_path, file.old_source or nil)
             if not restore_called or not file_restored then
                 recovery_failure = recovery_failure or flywow_result.failure(
-                    restore_called and native_code(restore_failure) or "HU_CONTROL_FAILED", file.entry_file)
-                recovery_errors[#recovery_errors + 1] = file.entry_file .. ": "
+                    restore_called and native_code(restore_failure) or "HU_CONTROL_FAILED", file.host_relative_path)
+                recovery_errors[#recovery_errors + 1] = file.host_relative_path .. ": "
                     .. tostring(restore_called and native_code(restore_failure) or file_restored)
             end
         end
@@ -2705,7 +2697,7 @@ faulty 结束后 last_batch.phase 为 RECOVERY_REQUIRED；V3 进行中仍能看�
 
 ### 22.3 正式文件部署在中途失败
 
-**调用位置**：`deploy_batch_files()` 的文件循环，调用 `hotupgrade_native.replace_file(root,entry_file,source)`。假设本批需要部署 `player_logic.lua`、`combat_rules.lua` 和 `player_service.lua`，前两个写入成功，第三个失败。
+**调用位置**：`deploy_batch_files()` 的文件循环，调用 `hotupgrade_native.replace_file(root,host_relative_path,source)`。假设本批需要部署 `player_logic.lua`、`combat_rules.lua` 和 `player_service.lua`，前两个写入成功，第三个失败。
 
 此时**一个目标 Update RPC 都还没有发送**。但是宿主磁盘已经局部改变，需要按 `file.touched` 逆序恢复，新增的 `combat_rules.lua` 若原来不存在就应该删除，恢复已触及文件后清缓存，再 Abort 已 Prepare 的业务 Service。
 

@@ -490,7 +490,7 @@ scenarios['paths'] = function()
             has_service_update = true}, 50, "battle/worker").ok)
     local batch = {patch_dir = "host_paths"} -- 仅用于直接测试 load_patch 的批次输入，路径对应待测发布包。
     assert(paths:load_patch(batch).ok and #batch.modules == 3)
-    assert(batch.files[1].entry_file == "config/settings.lua")
+    assert(batch.files[1].host_relative_path == "config/settings.lua")
     assert(batch.modules[1].name == "config.settings")
     for _, module_patch in ipairs(batch.modules) do
         for key in pairs(module_patch) do
@@ -498,7 +498,9 @@ scenarios['paths'] = function()
         end
     end
     assert(batch.modules[2].name == "lualib.battle.state_sync.runtime")
-    assert(paths:load_patch({patch_dir = "nested_named_service"}).ok)
+    local nested_batch = {patch_dir = "nested_named_service"} -- 含 service/battle/worker.patch 的本批目标记录。
+    assert(paths:load_patch(nested_batch).ok)
+    assert(nested_batch.service_patches["battle/worker"].patch_relative_path == "service/battle/worker.patch")
 
     for _, path in ipairs({"duplicate_module", "duplicate_service"}) do
         assert(paths:load_patch({patch_dir = path}).code == "HU_INVALID_PATCH")

@@ -149,6 +149,25 @@ register_service 必须提供 before_upgrade 函数；缺失或非函数会在�
 
 Prepare 期间继续使用旧宿主文件，允许正常创建和首次加载。每轮回调结束后，Controller 等在途操作完成，再用同一份冻结 Patch 重新匹配登记信息：新匹配的 Service 补做一次 Prepare；已准备目标新增受影响模块，只补模块清单，不重复 before_upgrade。不匹配本批 Patch 的新 Service 不做 Prepare，但仍须完成初始化和登记。所有匹配目标准备完成后，在不 yield 的连续步骤中固定最终清单并进入 UPDATE、关闭普通创建和首次加载门禁。Controller 随后先部署完整 `.lua` 并清理缓存，再向目标发送 Update。目标先准备 Service Patch 并处理 `new_modules`，再 Stage 本批冻结的普通模块，之后 Activate 同步提交模块、Service 状态和函数，最后执行 after_upgrade。after_upgrade 只检查已提交状态，不得 yield 或产生外部副作用；false 或异常触发组合恢复。
 
+### Prepare 收口与版本一致性
+
+Prepare 期间，Controller 逐个通过 RPC 等待目标 Service 返回 Prepare 结果；每次等待都会让出 Controller 协程。目标的 `before_upgrade()` 还会通过同一条业务 queue 等待已接纳业务排空，队列被占用时也会让出目标协程。Controller 与目标 Service 两端的协程会交错运行：Controller 等 RPC 时可处理其他受管理请求；目标等待 queue 时，先前排队的业务得以完成。因此首轮匹配不能当作最终清单。
+
+Controller 完成一轮 Prepare 发送后等待两类在途工作结束：尚未完成登记的受管理 Service 创建，以及尚未完成的普通模块首次加载。创建记录在 Service 登记完成或创建失败、取消、退出收尾前一直保留；模块许可在模块成功登记、加载取消或 Service 退出清理前一直保留。随后 Controller 用本批已固定的 Patch 内容，根据最新登记表重建目标清单和每个目标的模块清单。新匹配到的 Service 会补做 Prepare；已 Prepare 的目标如果此时新增了受影响模块，只刷新模块清单，不重复执行 Prepare。若这一轮又 Prepare 了新目标，就继续等待和重匹配，直到没有未 Prepare 的匹配目标。
+
+最终重匹配成功后，Controller 到把批次阶段设为 UPDATE 之间没有 yield。阶段变为 UPDATE 时，普通 Service 创建和普通模块首次加载入口关闭；此后到达的请求在生命周期门禁处等待，不会在最终清单确定后插入本批。Controller 先部署已固定的文件并清理缓存，再对最终清单中的目标发送 Update。
+
+成功路径的顺序是：
+
+1. 最终匹配并关闭普通创建、首次加载入口。
+2. 部署本批完整 Lua 文件并清理缓存。
+3. 对最终目标执行 Update，成功后逐个 Finish。
+4. 批次终态保存、释放门禁；等待中的普通创建和模块首次加载继续执行。
+
+因此，新 Service 或普通模块的首次加载不会读到“文件已是新版、但旧目标尚未完成 Update”的中间状态：成功 Finish 后它们才继续，读取到已部署的新文件；本批目标已完成 Update。Service Patch 的 `new_modules` 是例外的专用当前批次流程：它在文件部署后由正在 Update 的目标加载并登记，不走普通首次加载门禁，也不加入本批冻结的普通模块清单，从下一批开始参加普通模块匹配。
+
+该版本一致性结论只针对成功完成 Update 和 Finish 的路径。失败时框架会尝试恢复已替换文件并 Abort 存活目标，等待请求在恢复或最终保留的文件上继续；但它不构成所有运行态都回到旧版本的保证：已成功加载登记的 Service Patch `new_modules` 按现有合同不会因后续失败而撤销。若文件恢复或 Abort 失败，批次进入 `RECOVERY_REQUIRED`，此时更不能保证所有存活 Service 和正式文件处于同一版本，需依据 status 诊断并处理。
+
 普通模块 Stage 依赖 Controller 已完成的路径映射、语法检查、模块名去重与连续数组构建，不重复校验这些输入。Stage 在目标 Lua State 内检查线上及候选导出，准备隔离状态，并按输入顺序保存模块记录；每条记录集中持有线上根表、候选与旧字段，供 Commit 安装和 Abort 恢复。Commit/Abort 核对根表身份后，字段覆盖函数直接执行原地替换。
 
 
@@ -169,7 +188,7 @@ Finish 释放旧快照并清除本地批次后将 hot.patching 设为 false。Ab
     battle/worker.patch
 ```
 
-发布包内部路径对应宿主 root_path 下的实际路径。递归扫描全部 .lua 和 .patch，并先冻结内容、检查语法。配置 service_path 中的 .lua 是完整新版 Service，只部署；该目录中的 .patch 是一次性 Service 更新脚本，只更新现存实例、不部署。其他目录中的 .lua 是完整普通模块：已登记时同时更新运行时和部署文件，未登记时仅部署。.patch 不能出现在 service_path 之外。
+发布包内部路径对应宿主 root_path 下的实际路径。批次 files 中的 `host_relative_path` 是相对 `root_path` 的宿主 Lua 路径，例如 `lualib/player_logic.lua`；快照、部署和恢复都用它定位同一正式文件。Service Patch 记录中的 `patch_relative_path` 则相对于本批 `patch_dir`，例如 `service/player_service.patch`；它用于目标匹配和错误诊断，不是宿主部署路径。递归扫描全部 .lua 和 .patch，并先冻结内容、检查语法。配置 service_path 中的 .lua 是完整新版 Service，只部署；该目录中的 .patch 是一次性 Service 更新脚本，只更新现存实例、不部署。其他目录中的 .lua 是完整普通模块：已登记时同时更新运行时和部署文件，未登记时仅部署。.patch 不能出现在 service_path 之外。
 
 .lua 与 .patch 无须成对出现；允许仅 Service 源码、仅 Service Patch、仅普通模块，以及没有任何运行时目标的纯文件发布。Service .patch 必须匹配至少一个已登记且支持内部更新的目标；未匹配返回 HU_TARGET_MISSING，不支持则返回 HU_SERVICE_PATCH_UNSUPPORTED。普通模块名称仍按实际路径登记，例如 config.settings、lualib.player_logic。不同路径映射到同一普通模块名或同一 Service Patch 名时拒绝整包；其他普通文件忽略，符号链接和特殊文件拒绝。
 
@@ -308,7 +327,7 @@ while true do
 end
 ~~~
 
-Controller 从 begin 到终态复用同一个 batch。load_patch(batch) 将冻结源码和初次匹配目标直接写入该记录，Prepare 重匹配复用原目标对象。batch.phase 是唯一保存的发布进度，门禁直接读取活动批次。目标 Service 的本地批次 phase 在首次 Update 入口立即从 nil 变为 UPDATING，因此新模块登记等可能 yield 的操作期间，重入 Update 会以 HU_PHASE_INVALID 拒绝；只有模块和 Service 状态全部提交成功后才变为 ACTIVATED。status 的 lifecycle.pending_service_count 和 pending_module_count 分别表示尚未完成创建或登记的受管理 Service 数、尚未完成首次加载或登记的普通模块数；phase 和 recovery_required 仍由当前及最近终态批次生成，新批次进行中保留最近终态的恢复诊断。
+Controller 从 begin 到终态复用同一个 batch。load_patch(batch) 将冻结源码和初次匹配目标直接写入该记录，Prepare 重匹配复用原目标对象。Controller 的 batch.phase 是唯一保存的发布进度，生命周期门禁直接读取活动批次；Update 按唯一 Service handle 顺序各派发一次，且只有全部 Update 成功后才派发 Finish。Service 本地批次只保留提交与恢复所需的快照，不另存 Controller 已保证的 Update/Finish 阶段状态。status 的 lifecycle.pending_service_count 和 pending_module_count 分别表示尚未完成创建或登记的受管理 Service 数、尚未完成首次加载或登记的普通模块数；phase 和 recovery_required 仍由当前及最近终态批次生成，新批次进行中保留最近终态的恢复诊断。
 
 每个目标 Lua State 都保存本批次的 Service Patch 提交内容、恢复快照和 module_stage；本地记录沿内部调用链统一称为 batch。Abort、Finish 和控制异常共用同一批次收尾操作。输入在首次可信边界检查，内部不重复校验没有变化的数据；Service Patch 返回值、自定义快照和候选导出在产生处检查，执行 import_state 后才再次检查候选图。跨 yield 后的来源、许可、缓存身份和模块代码可能改变的状态仍在使用处核对。
 

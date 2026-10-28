@@ -34,7 +34,6 @@ local module_state =
 ---@class FlyWowHotUpgradeServiceBatch
 ---@field batch_id string Controller 为本次发布生成的身份；用于拒绝其他批次的控制命令。
 ---@field sequence integer Controller 单调递增的本地序号；finish/abort 后写入 completed_sequence。
----@field phase? string nil 表示 Update 尚未开始，之后为 UPDATING 或 ACTIVATED；Finish/Abort 结束时批次记录本身被清除。
 ---@field new_module_context? FlyWowHotUpgradeNewModuleContext Update 中的临时声明权限；候选 Stage 完成后立即清除。
 ---@field module_stage? FlyWowHotUpgradeModuleStage 候选模块的旧/新导出记录；保留至 Finish 或 Abort。
 ---@field service_patch? FlyWowHotUpgradeServicePatchState Service 私有状态与函数的提交/恢复记录。
@@ -465,15 +464,9 @@ end
 --- 新增模块的加载/登记可能 yield；失败时保留 Stage 与旧状态供 Abort 恢复。
 ---@param batch FlyWowHotUpgradeServiceBatch Prepare 已建立的本地批次；本函数把模块 Stage 和 Service 恢复记录写入其中。
 ---@param request FlyWowHotUpgradeControlRequest Controller 发给当前 Service 的 Update 内容；modules 保存普通模块名和源码，service_patch_source 保存可选的 Service .patch 源码。
----@return FlyWowResult<nil> 成功将批次记录设为 ACTIVATED；失败保留恢复记录，交由 Abort 处理
+---@return FlyWowResult<nil> 成功完成本 Service 的候选提交；失败保留恢复记录，交由 Abort 处理
 local function update_batch(batch, request)
-    -- batch.phase 标识本地 Update 是否已开始；request.modules 和 service_patch_source 是 Controller 已为本批固定读取的输入。
-    if batch.phase ~= nil then
-        return flywow_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
-    end
-
-    -- Prepare 状态校验通过后进入 Update 阶段，后续只允许本批次受控加载。
-    batch.phase = "UPDATING"
+    -- request.modules 和 service_patch_source 是 Controller 为本批固定读取的候选输入。
     -- Controller 在 Prepare 收口时已固定普通候选；new_modules 在这里才首次加载并登记，从下一批 Stage 起才会匹配。
     -- Service Patch 构建和 new_modules 登记结果；成功后才能执行普通候选 Stage。
     local service_patch_result = stage_service_patch_and_new_modules(batch, request.service_patch_source)
@@ -534,22 +527,15 @@ local function update_batch(batch, request)
         return flywow_result.failure("HU_ACTIVATE_FAILED", "after_upgrade 拒绝更新")
     end
 
-    -- Service 更新和 after_upgrade 均成功后，记录本地批次已激活。
-    batch.phase = "ACTIVATED"
     return flywow_result.success()
 end
 
 --- 确认本 Service 的 Update 成功，释放普通模块 Stage 和 Service 恢复记录。
 --- Finish 不执行回滚；完成后重新开放业务入口。
 ---@param batch FlyWowHotUpgradeServiceBatch Prepare 建立且 Update 已成功的本地批次；本函数释放其中保存的候选和恢复快照。
----@return FlyWowResult<nil> 模块快照清理结果；未 Activate 时返回 HU_PHASE_INVALID
+---@return FlyWowResult<nil> 释放模块 Stage 快照的结果；完成后关闭本地批次并重新开放业务入口
 local function finish_batch(batch)
-    -- module_stage 保留旧导出和候选引用；到 Finish 才释放，Service 业务入口随后由 close_batch 打开。
-    if batch.phase ~= "ACTIVATED" then
-        return flywow_result.failure("HU_PHASE_INVALID", "当前阶段不能执行 finish")
-    end
-
-    -- 释放模块 Stage 保存的旧/新导出引用；Finish 不执行回滚。
+    -- Controller 仅在全部目标 Update 成功后发送 Finish；这里释放旧/新导出引用并开放业务入口。
     local finished = hotupgrade_module_patch.finish(batch.module_stage)
     close_batch(batch)
     return finished
