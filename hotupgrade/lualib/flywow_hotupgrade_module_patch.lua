@@ -72,7 +72,11 @@ local function copy_state_graph(source_graph, target_graph)
             if not child_result.ok then
                 return child_result
             end
-            fields[#fields + 1] = {key = key, value = child_result.value}
+            fields[#fields + 1] =
+            {
+                key   = key,                 -- 源状态表中的字段键，复制到目标表时保持不变。
+                value = child_result.value, -- 已完成校验的复制值；全部字段成功后才写入目标表。
+            }
         end
 
         -- 所有字段复制和限制检查均已通过；此时才开始改写现存目标表。
@@ -200,7 +204,11 @@ function M.stage(module_patches, module_loaders)
     end
 
     -- Stage 持有到 Finish/Abort；每项保存候选和恢复所需的旧字段。
-    local module_stage = {entries = {}, committed = false}
+    local module_stage =
+    {
+        entries   = {},     -- 每个候选模块的线上表、旧字段、编译结果和候选导出；Commit/Abort 使用，Finish 清空。
+        committed = false, -- Commit 开始改写线上导出后置为 true；Abort 据此恢复旧字段。
+    }
     -- 将结构检查产生的错误收敛为 Stage 的稳定外层错误码，并保留原始原因。
     --- 将候选结构校验错误转为 Stage 外层错误，并保留原始错误码。
     ---@param result FlyWowResult<nil> 导出检查或快照复制产生的失败结果。
@@ -231,13 +239,13 @@ function M.stage(module_patches, module_loaders)
         local loader = module_loaders and module_loaders[module_patch.name]
         module_stage.entries[#module_stage.entries + 1] =
         {
-            name = module_patch.name,
-            live = live,
-            old = fields,
-            chunk = chunk,
-            loader_name = loader and loader.name or module_patch.name,
-            loader_path = loader and loader.path,
-            candidate = nil,
+            name        = module_patch.name, -- package.loaded 中线上模块的名字，也是错误信息中的模块名。
+            live        = live,              -- 现有导出根表；Commit 原地改它，Abort 保留并恢复同一对象。
+            old         = fields,            -- Stage 前保存的导出字段；Abort 用它恢复线上模块。
+            chunk       = chunk,             -- 已编译的候选源码；下一阶段运行它并检查新导出表。
+            loader_name = loader and loader.name or module_patch.name, -- 候选 chunk 收到的原始 require 名。
+            loader_path = loader and loader.path, -- 候选 chunk 收到的来源路径；无首次加载元数据时为 nil。
+            candidate   = nil,               -- 候选 chunk 执行后保存的新导出表；Commit 从中安装字段。
         }
     end
 

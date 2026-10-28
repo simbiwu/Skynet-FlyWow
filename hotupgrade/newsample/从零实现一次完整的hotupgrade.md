@@ -1563,13 +1563,13 @@ for _, module_patch in ipairs(module_patches) do
     local loader = module_loaders and module_loaders[module_patch.name] -- 普通 require 返回的加载器；Skynet loader 会另行确认其来源。
     module_stage.entries[#module_stage.entries + 1] =
     {
-        name = module_patch.name,
-        live = live,
-        old = fields,
-        chunk = chunk,
-        loader_name = loader and loader.name or module_patch.name,
-        loader_path = loader and loader.path,
-        candidate = nil,
+        name        = module_patch.name, -- package.loaded 中线上模块的名字，也是错误信息中的模块名。
+        live        = live,              -- 现有导出根表；Commit 原地改它，Abort 保留并恢复同一对象。
+        old         = fields,            -- Stage 前保存的导出字段；Abort 用它恢复线上模块。
+        chunk       = chunk,             -- 已编译的候选源码；下一阶段运行它并检查新导出表。
+        loader_name = loader and loader.name or module_patch.name, -- 候选 chunk 收到的原始 require 名。
+        loader_path = loader and loader.path, -- 候选 chunk 收到的来源路径；无首次加载元数据时为 nil。
+        candidate   = nil,               -- 候选 chunk 执行后保存的新导出表；Commit 从中安装字段。
     }
 end
 ```

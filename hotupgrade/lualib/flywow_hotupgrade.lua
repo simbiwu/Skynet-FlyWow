@@ -13,17 +13,16 @@ local M =
 -- 模块级私有状态表保存本 Lua State 共用的登记、当前批次和模块加载记录。
 local module_state =
 {
-    hotupgrade_handle = nil, -- 首次跨 Service RPC 时取得；宿主必须先完成控制面初始化。
+    hotupgrade_handle    = nil,                              -- 首次跨 Service RPC 时取得；宿主必须先完成控制面初始化。
     registration_config  = nil,                              -- 本 Lua State 的回调配置；登记结果单独保存在 registration_result。
     registration_result  = nil,                              -- nil 表示无最终结果；配置存在时为 RPC 在途，true/false 表示登记成功/失败。
-    -- Controller 登记 RPC 会 yield；期间到达的并发 require 协程在这里等待最终登记结果。
-    registration_waiters  = {},
-    active_batch          = nil,                              -- 当前批次的恢复数据保留至 finish/abort 确认完成。
-    completed_sequence    = 0,                                -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
-    last_batch_id         = nil,                              -- 最近完成的批次，用于 finish/abort 幂等响应。
-    declared_modules      = {},                               -- 统一模块名到首次加载名/路径的记录；例如 a/b.lua 会登记为 a.b。
-    module_loads          = {},                               -- 同一规范模块的首次声明串行完成，等待者不能观察半完成的本地状态。
-    module_sources        = setmetatable({}, {__mode = "k"}), -- 仅保存本入口确认的模块表与文件路径；弱键不延长模块生命周期。
+    registration_waiters = {},                              -- 登记 RPC yield 期间等待结果的 require 协程；答复后唤醒并清空。
+    active_batch         = nil,                              -- 当前批次的恢复数据保留至 finish/abort 确认完成。
+    completed_sequence   = 0,                                -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
+    last_batch_id        = nil,                              -- 最近完成的批次，用于 finish/abort 幂等响应。
+    declared_modules     = {},                               -- 统一模块名到首次加载名/路径的记录；例如 a/b.lua 会登记为 a.b。
+    module_loads         = {},                               -- 同一规范模块的首次声明串行完成，等待者不能观察半完成的本地状态。
+    module_sources       = setmetatable({}, {__mode = "k"}), -- 仅保存本入口确认的模块表与文件路径；弱键不延长模块生命周期。
 }
 
 ---@class FlyWowHotUpgradeNewModuleContext
@@ -143,7 +142,11 @@ function M.uniqueservice(name_or_global, ...)
     -- 调用 Controller 查询或创建唯一 Service，并保留原生 handle/抛错合同。
     -- Controller 返回的 FlyWowResult；成功值里包含唯一 Service 的 handle。
     local answer = skynet.call(get_hotupgrade_handle(), "hotupgrade", "uniqueservice",
-        {service_name = name, global = global, arguments = arguments})
+        {
+            service_name = name,     -- Controller 内复用或创建的 Service 逻辑名。
+            global       = global,   -- 保留原生重载标记；Controller 会明确拒绝全局唯一形式。
+            arguments    = arguments, -- 除名字外的原生启动参数及 nil 位置，按原顺序传给 Skynet。
+        })
     assert(answer.ok, tostring(answer.code) .. ": " .. tostring(answer.message))
     return answer.value.service_handle
 end
@@ -370,12 +373,12 @@ end
 ---@param service_patch_source? string 当前目标的 Service .patch 源码；nil 表示本批不更新 Service 状态或函数。
 ---@return FlyWowResult<FlyWowHotUpgradeServicePatchState|nil> 成功载荷为提交记录或 nil；失败保留所属阶段错误码。
 local function stage_service_patch_and_new_modules(batch, service_patch_source)
-    -- 临时上下文只允许当前 Update 协程加载 Patch 清单内的新模块。
+    -- 保存本批允许首次加载的新模块；hotupgrade.require 用这三项限制当前协程和模块清单。
     local new_module_context =
     {
-        owner = coroutine.running(),
-        batch_id = batch.batch_id,
-        names = {},
+        owner    = coroutine.running(), -- 只有当前 Update 协程可以使用这份新模块清单。
+        batch_id = batch.batch_id,      -- Controller 的本批身份；新模块登记 RPC 必须携带它。
+        names    = {},                  -- Service Patch 声明并核验过的模块名；仅这些名字可首次加载。
     }
     batch.new_module_context = new_module_context
     if not service_patch_source then
@@ -611,7 +614,10 @@ local function dispatch_upgrade_command(session, source, command, request)
             if control_result.ok then
                 control_result = original
             else
-                control_result.details = {original_error = original}
+                control_result.details =
+                {
+                    original_error = original, -- Abort 也失败时保留最初控制异常，供管理端诊断。
+                }
             end
         else
             if batch then
@@ -703,8 +709,8 @@ function M.register_service(registration)
     -- 发给 Controller 的登记快照；业务状态、函数和回调不跨 Lua State 传递。
     local metadata =
     {
-        modules = names,
-        has_service_update = service_update ~= nil,
+        modules            = names,                  -- 已排序的模块名；Controller 用它匹配本批普通候选。
+        has_service_update = service_update ~= nil, -- Service 是否提供应用和恢复 Service Patch 的本地接口。
     }
     -- Controller 登记 RPC 是否正常返回，以及它对本 State 登记请求的答复。
     local registration_call_succeeded, registration_response = pcall(
@@ -824,12 +830,12 @@ local function load_and_register_module(name, module_identity, new_module_contex
     local canonical_name = module_identity.canonical_name
     local attempt =
     {
-        loader_path = module_identity.source_path,
-        permit_id = nil,
-        cache_snapshot = nil,
-        module_exports = nil,
-        source_mapping_added = false,
-        module_declaration_added = false,
+        loader_path              = module_identity.source_path, -- 本次 require 命中的文件路径；成功时更新为实际加载路径。
+        permit_id                = nil,                         -- Controller 发放的首次加载许可；失败或完成后会消费/取消。
+        cache_snapshot           = nil,                         -- require 前两个 package.loaded 槽的值；失败时原样恢复。
+        module_exports           = nil,                         -- 本次加载得到的模块表；登记失败时用于撤销来源映射。
+        source_mapping_added     = false,                       -- 本次是否新增模块表到路径映射；仅撤销本次新增项。
+        module_declaration_added = false,                       -- 本次是否新增模块登记；失败时仅删除本次登记。
     }
     local result = flywow_result.success()
 
@@ -855,8 +861,8 @@ local function load_and_register_module(name, module_identity, new_module_contex
     if result.ok then
         attempt.cache_snapshot =
         {
-            module = package.loaded[name],
-            canonical_alias = package.loaded[canonical_name],
+            module           = package.loaded[name],           -- 调用方原始 require 名对应的缓存值。
+            canonical_alias = package.loaded[canonical_name], -- FlyWow 统一模块名对应的缓存值。
         }
         result = load_module_exports(name, module_identity, attempt)
     end
@@ -875,10 +881,18 @@ local function load_and_register_module(name, module_identity, new_module_contex
         -- 本地登记状态恢复后，尽力通知 Controller 取消未消费的首次加载许可。
     if attempt.permit_id then
             command = "register_module"
-            request = {name = canonical_name, permit_id = attempt.permit_id}
+            request =
+            {
+                name      = canonical_name, -- Controller 登记的统一模块名。
+                permit_id = attempt.permit_id, -- 本次普通首次加载对应的许可 ID。
+            }
         elseif register_new_module and attempt.module_declaration_added then
             command = "register_new_module"
-            request = {batch_id = new_module_context.batch_id, name = canonical_name}
+            request =
+            {
+                batch_id = new_module_context.batch_id, -- 限定新模块登记属于当前 Update 批次。
+                name     = canonical_name,              -- Service Patch 清单中的统一模块名。
+            }
         end
         if command then
             local called, answer = pcall(skynet.call, get_hotupgrade_handle(), "hotupgrade", command, request)
@@ -967,7 +981,11 @@ require_module = function(name, module_identity)
         return require_module(name, module_identity)
     end
 
-    module_load = {owner = coroutine.running(), waiters = {}}
+    module_load =
+    {
+        owner    = coroutine.running(), -- 当前负责完成首次加载的协程；同协程递归加载会被拒绝。
+        waiters  = {},                  -- 等待该模块加载结果的其他协程；加载完成后逐个唤醒。
+    }
     module_state.module_loads[canonical_name] = module_load
     local result = load_and_register_module(name, module_identity, new_module_context, register_new_module)
     module_state.module_loads[canonical_name] = nil

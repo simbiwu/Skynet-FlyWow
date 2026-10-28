@@ -18,19 +18,19 @@ local fail_restore = false  -- 只用于故障实验，正常运行恒为 false�
 local function inspect_state()
     return
     {
-        ok = true,
-        handle = skynet.self(),
-        version = logic.version(),
-        weapon = state.weapon,
-        level = state.level,
-        gold = state.gold,
-        schema_version = state.schema_version,
-        attack = operations.attack(100),
-        old_attack = old_attack(100),
-        state_same = state == state_identity,
-        module_alias_same = package.loaded["lualib.player_logic"] == logic,
-        combat_loaded = package.loaded["lualib.combat_rules"] ~= nil,
-        patching = hotupgrade.patching,
+        ok = true, -- inspect 请求是否成功；调用方据此读取快照字段。
+        handle = skynet.self(), -- 当前 PlayerService 的真实 handle。
+        version = logic.version(), -- 当前普通模块版本，用于确认目标实例已加载 V2。
+        weapon = state.weapon, -- 当前玩家装备，验证 Service Patch 的状态迁移。
+        level = state.level, -- 当前等级，验证未涉及字段保持不变。
+        gold = state.gold, -- 当前金币，验证运行时累积状态未丢失。
+        schema_version = state.schema_version, -- 当前状态结构版本，验证迁移结果。
+        attack = operations.attack(100), -- 新业务函数结果，用于确认函数表已更新。
+        old_attack = old_attack(100), -- 初始化时缓存的旧闭包结果，用于展示旧引用不自动变化。
+        state_same = state == state_identity, -- 状态根表是否仍是初始化时的同一对象。
+        module_alias_same = package.loaded["lualib.player_logic"] == logic, -- 原始 require 名是否仍指向稳定模块表。
+        combat_loaded = package.loaded["lualib.combat_rules"] ~= nil, -- 候选首次加载的依赖是否已进入原生 require 缓存。
+        patching = hotupgrade.patching, -- Service 是否仍处于暂停业务的更新窗口。
     }
 end
 
@@ -62,10 +62,10 @@ local function initialize_player()
     -- register_service 返回的统一结果；只有登记成功后才允许业务请求进入 queue。
     local answer = hotupgrade.register_service(
     {
-        service_update =
+        service_update = -- 本地状态与函数的更新接口；Controller 只传命令，不跨 Lua State 传对象。
         {
-            state = state,
-            functions = operations,
+            state = state,                 -- 本 Service 保持身份的玩家数据根表；Abort 将快照恢复到这张表。
+            functions = operations,        -- 本 State 持有的业务函数表；Commit 在原表上替换声明的函数。
             -- 课堂故障需要显式控制恢复失败，所以这里使用成对自定义快照。
             --- 快照当前私有状态字段；Controller 不接收状态本体，快照只留在本 Service 供 Abort 使用。
             ---@param source table 当前 Service 私有状态根表
@@ -74,10 +74,10 @@ local function initialize_player()
             snapshot = function(source)
                 return require("flywow_result").success(
                 {
-                    weapon = source.weapon,
-                    level = source.level,
-                    gold = source.gold,
-                    schema_version = source.schema_version,
+                    weapon = source.weapon, -- 快照中的装备值；Abort 将它写回原状态表。
+                    level = source.level, -- 快照中的等级值；用于验证普通状态在热更后保留。
+                    gold = source.gold, -- 快照中的金币值；失败恢复时还原本批前数值。
+                    schema_version = source.schema_version, -- 快照中的结构版本；决定恢复后的状态解释方式。
                 })
             end,
             --- Abort 时将快照写回同一状态根表；课堂故障开关可让恢复抛错以验证失败报告。
@@ -99,7 +99,7 @@ local function initialize_player()
         },
         --- Prepare 时排在已接纳业务之后取得同一条 queue；返回 true 表示业务已到安全点。
         ---@return boolean 安全点确认值；queue 回调可能 yield，返回 false 会拒绝 Prepare
-        before_upgrade = function()
+        before_upgrade = function() -- 排空已接纳业务并返回安全点；失败时拒绝进入 Update。
             -- 必须排在所有已接纳业务之后取得同一条 queue。
             return business_queue(function() return true end)
         end,
@@ -134,12 +134,12 @@ skynet.start(function()
             -- 教学观测口：只读、不进入业务 queue，避免观察者自身被 queue 挡住。
             answer =
             {
-                ok = true,
-                holding = holding_thread ~= nil,
-                waiting_spends = waiting_spends,
-                patching = hotupgrade.patching,
-                gold = state.gold,
-                schema_version = state.schema_version,
+                ok = true, -- peek 请求是否成功；调用方据此读取观测字段。
+                holding = holding_thread ~= nil, -- 是否有 hold 请求正在占用业务 queue。
+                waiting_spends = waiting_spends, -- 已进入 spend 但仍在 queue 前排队的请求数。
+                patching = hotupgrade.patching, -- 更新门禁是否已关闭业务入口。
+                gold = state.gold, -- 当前金币；用于观察 queue 内更新后的值。
+                schema_version = state.schema_version, -- 当前状态结构版本；用于观察 Update/恢复结果。
             }
         elseif command == "hold" then
             if hotupgrade.patching then

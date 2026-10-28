@@ -6,10 +6,20 @@ local hotupgrade_common = require "flywow_hotupgrade_common" -- 提供 HotUpgrad
 local skynet_core = require "skynet.core" -- 查询并设置 Skynet 进程级退出监视器。
 local controller_initialized = false -- 成功 init 后锁定配置；失败时保持 false 以允许重试。
 
-skynet.register_protocol({name = "hotupgrade", id = hotupgrade_common.PROTOCOL_ID,
-    pack = skynet.pack, unpack = skynet.unpack})
+skynet.register_protocol(
+{
+    name   = "hotupgrade",                    -- Controller 与目标 Service 共用的原生控制协议名。
+    id     = hotupgrade_common.PROTOCOL_ID,    -- 本框架固定的 Skynet 协议号。
+    pack   = skynet.pack,                      -- 沿用 Skynet 默认序列化器。
+    unpack = skynet.unpack,                    -- 沿用 Skynet 默认反序列化器。
+})
 -- client 消息只用于通知 Service 退出，没有请求体，因此解包回调不返回参数。
-skynet.register_protocol({name = "client", id = skynet.PTYPE_CLIENT, unpack = function() end})
+skynet.register_protocol(
+{
+    name   = "client",                    -- Skynet 原生客户端协议；这里仅接收 Service 退出通知。
+    id     = skynet.PTYPE_CLIENT,          -- 使用 Skynet 预定义的客户端消息类型。
+    unpack = function() end,               -- 退出通知没有请求体，不产生解包参数。
+})
 
 skynet.start(function()
     skynet.dispatch("lua", function(session, _source, command, controller_config)

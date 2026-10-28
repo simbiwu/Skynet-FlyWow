@@ -16,9 +16,9 @@ local sample_root = "./third_party/skynet-flywow/build/hotupgrade-sample"
         -- Controller 初始化结果；失败时停止 Sample，不继续创建业务 Service。
 local initialized = skynet.call(hotupgrade_handle, "lua", "init",
         {
-            patch_path = sample_root .. "/patches",
-            root_path = sample_root .. "/host",
-            service_path = "service",
+            patch_path = sample_root .. "/patches", -- 发布版本目录所在根路径。
+            root_path = sample_root .. "/host", -- Service 正式 Lua 文件所在宿主根路径。
+            service_path = "service", -- 宿主根目录下 Service 入口文件的相对目录。
         })
         if not initialized.ok then
             error(initialized.code .. ": " .. initialized.message)

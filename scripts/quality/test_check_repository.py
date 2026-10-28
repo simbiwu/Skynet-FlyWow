@@ -105,6 +105,59 @@ class HotUpgradeControllerTypeGateTests(unittest.TestCase):
             self.assertTrue(any("未声明 load_patch" in error for error in errors))
 
 
+class HotUpgradeRecordFieldGateTests(unittest.TestCase):
+    """确保多行 HotUpgrade record 的每个具名字段都有就近说明。"""
+
+    def test_rejects_uncommented_record_field(self) -> None:
+        source = "local record = {\n    first = 1, -- 已说明。\n    second = 2,\n}\n"
+
+        errors = CHECKER.check_lua_multiline_record_field_comments(Path("sample.lua"), source)
+
+        self.assertEqual(1, len(errors))
+        self.assertIn(":3:", errors[0])
+
+    def test_rejects_multiple_record_fields_on_one_line(self) -> None:
+        source = "local record = {\n    first = 1, second = 2, -- 一条注释不能代替逐字段说明。\n}\n"
+
+        errors = CHECKER.check_lua_multiline_record_field_comments(Path("sample.lua"), source)
+
+        self.assertTrue(any("不能挤在同一行" in error for error in errors))
+
+    def test_does_not_treat_comment_marker_inside_string_as_comment(self) -> None:
+        source = 'local record = {\n    message = "-- not a comment",\n}\n'
+
+        errors = CHECKER.check_lua_multiline_record_field_comments(Path("sample.lua"), source)
+
+        self.assertEqual(1, len(errors))
+
+    def test_accepts_inline_and_preceding_field_comments(self) -> None:
+        source = (
+            "local record = {\n"
+            "    first = 1, -- 行尾字段说明。\n"
+            "    -- 第二个字段的独立说明。\n"
+            "    second = { nested = true },\n"
+            "}\n"
+        )
+
+        errors = CHECKER.check_lua_multiline_record_field_comments(Path("sample.lua"), source)
+
+        self.assertEqual([], errors)
+
+    def test_does_not_treat_nested_function_locals_as_record_fields(self) -> None:
+        source = (
+            "local record = {\n"
+            "    callback = function() -- record 内负责执行的业务检查回调。\n"
+            "        local result = true\n"
+            "        return result\n"
+            "    end, -- 完成该回调的业务检查。\n"
+            "}\n"
+        )
+
+        errors = CHECKER.check_lua_multiline_record_field_comments(Path("sample.lua"), source)
+
+        self.assertEqual([], errors)
+
+
 class HotUpgradeFullSourceGateTests(unittest.TestCase):
     """确保 HotUpgrade 生产模块即使未改动也执行函数合同和阶段门禁。"""
 

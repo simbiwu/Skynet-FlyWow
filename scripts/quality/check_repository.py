@@ -664,12 +664,132 @@ def check_hotupgrade_controller_type_contract(root: Path) -> list[str]:
     return []
 
 
+def _has_lua_line_comment(line: str) -> bool:
+    """忽略短字符串和长字符串后，判断源码行是否含 Lua 注释起始符。"""
+
+    index = 0
+    while index < len(line):
+        if line.startswith("--", index):
+            return True
+        if line[index] in ("\'", '"'):
+            quote = line[index]
+            index += 1
+            while index < len(line):
+                if line[index] == "\\":
+                    index += 2
+                    continue
+                if line[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+        long_string = re.match(r"\[(=*)\[", line[index:])
+        if long_string:
+            closer = "]" + long_string.group(1) + "]"
+            closing_index = line.find(closer, index + len(long_string.group(0)))
+            if closing_index < 0:
+                return False
+            index = closing_index + len(closer)
+            continue
+        index += 1
+    return False
+
+
+def check_lua_multiline_record_field_comments(path: Path, source: str) -> list[str]:
+    """要求 HotUpgrade 多行具名 table/record 的每个字段单独书写并紧邻有说明。"""
+
+    tokens = _tokenize_lua(source)
+    source_lines = source.splitlines()
+    errors: list[str] = []
+
+    for open_index, (token, open_line) in enumerate(tokens):
+        if token != "{":
+            continue
+
+        close_index = open_index + 1
+        brace_depth = 1
+        while close_index < len(tokens) and brace_depth:
+            if tokens[close_index][0] == "{":
+                brace_depth += 1
+            elif tokens[close_index][0] == "}":
+                brace_depth -= 1
+            close_index += 1
+        if brace_depth:
+            continue
+
+        close_line = tokens[close_index - 1][1]
+        if close_line <= open_line:
+            continue
+
+        # 只把 table 顶层以逗号分隔的 name = value 或 [key] = value 识别为字段；
+        # 跳过字段值里的函数体、函数参数和嵌套 table。
+        fields: list[int] = []
+        nested_braces = 0
+        parentheses = 0
+        brackets = 0
+        previous_top_level = "{"
+        index = open_index + 1
+        while index < close_index - 1:
+            value, line = tokens[index]
+            if nested_braces == 0 and parentheses == 0 and brackets == 0:
+                if previous_top_level in ("{", ","):
+                    if (re.match(r"^[A-Za-z_]\w*$", value)
+                            and index + 1 < close_index and tokens[index + 1][0] == "="):
+                        fields.append(line)
+                    elif value == "[":
+                        key_end = index + 1
+                        while key_end < close_index - 1 and tokens[key_end][0] != "]":
+                            key_end += 1
+                        if key_end + 1 < close_index and tokens[key_end + 1][0] == "=":
+                            fields.append(line)
+
+                if value == ",":
+                    previous_top_level = ","
+                elif value not in (",",):
+                    previous_top_level = value
+
+            if value == "{":
+                nested_braces += 1
+            elif value == "}":
+                nested_braces -= 1
+            elif value == "(":
+                parentheses += 1
+            elif value == ")":
+                parentheses -= 1
+            elif value == "[":
+                brackets += 1
+            elif value == "]":
+                brackets -= 1
+            index += 1
+
+        for field_line in sorted(set(fields)):
+            if fields.count(field_line) > 1:
+                errors.append(
+                    f"{path}:{field_line}: 多行 record 的多个具名字段不能挤在同一行"
+                )
+            text = source_lines[field_line - 1]
+            has_inline_comment = _has_lua_line_comment(text)
+            previous_line_is_comment = (
+                field_line > 1 and source_lines[field_line - 2].lstrip().startswith("--")
+            )
+            if not has_inline_comment and not previous_line_is_comment:
+                errors.append(
+                    f"{path}:{field_line}: HotUpgrade table 字段缺少就近注释"
+                )
+
+    return errors
+
+
 def check_hotupgrade_lua_function_contracts(root: Path) -> list[str]:
     """全量检查 HotUpgrade 生产 Lua 的函数合同、阶段分段和压缩控制体。"""
 
     source_paths = sorted(
         list((root / "hotupgrade/lualib").rglob("*.lua"))
         + list((root / "hotupgrade/service").rglob("*.lua"))
+    )
+    record_paths = source_paths + sorted(
+        list((root / "hotupgrade/sample").rglob("*.lua"))
+        + list((root / "hotupgrade/newsample").rglob("*.lua"))
     )
     errors = check_hotupgrade_controller_type_contract(root)
     for path in source_paths:
@@ -680,6 +800,13 @@ def check_hotupgrade_lua_function_contracts(root: Path) -> list[str]:
             continue
         changed_lines = set(range(1, len(source.splitlines()) + 1))
         errors.extend(check_lua_function_comments(path.relative_to(root), source, changed_lines))
+    for path in record_paths:
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exception:
+            errors.append(f"{path.relative_to(root)}: 无法读取 HotUpgrade record 源码：{exception}")
+            continue
+        errors.extend(check_lua_multiline_record_field_comments(path.relative_to(root), source))
     return errors
 
 

@@ -654,7 +654,7 @@ function M:begin_module_load(request, source)
     local permit_id = tostring(skynet.self()) .. ":module:" .. self.module_permit_sequence
     self.module_load_permits[permit_id] =
     {
-        service_handle = source,      -- 获得许可的已登记 Service；退出通知据此释放许可。
+        service_handle = source,       -- 获得许可的已登记 Service；退出通知据此释放许可。
         module_name    = request.name, -- 与 Service 本地 loading_modules 对应的规范模块名。
     }
     service_registration.loading_modules[request.name] = permit_id
@@ -846,8 +846,7 @@ local function match_service_targets(batch, registered_services)
             if not service_target then
                 service_target =
                 {
-                    -- register 消息真实来源的 Service handle，也是后续热更 RPC 的接收者。
-                    service_handle = service_registration.service_handle,
+                    service_handle = service_registration.service_handle, -- register 消息来源；后续 Prepare/Update/Abort/Finish 都发给它。
                 }
             end
             -- 当前 Service 要执行的 Service Patch；nil 表示本批只更新普通模块。
@@ -938,10 +937,18 @@ local function freeze_patch_files(controller, batch)
             if not valid_service_name(service_name) or batch.service_patches[service_name] then
                 return flywow_result.failure("HU_INVALID_PATCH", "Service 路径映射重复或无效: " .. relative_path)
             end
-            batch.service_patches[service_name] = {patch_relative_path = relative_path, service_patch_source = source}
+            batch.service_patches[service_name] =
+            {
+                patch_relative_path   = relative_path, -- 相对本批 patch_dir 的 .patch 路径，用于诊断和目标匹配。
+                service_patch_source = source,        -- Controller 已读取并冻结的 Service Patch 源码。
+            }
         else
             -- 正式部署的一条文件记录；保留相对路径和新源码供后续部署与恢复使用。
-            local file = {host_relative_path = relative_path, source = source}
+            local file =
+            {
+                host_relative_path = relative_path, -- 相对宿主 root_path 的正式 Lua 文件路径，用于部署和恢复。
+                source             = source,        -- 从本批发布包读取并冻结的文件内容。
+            }
             batch.files[#batch.files + 1] = file
             if not is_service then
                 -- 普通 Lua 文件对应的 require 名；按斜杠转点，例如 a/b.lua 得到 a.b。
@@ -950,7 +957,11 @@ local function freeze_patch_files(controller, batch)
                     return flywow_result.failure("HU_INVALID_PATCH", "Lua 路径映射重复或无效: " .. relative_path)
                 end
                 module_names[name] = true
-                batch.modules[#batch.modules + 1] = {name = name, source = source}
+                batch.modules[#batch.modules + 1] =
+                {
+                    name   = name,   -- 从相对路径转换出的 require 名，用于 Service 登记匹配。
+                    source = source, -- Controller 冻结的候选源码，Update 时随请求发送。
+                }
             end
         end
     end
@@ -1277,8 +1288,8 @@ local function complete_batch(controller, batch)
                 or flywow_result.success())
             batch.service_results[#batch.service_results + 1] =
             {
-                service_handle = service_target.service_handle,
-                hotupgrade_result = service_result,
+                service_handle   = service_target.service_handle, -- 该条结果对应的目标 Service。
+                hotupgrade_result = service_result,              -- 目标最后一次控制步骤的 FlyWowResult。
             }
         end
     end
@@ -1475,8 +1486,12 @@ local function handle_status_request(controller, request)
         service_results = requested_batch.service_results, -- 各目标 Service 的控制结果及错误详情。
         error = requested_batch.error, -- 批次级失败或恢复报告；不作为下一批门禁。
     }
-    return flywow_result.success({record = batch_status,
-        lifecycle = lifecycle, recovery_required = recovery_required})
+    return flywow_result.success(
+    {
+        record = batch_status, -- 指定 batch_id 对应的当前或终态发布记录。
+        lifecycle = lifecycle, -- Controller 当前生命周期视图。
+        recovery_required = recovery_required, -- 最近批次是否报告无法完全恢复。
+    })
 end
 
 --- 按管理命令名称把请求交给对应 Controller 方法，并统一返回 FlyWowResult。

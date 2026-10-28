@@ -36,12 +36,12 @@ skynet.start(function()
                 -- Controller 登记结果；只有成功后才开放 inspect 业务入口。
                 answer = hotupgrade.register_service(
                 {
-                    service_update =
+                    service_update = -- 本地状态和业务函数表的更新接口；对象只在当前 Service Lua State 内使用。
                     {
-                        state = player_state,
-                        functions = business_functions,
+                        state = player_state,           -- Service 的长期状态根表；更新和恢复都保留它的身份。
+                        functions = business_functions, -- Service 当前业务函数表；普通模块提交后替换相应函数。
                     },
-                    before_upgrade = function()
+                    before_upgrade = function() -- 等待已接纳业务排空；返回 false 或抛错会拒绝本批 Prepare。
                         return business_queue(function() return true end)
                     end,
                 })
@@ -56,12 +56,12 @@ skynet.start(function()
                 answer = business_queue(function()
                     return
                     {
-                        ok = true,
-                        version = player_logic.version(),
-                        equip = player_state.equip,
-                        level = player_state.level,
-                        schema_version = player_state.schema_version,
-                        attack = business_functions.load(100),
+                        ok = true, -- inspect 请求是否成功；调用方据此读取玩家快照。
+                        version = player_logic.version(), -- 当前模块版本，用于确认现存实例已更新。
+                        equip = player_state.equip, -- 当前装备，验证 Service Patch 的迁移结果。
+                        level = player_state.level, -- 当前等级，验证未涉及状态保持不变。
+                        schema_version = player_state.schema_version, -- 当前状态结构版本。
+                        attack = business_functions.load(100), -- 新业务函数计算出的攻击值，验证函数表已更新。
                     }
                 end)
             end

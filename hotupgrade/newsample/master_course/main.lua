@@ -77,9 +77,9 @@ local function initialize_controller()
     local runtime_root = assert(os.getenv("FLYWOW_MASTER_RUNTIME_ROOT"))
     expect(skynet.call(controller, "lua", "init",
     {
-        root_path = runtime_root .. "/host",
-        patch_path = runtime_root .. "/patches",
-        service_path = "service",
+        root_path = runtime_root .. "/host", -- 运行夹具内 Service 正式 Lua 文件的宿主根目录。
+        patch_path = runtime_root .. "/patches", -- 本次发布候选文件所在目录。
+        service_path = "service", -- 宿主根目录下 Service 入口文件的相对目录。
     }))
     return controller
 end
