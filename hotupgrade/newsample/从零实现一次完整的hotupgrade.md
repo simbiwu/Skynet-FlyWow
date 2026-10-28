@@ -1882,6 +1882,8 @@ Module Patch Engine 的候选 chunk 使用 Lua State 的默认全局环境，因
 
 同样，**Abort 不负责卸载已成功加载的新依赖或撤销初始化副作用**。如果本批后续失败，当前 Lua State 可能仍保留新模块登记，磁盘文件却已被恢复或删除。后续发布以这一真实现场继续，而不是假装新模块从未出现。
 
+如果新模块自身的登记 RPC 失败，`load_and_register_module()` 会在把错误交回 Update 前恢复本次修改的 `package.loaded` 两个键、撤销本次新增的来源映射和本地声明；外层再释放该模块的本地加载锁。Controller 随后按失败流程 Abort 并恢复正式文件。若该 Lua 文件是本批新增，恢复后文件会被删除，重试前须由后续批次重新部署。Foundation 测试夹具保留文件，只验证 Lua State 的缓存回退和普通首次加载重试；真实 Skynet `new_modules_failure` 场景验证新增文件被删除且后续批次可继续。
+
 ## 第 15 章：引擎的 Abort 与 Finish，先建立准确边界
 
 正常流程只调用 Stage→Commit→Finish；错误流程才会调用 Abort。为了理解下一部分的真实故障，先把两个函数看完整。

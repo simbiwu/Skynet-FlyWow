@@ -548,6 +548,12 @@ fail_new_module_registration = false
 assert(rejected_new_module.code == "HU_NEW_MODULE_FAILED")
 assert(package.loaded.hotupgrade_early_module == nil and package.loaded["lualib.hotupgrade_early_module"] == nil)
 assert(target_control("abort", 11).ok)
+-- 登记失败已回退缓存；Abort 清理批次上下文后，保留在测试目录的文件可普通重试。
+local declarations_before_retry = begin_count -- 失败前的许可计数，用于确认重试重新申请。
+local retried_new_module = hotupgrade.require("hotupgrade_early_module") -- 夹具文件仍在，重试普通首次加载。
+assert(retried_new_module.value == 1 and begin_count == declarations_before_retry + 1 and next(permits) == nil)
+assert(package.loaded.hotupgrade_early_module == retried_new_module)
+assert(package.loaded["lualib.hotupgrade_early_module"] == retried_new_module)
 assert(hotupgrade.require("hotupgrade_new_rules").value() == 42)
 for _, name in ipairs({"hotupgrade_new_dependency", "hotupgrade_new_rules", "hotupgrade_early_module",
     "hotupgrade_unlisted_dependency", "hotupgrade_bad_new_parent"}) do

@@ -113,7 +113,7 @@ Controller 使用 newservice()/uniqueservice() 创建记录中的 service_name �
 
 hotupgrade.require(name) 仍用宿主原有 name 加载模块，通过 package.searchpath(name, package.path) 定位 Lua 文件，再复用 Native resolve 得到规范化路径。Controller 登记名由该文件相对 root_path 的路径去掉 .lua、将 / 转为 . 得到。例如原调用 hotupgrade.require("battle.state_sync.runtime") 加载 lualib/battle/state_sync/runtime.lua，登记名为 lualib.battle.state_sync.runtime；不是给原 name 固定增加目录前缀。?/init.lua 解析出的文件也按真实路径登记，例如 lualib/battle/init.lua 对应 lualib.battle.init。
 
-原 require 名和文件登记名在 package.loaded 中指向同一个模块根表，热更和恢复都通过同一根表对两种名称生效。只有首次通过 hotupgrade.require 确认加载来源的模块表才允许复用；先经普通 require 加载而没有来源记录的缓存模块会被明确拒绝，即使原名恰好等于文件登记名。须从首次加载时就使用 hotupgrade.require，不要清空已有业务缓存来绕过检查。建立别名前同时检查原名来源、文件登记名缓存和 package.preload；冲突时明确拒绝，不覆盖已有缓存或预加载器。加载、来源验证或动态登记失败会恢复本次涉及的原名缓存和规范别名，撤销本次新增的来源映射及声明计数，保留操作前已有的合法缓存，允许重试。仅支持通过标准 package.path 搜索的 Lua 文件；package.preload、自定义加载器来源不一致、无法定位文件或文件位于 root_path 外时明确拒绝。宿主应保持受控模块的搜索路径稳定，不在已加载后改写其加载来源。
+原 require 名和文件登记名在 package.loaded 中指向同一个模块根表，热更和恢复都通过同一根表对两种名称生效。只有首次通过 hotupgrade.require 确认加载来源的模块表才允许复用；先经普通 require 加载而没有来源记录的缓存模块会被明确拒绝，即使原名恰好等于文件登记名。须从首次加载时就使用 hotupgrade.require，不要清空已有业务缓存来绕过检查。建立别名前同时检查原名来源、文件登记名缓存和 package.preload；冲突时明确拒绝，不覆盖已有缓存或预加载器。加载、来源验证或动态登记失败会恢复本次涉及的原名缓存和规范别名，撤销本次新增的来源映射及声明计数，保留操作前已有的合法缓存，允许重试。对于 new_modules 批次中新部署的文件，失败恢复会删除该文件；重试前须由后续批次重新部署。仅支持通过标准 package.path 搜索的 Lua 文件；package.preload、自定义加载器来源不一致、无法定位文件或文件位于 root_path 外时明确拒绝。宿主应保持受控模块的搜索路径稳定，不在已加载后改写其加载来源。
 
 登记前声明随初始元数据提交，由待创建记录保护。register_service 会拒绝本 State 尚在执行的首次声明（HU_LIFECYCLE_PENDING），调用方须待声明完成后登记；登记 RPC 期间的新声明等待登记结果，避免落在初始模块快照之外。
 
@@ -305,7 +305,7 @@ while true do
 end
 ~~~
 
-Controller 从 begin 到终态复用同一个 batch。load_patch(batch) 将冻结源码和初次匹配目标直接写入该记录，Prepare 重匹配复用原目标对象。batch.phase 是唯一保存的发布进度，门禁直接读取活动批次。status 的 lifecycle.pending_service_count 和 pending_module_count 分别表示尚未完成创建或登记的受管理 Service 数、尚未完成首次加载或登记的普通模块数；phase 和 recovery_required 仍由当前及最近终态批次生成，新批次进行中保留最近终态的恢复诊断。
+Controller 从 begin 到终态复用同一个 batch。load_patch(batch) 将冻结源码和初次匹配目标直接写入该记录，Prepare 重匹配复用原目标对象。batch.phase 是唯一保存的发布进度，门禁直接读取活动批次。目标 Service 的本地批次 phase 在首次 Update 入口立即从 nil 变为 UPDATING，因此新模块登记等可能 yield 的操作期间，重入 Update 会以 HU_PHASE_INVALID 拒绝；只有模块和 Service 状态全部提交成功后才变为 ACTIVATED。status 的 lifecycle.pending_service_count 和 pending_module_count 分别表示尚未完成创建或登记的受管理 Service 数、尚未完成首次加载或登记的普通模块数；phase 和 recovery_required 仍由当前及最近终态批次生成，新批次进行中保留最近终态的恢复诊断。
 
 每个目标 Lua State 都保存本批次的 Service Patch 提交内容、恢复快照和 module_stage；本地记录沿内部调用链统一称为 batch。Abort、Finish 和控制异常共用同一批次收尾操作。输入在首次可信边界检查，内部不重复校验没有变化的数据；Service Patch 返回值、自定义快照和候选导出在产生处检查，执行 import_state 后才再次检查候选图。跨 yield 后的来源、许可、缓存身份和模块代码可能改变的状态仍在使用处核对。
 
@@ -358,7 +358,7 @@ bash scripts/build_flywow.sh ../skynet hotupgrade
 bash hotupgrade/scripts/run_hotupgrade_tests.sh ../skynet
 ```
 
-脚本测试创建中/待登记屏障、两种登记时序、启动与业务初始化失败、创建者取消权限、模块许可匹配/消费/失败清理、并发首次声明、Update 起门禁等待，以及父子孙创建链、queue 内创建与首次声明、嵌套许可、已准备目标补模块、新目标 Prepare/Update 失败恢复、排空及控制 RPC 期间拒绝管理端 abort、冻结源码只读一次、queue 排空与 patching、完整模块增改删、候选根表与 self 的身份边界、缓存旧函数和新旧闭包状态隔离、私有状态迁移、Service 状态/函数组合提交、真实 handle/State/表身份保持、Update 内 Stage/Activate 与整批恢复、纯文件发布、文件部署失败恢复、新实例与首次加载版本一致，以及 Finish 故障报告及失败后连续发布。新模块场景验证了文件先部署、递归登记依赖、当前批次不重复 Stage、Service Patch 与普通候选中漏列的新依赖快速失败、并发首次加载冲突时 Update 失败后解除等待、捕获依赖错误不污染后续根因，以及失败后下一批继续更新。Skynet 集成只启动测试专用进程，不监听业务端口；结果不替代宿主真实业务状态与数据库验证。
+脚本测试创建中/待登记屏障、两种登记时序、启动与业务初始化失败、创建者取消权限、模块许可匹配/消费/失败清理、并发首次声明、Update 起门禁等待，以及父子孙创建链、queue 内创建与首次声明、嵌套许可、已准备目标补模块、新目标 Prepare/Update 失败恢复、排空及控制 RPC 期间拒绝管理端 abort、冻结源码只读一次、queue 排空与 patching、完整模块增改删、候选根表与 self 的身份边界、缓存旧函数和新旧闭包状态隔离、私有状态迁移、Service 状态/函数组合提交、真实 handle/State/表身份保持、Update 内 Stage/Activate 与整批恢复、纯文件发布、文件部署失败恢复、新实例与首次加载版本一致，以及 Finish 故障报告及失败后连续发布。新模块场景验证了文件先部署、递归登记依赖、当前批次不重复 Stage、Service Patch 与普通候选中漏列的新依赖快速失败、并发首次加载冲突时 Update 失败后解除等待、捕获依赖错误不污染后续根因、登记失败后验证缓存回退；Foundation 夹具保留文件验证普通 require 重试；真实 Skynet 场景验证失败恢复删除新增文件、后续批次重新部署并继续更新。Skynet 集成只启动测试专用进程，不监听业务端口；结果不替代宿主真实业务状态与数据库验证。
 
 
 ### 宿主启动顺序与原生退出通知
