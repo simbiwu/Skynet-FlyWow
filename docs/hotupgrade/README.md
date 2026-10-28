@@ -331,7 +331,7 @@ prepare/update/finish 是正常目标控制 RPC，abort 用于失败恢复。没
 
 Finish 发生在新版文件和全部 Update 已确认成功之后。某个 Finish 失败或结果不明时，继续尝试其余目标，逐项报告收尾错误并结束本批；不回滚已经 Finish 的目标，也不撤回新版文件。批量更新不承诺严格跨 Service 原子性。
 
-status 不带 batch_id 返回生命周期概览；带 batch_id 还返回当前或最近终态 record。begin 接受后的异步检查、更新和恢复错误均保存在 record.error。只保留活动及最近批次，不持久化历史。target_service_count 在 Prepare 期间随重新匹配更新，进入 Update 前确定最终目标 Service 数；succeeded_service_count/failed_service_count 分别统计成功和失败的目标 Service，service_results 保存参与控制的逐 Service 结果；整批已恢复的失败中，其他参与目标以 HU_BATCH_ABORTED 表示已尝试恢复。
+status 不带 batch_id 返回生命周期概览；带 batch_id 还返回当前或最近终态 record。begin 接受后的异步检查、更新和恢复错误均保存在 record.error。只保留活动及最近批次，不持久化历史。target_service_count 在活动期间由 service_targets 列表长度动态计算；complete_batch() 释放列表前保存最终数量，终态查询读取该快照，公开字段名和语义不变；succeeded_service_count/failed_service_count 分别统计成功和失败的目标 Service，service_results 保存参与控制的逐 Service 结果；整批已恢复的失败中，其他参与目标以 HU_BATCH_ABORTED 表示已尝试恢复。
 
 ### 失败报告与后续发布
 

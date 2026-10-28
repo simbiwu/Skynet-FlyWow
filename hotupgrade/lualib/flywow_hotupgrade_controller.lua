@@ -98,7 +98,7 @@ end
 ---@field service_handle integer register 消息头中的真实 source；作为登记索引和热更 RPC 接收者
 ---@field service_name string Skynet Service 入口名，用于匹配 Service Patch
 ---@field modules table<string, boolean> 当前 Lua State 声明的完整模块名集合
----@field loading_modules table<string, boolean> 正在首次加载的模块；并发许可期间阻止重复加载
+---@field loading_modules table<string, string> 规范模块名到在途 permit_id 的索引；提供同一 Service/模块的 O(1) 重复许可检查
 ---@field has_service_update boolean 是否提供 Service 私有状态/函数更新入口
 
 ---@class FlyWowHotUpgradeServiceTarget
@@ -132,7 +132,6 @@ end
 
 ---@class FlyWowHotUpgradeModulePatch
 ---@field name string 与目标 Service 已登记模块名匹配的规范模块名
----@field entry_file string 发布包内模块文件的相对路径，用于冻结和错误诊断
 ---@field source string 本批冻结的模块源码，随 Update 发给匹配 Service
 
 ---@class FlyWowHotUpgradeServicePatchSource
@@ -149,7 +148,7 @@ end
 ---@field service_results FlyWowHotUpgradeServiceResult[] 本批参与控制的 Service 结果；终态汇总并由 status 返回
 ---@field service_targets FlyWowHotUpgradeServiceTarget[] 本批匹配到的目标 Service 记录；Prepare 期间可增长，Update 前固定并保留参与记录
 ---@field files? FlyWowHotUpgradePatchFile[] 本批冻结的宿主文件及恢复快照
----@field target_service_count integer 当前匹配到的目标 Service 数；Prepare 期间可增长，Update 前确定最终数量
+---@field target_service_count? integer 终态释放 service_targets 前保存的最终目标数；活动期间从目标列表计算
 ---@field current_service_handle? integer 当前或最近一次处理的业务 Service handle；status 对外返回此值
 ---@field waiter? thread 等待创建/登记或首次模块加载完成的批次协程
 ---@field error? FlyWowResult 本批首个失败或恢复失败结果
@@ -756,7 +755,6 @@ local function match_service_targets(batch, registered_services)
         return left.service_handle < right.service_handle
     end)
     batch.service_targets = service_targets
-    batch.target_service_count = #service_targets
     return flywow_result.success({needs_prepare = needs_prepare})
 end
 
@@ -815,7 +813,7 @@ local function freeze_patch_files(controller, batch)
                     return flywow_result.failure("HU_INVALID_PATCH", "Lua 路径映射重复或无效: " .. relative_path)
                 end
                 module_names[name] = true
-                batch.modules[#batch.modules + 1] = {name = name, entry_file = relative_path, source = source}
+                batch.modules[#batch.modules + 1] = {name = name, source = source}
             end
         end
     end
@@ -1108,6 +1106,7 @@ local function complete_batch(controller, batch)
         end
     end
 
+    batch.target_service_count = #batch.service_targets
     batch.service_targets = nil
     batch.files = nil
     batch.modules = nil
@@ -1172,7 +1171,6 @@ function M:begin(request)
         phase                = "WAITING_CREATIONS",                                   -- run_batch 推进；生命周期门禁和 status 视图据此生成。
         service_results      = {},                                                    -- run_batch 终态汇总参与控制的 Service 结果，供 status 返回。
         service_targets      = {},                                                    -- 目标 Service 记录；Prepare 重匹配时补齐，Update 前固定，终态后释放。
-        target_service_count = 0,                                                     -- 当前匹配的目标 Service 数；Prepare 可增长，Update 前确定最终值。
     }
     self.active_batch = batch
     skynet.fork(function()
@@ -1192,6 +1190,75 @@ end
 ---| "register_new_module"
 ---| "cancel_module_load"
 ---| "status"
+
+--- 按当前和最近批次生成管理查询视图；在途数量从事实表统计，终态结果保留恢复诊断而不限制续批。
+---@param controller FlyWowHotUpgradeController 已初始化的唯一控制面
+---@param request FlyWowHotUpgradeManagementRequest 可选 batch_id 指定活动或最近终态批次
+---@return FlyWowResult 查询成功包含 lifecycle；指定批次时另含 record，批次不存在时报告 HU_BATCH_MISSING
+local function handle_status_request(controller, request)
+    local lifecycle_batch = controller.active_batch or controller.last_batch
+    local phase = lifecycle_batch and lifecycle_batch.phase or "IDLE"
+    if controller.active_batch then
+        if phase == "PREPARE" or phase == "UPDATE" or phase == "PUBLISH_DECIDED" then
+            phase = "APPLYING"
+        end
+    elseif lifecycle_batch and lifecycle_batch.error then
+        phase = "IDLE"
+    end
+    -- 管理查询字段由批次事实生成，沿用现有对外值，不独立保存和同步。
+    local recovery_required = controller.last_batch ~= nil and controller.last_batch.phase == "RECOVERY_REQUIRED"
+    if controller.active_batch and lifecycle_batch.phase == "PUBLISH_DECIDED" and lifecycle_batch.error then
+        recovery_required = lifecycle_batch.error.code == "HU_RECOVERY_REQUIRED"
+    end
+    -- 对外保留在途数量，但每次从唯一事实表统计，不另存同步计数。
+    local pending_service_count = 0
+    for _ in pairs(controller.pending_creations) do
+        pending_service_count = pending_service_count + 1
+    end
+    local pending_module_count = 0
+    for _ in pairs(controller.module_load_permits) do
+        pending_module_count = pending_module_count + 1
+    end
+    local lifecycle =
+    {
+        phase = phase,
+        batch_id = lifecycle_batch and lifecycle_batch.batch_id,
+        pending_service_count = pending_service_count,
+        pending_module_count = pending_module_count,
+        active_batch_id = controller.active_batch and controller.active_batch.batch_id,
+        recovery_required = recovery_required,
+    }
+    if request.batch_id == nil then
+        return flywow_result.success({lifecycle = lifecycle, recovery_required = recovery_required})
+    end
+
+    local requested_batch = controller.active_batch and controller.active_batch.batch_id == request.batch_id and controller.active_batch or controller.last_batch
+    if not requested_batch or requested_batch.batch_id ~= request.batch_id then
+        return flywow_result.failure("HU_BATCH_MISSING", "仅保留活动及最近终态批次")
+    end
+
+    -- 活动期间结果列表为空，计数自然为 0；终态直接统计保留的结果快照。
+    local succeeded_service_count = 0 -- 本批成功的终态目标数。
+    local failed_service_count    = 0 -- 本批失败的终态目标数。
+    for _, service_result in ipairs(requested_batch.service_results) do
+        if service_result.hotupgrade_result.ok then
+            succeeded_service_count = succeeded_service_count + 1
+        else
+            failed_service_count = failed_service_count + 1
+        end
+    end
+
+    ---@type FlyWowHotUpgradeBatchStatus
+    local batch_status =
+    {
+        batch_id = requested_batch.batch_id, phase = requested_batch.phase, succeeded_service_count = succeeded_service_count,
+        failed_service_count = failed_service_count,
+        target_service_count = requested_batch.service_targets and #requested_batch.service_targets or requested_batch.target_service_count, current_service_handle = requested_batch.current_service_handle,
+        service_results = requested_batch.service_results, error = requested_batch.error, control_started = requested_batch.control_started == true,
+    }
+    return flywow_result.success({record = batch_status,
+        lifecycle = lifecycle, recovery_required = recovery_required})
+end
 
 --- 管理命令不做远程认证；宿主掌握 Controller handle，登记来源由消息头确定。
 ---@param command FlyWowHotUpgradeManagementCommand Controller Service 分发的稳定管理命令
@@ -1237,68 +1304,7 @@ function M:handle_command(command, request, source)
     end
 
     if command == "status" then
-        local lifecycle_batch = self.active_batch or self.last_batch
-        local phase = lifecycle_batch and lifecycle_batch.phase or "IDLE"
-        if self.active_batch then
-            if phase == "PREPARE" or phase == "UPDATE" or phase == "PUBLISH_DECIDED" then
-                phase = "APPLYING"
-            end
-        elseif lifecycle_batch and lifecycle_batch.error then
-            phase = "IDLE"
-        end
-        -- 管理查询字段由批次事实生成，沿用现有对外值，不独立保存和同步。
-        local recovery_required = self.last_batch ~= nil and self.last_batch.phase == "RECOVERY_REQUIRED"
-        if self.active_batch and lifecycle_batch.phase == "PUBLISH_DECIDED" and lifecycle_batch.error then
-            recovery_required = lifecycle_batch.error.code == "HU_RECOVERY_REQUIRED"
-        end
-        -- 对外保留在途数量，但每次从唯一事实表统计，不另存同步计数。
-        local pending_service_count = 0
-        for _ in pairs(self.pending_creations) do
-            pending_service_count = pending_service_count + 1
-        end
-        local pending_module_count = 0
-        for _ in pairs(self.module_load_permits) do
-            pending_module_count = pending_module_count + 1
-        end
-        local lifecycle =
-        {
-            phase = phase,
-            batch_id = lifecycle_batch and lifecycle_batch.batch_id,
-            pending_service_count = pending_service_count,
-            pending_module_count = pending_module_count,
-            active_batch_id = self.active_batch and self.active_batch.batch_id,
-            recovery_required = recovery_required,
-        }
-        if request.batch_id == nil then
-            return flywow_result.success({lifecycle = lifecycle, recovery_required = recovery_required})
-        end
-
-        local requested_batch = self.active_batch and self.active_batch.batch_id == request.batch_id and self.active_batch or self.last_batch
-        if not requested_batch or requested_batch.batch_id ~= request.batch_id then
-            return flywow_result.failure("HU_BATCH_MISSING", "仅保留活动及最近终态批次")
-        end
-
-        -- 活动期间结果列表为空，计数自然为 0；终态直接统计保留的结果快照。
-        local succeeded_service_count = 0 -- 本批成功的终态目标数。
-        local failed_service_count    = 0 -- 本批失败的终态目标数。
-        for _, service_result in ipairs(requested_batch.service_results) do
-            if service_result.hotupgrade_result.ok then
-                succeeded_service_count = succeeded_service_count + 1
-            else
-                failed_service_count = failed_service_count + 1
-            end
-        end
-
-        ---@type FlyWowHotUpgradeBatchStatus
-        local batch_status =
-        {
-            batch_id = requested_batch.batch_id, phase = requested_batch.phase, succeeded_service_count = succeeded_service_count,
-            failed_service_count = failed_service_count,
-            target_service_count = requested_batch.target_service_count, current_service_handle = requested_batch.current_service_handle,
-            service_results = requested_batch.service_results, error = requested_batch.error, control_started = requested_batch.control_started == true,
-        }
-        return flywow_result.success({record = batch_status,
-            lifecycle = lifecycle, recovery_required = recovery_required})
+        return handle_status_request(self, request)
     end
 
     return flywow_result.failure("HU_UNKNOWN_COMMAND", tostring(command))

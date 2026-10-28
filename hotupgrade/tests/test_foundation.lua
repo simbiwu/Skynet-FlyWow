@@ -211,9 +211,11 @@ local unique_calls = 0
 local last_loaded_value
 local new_module_registrations = {}
 local active_new_module_batch
-local pause_service_registration   = false -- 让 Service 登记 RPC 暂停，制造其他协程并发 require 的窗口。
-local fail_service_registration    = false -- 模拟登记 RPC 失败，检查等待者醒来后会拒绝加载。
-local registration_wake_results    = {}    -- 记录测试调度器唤醒协程后的执行结果。
+local fail_new_module_registration  = false -- 模拟本批新模块登记失败，验证缓存和来源回退。
+local pause_new_module_registration = false -- 暂停顶层新模块登记，制造同批重复 Update 的窗口。
+local pause_service_registration    = false -- 暂停 Service 登记 RPC，制造其他协程并发 require 的窗口。
+local fail_service_registration     = false -- 模拟 Service 登记失败，验证等待者醒来后拒绝加载。
+local registration_wake_results     = {}    -- 测试调度器唤醒登记等待协程后的执行结果。
 local forwarded = {}
 local control_dispatch
 local control_answer
@@ -257,6 +259,9 @@ package.loaded.skynet =
             forwarded.cancel = request
             return {ok = true}
         elseif command == "begin_module_load" then
+            if fail_registration == "permit" then
+                return {ok = false, code = "HU_FIXTURE_PERMIT_FAILED"}
+            end
             begin_count = begin_count + 1
             permit_sequence = permit_sequence + 1
             local id = tostring(permit_sequence)
@@ -277,7 +282,13 @@ package.loaded.skynet =
             permits[request.permit_id] = nil
             return {ok = true}
         elseif command == "register_new_module" then
+            if pause_new_module_registration and request.name == "lualib.hotupgrade_new_rules" then
+                coroutine.yield()
+            end
             assert(request.batch_id == active_new_module_batch)
+            if fail_new_module_registration then
+                return {ok = false, message = "injected new module registration failure"}
+            end
             new_module_registrations[#new_module_registrations + 1] = request.name
             return {ok = true}
         elseif command == "cancel_module_load" then
@@ -412,6 +423,17 @@ for _, failure in ipairs({"execute", "path", "register", "rpc"}) do
     assert(not loaded_ok and next(permits) == nil)
     assert(package.loaded.hotupgrade_extra == nil and package.loaded["lualib.hotupgrade_extra"] == nil)
 end
+-- 许可拒绝发生在缓存快照之前，两个缓存槽都必须保留原值。
+fail_registration = "permit"
+local permit_rejected_cache = {}
+package.loaded.hotupgrade_extra = permit_rejected_cache
+package.loaded["lualib.hotupgrade_extra"] = permit_rejected_cache
+assert(not pcall(hotupgrade.require, "hotupgrade_extra"))
+assert(package.loaded.hotupgrade_extra == permit_rejected_cache)
+assert(package.loaded["lualib.hotupgrade_extra"] == permit_rejected_cache)
+package.loaded.hotupgrade_extra = nil
+package.loaded["lualib.hotupgrade_extra"] = nil
+fail_registration = false
 -- 登记失败后新增的来源记录也必须撤销；不能把留下的表当成合法既有缓存。
 package.loaded.hotupgrade_extra = last_loaded_value
 local loaded_ok, load_error = pcall(hotupgrade.require, "hotupgrade_extra")
@@ -464,7 +486,34 @@ assert(target_control("prepare", 8).ok)
 local new_module_service_patch_source = [[return function()
     return {new_modules = {"hotupgrade_new_rules", "hotupgrade_new_dependency"}}
 end]]
-local new_module_update = target_control("update", 8, {service_patch_source = new_module_service_patch_source})
+local new_module_update -- 首次 Update 协程返回的结果；恢复后由主测试协程检查。
+local staged_calls = 0   -- 统计首次 Update 的 Stage 次数，重复 Update 不得增加。
+patch.stage = function(...)
+    staged_calls = staged_calls + 1
+    -- 重复请求结束后，首次 Update 的声明权限必须仍有效；清单外加载不能走普通许可。
+    local permits_before_stage = begin_count
+    local loaded           -- 清单外模块是否意外加载成功。
+    local undeclared_error -- 首次 Update 上下文拒绝清单外模块的结构化错误。
+    loaded, undeclared_error = pcall(hotupgrade.require, "hotupgrade_early_module")
+    assert(not loaded and type(undeclared_error) == "table"
+        and undeclared_error.code == "HU_NEW_MODULE_NOT_DECLARED")
+    assert(begin_count == permits_before_stage)
+    return original_stage(...)
+end
+pause_new_module_registration = true
+local updating = coroutine.create(function()
+    new_module_update = target_control("update", 8, {service_patch_source = new_module_service_patch_source})
+end)
+local update_resumed -- 首次 Update 协程是否正常执行到暂停点。
+local update_failure -- 协程恢复失败时的诊断，供断言报告。
+update_resumed, update_failure = coroutine.resume(updating)
+assert(update_resumed and coroutine.status(updating) == "suspended", tostring(update_failure) .. ": " .. tostring(new_module_update and new_module_update.message))
+assert(target_control("update", 8, {service_patch_source = new_module_service_patch_source}).code == "HU_PHASE_INVALID")
+assert(staged_calls == 0)
+pause_new_module_registration = false
+assert(coroutine.resume(updating) and coroutine.status(updating) == "dead")
+assert(staged_calls == 1)
+patch.stage = original_stage
 assert(new_module_update.ok, new_module_update.message)
 assert(begin_count == declarations_before_new_modules)
 assert(table.concat(new_module_registrations, ",") == "lualib.hotupgrade_new_dependency,lualib.hotupgrade_new_rules")
@@ -489,6 +538,17 @@ assert(not undeclared_result.ok and undeclared_result.code == "HU_NEW_MODULE_FAI
 assert(undeclared_result.details.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
 assert(begin_count == declarations_before_new_modules)
 assert(target_control("abort", 10).ok)
+-- 新模块登记失败时撤销本次两个缓存键；此前已成功登记的模块仍可复用。
+active_new_module_batch = "fixture:11"
+assert(target_control("prepare", 11).ok)
+fail_new_module_registration = true
+local rejected_new_module = target_control("update", 11,
+    {service_patch_source = [[return function() return {new_modules = {"hotupgrade_early_module"}} end]]})
+fail_new_module_registration = false
+assert(rejected_new_module.code == "HU_NEW_MODULE_FAILED")
+assert(package.loaded.hotupgrade_early_module == nil and package.loaded["lualib.hotupgrade_early_module"] == nil)
+assert(target_control("abort", 11).ok)
+assert(hotupgrade.require("hotupgrade_new_rules").value() == 42)
 for _, name in ipairs({"hotupgrade_new_dependency", "hotupgrade_new_rules", "hotupgrade_early_module",
     "hotupgrade_unlisted_dependency", "hotupgrade_bad_new_parent"}) do
     assert(os.remove("build/hotupgrade-tests/host/lualib/" .. name .. ".lua"))

@@ -96,6 +96,7 @@ scenarios['lifecycle'] = function()
     assert(managed_register(lifecycle, metadata, 61).ok)
     local permit = lifecycle:handle_command("begin_module_load", {name = "lualib.exit_pending"}, 61)
     assert(permit.ok and lifecycle_status(lifecycle).pending_module_count == 1)
+    assert(lifecycle.service_registrations[61].loading_modules["lualib.exit_pending"] == permit.value.permit_id)
     lifecycle:on_service_exit(61)
     assert(lifecycle.service_registrations[61] == nil)
     assert(lifecycle_status(lifecycle).pending_module_count == 0 and next(lifecycle.module_load_permits) == nil)
@@ -224,6 +225,7 @@ scenarios['lifecycle'] = function()
 
     local permit = lifecycle:handle_command("begin_module_load", {name = "extra"}, 70)
     assert(permit.ok)
+    assert(lifecycle.service_registrations[70].loading_modules.extra == permit.value.permit_id)
     assert(lifecycle:handle_command("begin_module_load", {name = "extra"}, 70).code == "HU_MODULE_LOADING")
     blocked(lifecycle)
     local request = {name = "extra", permit_id = permit.value.permit_id}
@@ -231,10 +233,14 @@ scenarios['lifecycle'] = function()
     assert(lifecycle:handle_command("register_module", {name = "wrong", permit_id = permit.value.permit_id}, 70).code == "HU_MODULE_PERMIT_MISMATCH")
     assert(lifecycle_status(lifecycle).pending_module_count == 1)
     assert(lifecycle:handle_command("register_module", request, 70).ok and lifecycle_status(lifecycle).pending_module_count == 0)
+    assert(lifecycle.service_registrations[70].loading_modules.extra == nil)
+    assert(lifecycle.module_load_permits[permit.value.permit_id] == nil)
     assert(lifecycle:handle_command("register_module", request, 70).code == "HU_MODULE_PERMIT_MISSING")
     permit = lifecycle:handle_command("begin_module_load", {name = "cancelled"}, 70)
     assert(lifecycle:handle_command("cancel_module_load", {name = "cancelled", permit_id = permit.value.permit_id}, 70).ok)
     assert(lifecycle_status(lifecycle).pending_module_count == 0 and not lifecycle.service_registrations[70].modules.cancelled)
+    assert(lifecycle.service_registrations[70].loading_modules.cancelled == nil)
+    assert(lifecycle.module_load_permits[permit.value.permit_id] == nil)
     assert(lifecycle:handle_command("begin_module_load", {name = "extra"}, 90).code == "HU_SERVICE_NOT_REGISTERED")
     local started_lifecycle = publish(lifecycle, {path = "module"})
     assert(started_lifecycle.ok)
@@ -448,13 +454,25 @@ scenarios['paths'] = function()
             has_service_update = true}, 50, "battle/worker").ok)
     local batch = {patch_dir = "host_paths"}
     assert(paths:load_patch(batch).ok and #batch.modules == 3)
-    assert(batch.modules[1].entry_file == "config/settings.lua")
+    assert(batch.files[1].entry_file == "config/settings.lua")
+    assert(batch.modules[1].name == "config.settings")
+    for _, module_patch in ipairs(batch.modules) do
+        for key in pairs(module_patch) do
+            assert(key == "name" or key == "source")
+        end
+    end
     assert(batch.modules[2].name == "lualib.battle.state_sync.runtime")
     assert(paths:load_patch({patch_dir = "nested_named_service"}).ok)
 
     for _, path in ipairs({"duplicate_module", "duplicate_service"}) do
         assert(paths:load_patch({patch_dir = path}).code == "HU_INVALID_PATCH")
     end
+    local zero = paths:handle_command("begin", {path = "module"}, 1)
+    assert(paths:handle_command("status", {batch_id = zero.value.batch_id}, 1).value.record.target_service_count == 0)
+    module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+    assert(paths.last_batch.service_targets == nil)
+    assert(paths:handle_command("status", {batch_id = zero.value.batch_id}, 1).value.record.target_service_count == 0)
+
 end
 
 scenarios['custom_paths'] = function()
@@ -573,12 +591,15 @@ scenarios['draining'] = function()
     module_state.control_hook = function(service_handle, command, request)
         if command == "prepare" and service_handle == 10 then
             assert(c.active_batch.phase == "PREPARE")
+            assert(c.active_batch.target_service_count == nil)
+            assert(c:handle_command("status", {batch_id = c.active_batch.batch_id}, 1).value.record.target_service_count == #c.active_batch.service_targets)
             prepared_service_target = c.active_batch.service_targets[1]
             assert(managed_register(c, metadata, 30).ok)
             assert(managed_register(c, {modules = {}, has_service_update = false}, 31, "unaffected").ok)
             assert(register_module(c, "lualib.hotupgrade_extra", 10).ok)
             assert(register_module(c, "lualib.hotupgrade_extra", 20).ok)
         elseif command == "prepare" and service_handle == 30 then
+            assert(c:handle_command("status", {batch_id = c.active_batch.batch_id}, 1).value.record.target_service_count == 3)
             module_state.launch_service_handle = 40
             assert(c:handle_command("uniqueservice",
                 {service_name = "child", arguments = {n = 0}}, 30).value.service_handle == 40)
@@ -610,6 +631,7 @@ scenarios['draining'] = function()
     assert(c.last_batch.batch_id == id and c.last_batch.phase == "COMPLETED")
     local status = c:handle_command("status", {batch_id = id}, 1).value.record
     assert(status.target_service_count == 4 and status.succeeded_service_count == 4 and scans == 1)
+    assert(c.last_batch.service_targets == nil and c.last_batch.target_service_count == 4)
     local prepares = {}
     for _, operation in ipairs(module_state.operations) do
         local service_handle = operation:match("^(%d+):prepare$")

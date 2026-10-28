@@ -31,7 +31,7 @@ local module_state =
 ---@class FlyWowHotUpgradeServiceBatch
 ---@field batch_id string Controller 为本次发布生成的身份；用于拒绝其他批次的控制命令。
 ---@field sequence integer Controller 单调递增的本地序号；finish/abort 后写入 completed_sequence。
----@field phase? string nil 表示 Update 尚未开始，之后为 STAGED 或 ACTIVATED；Finish/Abort 结束时批次记录本身被清除。
+---@field phase? string nil 表示 Update 尚未开始，之后为 UPDATING 或 ACTIVATED；Finish/Abort 结束时批次记录本身被清除。
 ---@field new_module_context? FlyWowHotUpgradeNewModuleContext Update 中的临时声明权限；候选 Stage 完成后立即清除。
 ---@field module_stage? FlyWowHotUpgradeModuleStage 候选模块的旧/新导出记录；保留至 Finish 或 Abort。
 ---@field service_patch? FlyWowHotUpgradeServicePatchState Service 私有状态与函数的提交/恢复记录。
@@ -340,6 +340,7 @@ local function update_batch(batch, request)
     if batch.phase ~= nil then
         return flywow_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
+    batch.phase = "UPDATING"
     -- Controller 在 Prepare 收口时已固定普通候选；new_modules 在这里才首次加载并登记，从下一批 Stage 起才会匹配。
     local service_patch_result = stage_service_patch_and_new_modules(batch, request.service_patch_source)
     if not service_patch_result.ok then
@@ -362,7 +363,6 @@ local function update_batch(batch, request)
 
     batch.module_stage = module_result.value.stage
     batch.service_patch = service_patch
-    batch.phase = "STAGED"
 
     -- Activate 同步提交；失败先报告，再由 Controller 串行 Abort 整批目标。
     local commit_result = hotupgrade_module_patch.commit(batch.module_stage)
@@ -569,6 +569,51 @@ function M.register_service(registration)
     return registration_response
 end
 
+--- 读取并验证模块导出及加载来源；只记录本次新增来源映射，许可、别名登记和失败恢复由调用方负责。
+---@param name string 调用方原始 require 名
+---@param module_identity FlyWowHotUpgradeModuleIdentity 已验证的搜索路径、真实路径和规范登记名
+---@param module_load_attempt table 许可返回后已建立缓存快照的本次加载记录
+---@return nil 原生 require 可能 yield；验证失败抛出原错误，由调用方恢复本次变更
+local function load_module_exports(name, module_identity, module_load_attempt)
+    local source_path    = module_identity.source_path    -- 首次搜索路径，用于核对 Skynet 加载器。
+    local resolved_path  = module_identity.resolved_path  -- 规范真实路径，用于核对缓存来源。
+    local canonical_name = module_identity.canonical_name -- 文件登记名，用于核对别名占用。
+    module_load_attempt.module_exports = module_load_attempt.cache_snapshot.module
+    -- 缓存占用不能证明来源；仅复用本入口确认过的同表来源。
+    assert(module_load_attempt.cache_snapshot.module == nil or (type(module_load_attempt.cache_snapshot.module) == "table"
+        and module_state.module_sources[module_load_attempt.cache_snapshot.module] == resolved_path),
+        "HU_INVALID_PATH: 无法确认缓存模块来源，须先通过 hotupgrade.require 加载: " .. name)
+    assert(package.preload[canonical_name] == nil and package.preload[name] == nil,
+        "HU_DUPLICATE_MODULE: 模块名称已被 package.preload 占用: " .. canonical_name)
+    assert(module_load_attempt.cache_snapshot.canonical_alias == nil or (rawequal(module_load_attempt.cache_snapshot.canonical_alias, module_load_attempt.cache_snapshot.module)
+        and module_state.module_sources[module_load_attempt.cache_snapshot.canonical_alias] == resolved_path),
+        "HU_DUPLICATE_MODULE: 模块路径登记名已被其他模块占用: " .. canonical_name)
+    if module_load_attempt.module_exports == nil then
+        module_load_attempt.module_exports, module_load_attempt.loader_path = require(name)
+        assert(type(module_load_attempt.module_exports) == "table", "可更新模块必须返回 table")
+        if module_load_attempt.loader_path ~= nil then
+            assert(type(module_load_attempt.loader_path) == "string" and hotupgrade_native.resolve(module_load_attempt.loader_path) == resolved_path,
+                "HU_INVALID_PATH: 模块加载来源与 package.path 不一致: " .. name)
+        else
+            -- Skynet 协程 require 不返回路径；固定走 searchpath/loadfile，只认可此已知加载器。
+            assert(require == skynet_require.require and loadfile(source_path, "t") ~= nil,
+                "HU_INVALID_PATH: 加载器未提供可确认的模块来源: " .. name)
+        end
+        assert(module_state.module_sources[module_load_attempt.module_exports] == nil
+            or module_state.module_sources[module_load_attempt.module_exports] == resolved_path,
+            "HU_DUPLICATE_MODULE: 同一模块表已对应其他文件: " .. name)
+        assert(package.preload[name] == nil and package.preload[canonical_name] == nil,
+            "HU_DUPLICATE_MODULE: 模块名称已被 package.preload 占用: " .. canonical_name)
+        assert(package.loaded[canonical_name] == nil or rawequal(package.loaded[canonical_name], module_load_attempt.module_exports),
+            "HU_DUPLICATE_MODULE: 模块路径登记名已被其他模块占用: " .. canonical_name)
+        module_load_attempt.loader_path = module_load_attempt.loader_path or source_path
+        if module_state.module_sources[module_load_attempt.module_exports] == nil then
+            module_state.module_sources[module_load_attempt.module_exports] = resolved_path
+            module_load_attempt.source_mapping_added = true
+        end
+    end
+end
+
 --- 执行一次首次加载与登记；许可、缓存和本地声明构成同一恢复边界，失败先回退再抛出原错误。
 ---@param name string 调用方原始 require 名
 ---@param module_identity FlyWowHotUpgradeModuleIdentity 已验证的文件身份
@@ -576,19 +621,15 @@ end
 ---@param register_new_module? boolean 是否使用本批新模块登记通道
 ---@return table module_exports 已完成加载与登记的稳定导出表；许可、require 或登记可能 yield
 local function load_and_register_module(name, module_identity, new_module_context, register_new_module)
-    local source_path    = module_identity.source_path    -- 已验证的首次搜索路径，供加载器来源校验使用。
-    local resolved_path  = module_identity.resolved_path  -- 已验证的真实路径，供缓存和实际加载来源比较。
     local canonical_name = module_identity.canonical_name -- 本地声明、缓存别名和 Controller 登记的共同身份。
     local module_load_attempt =
     {
-        loader_path              = source_path, -- 加载器返回路径缺失时沿用首次 searchpath 结果。
-        permit_id                = nil,         -- 普通首次声明的许可；登记完成或失败取消后释放。
-        cached_module            = nil,         -- 取得许可后保存的原名缓存，失败时原样装回。
-        previous_canonical_alias = nil,         -- 同时保存规范别名，避免回退时破坏既有合法缓存。
-        module_exports           = nil,         -- 本次加载或复用的模块表，供来源映射与成功返回使用。
-        cache_snapshot_taken     = false,       -- 许可失败时缓存尚未触及，不应执行缓存恢复。
-        source_mapping_added     = false,       -- 只撤销本次新建的模块表到文件路径映射。
-        module_declaration_added = false,       -- 只撤销本次新增的本地模块声明。
+        loader_path              = module_identity.source_path, -- 加载器返回路径缺失时沿用首次 searchpath 结果。
+        permit_id                = nil,                         -- 普通首次声明的许可；登记完成或失败取消后释放。
+        cache_snapshot           = nil,                         -- 许可返回后保存两个缓存槽；失败时按原值恢复。
+        module_exports           = nil,                         -- 本次加载或复用的模块表，供来源映射与成功返回使用。
+        source_mapping_added     = false,                       -- 只撤销本次新建的模块表到文件路径映射。
+        module_declaration_added = false,                       -- 只撤销本次新增的本地模块声明。
     }
     local load_succeeded, load_failure = pcall(function()
         if module_state.registration_config and not module_state.declared_modules[canonical_name] and not register_new_module then
@@ -599,43 +640,12 @@ local function load_and_register_module(name, module_identity, new_module_contex
         end
 
         -- 申请许可会 yield；恢复后再读取快照，等待者须等本次登记成功或完整回退。
-        module_load_attempt.cached_module = package.loaded[name]
-        module_load_attempt.previous_canonical_alias = package.loaded[canonical_name]
-        module_load_attempt.module_exports = module_load_attempt.cached_module
-        module_load_attempt.cache_snapshot_taken = true
-        -- 缓存占用不能证明来源；仅复用本入口确认过的同表来源。
-        assert(module_load_attempt.cached_module == nil or (type(module_load_attempt.cached_module) == "table"
-            and module_state.module_sources[module_load_attempt.cached_module] == resolved_path),
-            "HU_INVALID_PATH: 无法确认缓存模块来源，须先通过 hotupgrade.require 加载: " .. name)
-        assert(package.preload[canonical_name] == nil and package.preload[name] == nil,
-            "HU_DUPLICATE_MODULE: 模块名称已被 package.preload 占用: " .. canonical_name)
-        assert(module_load_attempt.previous_canonical_alias == nil or (rawequal(module_load_attempt.previous_canonical_alias, module_load_attempt.cached_module)
-            and module_state.module_sources[module_load_attempt.previous_canonical_alias] == resolved_path),
-            "HU_DUPLICATE_MODULE: 模块路径登记名已被其他模块占用: " .. canonical_name)
-        if module_load_attempt.module_exports == nil then
-            module_load_attempt.module_exports, module_load_attempt.loader_path = require(name)
-            assert(type(module_load_attempt.module_exports) == "table", "可更新模块必须返回 table")
-            if module_load_attempt.loader_path ~= nil then
-                assert(type(module_load_attempt.loader_path) == "string" and hotupgrade_native.resolve(module_load_attempt.loader_path) == resolved_path,
-                    "HU_INVALID_PATH: 模块加载来源与 package.path 不一致: " .. name)
-            else
-                -- Skynet 协程 require 不返回路径；固定走 searchpath/loadfile，只认可此已知加载器。
-                assert(require == skynet_require.require and loadfile(source_path, "t") ~= nil,
-                    "HU_INVALID_PATH: 加载器未提供可确认的模块来源: " .. name)
-            end
-            assert(module_state.module_sources[module_load_attempt.module_exports] == nil
-                or module_state.module_sources[module_load_attempt.module_exports] == resolved_path,
-                "HU_DUPLICATE_MODULE: 同一模块表已对应其他文件: " .. name)
-            assert(package.preload[name] == nil and package.preload[canonical_name] == nil,
-                "HU_DUPLICATE_MODULE: 模块名称已被 package.preload 占用: " .. canonical_name)
-            assert(package.loaded[canonical_name] == nil or rawequal(package.loaded[canonical_name], module_load_attempt.module_exports),
-                "HU_DUPLICATE_MODULE: 模块路径登记名已被其他模块占用: " .. canonical_name)
-            module_load_attempt.loader_path = module_load_attempt.loader_path or source_path
-            if module_state.module_sources[module_load_attempt.module_exports] == nil then
-                module_state.module_sources[module_load_attempt.module_exports] = resolved_path
-                module_load_attempt.source_mapping_added = true
-            end
-        end
+        module_load_attempt.cache_snapshot =
+        {
+            module          = package.loaded[name],           -- 原始 require 名的旧缓存，失败时恢复。
+            canonical_alias = package.loaded[canonical_name], -- 规范登记名的旧别名，失败时恢复。
+        }
+        load_module_exports(name, module_identity, module_load_attempt)
 
         -- 登记 RPC 前建立全部本地状态；许可阻止 Controller 在此关键区间启动批次。
         package.loaded[canonical_name] = module_load_attempt.module_exports
@@ -655,9 +665,9 @@ local function load_and_register_module(name, module_identity, new_module_contex
     end)
     -- 任一步失败都恢复原名缓存、规范别名和本次新增的本地声明。
     if not load_succeeded then
-        if module_load_attempt.cache_snapshot_taken then
-            package.loaded[name] = module_load_attempt.cached_module
-            package.loaded[canonical_name] = module_load_attempt.previous_canonical_alias
+        if module_load_attempt.cache_snapshot then
+            package.loaded[name] = module_load_attempt.cache_snapshot.module
+            package.loaded[canonical_name] = module_load_attempt.cache_snapshot.canonical_alias
         end
         if module_load_attempt.source_mapping_added then
             module_state.module_sources[module_load_attempt.module_exports] = nil
@@ -682,8 +692,8 @@ end
 require_module = function(name, module_identity)
     -- 入口已固定模块身份；等待和加载后的缓存/来源检查保留在实际变化点。
     local canonical_name = module_identity.canonical_name
-    local batch = module_state.active_batch
-    local new_module_context = batch and batch.new_module_context
+    local new_module_context = module_state.active_batch
+        and module_state.active_batch.new_module_context
     local in_new_module_context = new_module_context and new_module_context.owner == coroutine.running()
     local register_new_module = in_new_module_context and new_module_context.names[canonical_name] == true
     if in_new_module_context and not module_state.declared_modules[canonical_name] and not register_new_module then

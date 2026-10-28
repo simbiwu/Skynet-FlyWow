@@ -1109,7 +1109,6 @@ function M:begin(request)
         phase                = "WAITING_CREATIONS",                                   -- run_batch 推进；生命周期门禁和 status 视图据此生成。
         service_results      = {},                                                    -- run_batch 终态汇总参与控制的 Service 结果，供 status 返回。
         service_targets      = {},                                                    -- 目标 Service 记录；Prepare 重匹配时补齐，Update 前固定，终态后释放。
-        target_service_count = 0,                                                     -- 当前匹配的目标 Service 数；Prepare 可增长，Update 前确定最终值。
     }
     self.active_batch = batch
     skynet.fork(function()
@@ -1205,7 +1204,7 @@ end
 
 四阶段共用同一个 batch。第一个阶段失败会写入 batch.error 并返回；编排函数立即停止后续阶段，回到 run_batch() 后进入恢复，不会跳过批次收尾。
 
-`load_patch(batch)` 先调用 `freeze_patch_files(controller,batch)` 扫描、读取、检查语法并分类源码，将结果写入 `batch.files`、`batch.modules`、`batch.service_patches`，再完成初次匹配，写入 `batch.service_targets` 和 `batch.target_service_count`。`service_targets` 的每一项是一个目标 Service 的本批记录，包含真实 handle、匹配到的模块及 Prepare/Abort 所需参与状态；它不是另一种批次或发布包。返回的 `frozen` 仅是冻结操作结果；它不再携带另一层 patch/targets 包装。普通模块源码记录与文件恢复记录分别用于目标 RPC 和正式文件恢复，旧文件快照不发送给目标 Service。
+`load_patch(batch)` 先调用 `freeze_patch_files(controller,batch)` 扫描、读取、检查语法并分类源码，将结果写入 `batch.files`、`batch.modules`、`batch.service_patches`，再完成初次匹配，写入 `batch.service_targets`；活动目标数由该列表长度计算，终态释放列表前才保存 `batch.target_service_count`。`service_targets` 的每一项是一个目标 Service 的本批记录，包含真实 handle、匹配到的模块及 Prepare/Abort 所需参与状态；它不是另一种批次或发布包。返回的 `frozen` 仅是冻结操作结果；它不再携带另一层 patch/targets 包装。普通模块源码记录与文件恢复记录分别用于目标 RPC 和正式文件恢复，旧文件快照不发送给目标 Service。
 
 这里的 `read_file` 能区分“旧文件本来不存在”与“读取操作失败”：新增 `combat_rules.lua` 在 V1 宿主里不存在，其 `old_source` 表示不存在，而不是因为没有旧文件就拒绝新模块发布。回滚时对本批新创建的文件执行删除。
 
@@ -1272,7 +1271,7 @@ local function prepare_batch(request)
     }
     M.patching = true
 
-    local prepare_succeeded, prepare_result = pcall(module_state.registration.before_upgrade)
+    local prepare_succeeded, prepare_result = pcall(module_state.registration_config.before_upgrade)
 
     if not prepare_succeeded then
         return flywow_result.failure("HU_PREPARE_FAILED", tostring(prepare_result))
@@ -1403,6 +1402,7 @@ local function update_batch(batch, request)
     if batch.phase ~= nil then
         return flywow_result.failure("HU_PHASE_INVALID", "当前批次已进入更新或恢复阶段")
     end
+    batch.phase = "UPDATING"
     -- Controller 在 Prepare 收口时已固定普通候选；new_modules 在这里才首次加载并登记，从下一批 Stage 起才会匹配。
     local service_patch_result = stage_service_patch_and_new_modules(batch, request.service_patch_source)
     if not service_patch_result.ok then
@@ -1425,7 +1425,6 @@ local function update_batch(batch, request)
 
     batch.module_stage = module_result.value.stage
     batch.service_patch = service_patch
-    batch.phase = "STAGED"
 
     -- Activate 同步提交；失败先报告，再由 Controller 串行 Abort 整批目标。
     local commit_result = hotupgrade_module_patch.commit(batch.module_stage)
@@ -1434,7 +1433,7 @@ local function update_batch(batch, request)
     end
     local activation_succeeded, activation_failure = pcall(function()
         if service_patch then
-            local service_update = module_state.registration.service_update
+            local service_update = module_state.registration_config.service_update
             service_patch.touched = true
             if service_patch.update_state then
                 service_patch.update_state()
@@ -1445,8 +1444,8 @@ local function update_batch(batch, request)
             end
         end
 
-        if module_state.registration.after_upgrade then
-            assert(module_state.registration.after_upgrade() ~= false, "after_upgrade 拒绝更新")
+        if module_state.registration_config.after_upgrade then
+            assert(module_state.registration_config.after_upgrade() ~= false, "after_upgrade 拒绝更新")
         end
     end)
 
@@ -1461,6 +1460,8 @@ end
 ```
 
 这段看起来很长，但不能拆成毫无关系的 API 介绍。它属于**同一次目标 Update RPC**，严格按下面的发生顺序继续：
+
+阶段检查通过后先设置 `batch.phase = "UPDATING"`，使新模块登记 RPC 暂停期间的同批重复 Update 立即返回 `HU_PHASE_INVALID`。只有提交与检查全部成功，才进入 `ACTIVATED`。
 
 1. `stage_service_patch_and_new_modules()`：构建 Service Patch，解析 `new_modules`，加载并登记同批新增的依赖。
 2. `hotupgrade_module_patch.stage()`：加载本批**已有**受影响模块的候选源码，为原地更新准备旧导出和候选状态。
@@ -1685,7 +1686,7 @@ end
 
 ```lua
 if service_patch then
-    local service_update = module_state.registration.service_update
+    local service_update = module_state.registration_config.service_update
     service_patch.touched = true
     if service_patch.update_state then
         service_patch.update_state()
@@ -1696,8 +1697,8 @@ if service_patch then
     end
 end
 
-if module_state.registration.after_upgrade then
-    assert(module_state.registration.after_upgrade() ~= false, "after_upgrade 拒绝更新")
+if module_state.registration_config.after_upgrade then
+    assert(module_state.registration_config.after_upgrade() ~= false, "after_upgrade 拒绝更新")
 end
 ```
 
@@ -1859,7 +1860,7 @@ local function stage_service_patch_and_new_modules(batch, service_patch_source)
 end
 ```
 
-私有 `require_module` 检查当前 Update 协程的声明权限，再取得同模块加载锁，调用 `load_and_register_module()`。后者用 `module_load_attempt` 保存本次许可、缓存和声明的恢复数据，并完成加载与 Controller 登记；失败先回退并抛出原错误。外层无论成功失败都先释放锁、唤醒等待者，再返回模块表或继续抛错。
+私有 `require_module` 检查当前 Update 协程的声明权限，再取得同模块加载锁，调用 `load_and_register_module()`。后者在许可 RPC 返回后用 `module_load_attempt.cache_snapshot` 保存原名与规范别名两个缓存槽，再调用 `load_module_exports()` 校验缓存、加载器路径和模块来源；随后建立别名与本地声明，完成 Controller 登记；失败先回退并抛出原错误。外层无论成功失败都先释放锁、唤醒等待者，再返回模块表或继续抛错。
 
 **【真实源码摘录】** 同文件 `load_and_register_module()` 完成本地模块加载与声明后，发送本批新模块登记的逻辑：
 
@@ -2591,6 +2592,7 @@ MASTER_FORWARD_OK
 **【真实源码摘录】** `flywow_hotupgrade_controller.lua` → `complete_batch()` 的终态保存逻辑：
 
 ```lua
+batch.target_service_count = #batch.service_targets
 batch.service_targets = nil
 batch.files = nil
 batch.modules = nil
@@ -2600,15 +2602,15 @@ controller.active_batch = nil
 controller:wake_lifecycle()
 ```
 
-complete_batch() 在这里释放冻结源码和恢复快照，将同一个 batch 保留为 last_batch，然后唤醒门禁等待者。 成功/失败计数在 status 查询时由 service_results 统计，不再额外保存在 batch；target_service_count 因活动目标已释放而继续保留。管理端下次发送 status 时，消息重新进入 Controller 的 handle_command(`status`)，该分支从 last_batch 和活动批次生成恢复诊断：
+complete_batch() 在这里释放冻结源码和恢复快照，将同一个 batch 保留为 last_batch，然后唤醒门禁等待者。 成功/失败计数在 status 查询时由 service_results 统计，不再额外保存在 batch；活动期间目标数量从 service_targets 的长度计算，complete_batch() 释放列表前才保存 target_service_count 终态快照。管理端下次发送 status 时，消息重新进入 Controller 的 handle_command(`status`)，该路由调用 handle_status_request(controller, request)，由查询函数从 last_batch 和活动批次生成恢复诊断：
 
-该分支入口的 lifecycle_batch 取值为 self.active_batch or self.last_batch，表示当前活动批次；没有活动批次时指向最近终态。下面的代码读取它以及 self.last_batch，生成返回给管理端的布尔值。
+查询函数入口的 lifecycle_batch 取值为 controller.active_batch or controller.last_batch，表示当前活动批次；没有活动批次时指向最近终态。下面的代码读取它以及 controller.last_batch，生成返回给管理端的布尔值。
 
-**【真实源码摘录】** `M:handle_command()` 的 status 分支中恢复诊断的生成逻辑：
+**【真实源码摘录】** `handle_status_request()` 中恢复诊断的生成逻辑；`M:handle_command()` 的 status 分支只分派到此函数：
 
 ```lua
-local recovery_required = self.last_batch ~= nil and self.last_lifecycle_batch.phase == "RECOVERY_REQUIRED"
-if self.active_batch and lifecycle_batch.phase == "PUBLISH_DECIDED" and lifecycle_batch.error then
+local recovery_required = controller.last_batch ~= nil and controller.last_batch.phase == "RECOVERY_REQUIRED"
+if controller.active_batch and lifecycle_batch.phase == "PUBLISH_DECIDED" and lifecycle_batch.error then
     recovery_required = lifecycle_batch.error.code == "HU_RECOVERY_REQUIRED"
 end
 ```
