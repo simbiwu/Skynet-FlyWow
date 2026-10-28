@@ -19,6 +19,7 @@ REQUIRED_FILES = (
     ".editorconfig",
     ".gitattributes",
     ".agents/skills/skynet-flywow-coding-standard/SKILL.md",
+    ".github/workflows/quality.yml",
     "AGENTS.md",
     "README.md",
     "docs/采用指南.md",
@@ -85,6 +86,31 @@ def check_markdown(path: Path, text: str) -> list[str]:
             errors.append(f"{path}: {marker} 代码围栏数量为 {count}，没有成对闭合")
     if "[TODO" in text or "[TBD" in text:
         errors.append(f"{path}: 保留了初始化占位符")
+    return errors
+
+
+def check_quality_workflow(root: Path) -> list[str]:
+    """确认 CI 会运行门禁单测，并按提交基线扫描变更 Lua 函数。"""
+
+    path = root / ".github/workflows/quality.yml"
+    if not path.is_file():
+        return [f"{path}: 缺少自动质量门禁工作流"]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exception:
+        return [f"{path}: 无法读取质量门禁工作流：{exception}"]
+
+    errors: list[str] = []
+    required_fragments = {
+        "pull_request:": "必须在 Pull Request 上运行",
+        "push:": "必须在推送提交时运行",
+        "fetch-depth: 0": "必须获取基线历史以扫描提交差异",
+        "python -m unittest discover -s scripts/quality -p 'test_*.py'": "必须运行门禁单测",
+        "python scripts/quality/check_repository.py --base-ref": "必须按提交基线扫描变更函数",
+    }
+    for fragment, message in required_fragments.items():
+        if fragment not in text:
+            errors.append(f"{path}: {message}")
     return errors
 
 
@@ -274,24 +300,170 @@ def _has_lua_function_summary(source_lines: list[str], start_line: int) -> bool:
     return False
 
 
+def _lua_doc_block(source_lines: list[str], start_line: int) -> list[str]:
+    """读取函数声明前紧邻的 LuaDoc 行；普通注释摘要也包含在同一块中。"""
+
+    index = start_line - 2
+    block: list[str] = []
+    while index >= 0 and source_lines[index].strip().startswith("---"):
+        block.append(source_lines[index].strip())
+        index -= 1
+    return block
+
+
+def _lua_function_parameters(source_lines: list[str], start_line: int) -> list[str]:
+    """从具名函数声明读取显式参数名；Lua 参数列表不支持嵌套表达式。"""
+
+    signature = " ".join(source_lines[start_line - 1:start_line + 3])
+    match = re.search(r"\bfunction\s+(?:[A-Za-z_]\w*(?:[.:][A-Za-z_]\w*)*)?\s*\(([^)]*)\)", signature)
+    if not match:
+        return []
+    return [parameter.strip() for parameter in match.group(1).split(",") if parameter.strip()]
+
+
+def _missing_lua_param_annotations(source_lines: list[str], start_line: int) -> list[str]:
+    """返回缺少 LuaDoc 的业务参数；self 和丢弃参数不要求重复说明。"""
+
+    documented: dict[str, bool] = {}
+    for line in _lua_doc_block(source_lines, start_line):
+        match = re.match(r"---@param\s+(\S+)\s+\S+(?:\s+(.+))?$", line)
+        if match:
+            parameter_name = match.group(1).rstrip("?")
+            description = match.group(2) or ""
+            documented[parameter_name] = bool(description and CHINESE_PATTERN.search(description))
+
+    return [
+        parameter for parameter in _lua_function_parameters(source_lines, start_line)
+        if parameter not in {"self", "_"} and not documented.get(parameter, False)
+    ]
+
+
+def _has_lua_return_annotation(source_lines: list[str], start_line: int) -> bool:
+    """检查函数声明前紧邻的 LuaDoc 是否描述返回类型和中文合同。"""
+
+    return_lines = [
+        line for line in _lua_doc_block(source_lines, start_line)
+        if line.startswith("---@return")
+    ]
+    annotations = [
+        match.groups()
+        for line in return_lines
+        if (match := re.match(r"---@return\s+(\S+)(?:\s+(.+))?$", line))
+    ]
+    if not annotations or len(annotations) != len(return_lines):
+        return False
+    return all(
+        type_name == "nil" or (description is not None and CHINESE_PATTERN.search(description))
+        for type_name, description in annotations
+    )
+
+
+def _inline_lua_control_body_lines(source_lines: list[str], start_line: int, end_line: int) -> list[int]:
+    """用 Lua token 定位把 if/loop 主体与控制头挤在同一行的代码。"""
+
+    function_source = "\n".join(source_lines[start_line - 1:end_line])
+    tokens = _tokenize_lua(function_source)
+    violations: set[int] = set()
+
+    for index, (value, token_line) in enumerate(tokens):
+        next_line = tokens[index + 1][1] if index + 1 < len(tokens) else -1
+        if value in {"then", "do", "else"} and next_line == token_line:
+            violations.add(start_line + token_line - 1)
+        if value == "repeat":
+            for next_value, next_token_line in tokens[index + 1:]:
+                if next_value == "until":
+                    if next_token_line == token_line:
+                        violations.add(start_line + token_line - 1)
+                    break
+                if next_value == "repeat":
+                    break
+
+    return sorted(violations)
+
+
+def _has_lua_blank_line_between_statements(source_lines: list[str], start_line: int, end_line: int) -> bool:
+    """判断长函数中至少有一处空行真正分隔两段代码。"""
+
+    statement_lines = [
+        index for index in range(start_line, end_line - 1)
+        if source_lines[index].strip() and not source_lines[index].lstrip().startswith("--")
+    ]
+    return any(
+        any(not source_lines[line_index].strip() for line_index in range(previous + 1, current))
+        for previous, current in zip(statement_lines, statement_lines[1:])
+    )
+
+
+def _has_lua_internal_comment(source_lines: list[str], start_line: int, end_line: int) -> bool:
+    """判断长函数体是否至少解释一项非显然处理阶段。"""
+
+    return any(
+        line.lstrip().startswith("--") and CHINESE_PATTERN.search(line)
+        for line in source_lines[start_line:end_line - 1]
+    )
+
+
+def _lua_function_comment_start_line(source_lines: list[str], start_line: int) -> int:
+    """找到函数前紧邻的摘要和 LuaDoc 起始行，用于识别只改注释的函数。"""
+
+    index = start_line - 2
+    while index >= 0 and source_lines[index].strip().startswith("--"):
+        index -= 1
+    return index + 2
+
+
 def check_lua_function_comments(path: Path, source: str, changed_lines: set[int]) -> list[str]:
-    """检查变更行所在的具名非平凡 Lua 函数是否有紧邻职责说明。"""
+    """检查变更函数的 LuaDoc、职责说明和长逻辑块排版。"""
 
     if not changed_lines:
         return []
 
     source_lines = source.splitlines()
     errors: list[str] = []
+    inline_control_lines = _inline_lua_control_body_lines(source_lines, 1, len(source_lines))
+    for line_number in sorted(set(inline_control_lines) & changed_lines):
+        errors.append(
+            f"{path}:{line_number}: Lua 控制结构的主体不能与 if/loop 头部挤在同一行"
+        )
+
     for start_line, end_line in find_lua_named_function_spans(source):
-        if not any(start_line <= changed_line <= end_line for changed_line in changed_lines):
+        comment_start = _lua_function_comment_start_line(source_lines, start_line)
+        if not any(
+            comment_start <= changed_line <= end_line
+            for changed_line in changed_lines
+        ):
             continue
-        if not _is_nontrivial_lua_function(source_lines, start_line, end_line):
-            continue
-        if not _has_lua_function_summary(source_lines, start_line):
+
+        if not _has_lua_return_annotation(source_lines, start_line):
+            errors.append(f"{path}:{start_line}: 变更的具名 Lua 函数缺少紧邻的 @return 固定返回合同")
+
+        missing_params = _missing_lua_param_annotations(source_lines, start_line)
+        if missing_params:
             errors.append(
-                f"{path}:{start_line}: 非平凡 Lua 函数缺少紧邻的职责说明；"
-                "请说明函数职责及关键约束"
+                f"{path}:{start_line}: LuaDoc 缺少参数说明：{', '.join(missing_params)}"
             )
+
+        if _is_nontrivial_lua_function(source_lines, start_line, end_line):
+            if not _has_lua_function_summary(source_lines, start_line):
+                errors.append(
+                    f"{path}:{start_line}: 非平凡 Lua 函数缺少紧邻的职责说明；"
+                    "请说明函数职责及关键约束"
+                )
+            statement_lines = [
+                line for line in source_lines[start_line:end_line - 1]
+                if line.strip() and not line.lstrip().startswith("--")
+            ]
+            if len(statement_lines) >= 18:
+                if not _has_lua_blank_line_between_statements(source_lines, start_line, end_line):
+                    errors.append(
+                        f"{path}:{start_line}: 长 Lua 函数的代码段之间没有空行；"
+                        "请按真实逻辑阶段分段，不要把连续步骤机械拆开"
+                    )
+                if not _has_lua_internal_comment(source_lines, start_line, end_line):
+                    errors.append(
+                        f"{path}:{start_line}: 长 Lua 函数没有阶段说明注释；"
+                        "请解释非显然处理阶段，不要逐行翻译代码"
+                    )
     return errors
 
 
@@ -327,10 +499,11 @@ def _parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
     return changed
 
 
-def check_changed_lua_function_comments(root: Path) -> list[str]:
+def check_changed_lua_function_comments(root: Path, base_ref: str | None = None) -> list[str]:
     """检查 Git 工作区/暂存区中变更行覆盖的非平凡具名 Lua 函数。
 
-    只检查相对 HEAD 的当前变更；不回溯历史提交。无 Git 元数据的源码快照会跳过此门禁。
+    默认检查相对 HEAD 的工作区变更；给定 base_ref 时检查 base_ref...HEAD，供 CI 验证已提交差异。
+    不回溯未变更历史函数；无 Git 元数据的源码快照会跳过此门禁。
     该门禁只验证职责注释是否存在，不判断注释语义是否充分。
     """
 
@@ -339,7 +512,7 @@ def check_changed_lua_function_comments(root: Path) -> list[str]:
 
     try:
         diff = subprocess.run(
-            ["git", "diff", "--unified=0", "HEAD", "--"],
+            ["git", "diff", "--unified=0", f"{base_ref}...HEAD" if base_ref else "HEAD", "--"],
             cwd=root,
             capture_output=True,
             text=True,
@@ -391,7 +564,7 @@ def check_changed_lua_function_comments(root: Path) -> list[str]:
     return errors
 
 
-def check_repository(root: Path) -> list[str]:
+def check_repository(root: Path, base_ref: str | None = None) -> list[str]:
     """汇总执行不会启动业务运行时的仓库级静态检查。"""
 
     errors: list[str] = []
@@ -410,7 +583,8 @@ def check_repository(root: Path) -> list[str]:
             errors.extend(check_markdown(path.relative_to(root), markdown_text))
 
     errors.extend(check_skill(root))
-    errors.extend(check_changed_lua_function_comments(root))
+    errors.extend(check_quality_workflow(root))
+    errors.extend(check_changed_lua_function_comments(root, base_ref))
     return errors
 
 
@@ -418,6 +592,10 @@ def parse_args() -> argparse.Namespace:
     """解析仓库级检查的命令行参数；默认仓库路径由脚本位置推导。"""
 
     parser = argparse.ArgumentParser(description="检查 Skynet-FlyWow 仓库基础合同")
+    parser.add_argument(
+        "--base-ref",
+        help="可选 Git 基线；检查 base-ref...HEAD，用于 CI 已提交差异扫描",
+    )
     parser.add_argument(
         "--root",
         type=Path,
@@ -430,12 +608,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     """执行命令行检查并把所有失败一次性报告给开发者。"""
 
-    root = parse_args().root.resolve()
+    arguments = parse_args()
+    root = arguments.root.resolve()
     if not root.is_dir():
         print(f"仓库根目录不存在：{root}", file=sys.stderr)
         return 1
 
-    errors = check_repository(root)
+    errors = check_repository(root, arguments.base_ref)
     if errors:
         print("SKYNET_FLYWOW_REPOSITORY_CHECK_FAILED", file=sys.stderr)
         for error in errors:

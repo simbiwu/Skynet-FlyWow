@@ -193,8 +193,10 @@ local functions = {load = old_function} -- Service 私有函数集合，用于�
 package.loaded.state_merge_logic = live_module
 local service_update = {state = scenario.state, functions = functions} -- 登记给 HotUpgrade 的私有状态和函数集合。
 if scenario.custom then
-    service_update.snapshot = module_patch.snapshot_state
-    service_update.restore = function(target, source) module_patch.restore_state(source, target) end
+    service_update.snapshot = function(source)
+        return module_patch.snapshot_state(source)
+    end
+    service_update.restore = function(target, source) return module_patch.restore_state(source, target) end
 end
 --- 确认无效的 service_update 配置会被拒绝，且不会安装控制消息接收器。
 ---@param config table 本次要验证的错误状态更新配置；本函数将它传给 register_service。

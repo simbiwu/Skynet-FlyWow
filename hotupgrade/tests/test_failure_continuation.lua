@@ -99,14 +99,14 @@ elseif scenario == "service" then
     assert(hotupgrade.register_service({
         before_upgrade = function()
             if malformed then
-                return setmetatable({}, {__index = function() error("injected control exception") end})
+                error("injected control exception")
             end
             return true
         end,
         after_upgrade = function() return state.count == 3 end,
         service_update = {
             state = state, functions = {},
-            snapshot = function(value) return {count = value.count} end,
+            snapshot = function(value) return require("flywow_result").success({count = value.count}) end,
             restore = function() error("injected rollback failure") end,
         },
     }).ok)
@@ -132,7 +132,8 @@ elseif scenario == "service" then
     assert(command("update", 2, 3).ok)
     assert(command("finish", 2, 3).ok and state.count == 3 and not hotupgrade.patching)
     malformed = true
-    assert(not command("prepare", 3, 3).ok and not hotupgrade.patching)
+    assert(not command("prepare", 3, 3).ok and hotupgrade.patching)
+    assert(command("abort", 3, 3).ok and not hotupgrade.patching)
     malformed = false
     assert(command("prepare", 4, 3).ok and command("update", 4, 3).ok)
     assert(command("finish", 4, 3).ok and not hotupgrade.patching)

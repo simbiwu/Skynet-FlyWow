@@ -30,3 +30,9 @@ PlayerService 的 skynet.queue() 是更新安全点的一部分：更新前停�
 Prepare 排空期间，队列中已进入的业务仍可正常创建 Service 或首次加载模块。Controller 会等待这些操作完成，并让新增的匹配目标也执行一次 Prepare；全部准备好后才在 Update 前关闭创建和加载门禁，后续请求由框架等待到发布结束。
 
 Service Patch 用 new_modules 声明本 Service 首次使用的 combat_rules。Controller 先部署全部 Lua 文件，目标再加载并登记该模块，然后 Stage player_logic；因此 V2 候选中的 hotupgrade.require("combat_rules") 能命中已登记模块，不会在 UPDATE 等普通首次加载许可。新模块不加入当前批次的模块 Stage，下一批才可作为普通模块更新。Service Patch 的 update_state() 在 Update 中直接修改现存 state；未修改字段保留，嵌套赋值和赋 nil 删除遵循 Lua 语义。replace_functions 指定要替换的现有函数；旧快照仅用于恢复。
+
+## 返回值合同
+
+框架内部可失败操作返回 FlyWowResult<T>：先判断 ok，再读成功载荷 value；失败诊断使用 code、message 和可选 details。hotupgrade.require、newservice、uniqueservice 保持原生 Lua/Skynet 风格，成功直接返回模块表或 handle，失败抛错；首次受控加载、许可等待和 Service 创建可能 yield，调用方可用 pcall 包住这些适配入口。
+
+模块 export_state 返回自然状态值，import_state 必须返回 FlyWowResult<nil>。默认 snapshot_state / restore_state 与 Service 自定义 snapshot / restore 分别返回 FlyWowResult<any> / FlyWowResult<nil>。before_upgrade、after_upgrade 固定返回 boolean：仅 true 表示通过，false 表示拒绝；异常由框架回调边界转换为阶段结果。

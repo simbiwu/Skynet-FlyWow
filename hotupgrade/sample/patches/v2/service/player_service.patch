@@ -4,7 +4,6 @@ return function(state)
     {
         new_modules = {"combat_rules"},
         update_state = function()
-            assert(state.schema_version == 1, "PlayerService 需要 schema 1")
             state.equip = "剑"
             state.schema_version = 2
         end,

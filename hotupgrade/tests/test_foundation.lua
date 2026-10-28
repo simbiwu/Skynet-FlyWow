@@ -18,26 +18,29 @@ assert(not load(common.normalize_source("\239\187xreturn {}"), "@header.lua", "t
 local graph = {nested = {count = 7}} -- 含共享子表的数据图，snapshot 必须保留其引用关系。
 graph.self = graph
 graph.shared = graph.nested
-local snapshot = patch.snapshot_state(graph) -- 从 graph 生成的独立状态快照。
+local snapshot_result = patch.snapshot_state(graph) -- 从 graph 生成的统一结果快照。
+assert(snapshot_result.ok)
+local snapshot = snapshot_result.value
 assert(snapshot ~= graph and snapshot.self == snapshot and snapshot.shared == snapshot.nested)
 snapshot.nested.count = 8
 assert(graph.nested.count == 7)
-patch.restore_state(snapshot, graph)
+assert(patch.restore_state(snapshot, graph).ok)
 assert(graph.self == graph and graph.nested.count == 8 and graph.shared == graph.nested)
-assert(not pcall(patch.snapshot_state, {resource = io.stdout}))
-assert(not pcall(patch.snapshot_state, setmetatable({}, {})))
+assert(patch.snapshot_state({resource = io.stdout}).code == "HU_STATE_COPY_FAILED")
+assert(patch.snapshot_state(setmetatable({}, {})).code == "HU_STATE_COPY_FAILED")
 
 local old_state = {count = 7} -- 故意导出私有表本身，验证框架额外隔离。
 local live = -- package.loaded 中当前模块的线上导出表，候选提交只能原地替换字段。
 {
     value = function() return old_state.count end,
     export_state = function() return old_state end,
-    import_state = function(state) old_state = state end,
+    import_state = function(state) old_state = state; return require("flywow_result").success() end,
     removed = true,
 }
 local cached = live.value -- 提交前缓存的 live.value 函数引用，验证更新不会重绑旧引用。
 package.loaded.logic = live
 local source = [[
+local result = require "flywow_result"
 local count = 0
 return {
     value = function() return count + 1 end,
@@ -45,6 +48,7 @@ return {
     import_state = function(state)
         count = state.count
         state.count = 999
+        return require("flywow_result").success()
     end,
     added = 42,
 }
@@ -105,13 +109,13 @@ assert(package.loaded.a == simple and package.loaded.b == second)
 assert(simple.value() == 10 and second.value() == 20 and second.added)
 assert(patch.abort(combined.value.stage).ok)
 assert(simple.value == old_first_value and second.value == old_second_value and second.added == nil)
-package.loaded.a = {export_state = function() return {old = true} end, import_state = function() end}
+package.loaded.a = {export_state = function() return {old = true} end, import_state = function() return require("flywow_result").success() end}
 local reset_state = patch.stage({{name = "a", source = "return {}"}}) -- 不提供可迁移状态钩子的候选 Stage 结果。
 assert(reset_state.ok and patch.abort(reset_state.value.stage).ok)
 package.loaded.a = {
     value = function() return 1 end,
     export_state = function() return {} end,
-    import_state = function() end,
+    import_state = function() return require("flywow_result").success() end,
 }
 assert(not patch.stage({{name = "a", source = [[return {
     value = function() return 2 end,
@@ -124,6 +128,7 @@ local M = {config = {}}
 M.export_state = function() return {} end
 M.import_state = function()
     M.config.root = M
+    return require("flywow_result").success()
 end
 return M
 ]]}})
@@ -132,7 +137,7 @@ assert(package.loaded.a == before_corrupt_import)
 local retried = patch.stage({{name = "a", source = [[return {
     value = function() return 2 end,
     export_state = function() return {} end,
-    import_state = function() end,
+    import_state = function() return require("flywow_result").success() end,
 }]]}})
 assert(retried.ok and patch.abort(retried.value.stage).ok)
 -- 嵌套配置、辅助函数、共享与循环图均按完整新版本安装；回滚必须找回原引用。
@@ -372,7 +377,7 @@ assert(target_control("abort", 2).ok and not hotupgrade.patching)
 registration.before_upgrade = function()
     assert(hotupgrade.patching)
     coroutine.yield()
-    return {ok = true}
+    return true
 end
 local preparing = coroutine.create(function() assert(target_control("prepare", 3).ok) end) -- 执行 prepare 控制命令的协程，用于验证协议状态推进。
 assert(coroutine.resume(preparing) and hotupgrade.patching)
@@ -501,8 +506,7 @@ patch.stage = function(...)
     local loaded           -- 清单外模块是否意外加载成功。
     local undeclared_error -- 首次 Update 上下文拒绝清单外模块的结构化错误。
     loaded, undeclared_error = pcall(hotupgrade.require, "hotupgrade_early_module")
-    assert(not loaded and type(undeclared_error) == "table"
-        and undeclared_error.code == "HU_NEW_MODULE_NOT_DECLARED")
+    assert(not loaded and tostring(undeclared_error):find("HU_NEW_MODULE_NOT_DECLARED", 1, true))
     assert(begin_count == permits_before_stage)
     return original_stage(...)
 end
@@ -520,7 +524,7 @@ pause_new_module_registration = false
 assert(coroutine.resume(updating) and coroutine.status(updating) == "dead")
 assert(staged_calls == 1)
 patch.stage = original_stage
-assert(new_module_update.ok, new_module_update.message)
+assert(new_module_update.ok, tostring(new_module_update.code) .. ": " .. tostring(new_module_update.message))
 assert(begin_count == declarations_before_new_modules)
 assert(table.concat(new_module_registrations, ",") == "lualib.hotupgrade_new_dependency,lualib.hotupgrade_new_rules")
 assert(hotupgrade.require("hotupgrade_new_rules").value() == 42)
@@ -534,7 +538,7 @@ local early_service_patch_source = [[return function()
 end]]
 local early_result = target_control("update", 9, {service_patch_source = early_service_patch_source}) -- 新模块登记窗口开放前发送 Update 的失败结果。
 assert(not early_result.ok and early_result.code == "HU_SERVICE_STAGE_FAILED")
-assert(early_result.details.cause_code == "HU_NEW_MODULE_NOT_DECLARED")
+assert(early_result.details and early_result.details.cause_code == "HU_NEW_MODULE_NOT_DECLARED", tostring(early_result.message) .. ": " .. tostring(early_result.details and early_result.details.cause_code))
 assert(target_control("abort", 9).ok)
 active_new_module_batch = "fixture:10"
 assert(target_control("prepare", 10).ok)

@@ -36,7 +36,7 @@ end
 function M.export_state() return {count = count} end
 function M.import_state(state)
     count = state.count
-    return true
+    return require("flywow_result").success()
 end
 M.added = true
 return M
@@ -58,7 +58,7 @@ end
 function M.export_state() return {count = count} end
 function M.import_state(state)
     count = state.count
-    return true
+    return require("flywow_result").success()
 end
 M.added = true
 return M

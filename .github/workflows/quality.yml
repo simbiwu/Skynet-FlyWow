@@ -1,0 +1,44 @@
+name: FlyWow 质量门禁
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: 编码与 Lua 注释门禁
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出完整 Git 历史
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 运行门禁单测
+        run: python -m unittest discover -s scripts/quality -p 'test_*.py'
+
+      - name: 检查当前提交的变更函数
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BASE: ${{ github.event.before }}
+          PR_BASE: ${{ github.base_ref }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base_ref="origin/$PR_BASE"
+          elif [[ "$EVENT_NAME" == "push" && "$PUSH_BASE" != "0000000000000000000000000000000000000000" ]]; then
+            base_ref="$PUSH_BASE"
+          else
+            base_ref="origin/main"
+          fi
+          python scripts/quality/check_repository.py --base-ref "$base_ref"

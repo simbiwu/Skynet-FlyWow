@@ -70,19 +70,20 @@ local function initialize_player()
             --- 快照当前私有状态字段；Controller 不接收状态本体，快照只留在本 Service 供 Abort 使用。
             ---@param source table 当前 Service 私有状态根表
             ---@return table 独立快照，仅含本课程需要验证的玩家字段
+            ---@return FlyWowResult<any> 成功载荷是与业务状态隔离的普通快照。
             snapshot = function(source)
-                return
+                return require("flywow_result").success(
                 {
                     weapon = source.weapon,
                     level = source.level,
                     gold = source.gold,
                     schema_version = source.schema_version,
-                }
+                })
             end,
             --- Abort 时将快照写回同一状态根表；课堂故障开关可让恢复抛错以验证失败报告。
             ---@param destination table 仍在线的 Service 私有状态根表，恢复时保持该表身份
             ---@param snapshot table snapshot 返回的状态副本
-            ---@return boolean true 表示状态已恢复；异常由框架转换成恢复失败
+            ---@return FlyWowResult<nil> 恢复结果；异常由框架转换成恢复失败
             restore = function(destination, snapshot)
                 if fail_restore then
                     error("injected restore failure")
@@ -93,7 +94,7 @@ local function initialize_player()
                 for key, value in pairs(snapshot) do
                     destination[key] = value
                 end
-                return true
+                return require("flywow_result").success()
             end,
         },
         --- Prepare 时排在已接纳业务之后取得同一条 queue；返回 true 表示业务已到安全点。

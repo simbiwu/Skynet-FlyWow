@@ -31,7 +31,7 @@ end)
 
 公开入口是 hotupgrade/lualib/flywow_hotupgrade.lua；控制 Service 入口是 hotupgrade/service/flywow_hotupgrade_service.lua。Controller 加载 flywow_hotupgrade_native 时，Lua 从 Native 搜索路径定位统一构建入口产出的 build/native/flywow_hotupgrade_native.so。宿主先在 composition root 初始化 Controller 并确认成功，再创建受管理业务 Service。业务 Service 可先在文件顶部 require 公开入口，并在 register_service() 前调用 hotupgrade.require() 声明初始模块；此时 Service 尚未登记，不会获取 Controller handle 或执行 Controller RPC。Service 登记后首次加载未声明模块时，hotupgrade.require() 会向 Controller 申请许可并在加载后登记；等待首次登记结果、Controller 响应或同一 State 的同模块首次加载也可能 yield。调用会在等待完成后返回模块表；缓存命中且已声明的模块通常直接返回。Controller handle 仅在首次实际需要 RPC 时通过原生 skynet.uniqueservice() 获取并缓存。register_service() 会发送登记 RPC，必须在可 yield 的 Skynet 协程内调用。管理 State 无需登记为业务目标。
 
-HotUpgrade 内部可失败操作统一返回公共 FlyWowResult<T>：成功载荷放在 value，失败使用稳定 code 和诊断 message；模块专属诊断放在 details。例如，begin 成功后从 result.value.batch_id 读取批次 ID，status 成功后从 result.value.record 读取批次记录。hotupgrade.require()、newservice() 和 uniqueservice() 是面向 Lua/Skynet 的适配入口，保留直接返回模块表/Service handle、失败抛异常的原生使用习惯。
+HotUpgrade 内部可失败操作统一返回公共 FlyWowResult<T>：成功载荷放在 value，失败使用稳定 code 和诊断 message；模块专属诊断放在 details。例如，begin 成功后从 result.value.batch_id 读取批次 ID，status 成功后从 result.value.record 读取批次记录。hotupgrade.require()、newservice() 和 uniqueservice() 是面向 Lua/Skynet 的适配入口，保留直接返回模块表/Service handle、失败抛异常的原生使用习惯。普通模块的 snapshot_state 返回 FlyWowResult<any>，restore_state 返回 FlyWowResult<nil>；模块 import_state 必须返回 FlyWowResult<nil>。Service Patch 自定义 snapshot/restore 也分别返回 FlyWowResult<any>/FlyWowResult<nil>。before_upgrade 与 after_upgrade 是业务决策钩子，固定返回 boolean，只有 true 表示通过，false 是业务拒绝；回调异常由框架边界捕获并转换为所属阶段结果。
 
 patch_path 必须存在且可读取。root_path 是已存在的宿主项目根目录，service_path 是它下面已存在的相对 Service 目录；拒绝绝对路径、空路径段、.、..、反斜杠和符号链接目录。目录允许多级，例如 service/battle。
 
@@ -143,7 +143,7 @@ end
 
 业务返回值和异常由业务自己定义。HotUpgrade 不管理 queue、不包装业务返回值，也不计数业务协程。queue 内的业务可以正常 yield；脱离该 queue 的协程不在排空保证范围内。
 
-register_service 必须提供 before_upgrade 函数；缺失或非函数会在登记时以 HU_INVALID_OPTIONS 拒绝。每次 Prepare 建立本地记录并设置 hot.patching=true 后都会调用该回调。回调允许 yield，必须通过上述同一个 queue 等待此前已进入的业务全部退出，例如 return business_queue(function() return true end)。Prepare 不维护额外阶段状态或比较回调前后本地记录的表身份；目标控制 RPC 由 Controller 串行等待；begin 接受后不允许管理端主动取消，失败时由 Controller 执行内部 Abort。只有 true 或 {ok=true} 确认业务安全点；回调失败、拒绝或异常均使 Prepare 失败，不能进入 Update。框架不轮询或超时放行业务。
+register_service 必须提供 before_upgrade 函数；缺失或非函数会在登记时以 HU_INVALID_OPTIONS 拒绝。每次 Prepare 建立本地记录并设置 hot.patching=true 后都会调用该回调。回调允许 yield，必须通过上述同一个 queue 等待此前已进入的业务全部退出，例如 return business_queue(function() return true end)。Prepare 不维护额外阶段状态或比较回调前后本地记录的表身份；目标控制 RPC 由 Controller 串行等待；begin 接受后不允许管理端主动取消，失败时由 Controller 执行内部 Abort。只有 boolean true 确认业务安全点；false 映射为 HU_SAFEPOINT_REQUIRED，非 boolean 或异常映射为 HU_PREPARE_FAILED，不能进入 Update。框架不轮询或超时放行业务。
 
 业务 Service 的 hot.patching 与 Controller 创建/加载门禁职责不同：Prepare 设置 hot.patching 后，业务入口按现有接入方式停止新业务；此前已进入 queue 的业务仍可调用创建和首次加载 API，Controller 在 PREPARE 窗口正常处理这些依赖。
 
@@ -221,6 +221,7 @@ return M
 需要跨版本保留或转换的闭包状态使用成对 export_state/import_state：
 
 ```lua
+local flywow_result = require "flywow_result" -- 模块状态钩子使用的统一结果构造器。
 local count = 0 -- 当前候选闭包捕获的私有计数，不会因导出表原地更新而自动变成旧闭包的状态。
 local M = {} -- 对业务函数表的引用，Service Patch 按已登记函数名替换其字段。
 
@@ -230,7 +231,7 @@ end
 
 function M.import_state(snapshot)
     count = snapshot.count
-    return true
+    return flywow_result.success()
 end
 
 function M.next()
@@ -241,7 +242,7 @@ end
 return M
 ```
 
-每个版本内的 export_state 与 import_state 须成对提供。只有旧版提供 export_state 且候选版提供 import_state 时，旧状态快照才会复制并传给候选版；缺少任一方时跳过迁移，由候选版使用自己的初始化状态。状态复制或钩子报错、import_state 返回 false，都会拒绝 Stage。更新前闭包在 Stage 中不变，Abort 恢复原函数字段后继续使用更新前状态；不使用 debug.upvaluejoin 搬运 upvalue。 Finish 后，业务仍持有的旧函数继续访问旧版私有状态；新版函数访问迁移后自己的私有状态，两者不是同一个 upvalue，后续修改不会自动互相同步。
+每个版本内的 export_state 与 import_state 须成对提供。只有旧版提供 export_state 且候选版提供 import_state 时，旧状态快照才会复制并传给候选版；缺少任一方时跳过迁移，由候选版使用自己的初始化状态。默认状态复制失败或状态钩子抛错会拒绝 Stage；import_state 必须返回 FlyWowResult<nil>，失败结果会以 HU_MODULE_IMPORT_FAILED 包装，并在 details.cause_code 保留原始错误码。更新前闭包在 Stage 中不变，Abort 恢复原函数字段后继续使用更新前状态；不使用 debug.upvaluejoin 搬运 upvalue。 Finish 后，业务仍持有的旧函数继续访问旧版私有状态；新版函数访问迁移后自己的私有状态，两者不是同一个 upvalue，后续修改不会自动互相同步。
 
 钩子必须同步、无外部副作用，不得改其他模块。默认快照只接受 nil、布尔、数值、字符串和无元表普通表，键是字符串/数值/布尔；图内共享和循环会保留，最多 128 层、10000 个字段。超限或不可复制值使 Stage 失败。
 
@@ -254,7 +255,6 @@ return function(state)
     return
     {
         update_state = function()
-            assert(state.schema_version == 1, "PlayerService 需要 schema 1")
             state.equip = "剑"
             state.schema_version = 2
         end,
@@ -280,21 +280,24 @@ replace_functions 只列出需要替换的现有业务函数；未列出的函�
 
 默认快照支持普通数据图，保留共享和循环关系，最多 128 层、10000 个字段。这是保存恢复快照的限制，不是更新值合并限制。恢复保持线上根表身份，不承诺嵌套表身份。特殊对象由 Service 提供成对回调：
 
-- snapshot(state)：返回与线上可变数据隔离的旧状态快照，可将特殊对象编码为普通表。
-- restore(state, old_state)：恢复现存状态及特殊业务对象；返回 false 或抛错表示恢复失败。
+- 默认 snapshot_state(state) 返回 FlyWowResult<any>；默认 restore_state(old_state, state) 返回 FlyWowResult<nil>。失败分别携带 HU_STATE_COPY_FAILED 或 HU_STATE_RESTORE_FAILED。
+- 自定义 snapshot(state) 必须返回 FlyWowResult<any>，其 value 是与线上可变数据隔离的快照；自定义 restore(state, old_state) 必须返回 FlyWowResult<nil>。回调抛错或返回错误结果会映射为当前阶段的失败结果，恢复失败使用 HU_RECOVERY_REQUIRED。
+- 快照载荷允许是 nil 或 false；框架单独记录快照是否存在，不能用载荷真值判断是否已保存。
 
 构建、更新、快照、恢复和检查都必须同步，不得 yield、执行外部 I/O 或产生不可撤销副作用；不得替换整个线上状态根表。框架不提供安全沙箱。
 
 ## 发布生命周期、文件部署与恢复
 
-管理端仅调用 begin({path=...}) 接受正式发布，通过 status({batch_id=...}) 查询终态。begin 成功表示请求已接受，不表示发布完成：
+管理端仅调用 begin({path=...}) 接受正式发布，通过 status({batch_id=...}) 查询终态。两次 RPC 都返回 FlyWowResult；先检查 ok，再读取 value。begin 成功表示请求已接受，不表示发布完成：
 
 ~~~lua
-local begun = skynet.call(hotupgrade_handle, "hotupgrade", "begin", {path = "current"})
-assert(begun.ok, begun.message)
+local begun_result = skynet.call(hotupgrade_handle, "hotupgrade", "begin", {path = "current"})
+assert(begun_result.ok, begun_result.message)
+local begun = begun_result.value
 while true do
-    local status = skynet.call(hotupgrade_handle, "hotupgrade", "status", {batch_id = begun.batch_id})
-    assert(status.ok, status.message)
+    local status_result = skynet.call(hotupgrade_handle, "hotupgrade", "status", {batch_id = begun.batch_id})
+    assert(status_result.ok, status_result.message)
+    local status = status_result.value
     local phase = status.record.phase
     if phase == "COMPLETED" then
         break

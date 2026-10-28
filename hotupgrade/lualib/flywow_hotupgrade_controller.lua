@@ -500,10 +500,7 @@ function M:uniqueservice(request, source)
     }
     self.unique_service_entries[request.service_name] = unique_service_entry
     -- 原生创建调用是否正常返回，以及创建成功的 handle 或失败信息。
-    local create_called, creation_result = pcall(start_service, self, request, source, request.service_name)
-    if not create_called then
-        creation_result = flywow_result.failure("HU_SERVICE_CREATE_FAILED", tostring(creation_result))
-    end
+    local creation_result = start_service(self, request, source, request.service_name)
     if creation_result.ok then
         unique_service_entry.service_handle = creation_result.value.service_handle
     else
@@ -970,149 +967,124 @@ local function wait_for_batch_work(controller, batch)
 end
 
 --- 读取发布包并保存每个正式 Lua 文件部署前的内容，再检查目标匹配。
---- 本阶段只读取，不写正式目录，也不向目标 Service 发 RPC。
 ---@param controller FlyWowHotUpgradeController 已初始化的 Controller；提供 patch_root、root_path 和 service_path。
 ---@param batch FlyWowHotUpgradeBatch 本批记录；本函数把新源码和部署前旧内容分别保存到 batch.files。
----@return nil 读取或匹配失败写入 batch.error；成功保留 file.old_source
+---@return FlyWowResult<nil> 读取和匹配成功；失败返回文件或匹配错误。
 local function load_and_snapshot_batch_files(controller, batch)
-    -- load_patch 填充的 files 只含正式 .lua；此处补齐 old_source，false 表示部署前没有该文件。
-    -- DEPLOYING 阶段只读取一次发布包，并保存所有正式文件的旧内容。
     local load_result = controller:load_patch(batch)
     if not load_result.ok then
-        batch.error = load_result
-        return
+        return load_result
     end
-
     for _, file in ipairs(batch.files) do
-        -- 当前正式文件的旧内容，以及读取失败时的诊断；旧内容用于发布失败恢复。
         local old_source, read_failure = hotupgrade_native.read_file(controller.root_path, file.entry_file)
         if old_source == nil then
-            batch.error = flywow_result.failure(native_code(read_failure), "文件准备失败: " .. file.entry_file)
-            return
+            return flywow_result.failure(native_code(read_failure), "文件准备失败: " .. file.entry_file)
         end
         file.old_source = old_source
     end
+    return flywow_result.success()
 end
 
---- 逐轮向尚未准备的目标发送 Prepare，等待依赖创建/首次加载结束，再重新匹配目标。
---- 全部目标准备好后返回；任何目标失败都会写入 batch.error 并停止后续 Prepare。
+--- 逐轮向尚未准备的目标发送 Prepare，并在新目标加入前等待创建和许可排空。
 ---@param controller FlyWowHotUpgradeController 负责发送目标 RPC 和记录 Service 退出的 Controller。
----@param batch FlyWowHotUpgradeBatch 保存本批目标及其 Prepare 进度的记录；本函数标记已参与目标，并检查目标退出等异步错误。
----@return nil 匹配目标全部准备后返回；失败写入 batch.error 并停止本阶段
+---@param batch FlyWowHotUpgradeBatch 保存本批目标及其 Prepare 进度的记录。
+---@return FlyWowResult<nil> 所有目标均已准备；目标、异步生命周期或匹配失败返回所属错误。
 local function prepare_batch_targets(controller, batch)
-    -- service_targets 来自上一轮匹配；participated 标识已发送过 Prepare 的目标，重匹配后只补新目标。
-    -- Prepare 期间继续接纳依赖；每轮排空后用同一份本批源码重新匹配目标。
     batch.phase = "PREPARE"
+
+    -- 先 Prepare 当前已匹配目标；逐个检查控制 RPC 和异步退出记录。
     while true do
         for _, service_target in ipairs(batch.service_targets) do
             if not service_target.participated then
                 batch.current_service_handle = service_target.service_handle
                 service_target.participated = true
-                -- 当前目标的 Prepare 结果；失败时记录结果并停止后续更新阶段。
                 local service_result = controller:step(batch, service_target, "prepare")
                 if batch.error then
-                    return
+                    return batch.error
                 end
                 if not service_result.ok then
                     service_target.hotupgrade_result = service_result
-                    batch.error = service_result
-                    return
+                    return service_result
                 end
             end
         end
 
+        -- Prepare 回调可能让出；等待创建和首次加载收敛后，再把新登记目标并入本批。
         wait_for_batch_work(controller, batch)
         if batch.error then
-            return
+            return batch.error
         end
-
-        -- 新登记的匹配目标由 matcher 标记；失败时保留已参与目标供 Abort 恢复。
         local matched = match_service_targets(batch, controller.service_registrations)
         if not matched.ok then
-            batch.error = matched
-            return
+            return matched
         end
         if not matched.value.needs_prepare then
             break
         end
     end
+    return flywow_result.success()
 end
 
---- Prepare 全部完成后，将 batch.files 中的源码写入宿主正式目录并清理 Lua 缓存。
---- 写入或缓存清理失败时记录 batch.error，由 run_batch 进入恢复。
+--- Prepare 全部完成后部署本批正式 Lua 文件并清理 Skynet 缓存。
 ---@param controller FlyWowHotUpgradeController 提供 root_path 的 Controller；正式文件写入该宿主根目录。
----@param batch FlyWowHotUpgradeBatch 已保存正式旧内容的批次；本函数读取新源码，并为成功替换的文件标记 touched。
----@return nil 写入成功标记 file.touched；部署或清缓存失败写入 batch.error
+---@param batch FlyWowHotUpgradeBatch 保存了新源码和旧文件快照的批次；成功替换后标记 touched。
+---@return FlyWowResult<nil> 部署与缓存清理成功；失败返回 Native 文件或缓存错误。
 local function deploy_batch_files(controller, batch)
-    -- files 保存本批源码和旧文件快照；只有替换成功才设 touched，失败恢复据此选择实际写过的文件。
-    -- PREPARE 收口后无 yield 地关闭入口；先部署本批完整 Lua 文件并清缓存。
     batch.phase = "UPDATE"
     for _, file in ipairs(batch.files) do
-        -- 正式文件是否替换成功，以及替换失败时 Native 返回的错误信息。
         local file_written, write_failure = hotupgrade_native.replace_file(
             controller.root_path, file.entry_file, file.source)
         if not file_written then
-            batch.error = flywow_result.failure(native_code(write_failure), "部署失败: " .. file.entry_file)
-            return
+            return flywow_result.failure(native_code(write_failure), "部署失败: " .. file.entry_file)
         end
         file.touched = true
     end
     if #batch.files > 0 then
-        -- Skynet 源码缓存是否清理成功；失败时进入文件恢复和目标 Abort 流程。
         local cache_cleared, cache_failure = pcall(skynet.cache.clear)
         if not cache_cleared then
-            batch.error = flywow_result.failure("HU_CACHE_CLEAR_FAILED", tostring(cache_failure))
-            return
+            return flywow_result.failure("HU_CACHE_CLEAR_FAILED", tostring(cache_failure))
         end
     end
+    return flywow_result.success()
 end
 
---- 按 service_targets 顺序向每个参与目标发送 Update。
---- 目标退出或任一 Update 失败时停止后续更新，并把错误留给 run_batch 恢复。
----@param controller FlyWowHotUpgradeController 负责向目标发送 Update 并接收 Service 退出通知的 Controller。
----@param batch FlyWowHotUpgradeBatch 正式文件已部署的活动批次；本函数按其中 service_targets 发起 Update。
----@return nil 失败保存目标结果和 batch.error；成功表示所有目标 Update 完成
+--- 按固定目标顺序发送 Update；首个失败交给批次恢复流程。
+---@param controller FlyWowHotUpgradeController 负责发送 Update 并接收 Service 退出通知的 Controller。
+---@param batch FlyWowHotUpgradeBatch 正式文件已部署的活动批次。
+---@return FlyWowResult<nil> 所有目标 Update 成功；失败返回首个目标或异步生命周期错误。
 local function update_batch_targets(controller, batch)
-    -- service_targets 已在 Prepare 收口时固定；current_service_handle 还用于允许当前目标登记 new_modules。
-    -- 全部文件就绪后才向目标发送 Update；新生命周期请求继续等待批次终态。
     for _, service_target in ipairs(batch.service_targets) do
         batch.current_service_handle = service_target.service_handle
-        -- 当前目标的 Update 结果；失败时不作发布决定而进入现有恢复流程。
         local service_result = controller:step(batch, service_target, "update")
         if batch.error then
-            return
+            return batch.error
         end
         if not service_result.ok then
             service_target.hotupgrade_result = service_result
-            batch.error = service_result
-            return
+            return service_result
         end
     end
+    return flywow_result.success()
 end
 
---- 按顺序等待已有工作、读取发布包、Prepare 目标、部署正式文件并执行 Update。
---- 任一步失败都写入 batch.error 并交回 run_batch；本函数不决定最终状态。
+--- 按顺序读取发布包、Prepare 目标、部署文件并执行 Update。
 ---@param controller FlyWowHotUpgradeController 持有本批进度和宿主目录配置的唯一 Controller。
----@param batch FlyWowHotUpgradeBatch begin 建立的活动批次；本函数按发布顺序更新它的阶段、文件和目标。
----@return nil 等待或 RPC 可 yield；失败写入 batch.error，异常由 run_batch 转换为 HU_CONTROL_FAILED。
+---@param batch FlyWowHotUpgradeBatch begin 建立的活动批次；本函数按发布顺序处理各阶段。
+---@return FlyWowResult<nil> 各阶段均成功；失败直接返回所属阶段结果，可能 yield。
 local function prepare_and_update_batch(controller, batch)
-    -- 各阶段共用 batch.error 传递首个失败；这里据此停止推进，恢复由外层 run_batch 统一执行。
-    load_and_snapshot_batch_files(controller, batch)
-    if batch.error then
-        return
+    local result = load_and_snapshot_batch_files(controller, batch)
+    if not result.ok then
+        return result
     end
-
-    prepare_batch_targets(controller, batch)
-    if batch.error then
-        return
+    result = prepare_batch_targets(controller, batch)
+    if not result.ok then
+        return result
     end
-
-    deploy_batch_files(controller, batch)
-    if batch.error then
-        return
+    result = deploy_batch_files(controller, batch)
+    if not result.ok then
+        return result
     end
-
-    update_batch_targets(controller, batch)
+    return update_batch_targets(controller, batch)
 end
 
 --- 更新失败时先逆序恢复已替换的正式文件并清缓存，再逆序 Abort 已参与且仍存活的目标。
@@ -1174,6 +1146,10 @@ local function recover_batch(controller, batch)
     end
     batch.phase = (#recovery_errors > 0 or batch.error.code == "HU_RECOVERY_REQUIRED")
         and "RECOVERY_REQUIRED" or "ABORTED"
+    if #recovery_errors > 0 then
+        return batch.error
+    end
+    return flywow_result.success()
 end
 
 --- 发布决定后向所有参与目标发送 Finish，并汇总收尾错误。
@@ -1195,6 +1171,10 @@ local function finish_batch(controller, batch)
         end
     end
     batch.phase = batch.error and "RECOVERY_REQUIRED" or "COMPLETED"
+    if batch.error then
+        return batch.error
+    end
+    return flywow_result.success()
 end
 
 --- 生成批次最终查询结果，释放批次源码和恢复快照，并重新开放等待入口。
@@ -1239,15 +1219,30 @@ function M:run_batch(batch)
     batch.phase = "DEPLOYING"
 
     -- Prepare/Update 主流程是否正常结束；异常在此转换为批次级控制错误。
-    local control_succeeded, control_failure = pcall(prepare_and_update_batch, self, batch)
+    local control_succeeded, control_result = pcall(prepare_and_update_batch, self, batch)
     if not control_succeeded then
-        batch.error = flywow_result.failure("HU_CONTROL_FAILED", tostring(control_failure))
+        batch.error = flywow_result.failure("HU_CONTROL_FAILED", tostring(control_result))
+    elseif not control_result.ok then
+        batch.error = control_result
     end
 
     if batch.error then
-        recover_batch(self, batch)
+        local recovered, recovery_result = pcall(recover_batch, self, batch)
+        if not recovered then
+            batch.error = flywow_result.failure("HU_RECOVERY_REQUIRED", tostring(recovery_result),
+                {original_error = batch.error})
+            batch.phase = "RECOVERY_REQUIRED"
+        elseif not recovery_result.ok then
+            batch.error = recovery_result
+        end
     else
-        finish_batch(self, batch)
+        local finished, finish_result = pcall(finish_batch, self, batch)
+        if not finished then
+            batch.error = flywow_result.failure("HU_RECOVERY_REQUIRED", tostring(finish_result), {step = "finish"})
+            batch.phase = "RECOVERY_REQUIRED"
+        elseif not finish_result.ok then
+            batch.error = finish_result
+        end
     end
     complete_batch(self, batch)
 end

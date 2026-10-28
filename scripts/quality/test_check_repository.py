@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
+from tempfile import TemporaryDirectory
 from pathlib import Path
 
 
@@ -58,28 +59,39 @@ class CheckMarkdownTests(unittest.TestCase):
         self.assertTrue(any("占位符" in error for error in errors))
 
 
+class CheckWorkflowTests(unittest.TestCase):
+    """确认仓库自检会阻止移除 CI 质量门禁。"""
+
+    def test_accepts_workflow_that_runs_tests_and_commit_diff_scan(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = root / ".github/workflows/quality.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text(
+                "pull_request:\npush:\nfetch-depth: 0\n"
+                "python -m unittest discover -s scripts/quality -p 'test_*.py'\n"
+                "python scripts/quality/check_repository.py --base-ref origin/main\n",
+                encoding="utf-8",
+            )
+            self.assertEqual([], CHECKER.check_quality_workflow(root))
+
+    def test_rejects_workflow_without_commit_diff_scan(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workflow = root / ".github/workflows/quality.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text("pull_request:\n", encoding="utf-8")
+            errors = CHECKER.check_quality_workflow(root)
+            self.assertEqual(4, len(errors))
+            self.assertTrue(any("基线" in error or "提交差异" in error for error in errors))
+
 class LuaCommentGateTests(unittest.TestCase):
-    """验证变更行定位、非平凡函数识别及紧邻职责注释门禁。"""
+    """验证变更函数的合同注释、逻辑排版和范围定位门禁。"""
 
     def test_rejects_changed_nontrivial_function_without_summary(self) -> None:
         source = (
-            "local function update_batch(batch)\n"
-            "    local paths = find_paths(batch)\n"
-            "    if not paths then\n"
-            "        return nil\n"
-            "    end\n"
-            "    batch.files = {}\n"
-            "    return true\n"
-            "end\n"
-        )
-        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {2, 3, 4, 5})
-        self.assertEqual(1, len(errors))
-        self.assertIn("缺少紧邻的职责说明", errors[0])
-        self.assertIn("demo.lua:1", errors[0])
-
-    def test_accepts_changed_nontrivial_function_with_summary(self) -> None:
-        source = (
-            "-- 根据本批发布包生成文件记录，并在发现无效输入时返回诊断。\n"
+            "---@param batch table 当前发布批次记录。\n"
+            "---@return boolean 是否完成。\n"
             "local function update_batch(batch)\n"
             "    local paths = find_paths(batch)\n"
             "    if not paths then\n"
@@ -90,15 +102,142 @@ class LuaCommentGateTests(unittest.TestCase):
             "end\n"
         )
         errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {3, 4, 5, 6})
+        self.assertEqual(1, len(errors))
+        self.assertIn("缺少紧邻的职责说明", errors[0])
+        self.assertIn("demo.lua:3", errors[0])
+
+    def test_accepts_changed_nontrivial_function_with_summary(self) -> None:
+        source = (
+            "-- 根据本批发布包生成文件记录，并在发现无效输入时返回诊断。\n"
+            "---@param batch table 当前发布批次记录。\n"
+            "---@return boolean 是否完成。\n"
+            "local function update_batch(batch)\n"
+            "    local paths = find_paths(batch)\n"
+            "    if not paths then\n"
+            "        return nil\n"
+            "    end\n"
+            "    batch.files = {}\n"
+            "    return true\n"
+            "end\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {4, 5, 6, 7})
         self.assertEqual([], errors)
 
-    def test_simple_getter_does_not_require_comment(self) -> None:
+    def test_checks_function_when_only_doc_comment_changed(self) -> None:
         source = (
+            "--- 准备候选状态并保留统一失败合同。\n"
+            "---@param state table 当前候选状态记录。\n"
+            "---@return table 已构建的候选状态。\n"
+            "local function build_state(state)\n"
+            "    return state\n"
+            "end\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {1})
+        self.assertEqual([], errors)
+
+    def test_rejects_changed_function_without_return_contract(self) -> None:
+        source = "local function has_value(value)\n    return value ~= nil\nend\n"
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {2})
+        self.assertTrue(any("缺少紧邻的 @return" in error for error in errors))
+
+    def test_rejects_changed_function_without_param_documentation(self) -> None:
+        source = (
+            "---@return table 状态记录。\n"
+            "local function build_record(request)\n"
+            "    return request\n"
+            "end\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {3})
+        self.assertTrue(any("缺少参数说明：request" in error for error in errors))
+
+    def test_rejects_param_annotation_without_chinese_description(self) -> None:
+        source = (
+            "---@param request table\n"
+            "---@return table 状态记录。\n"
+            "local function build_record(request)\n"
+            "    return request\n"
+            "end\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {3})
+        self.assertTrue(any("缺少参数说明：request" in error for error in errors))
+
+    def test_rejects_return_annotation_without_contract_description(self) -> None:
+        source = (
+            "---@return table\n"
+            "local function build_record()\n"
+            "    return {}\n"
+            "end\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {2})
+        self.assertTrue(any("缺少紧邻的 @return" in error for error in errors))
+
+    def test_rejects_long_function_without_logical_spacing(self) -> None:
+        statements = "".join(f"    local value_{index} = {index}\n" for index in range(18))
+        source = (
+            "--- 生成需要多步处理的候选记录。\n"
+            "---@return table 候选记录。\n"
+            "local function build_candidate()\n"
+            + statements
+            + "    -- 第二阶段返回所有校验通过的候选字段。\n"
+            + "    return {}\nend\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {4})
+        self.assertTrue(any("代码段之间没有空行" in error for error in errors))
+
+    def test_accepts_long_function_with_logical_spacing(self) -> None:
+        statements = "".join(f"    local value_{index} = {index}\n" for index in range(9))
+        source = (
+            "--- 生成需要多步处理的候选记录。\n"
+            "---@return table 候选记录。\n"
+            "local function build_candidate()\n"
+            + statements + "\n" + statements
+            + "    -- 第二阶段返回完整候选记录。\n"
+            + "    return {}\nend\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {4})
+        self.assertEqual([], errors)
+
+    def test_rejects_inline_control_body(self) -> None:
+        source = (
+            "--- 复制状态并保留失败合同。\n"
+            "---@param state table 当前业务状态表。\n"
+            "---@return table 复制后的业务状态。\n"
+            "local function copy_state(state)\n"
+            "    if not state then return {} end\n"
+            "    return state\n"
+            "end\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {5})
+        self.assertTrue(any("不能与 if/loop 头部挤在同一行" in error for error in errors))
+
+    def test_rejects_compressed_control_body_in_anonymous_callback(self) -> None:
+        source = (
+            "local callbacks = { function()\n"
+            "    while pending do wait_for_result() end\n"
+            "end }\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {2})
+        self.assertTrue(any("不能与 if/loop 头部挤在同一行" in error for error in errors))
+
+    def test_ignores_control_words_inside_strings(self) -> None:
+        source = (
+            "-- 返回固定字符串，覆盖控制关键字文本的门禁误报。\n"
+            "---@return string 测试字符串。\n"
+            "local function get_text()\n"
+            "    return 'if ready then return true end'\n"
+            "end\n"
+        )
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {3})
+        self.assertEqual([], errors)
+
+    def test_simple_getter_requires_return_but_not_summary(self) -> None:
+        source = (
+            "---@return integer ID 标识。\n"
             "function M:get_id()\n"
             "    return self.id\n"
             "end\n"
         )
-        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {2})
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {3})
         self.assertEqual([], errors)
 
     def test_ignores_unchanged_function(self) -> None:
@@ -118,6 +257,8 @@ class LuaCommentGateTests(unittest.TestCase):
     def test_handles_nested_blocks_and_strings(self) -> None:
         source = (
             "-- 处理候选批次并保留失败边界。\n"
+            "---@param batch table 当前候选批次记录。\n"
+            "---@return string 交给调用方的文本。\n"
             "local function update_batch(batch)\n"
             "    local text = 'end function fake()'\n"
             "    if batch then\n"
@@ -129,8 +270,8 @@ class LuaCommentGateTests(unittest.TestCase):
             "end\n"
         )
         spans = CHECKER.find_lua_named_function_spans(source)
-        self.assertEqual([(2, 10)], spans)
-        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {5})
+        self.assertEqual([(4, 12)], spans)
+        errors = CHECKER.check_lua_function_comments(Path("demo.lua"), source, {6})
         self.assertEqual([], errors)
 
 

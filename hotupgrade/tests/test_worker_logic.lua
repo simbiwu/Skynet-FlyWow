@@ -15,9 +15,11 @@ end
 function M.export_state()
     return {count = count}
 end
+---@param state table 从旧模块快照复制出的私有状态数据。
+---@return FlyWowResult<nil> 状态导入结果；测试模块始终成功。
 function M.import_state(state)
     count = state.count
-    return true
+    return require("flywow_result").success()
 end
 M.removed = true
 return M

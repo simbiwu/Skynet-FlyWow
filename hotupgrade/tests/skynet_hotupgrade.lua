@@ -89,13 +89,16 @@ end
 
 --- 对 worker 的只读快照核对初始业务值及对象身份，返回快照供调用方补充断言。
 ---@param worker_handle integer create_worker_service 返回的已登记 Worker handle；本函数读取并核对其初始状态。
+---@return table 核对通过的 Worker 状态快照；状态不符时由测试断言失败。
 local function assert_original_state(worker_handle)
     -- read 返回的是跨 State 的观察数据；各 identity 布尔值已在 worker 内与其原始引用比较。
     -- 跨 Service 读取的 Worker 状态快照，用来核对初始字段及对象身份。
     local worker_state = read_worker_state(worker_handle)
     assert(worker_state.service_handle == worker_handle and worker_state.state_identity and worker_state.lua_state_identity and worker_state.module_identity)
     assert(worker_state.equip == "刀" and worker_state.level == 50 and worker_state.schema_version == 1)
-    assert(worker_state.attack == 100 and worker_state.module_value == 1 and worker_state.save_identity and not worker_state.paused)
+    assert(worker_state.attack == 100 and worker_state.module_value == 1 and worker_state.save_identity and not worker_state.paused,
+        "attack=" .. tostring(worker_state.attack) .. " module_value=" .. tostring(worker_state.module_value)
+            .. " save_identity=" .. tostring(worker_state.save_identity) .. " paused=" .. tostring(worker_state.paused))
     assert(worker_state.nested_count == 7)
     return worker_state
 end

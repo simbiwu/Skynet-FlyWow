@@ -47,10 +47,13 @@ local original_save = business.save -- 缓存 V1 函数引用，验证热更不�
 
 --- 按场景配置 Service 更新回调与故障注入，再登记本测试 Service。
 ---@param request table 管理测试发来的 Worker 初始化配置；本函数把其中的故障开关保存给本 State 的更新回调读取。
+---@return FlyWowResult<nil> Controller 登记结果；失败时原样返回对应错误码和诊断。
 local function initialize(request)
     -- service_update 绑定现存 state/functions；自定义 snapshot/restore 只改变恢复方式，不替换这两个根表。
     worker_test_config = request
     local service_update = {state = service_state, functions = business} -- 交给 register_service 的私有状态和函数更新对象。
+
+    -- 按场景安装自定义状态恢复；这些回调只存在于当前测试 Worker 的 Lua State。
     if worker_test_config.custom then
         service_update.snapshot = function(source_state)
             return require("flywow_hotupgrade_module_patch").snapshot_state(source_state)
@@ -59,15 +62,17 @@ local function initialize(request)
             if worker_test_config.restore_failure then
                 error("service restore failed")
             end
-            require("flywow_hotupgrade_module_patch").restore_state(source_snapshot, target_state)
+            return require("flywow_hotupgrade_module_patch").restore_state(source_snapshot, target_state)
         end
     end
+
     if worker_test_config.custom_success then
         -- 模拟不可直接复制的业务对象，快照只包含它可迁移的普通数据。
         setmetatable(service_state.nested, {})
         service_update.snapshot = function(source_state)
-            return {equip = source_state.equip, level = source_state.level,
-                schema_version = source_state.schema_version, nested = {count = source_state.nested.count}}
+            return require("flywow_result").success(
+                {equip = source_state.equip, level = source_state.level,
+                    schema_version = source_state.schema_version, nested = {count = source_state.nested.count}})
         end
         service_update.restore = function(value, next_state)
             -- value 是仍在线的业务状态，next_state 是 snapshot 返回的恢复数据；这里只回填已约定字段。
@@ -75,9 +80,11 @@ local function initialize(request)
             value.level = next_state.level
             value.schema_version = next_state.schema_version
             value.nested.count = next_state.nested.count
+            return require("flywow_result").success()
         end
     end
-    -- 在接收真实热更控制消息时退出，验证 Controller 对原生退出与 RPC 失败交错的处理。
+
+    -- 按故障场景覆盖协议分发；只在指定控制命令到达时终止当前测试 Service。
     if worker_test_config.exit_command then
         local dispatch = skynet.dispatch -- 保存协议分发函数，以测试配置控制消息处理。
         skynet.dispatch = function(protocol, callback)
@@ -97,6 +104,8 @@ local function initialize(request)
             end
         end
     end
+
+    -- 最后提交登记，返回 Controller 的结果供 Skynet 初始化调用方决定是否继续。
     return hotupgrade.register_service(
     {
         service_update = service_update,
@@ -111,7 +120,9 @@ local function initialize(request)
             return business_queue(function() return true end)
         end or nil,
         after_upgrade = function()
-            if worker_test_config.custom then error("partial service update") end
+            if worker_test_config.custom then
+                error("partial service update")
+            end
             if worker_test_config.after_upgrade_failure then
                 error("after_upgrade failed")
             end
@@ -153,7 +164,9 @@ skynet.start(function()
             end
         elseif command == "read" then
             -- 诊断字段先在本 State 比较原始引用，再把布尔结果发给管理测试；跨 State 复制表本身不能验证身份。
-            while startup_mode and not startup_registration do skynet.sleep(1) end
+            while startup_mode and not startup_registration do
+                skynet.sleep(1)
+            end
             assert(not startup_registration or startup_registration.ok)
             -- 仅测试诊断用的只读观察，不是生产业务入口。
             answer =
@@ -314,7 +327,9 @@ skynet.start(function()
             local ordinary_load_waiting = false -- 普通模块首次加载是否已进入等待，用于验证冲突会立即失败而非互等。
             new_module_conflict_result = nil
             skynet.fork(function()
-                while not dependency_registration_started do skynet.sleep(1) end
+                while not dependency_registration_started do
+                    skynet.sleep(1)
+                end
                 local ok, message = pcall(hotupgrade.require, "hotupgrade_new_rules") -- 并发冲突测试中 hotupgrade.require 是否正常返回。
                 new_module_conflict_result = {ok = ok, message = tostring(message)}
                 skynet.call = original_call
@@ -323,7 +338,9 @@ skynet.start(function()
                 if protocol == "hotupgrade" and operation == "register_new_module"
                     and request.name == "lualib.hotupgrade_new_dependency" then
                     dependency_registration_started = true
-                    while not ordinary_load_waiting do skynet.sleep(1) end
+                    while not ordinary_load_waiting do
+                        skynet.sleep(1)
+                    end
                 elseif protocol == "hotupgrade" and operation == "begin_module_load"
                     and request.name == "lualib.hotupgrade_new_rules" then
                     ordinary_load_waiting = true
@@ -332,7 +349,9 @@ skynet.start(function()
             end
             answer = true
         elseif command == "new_module_conflict_result" then
-            while not new_module_conflict_result do skynet.sleep(1) end
+            while not new_module_conflict_result do
+                skynet.sleep(1)
+            end
             answer = new_module_conflict_result
         elseif command == "declare" then
             extra_logic = hotupgrade.require("hotupgrade_extra")

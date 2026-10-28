@@ -19,9 +19,17 @@
 课程从一个空的教学目录开始。你亲手敲出 V1、运行它、制造并发、发布 V2、观察对象引用，再有意制造恢复失败，最终发布 V3。每走到一个框架函数，先交代调用者、文件、执行 Service/Lua State、参数和触发原因，再按真正的运行顺序阅读源码；遇到大函数，分段进入，最后回到原来的调用链。
 
 
+### 当前源码的返回合同（以此节覆盖旧摘录中的返回形式）
+
+当前 HotUpgrade 内部可失败操作使用 FlyWowResult<T>：成功载荷读取 value，失败读取稳定 code、message 和可选 details。公开适配入口 hotupgrade.require、newservice、uniqueservice 保留原生返回值和抛错行为；首次受控加载、许可等待或 Service 创建可能 yield，调用方按原生习惯使用 pcall。
+
+状态合同：snapshot_state 返回 FlyWowResult<any>，restore_state 返回 FlyWowResult<nil>；模块 import_state 和 Service 自定义 restore 返回 FlyWowResult<nil>，自定义 snapshot 返回 FlyWowResult<any>。export_state 返回自然状态值。before_upgrade 与 after_upgrade 固定返回 boolean，只有 true 表示通过，false 表示业务拒绝。回调抛错由明确的候选代码或业务回调边界捕获，再转换为所属操作的结果；不要把 pcall 的布尔值泄漏为内部错误合同。
+
+下面部分早期源码摘录保留其教学背景；若摘录展示 {ok=true}、裸快照或裸 import_state 返回值，应以本节及当前 docs/hotupgrade/README.md 所列合同为准，实际运行以当前源码为准。
+
 ### 结果表读取方式
 
-FlyWow 内部可失败的操作统一使用公共 FlyWowResult<T>。先检查 ok，再读取成功载荷 value；失败时读取稳定 code、诊断 message，需要模块专属结构化诊断时读取 details。例如 Controller 的 begin 返回成功结果后，通过 begun.value.batch_id 查询批次；status 成功结果中的记录位于 status.value.record。HotUpgrade 的 require、newservice、uniqueservice 是面向 Lua/Skynet 的适配入口，仍直接返回模块表或 Service handle，失败时抛出异常。
+FlyWow 内部可失败的操作统一使用公共 FlyWowResult<T>。先检查 ok，再读取成功载荷 value；失败时读取稳定 code、诊断 message，需要模块专属结构化诊断时读取 details。HotUpgrade 的 require、newservice、uniqueservice 是面向 Lua/Skynet 的适配入口，仍直接返回模块表或 Service handle，失败时抛出异常。
 
 ### 六个学习阶段
 
@@ -205,13 +213,13 @@ local function initialize_player()
             functions = operations,
             -- 课堂故障需要显式控制恢复失败，所以这里使用成对自定义快照。
             snapshot = function(source)
-                return
+                return require("flywow_result").success(
                 {
                     weapon = source.weapon,
                     level = source.level,
                     gold = source.gold,
                     schema_version = source.schema_version,
-                }
+                })
             end,
             restore = function(destination, snapshot)
                 if fail_restore then
@@ -223,7 +231,7 @@ local function initialize_player()
                 for key, value in pairs(snapshot) do
                     destination[key] = value
                 end
-                return true
+                return require("flywow_result").success()
             end,
         },
         before_upgrade = function()
@@ -679,13 +687,13 @@ local function initialize_player()
             functions = operations,
             -- 课堂故障需要显式控制恢复失败，所以这里使用成对自定义快照。
             snapshot = function(source)
-                return
+                return require("flywow_result").success(
                 {
                     weapon = source.weapon,
                     level = source.level,
                     gold = source.gold,
                     schema_version = source.schema_version,
-                }
+                })
             end,
             restore = function(destination, snapshot)
                 if fail_restore then
@@ -697,7 +705,7 @@ local function initialize_player()
                 for key, value in pairs(snapshot) do
                     destination[key] = value
                 end
-                return true
+                return require("flywow_result").success()
             end,
         },
         before_upgrade = function()
@@ -805,7 +813,6 @@ return function(state)
         new_modules = {"combat_rules"},
         -- 在 Activate 阶段执行，不在构建 Patch 时提前改线上数据。
         update_state = function()
-            assert(state.schema_version == 1, "V2 要求从 schema 1 更新")
             state.weapon = "剑"
             state.schema_version = 2
             -- gold、level 不修改，保持原来的玩家运行数据。
@@ -2318,7 +2325,6 @@ return function(state)
     return
     {
         update_state = function()
-            assert(state.schema_version == 2, "faulty 批次要求从 V2 开始")
             state.gold = 0
             state.schema_version = 99
         end,
@@ -2465,13 +2471,13 @@ local function initialize_player()
             functions = operations,
             -- 课堂故障需要显式控制恢复失败，所以这里使用成对自定义快照。
             snapshot = function(source)
-                return
+                return require("flywow_result").success(
                 {
                     weapon = source.weapon,
                     level = source.level,
                     gold = source.gold,
                     schema_version = source.schema_version,
-                }
+                })
             end,
             restore = function(destination, snapshot)
                 if fail_restore then
@@ -2483,7 +2489,7 @@ local function initialize_player()
                 for key, value in pairs(snapshot) do
                     destination[key] = value
                 end
-                return true
+                return require("flywow_result").success()
             end,
         },
         before_upgrade = function()

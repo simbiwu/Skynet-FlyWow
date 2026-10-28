@@ -28,6 +28,7 @@ end
 
 function M.import_state(snapshot)
     count = snapshot.count
+    return require("flywow_result").success()
 end
 
 return M
