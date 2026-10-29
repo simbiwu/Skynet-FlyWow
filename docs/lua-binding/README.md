@@ -2,6 +2,6 @@
 
 最小 C++ Binding 读写示例见 [Lua Binding Sample](../../lua-binding/sample/README.md)。
 
-Lua Binding 为 C++ Native 提供参数、table、结果、闭包、metatable 与 userdata 操作。导航是本轮真实接入者。
+Lua Binding 为 C++ Native 提供参数、table、结果、闭包、metatable 与 userdata 操作。Gateway、Navigation、Word Filter 和 HotUpgrade 均通过该静态库接入；普通回调用 invoke，加载入口用 invokeModule 明确异常与资源边界。
 
 完整合同、构建、使用示例和验证入口见 [Lua Binding 使用说明](../../lua-binding/使用说明.md)。源码位于根模块目录 `lua-binding/`，静态 target 为 `flywow_lua_binding`。

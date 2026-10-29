@@ -4,9 +4,9 @@
 // 不负责：不访问 Socket、Skynet、业务、登录或文件；私钥和 secret 不返回 Lua 字符串。
 #include "lua_binding.h"
 #include "lua_table.h"
-#include <exception>
 #include <array>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <openssl/core_names.h>
 #include <openssl/crypto.h>
@@ -224,45 +224,51 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
 // 失败时清理其密钥，userdata 内存仍由 Lua GC 回收，不手工析构两次。
 int createCryptoContext(lua_State *state)
 {
-    LuaBinding  lua_binding(state);
-    std::string hello; // 从参数复制的完整 CLIENT_HELLO，校验后才用于密钥派生。
-    if (!lua_binding.readValue(1, hello))
-    {
-        return lua_binding.pushError();
-    }
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding  lua_binding(state);
+            std::string hello; // 从参数复制的完整 CLIENT_HELLO，校验后才用于密钥派生。
+            if (!lua_binding.readValue(1, hello))
+            {
+                return lua_binding.pushError();
+            }
 
-    if (hello.size() != 67 || hello[0] != 1 || hello[1] != 1 ||
-        static_cast<unsigned char>(hello[2]) != 4)
-    {
-        lua_binding.setError("HANDSHAKE_HELLO", "invalid handshake hello");
-        return lua_binding.pushError();
-    }
+            if (hello.size() != 67 || hello[0] != 1 || hello[1] != 1 ||
+                static_cast<unsigned char>(hello[2]) != 4)
+            {
+                lua_binding.setError("HANDSHAKE_HELLO", "invalid handshake hello");
+                return lua_binding.pushError();
+            }
 
-    CryptoContext *context = nullptr; // 从 Lua 栈借用的已构造对象；其内存仍由 userdata 拥有。
-    if (!lua_binding.newUserdata(kCryptoMetatable, context))
-    {
-        return lua_binding.pushError();
-    }
+            CryptoContext *context =
+                nullptr; // 从 Lua 栈借用的已构造对象；其内存仍由 userdata 拥有。
+            if (!lua_binding.newUserdata(kCryptoMetatable, context))
+            {
+                return lua_binding.pushError();
+            }
 
-    std::string response; // buildChallenge 产生的公开挑战消息，成功后交还 Lua。
-    try
-    {
-        response = buildChallenge(context, hello.data());
-    }
-    catch (const std::exception &error)
-    {
-        clearCryptoContext(context);
-        lua_binding.setError(error.what(), error.what());
-        return lua_binding.pushError();
-    }
-    catch (...)
-    {
-        clearCryptoContext(context);
-        lua_binding.setError("CRYPTO_FAILURE", "unknown native handshake failure");
-        return lua_binding.pushError();
-    }
+            std::string response; // buildChallenge 产生的公开挑战消息，成功后交还 Lua。
+            try
+            {
+                response = buildChallenge(context, hello.data());
+            }
+            catch (const std::exception &error)
+            {
+                clearCryptoContext(context);
+                lua_binding.setError(error.what(), error.what());
+                return lua_binding.pushError();
+            }
+            catch (...)
+            {
+                clearCryptoContext(context);
+                lua_binding.setError("CRYPTO_FAILURE", "unknown native handshake failure");
+                return lua_binding.pushError();
+            }
 
-    return lua_binding.returnValues(context, response);
+            return lua_binding.returnValues(context, response);
+        });
 }
 
 /// Lua handshake manager 在 proof 阶段验证客户端证明并生成服务端证明。
@@ -271,52 +277,60 @@ int createCryptoContext(lua_State *state)
 // 只借用栈中的 userdata；returnValues 追加输出，LuaBinding 负责错误结果与栈平衡。
 int verify(lua_State *state)
 {
-    LuaBinding     lua_binding(state);
-    CryptoContext *context = nullptr; // 从 Lua 栈借用的已构造对象；其内存仍由 userdata 拥有。
-    std::string    bytes;             // 从第二个参数复制的完整 CLIENT_PROOF，验证期间只读。
-    if (!lua_binding.readUserdata(1, kCryptoMetatable, context) || !lua_binding.readValue(2, bytes))
-    {
-        return lua_binding.pushError();
-    }
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding     lua_binding(state);
+            CryptoContext *context =
+                nullptr;       // 从 Lua 栈借用的已构造对象；其内存仍由 userdata 拥有。
+            std::string bytes; // 从第二个参数复制的完整 CLIENT_PROOF，验证期间只读。
+            if (!lua_binding.readUserdata(1, kCryptoMetatable, context) ||
+                !lua_binding.readValue(2, bytes))
+            {
+                return lua_binding.pushError();
+            }
 
-    if (!context->active || bytes.size() != 33 || bytes[0] != 3)
-    {
-        clearCryptoContext(context);
-        lua_binding.setError("HANDSHAKE_PROOF", "invalid handshake proof");
-        return lua_binding.pushError();
-    }
+            if (!context->active || bytes.size() != 33 || bytes[0] != 3)
+            {
+                clearCryptoContext(context);
+                lua_binding.setError("HANDSHAKE_PROOF", "invalid handshake proof");
+                return lua_binding.pushError();
+            }
 
-    std::array<unsigned char, 32> expected = {}; // 预期客户端 HMAC；与输入证明做常量时间比较。
-    std::string                   message  = "client-proof"; // 证明用途前缀，后接握手摘要。
-    message.append(reinterpret_cast<const char *>(context->transcript_hash.data()), 32);
-    try
-    {
-        // EVP 计算失败也须落入本回调的清理与错误返回路径。
-        computeHmac(context->proof_key.data(), message, expected.data());
-        requireCryptoSuccess(CRYPTO_memcmp(expected.data(), bytes.data() + 1, 32) == 0,
-                             "HANDSHAKE_PROOF");
+            std::array<unsigned char, 32> expected =
+                {};                               // 预期客户端 HMAC；与输入证明做常量时间比较。
+            std::string message = "client-proof"; // 证明用途前缀，后接握手摘要。
+            message.append(reinterpret_cast<const char *>(context->transcript_hash.data()), 32);
+            try
+            {
+                // EVP 计算失败也须落入本回调的清理与错误返回路径。
+                computeHmac(context->proof_key.data(), message, expected.data());
+                requireCryptoSuccess(CRYPTO_memcmp(expected.data(), bytes.data() + 1, 32) == 0,
+                                     "HANDSHAKE_PROOF");
 
-        message = "server-ready";
-        message.append(reinterpret_cast<const char *>(context->transcript_hash.data()), 32);
-        std::string response(33, '\0'); // SERVER_READY：1 字节类型加 32 字节服务端证明。
-        response[0] = 4;
-        computeHmac(context->proof_key.data(), message,
-                    reinterpret_cast<unsigned char *>(&response[1]));
-        clearCryptoContext(context);
-        return lua_binding.returnValues(response);
-    }
-    catch (const std::exception &error)
-    {
-        clearCryptoContext(context);
-        lua_binding.setError(error.what(), error.what());
-        return lua_binding.pushError();
-    }
-    catch (...)
-    {
-        clearCryptoContext(context);
-        lua_binding.setError("CRYPTO_FAILURE", "unknown native handshake failure");
-        return lua_binding.pushError();
-    }
+                message = "server-ready";
+                message.append(reinterpret_cast<const char *>(context->transcript_hash.data()), 32);
+                std::string response(33, '\0'); // SERVER_READY：1 字节类型加 32 字节服务端证明。
+                response[0] = 4;
+                computeHmac(context->proof_key.data(), message,
+                            reinterpret_cast<unsigned char *>(&response[1]));
+                clearCryptoContext(context);
+                return lua_binding.returnValues(response);
+            }
+            catch (const std::exception &error)
+            {
+                clearCryptoContext(context);
+                lua_binding.setError(error.what(), error.what());
+                return lua_binding.pushError();
+            }
+            catch (...)
+            {
+                clearCryptoContext(context);
+                lua_binding.setError("CRYPTO_FAILURE", "unknown native handshake failure");
+                return lua_binding.pushError();
+            }
+        });
 }
 
 /// Gateway 关闭连接或完成握手时幂等释放密码资源。
@@ -325,14 +339,20 @@ int verify(lua_State *state)
 // 不弹出或释放 userdata；Lua GC 随后调用析构，重复清理因空指针及复位状态而安全。
 int close(lua_State *state)
 {
-    LuaBinding     lua_binding(state);
-    CryptoContext *context = nullptr; // 从 Lua 栈借用的已构造对象；其内存仍由 userdata 拥有。
-    if (!lua_binding.readUserdata(1, kCryptoMetatable, context))
-    {
-        return lua_binding.pushError();
-    }
-    clearCryptoContext(context);
-    return lua_binding.returnValues();
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding     lua_binding(state);
+            CryptoContext *context =
+                nullptr; // 从 Lua 栈借用的已构造对象；其内存仍由 userdata 拥有。
+            if (!lua_binding.readUserdata(1, kCryptoMetatable, context))
+            {
+                return lua_binding.pushError();
+            }
+            clearCryptoContext(context);
+            return lua_binding.returnValues();
+        });
 }
 } // namespace
 } // namespace flywow_gateway
@@ -344,25 +364,30 @@ int close(lua_State *state)
 // __index 指向方法表，__gc 由 registerUserdata 安装，负责调用已构造对象的析构。
 extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
 {
-    using namespace flywow_gateway;
-    LuaBinding lua_binding(state); // 借用当前 Lua State；参数和结果均由本次回调管理。
-    LuaTable   metatable;          // 注册当前 userdata 类型及其由 LuaBinding 管理的 __gc 行为。
-    if (!lua_binding.registerUserdata<CryptoContext>(kCryptoMetatable, metatable))
-    {
-        return lua_binding.pushError();
-    }
+    return flywow_lua_binding::LuaBinding::invokeModule(
+        state,
+        [state]() -> int
+        {
+            using namespace flywow_gateway;
+            LuaBinding lua_binding(state); // 借用当前 Lua State；参数和结果均由本次回调管理。
+            LuaTable   metatable; // 注册当前 userdata 类型及其由 LuaBinding 管理的 __gc 行为。
+            if (!lua_binding.registerUserdata<CryptoContext>(kCryptoMetatable, metatable))
+            {
+                return lua_binding.pushError();
+            }
 
-    LuaTable methods = lua_binding.newTable(); // userdata 的公开 verify/close 方法集合。
-    if (!methods.setFunction("verify", verify) || !methods.setFunction("close", close) ||
-        !metatable.writeValue("__index", methods))
-    {
-        return lua_binding.pushError();
-    }
+            LuaTable methods = lua_binding.newTable(); // userdata 的公开 verify/close 方法集合。
+            if (!methods.setFunction("verify", verify) || !methods.setFunction("close", close) ||
+                !metatable.writeValue("__index", methods))
+            {
+                return lua_binding.pushError();
+            }
 
-    LuaTable module = lua_binding.newTable(); // require 返回的模块表，仅提供 new 构造入口。
-    if (!module.setFunction("new", createCryptoContext))
-    {
-        return lua_binding.pushError();
-    }
-    return lua_binding.returnValues(module);
+            LuaTable module = lua_binding.newTable(); // require 返回的模块表，仅提供 new 构造入口。
+            if (!module.setFunction("new", createCryptoContext))
+            {
+                return lua_binding.pushError();
+            }
+            return lua_binding.returnValues(module);
+        });
 }

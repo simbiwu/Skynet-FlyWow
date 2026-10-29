@@ -298,69 +298,84 @@ LuaTable cellResultTable(LuaBinding &lua_binding, const flywow_navigation::GridP
 /// query_cell(id,version,position)：按当前 map_id 查询并校验资产版本；只读、不 yield。
 int query_cell(lua_State *state)
 {
-    LuaBinding    lua_binding(state);
-    void         *registry_pointer = nullptr;
-    std::uint32_t map_id           = 0; // 必填地图身份，由正数业务检查拒绝默认 0。
-    std::uint32_t map_version      = 0;
-    WorldPosition position;
-    if (!lua_binding.readUpvalue(1, registry_pointer) ||
-        !readPositiveId(lua_binding, 1, "map_id", map_id) ||
-        !readPositiveId(lua_binding, 2, "map_version", map_version) ||
-        !readWorldPosition(lua_binding, 3, position))
-    {
-        return lua_binding.pushError();
-    }
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding    lua_binding(state);
+            void         *registry_pointer = nullptr;
+            std::uint32_t map_id           = 0; // 必填地图身份，由正数业务检查拒绝默认 0。
+            std::uint32_t map_version      = 0;
+            WorldPosition position;
+            if (!lua_binding.readUpvalue(1, registry_pointer) ||
+                !readPositiveId(lua_binding, 1, "map_id", map_id) ||
+                !readPositiveId(lua_binding, 2, "map_version", map_version) ||
+                !readWorldPosition(lua_binding, 3, position))
+            {
+                return lua_binding.pushError();
+            }
 
-    const auto found = static_cast<MapRegistry *>(registry_pointer)->Find(map_id);
-    if (!found.ok())
-    {
-        return lua_binding.pushError(flywow_navigation::NavErrorName(found.error), found.detail);
-    }
-    if (found.value->metadata().map_version != map_version)
-    {
-        return lua_binding.pushError("MAP_VERSION_MISMATCH",
-                                     "map_version does not match current map");
-    }
-    const auto grid = found.value->WorldToGrid(position);
-    if (!grid.ok())
-    {
-        return lua_binding.pushError(flywow_navigation::NavErrorName(grid.error), grid.detail);
-    }
-    const auto cell = found.value->QueryWorld(position);
-    if (!cell.ok())
-    {
-        return lua_binding.pushError(flywow_navigation::NavErrorName(cell.error), cell.detail);
-    }
-    auto table = cellResultTable(lua_binding, grid.value, cell.value);
-    return table.valid() ? lua_binding.returnValues(table) : lua_binding.pushError();
+            const auto found = static_cast<MapRegistry *>(registry_pointer)->Find(map_id);
+            if (!found.ok())
+            {
+                return lua_binding.pushError(flywow_navigation::NavErrorName(found.error),
+                                             found.detail);
+            }
+            if (found.value->metadata().map_version != map_version)
+            {
+                return lua_binding.pushError("MAP_VERSION_MISMATCH",
+                                             "map_version does not match current map");
+            }
+            const auto grid = found.value->WorldToGrid(position);
+            if (!grid.ok())
+            {
+                return lua_binding.pushError(flywow_navigation::NavErrorName(grid.error),
+                                             grid.detail);
+            }
+            const auto cell = found.value->QueryWorld(position);
+            if (!cell.ok())
+            {
+                return lua_binding.pushError(flywow_navigation::NavErrorName(cell.error),
+                                             cell.detail);
+            }
+            auto table = cellResultTable(lua_binding, grid.value, cell.value);
+            return table.valid() ? lua_binding.returnValues(table) : lua_binding.pushError();
+        });
 }
 
 /// load_navigation_profiles(profiles)：校验独立导航配置并原子替换当前只读表。
 int load_navigation_profiles(lua_State *state)
 {
-    LuaBinding  lua_binding(state);
-    LuaTable    profiles;
-    std::size_t profile_count = 0;
-    if (!lua_binding.readTable(1, profiles) || !profiles.denseArrayLength(profile_count))
-    {
-        return lua_binding.pushError();
-    }
-    if (profile_count == 0)
-    {
-        return lua_binding.pushError(kInvalidArgument, "profiles must not be empty");
-    }
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding  lua_binding(state);
+            LuaTable    profiles;
+            std::size_t profile_count = 0;
+            if (!lua_binding.readTable(1, profiles) || !profiles.denseArrayLength(profile_count))
+            {
+                return lua_binding.pushError();
+            }
+            if (profile_count == 0)
+            {
+                return lua_binding.pushError(kInvalidArgument, "profiles must not be empty");
+            }
 
-    std::vector<flywow_navigation::NavigationProfile> navigation_profiles;
-    if (!readNavigationProfiles(lua_binding, profiles, profile_count, navigation_profiles))
-    {
-        return lua_binding.pushError();
-    }
-    const auto loaded = NavigationProfileRegistry::Instance().Load(std::move(navigation_profiles));
-    if (!loaded.ok())
-    {
-        return lua_binding.pushError(flywow_navigation::NavErrorName(loaded.error), loaded.detail);
-    }
-    return lua_binding.returnValues(true);
+            std::vector<flywow_navigation::NavigationProfile> navigation_profiles;
+            if (!readNavigationProfiles(lua_binding, profiles, profile_count, navigation_profiles))
+            {
+                return lua_binding.pushError();
+            }
+            const auto loaded =
+                NavigationProfileRegistry::Instance().Load(std::move(navigation_profiles));
+            if (!loaded.ok())
+            {
+                return lua_binding.pushError(flywow_navigation::NavErrorName(loaded.error),
+                                             loaded.detail);
+            }
+            return lua_binding.returnValues(true);
+        });
 }
 
 /// new_context(map_id[,air_limits])：固定地图；owner 独占动态状态，Profile 在地面操作时读取。
@@ -453,108 +468,128 @@ bool readPathQuery(LuaBinding &lua_binding, PathQuery &query)
 /// find_path(unit_id,start,end,self_id)：同步规划，返回独占 Path/cursor。
 int find_path(lua_State *state)
 {
-    LuaBinding    lua_binding(state);
-    PathQuery     query;
-    std::uint32_t self_id       = 0;
-    bool          allow_partial = false;
-    if (!lua_binding.readOptionalValue(6, allow_partial) || !readPathQuery(lua_binding, query) ||
-        !readPositiveId(lua_binding, 5, "unit_instance_id", self_id))
-    {
-        return lua_binding.pushError();
-    }
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding    lua_binding(state);
+            PathQuery     query;
+            std::uint32_t self_id       = 0;
+            bool          allow_partial = false;
+            if (!lua_binding.readOptionalValue(6, allow_partial) ||
+                !readPathQuery(lua_binding, query) ||
+                !readPositiveId(lua_binding, 5, "unit_instance_id", self_id))
+            {
+                return lua_binding.pushError();
+            }
 
-    const NavigationAgent         agent{NavigationAgentHandle{self_id}, query.profile};
-    const DynamicNavigationPolicy policy{};
-    auto                          result = flywow_navigation::GridPathfinder::FindPath(
-        *query.owner->context, agent, query.start, query.target, policy, allow_partial);
-    if (!result.ok())
-    {
-        return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
-    }
-    LuaPath *path = nullptr;
-    if (!lua_binding.newUserdata(kPathMeta, path, std::move(result.value)))
-    {
-        return lua_binding.pushError();
-    }
-    return lua_binding.returnValues(path);
+            const NavigationAgent         agent{NavigationAgentHandle{self_id}, query.profile};
+            const DynamicNavigationPolicy policy{};
+            auto                          result = flywow_navigation::GridPathfinder::FindPath(
+                *query.owner->context, agent, query.start, query.target, policy, allow_partial);
+            if (!result.ok())
+            {
+                return lua_binding.pushError(flywow_navigation::NavErrorName(result.error),
+                                             result.detail);
+            }
+            LuaPath *path = nullptr;
+            if (!lua_binding.newUserdata(kPathMeta, path, std::move(result.value)))
+            {
+                return lua_binding.pushError();
+            }
+            return lua_binding.returnValues(path);
+        });
 }
 
 /// find_path_to_range：搜索进入指定通用中心距范围的可站立位置；不定义战斗规则。
 int find_path_to_range(lua_State *state)
 {
-    LuaBinding    lua_binding(state);
-    PathQuery     query;
-    std::uint32_t range_mm      = 0; // uint32 毫米距离，0 合法，不作为实体 ID 检查。
-    std::uint32_t self_id       = 0;
-    bool          allow_partial = false;
-    if (!lua_binding.readOptionalValue(7, allow_partial) || !readPathQuery(lua_binding, query) ||
-        !lua_binding.readValue(5, range_mm) ||
-        !readPositiveId(lua_binding, 6, "unit_instance_id", self_id))
-    {
-        return lua_binding.pushError();
-    }
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding    lua_binding(state);
+            PathQuery     query;
+            std::uint32_t range_mm      = 0; // uint32 毫米距离，0 合法，不作为实体 ID 检查。
+            std::uint32_t self_id       = 0;
+            bool          allow_partial = false;
+            if (!lua_binding.readOptionalValue(7, allow_partial) ||
+                !readPathQuery(lua_binding, query) || !lua_binding.readValue(5, range_mm) ||
+                !readPositiveId(lua_binding, 6, "unit_instance_id", self_id))
+            {
+                return lua_binding.pushError();
+            }
 
-    const NavigationAgent         agent{NavigationAgentHandle{self_id}, query.profile};
-    const DynamicNavigationPolicy policy{};
-    auto                          result = flywow_navigation::GridPathfinder::FindPathToRange(
-        *query.owner->context, agent, query.start, query.target, range_mm, policy, allow_partial);
-    if (!result.ok())
-    {
-        return lua_binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
-    }
-    LuaPath *path = nullptr;
-    if (!lua_binding.newUserdata(kPathMeta, path, std::move(result.value)))
-    {
-        return lua_binding.pushError();
-    }
-    return lua_binding.returnValues(path);
+            const NavigationAgent         agent{NavigationAgentHandle{self_id}, query.profile};
+            const DynamicNavigationPolicy policy{};
+            auto result = flywow_navigation::GridPathfinder::FindPathToRange(
+                *query.owner->context, agent, query.start, query.target, range_mm, policy,
+                allow_partial);
+            if (!result.ok())
+            {
+                return lua_binding.pushError(flywow_navigation::NavErrorName(result.error),
+                                             result.detail);
+            }
+            LuaPath *path = nullptr;
+            if (!lua_binding.newUserdata(kPathMeta, path, std::move(result.value)))
+            {
+                return lua_binding.pushError();
+            }
+            return lua_binding.returnValues(path);
+        });
 }
 
 /// find_path_to_unit_range：按双方导航半径寻找合法接近点；不接收战斗攻击距离。
 int find_path_to_unit_range(lua_State *state)
 {
-    LuaBinding            binding(state);
-    LuaNavigationContext *owner            = nullptr;
-    std::uint32_t         mover_unit_id    = 0;
-    std::uint32_t         target_unit_id   = 0;
-    std::uint32_t         unit_instance_id = 0;
-    WorldPosition         start{}, target{};
-    bool                  allow_partial = false;
-    if (!readContext(binding, owner) ||
-        !readPositiveId(binding, 2, "mover_unit_id", mover_unit_id) ||
-        !readWorldPosition(binding, 3, start) ||
-        !readPositiveId(binding, 4, "target_unit_id", target_unit_id) ||
-        !readWorldPosition(binding, 5, target) ||
-        !readPositiveId(binding, 6, "mover_unit_instance_id", unit_instance_id) ||
-        !binding.readOptionalValue(7, allow_partial))
-    {
-        return binding.pushError();
-    }
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding            binding(state);
+            LuaNavigationContext *owner            = nullptr;
+            std::uint32_t         mover_unit_id    = 0;
+            std::uint32_t         target_unit_id   = 0;
+            std::uint32_t         unit_instance_id = 0;
+            WorldPosition         start{}, target{};
+            bool                  allow_partial = false;
+            if (!readContext(binding, owner) ||
+                !readPositiveId(binding, 2, "mover_unit_id", mover_unit_id) ||
+                !readWorldPosition(binding, 3, start) ||
+                !readPositiveId(binding, 4, "target_unit_id", target_unit_id) ||
+                !readWorldPosition(binding, 5, target) ||
+                !readPositiveId(binding, 6, "mover_unit_instance_id", unit_instance_id) ||
+                !binding.readOptionalValue(7, allow_partial))
+            {
+                return binding.pushError();
+            }
 
-    const auto profiles = NavigationProfileRegistry::Instance().Snapshot();
-    if (profiles == nullptr)
-    {
-        return binding.pushError("INVALID_AGENT", "navigation profiles are not loaded");
-    }
-    const auto *mover_profile  = findNavigationProfile(binding, *profiles, mover_unit_id);
-    const auto *target_profile = findNavigationProfile(binding, *profiles, target_unit_id);
-    if (mover_profile == nullptr || target_profile == nullptr)
-    {
-        return binding.pushError();
-    }
+            const auto profiles = NavigationProfileRegistry::Instance().Snapshot();
+            if (profiles == nullptr)
+            {
+                return binding.pushError("INVALID_AGENT", "navigation profiles are not loaded");
+            }
+            const auto *mover_profile  = findNavigationProfile(binding, *profiles, mover_unit_id);
+            const auto *target_profile = findNavigationProfile(binding, *profiles, target_unit_id);
+            if (mover_profile == nullptr || target_profile == nullptr)
+            {
+                return binding.pushError();
+            }
 
-    const NavigationAgent mover{NavigationAgentHandle{unit_instance_id}, mover_profile};
-    auto                  result = flywow_navigation::GridPathfinder::findPathToUnitRange(
-        *owner->context, mover, start, *target_profile, target, DynamicNavigationPolicy{},
-        allow_partial);
-    if (!result.ok())
-    {
-        return binding.pushError(flywow_navigation::NavErrorName(result.error), result.detail);
-    }
-    LuaPath *path = nullptr;
-    return binding.newUserdata(kPathMeta, path, std::move(result.value))
-               ? binding.returnValues(path)
-               : binding.pushError();
+            const NavigationAgent mover{NavigationAgentHandle{unit_instance_id}, mover_profile};
+            auto                  result = flywow_navigation::GridPathfinder::findPathToUnitRange(
+                *owner->context, mover, start, *target_profile, target, DynamicNavigationPolicy{},
+                allow_partial);
+            if (!result.ok())
+            {
+                return binding.pushError(flywow_navigation::NavErrorName(result.error),
+                                         result.detail);
+            }
+            LuaPath *path = nullptr;
+            return binding.newUserdata(kPathMeta, path, std::move(result.value))
+                       ? binding.returnValues(path)
+                       : binding.pushError();
+        });
 }
 
 // 出生与移动本次调用持有 Registry 快照，handle 使用运行时 unit_instance_id。
@@ -620,34 +655,43 @@ int commitMove(LuaBinding &lua_binding, LuaNavigationContext &owner, const Navig
 /// place_unit：出生也是一次正常占位提交；失败不改变现有动态事实。
 int place_unit(lua_State *state)
 {
-    LuaBinding                   lua_binding(state);
-    LuaNavigationContext        *owner = nullptr;
-    NavigationProfileSnapshotPtr profiles;
-    NavigationAgent              agent;
-    WorldPosition                world;
-    if (!readMoveAgent(lua_binding, owner, profiles, agent) ||
-        !readWorldPosition(lua_binding, 4, world))
-    {
-        return lua_binding.pushError();
-    }
-    return commitMove(lua_binding, *owner, agent, world, world);
+    return LuaBinding::invoke(state,
+                              [state]() -> int
+                              {
+                                  LuaBinding                   lua_binding(state);
+                                  LuaNavigationContext        *owner = nullptr;
+                                  NavigationProfileSnapshotPtr profiles;
+                                  NavigationAgent              agent;
+                                  WorldPosition                world;
+                                  if (!readMoveAgent(lua_binding, owner, profiles, agent) ||
+                                      !readWorldPosition(lua_binding, 4, world))
+                                  {
+                                      return lua_binding.pushError();
+                                  }
+                                  return commitMove(lua_binding, *owner, agent, world, world);
+                              });
 }
 
 /// move_unit：复验当前子步并提交占位，成功返回 Server 地表 Y 归一的世界位置。
 int move_unit(lua_State *state)
 {
-    LuaBinding                   lua_binding(state);
-    LuaNavigationContext        *owner = nullptr;
-    NavigationProfileSnapshotPtr profiles;
-    NavigationAgent              agent;
-    WorldPosition                from;
-    WorldPosition                to;
-    if (!readMoveAgent(lua_binding, owner, profiles, agent) ||
-        !readWorldPosition(lua_binding, 4, from) || !readWorldPosition(lua_binding, 5, to))
-    {
-        return lua_binding.pushError();
-    }
-    return commitMove(lua_binding, *owner, agent, from, to);
+    return LuaBinding::invoke(state,
+                              [state]() -> int
+                              {
+                                  LuaBinding                   lua_binding(state);
+                                  LuaNavigationContext        *owner = nullptr;
+                                  NavigationProfileSnapshotPtr profiles;
+                                  NavigationAgent              agent;
+                                  WorldPosition                from;
+                                  WorldPosition                to;
+                                  if (!readMoveAgent(lua_binding, owner, profiles, agent) ||
+                                      !readWorldPosition(lua_binding, 4, from) ||
+                                      !readWorldPosition(lua_binding, 5, to))
+                                  {
+                                      return lua_binding.pushError();
+                                  }
+                                  return commitMove(lua_binding, *owner, agent, from, to);
+                              });
 }
 
 struct AdvanceRequest
@@ -711,49 +755,59 @@ LuaTable advanceResultTable(LuaBinding                                 &lua_bind
 /// request 的 path/from_world 本次同步借用；失败返回 nil,error。
 int advance_path(lua_State *state)
 {
-    LuaBinding            lua_binding(state);
-    LuaNavigationContext *owner = nullptr;
-    AdvanceRequest        request;
-    if (!readContext(lua_binding, owner) || !readAdvanceRequest(lua_binding, request))
-    {
-        return lua_binding.pushError();
-    }
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding            lua_binding(state);
+            LuaNavigationContext *owner = nullptr;
+            AdvanceRequest        request;
+            if (!readContext(lua_binding, owner) || !readAdvanceRequest(lua_binding, request))
+            {
+                return lua_binding.pushError();
+            }
 
-    const auto profiles = NavigationProfileRegistry::Instance().Snapshot();
-    if (profiles == nullptr)
-    {
-        return lua_binding.pushError("INVALID_AGENT", "navigation profiles are not loaded");
-    }
-    const auto *profile = findNavigationProfile(lua_binding, *profiles, request.unit_id);
-    if (profile == nullptr)
-    {
-        return lua_binding.pushError();
-    }
+            const auto profiles = NavigationProfileRegistry::Instance().Snapshot();
+            if (profiles == nullptr)
+            {
+                return lua_binding.pushError("INVALID_AGENT", "navigation profiles are not loaded");
+            }
+            const auto *profile = findNavigationProfile(lua_binding, *profiles, request.unit_id);
+            if (profile == nullptr)
+            {
+                return lua_binding.pushError();
+            }
 
-    const NavigationAgent         agent{NavigationAgentHandle{request.unit_instance_id}, profile};
-    const DynamicNavigationPolicy policy{};
-    auto                          advanced = flywow_navigation::GridPathfinder::AdvancePath(
-        *owner->context, agent, request.path->path, request.path->cursor, request.from_world,
-        request.distance_mm, policy);
-    if (!advanced.ok())
-    {
-        return lua_binding.pushError(flywow_navigation::NavErrorName(advanced.error),
-                                     advanced.detail);
-    }
-    auto table = advanceResultTable(lua_binding, advanced.value);
-    return table.valid() ? lua_binding.returnValues(table) : lua_binding.pushError();
+            const NavigationAgent agent{NavigationAgentHandle{request.unit_instance_id}, profile};
+            const DynamicNavigationPolicy policy{};
+            auto                          advanced = flywow_navigation::GridPathfinder::AdvancePath(
+                *owner->context, agent, request.path->path, request.path->cursor,
+                request.from_world, request.distance_mm, policy);
+            if (!advanced.ok())
+            {
+                return lua_binding.pushError(flywow_navigation::NavErrorName(advanced.error),
+                                             advanced.detail);
+            }
+            auto table = advanceResultTable(lua_binding, advanced.value);
+            return table.valid() ? lua_binding.returnValues(table) : lua_binding.pushError();
+        });
 }
 
 /// cell_size_mm：只读地图边长，单位毫米。
 int cell_size_mm(lua_State *state)
 {
-    LuaBinding            lua_binding(state);
-    LuaNavigationContext *owner = nullptr;
-    if (!readContext(lua_binding, owner))
-    {
-        return lua_binding.pushError();
-    }
-    return lua_binding.returnValues(owner->context->map()->metadata().cell_size_mm);
+    return LuaBinding::invoke(state,
+                              [state]() -> int
+                              {
+                                  LuaBinding            lua_binding(state);
+                                  LuaNavigationContext *owner = nullptr;
+                                  if (!readContext(lua_binding, owner))
+                                  {
+                                      return lua_binding.pushError();
+                                  }
+                                  return lua_binding.returnValues(
+                                      owner->context->map()->metadata().cell_size_mm);
+                              });
 }
 
 // 读取 Lua 的规则名；default 删除当前格覆盖，恢复默认允许重叠行为。
@@ -789,148 +843,192 @@ bool readCellDynamicEntryRule(LuaBinding &lua_binding, int index, CellDynamicEnt
 /// 成功返回 true；失败返回 nil,error。只影响当前 Battle，规则变化不移动已有单位。
 int set_cell_rule(lua_State *state)
 {
-    LuaBinding            lua_binding(state);
-    LuaNavigationContext *owner  = nullptr;
-    std::int32_t          grid_x = 0;
-    std::int32_t          grid_z = 0;
-    CellDynamicEntryRule  rule   = CellDynamicEntryRule::kDefault;
-    if (!readContext(lua_binding, owner) || !lua_binding.readValue(2, grid_x) ||
-        !lua_binding.readValue(3, grid_z) || !readCellDynamicEntryRule(lua_binding, 4, rule))
-    {
-        return lua_binding.pushError();
-    }
-    const auto changed = owner->context->SetCellDynamicEntryRule(GridPos{grid_x, grid_z}, rule);
-    if (!changed.ok())
-    {
-        return lua_binding.pushError(flywow_navigation::NavErrorName(changed.error),
-                                     changed.detail);
-    }
-    return lua_binding.returnValues(true);
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding            lua_binding(state);
+            LuaNavigationContext *owner  = nullptr;
+            std::int32_t          grid_x = 0;
+            std::int32_t          grid_z = 0;
+            CellDynamicEntryRule  rule   = CellDynamicEntryRule::kDefault;
+            if (!readContext(lua_binding, owner) || !lua_binding.readValue(2, grid_x) ||
+                !lua_binding.readValue(3, grid_z) ||
+                !readCellDynamicEntryRule(lua_binding, 4, rule))
+            {
+                return lua_binding.pushError();
+            }
+            const auto changed =
+                owner->context->SetCellDynamicEntryRule(GridPos{grid_x, grid_z}, rule);
+            if (!changed.ok())
+            {
+                return lua_binding.pushError(flywow_navigation::NavErrorName(changed.error),
+                                             changed.detail);
+            }
+            return lua_binding.returnValues(true);
+        });
 }
 
 /// release_unit：释放该 handle 当前 footprint，成功返回 true。
 int release_unit(lua_State *state)
 {
-    LuaBinding            lua_binding(state);
-    LuaNavigationContext *owner            = nullptr;
-    std::uint32_t         unit_instance_id = 0;
-    if (!readContext(lua_binding, owner) ||
-        !readPositiveId(lua_binding, 2, "unit_instance_id", unit_instance_id))
-    {
-        return lua_binding.pushError();
-    }
-    const auto released =
-        owner->context->occupancy().Release(NavigationAgentHandle{unit_instance_id});
-    if (!released.ok())
-    {
-        return lua_binding.pushError(flywow_navigation::NavErrorName(released.error),
-                                     released.detail);
-    }
-    return lua_binding.returnValues(true);
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding            lua_binding(state);
+            LuaNavigationContext *owner            = nullptr;
+            std::uint32_t         unit_instance_id = 0;
+            if (!readContext(lua_binding, owner) ||
+                !readPositiveId(lua_binding, 2, "unit_instance_id", unit_instance_id))
+            {
+                return lua_binding.pushError();
+            }
+            const auto released =
+                owner->context->occupancy().Release(NavigationAgentHandle{unit_instance_id});
+            if (!released.ok())
+            {
+                return lua_binding.pushError(flywow_navigation::NavErrorName(released.error),
+                                             released.detail);
+            }
+            return lua_binding.returnValues(true);
+        });
 }
 
 /// unit_radius_mm：每次调用按静态 unit_id 查询当前 Registry 的导航半径。
 int unit_radius_mm(lua_State *state)
 {
-    LuaBinding            binding(state);
-    LuaNavigationContext *owner   = nullptr;
-    std::uint32_t         unit_id = 0;
-    if (!readContext(binding, owner) || !readPositiveId(binding, 2, "unit_id", unit_id))
-    {
-        return binding.pushError();
-    }
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding            binding(state);
+            LuaNavigationContext *owner   = nullptr;
+            std::uint32_t         unit_id = 0;
+            if (!readContext(binding, owner) || !readPositiveId(binding, 2, "unit_id", unit_id))
+            {
+                return binding.pushError();
+            }
 
-    const auto profiles = NavigationProfileRegistry::Instance().Snapshot();
-    if (profiles == nullptr)
-    {
-        return binding.pushError("INVALID_AGENT", "navigation profiles are not loaded");
-    }
-    const auto *profile = findNavigationProfile(binding, *profiles, unit_id);
-    return profile == nullptr ? binding.pushError() : binding.returnValues(profile->radius_mm);
+            const auto profiles = NavigationProfileRegistry::Instance().Snapshot();
+            if (profiles == nullptr)
+            {
+                return binding.pushError("INVALID_AGENT", "navigation profiles are not loaded");
+            }
+            const auto *profile = findNavigationProfile(binding, *profiles, unit_id);
+            return profile == nullptr ? binding.pushError()
+                                      : binding.returnValues(profile->radius_mm);
+        });
 }
 
 /// map_version：返回该 Context 固定地图的资产版本。
 int map_version(lua_State *state)
 {
-    LuaBinding            binding(state);
-    LuaNavigationContext *owner = nullptr;
-    if (!readContext(binding, owner))
-    {
-        return binding.pushError();
-    }
-    return binding.returnValues(owner->context->map()->metadata().map_version);
+    return LuaBinding::invoke(state,
+                              [state]() -> int
+                              {
+                                  LuaBinding            binding(state);
+                                  LuaNavigationContext *owner = nullptr;
+                                  if (!readContext(binding, owner))
+                                  {
+                                      return binding.pushError();
+                                  }
+                                  return binding.returnValues(
+                                      owner->context->map()->metadata().map_version);
+                              });
 }
 
 /// close：幂等释放大块 Context 内存；userdata 外壳由统一 GC 最终析构。
 int close(lua_State *state)
 {
-    LuaBinding            lua_binding(state);
-    LuaNavigationContext *owner = nullptr;
-    if (!lua_binding.readUserdata(1, kContextMeta, owner))
-    {
-        return lua_binding.pushError();
-    }
-    if (!owner->closed)
-    {
-        owner->context.reset();
-        owner->closed = true;
-    }
-    return lua_binding.returnValues();
+    return LuaBinding::invoke(state,
+                              [state]() -> int
+                              {
+                                  LuaBinding            lua_binding(state);
+                                  LuaNavigationContext *owner = nullptr;
+                                  if (!lua_binding.readUserdata(1, kContextMeta, owner))
+                                  {
+                                      return lua_binding.pushError();
+                                  }
+                                  if (!owner->closed)
+                                  {
+                                      owner->context.reset();
+                                      owner->closed = true;
+                                  }
+                                  return lua_binding.returnValues();
+                              });
 }
 
 /// count：返回 Path 世界点数量，不修改 Path。
 int count(lua_State *state)
 {
-    LuaBinding lua_binding(state);
-    LuaPath   *path = nullptr;
-    if (!lua_binding.readUserdata(1, kPathMeta, path))
-    {
-        return lua_binding.pushError();
-    }
-    return lua_binding.returnValues(path->path.count());
+    return LuaBinding::invoke(state,
+                              [state]() -> int
+                              {
+                                  LuaBinding lua_binding(state);
+                                  LuaPath   *path = nullptr;
+                                  if (!lua_binding.readUserdata(1, kPathMeta, path))
+                                  {
+                                      return lua_binding.pushError();
+                                  }
+                                  return lua_binding.returnValues(path->path.count());
+                              });
 }
 
 /// world_point：Lua 1-based index 对应的毫米 WorldPosition；越界返回 nil,error。
 int world_point(lua_State *state)
 {
-    LuaBinding   lua_binding(state);
-    LuaPath     *path  = nullptr;
-    std::int64_t index = 0; // Lua 下标先保留有符号值，验证后转为 Native 0-based。
-    if (!lua_binding.readUserdata(1, kPathMeta, path) || !lua_binding.readValue(2, index))
-    {
-        return lua_binding.pushError();
-    }
-    if (index <= 0 || static_cast<std::uint64_t>(index) > path->path.count())
-    {
-        return lua_binding.pushError(kInvalidArgument, "path index out of range");
-    }
-    auto table =
-        worldPositionTable(lua_binding, path->path.WorldPoint(static_cast<std::size_t>(index - 1)));
-    return table.valid() ? lua_binding.returnValues(table) : lua_binding.pushError();
+    return LuaBinding::invoke(
+        state,
+        [state]() -> int
+        {
+            LuaBinding   lua_binding(state);
+            LuaPath     *path  = nullptr;
+            std::int64_t index = 0; // Lua 下标先保留有符号值，验证后转为 Native 0-based。
+            if (!lua_binding.readUserdata(1, kPathMeta, path) || !lua_binding.readValue(2, index))
+            {
+                return lua_binding.pushError();
+            }
+            if (index <= 0 || static_cast<std::uint64_t>(index) > path->path.count())
+            {
+                return lua_binding.pushError(kInvalidArgument, "path index out of range");
+            }
+            auto table = worldPositionTable(
+                lua_binding, path->path.WorldPoint(static_cast<std::size_t>(index - 1)));
+            return table.valid() ? lua_binding.returnValues(table) : lua_binding.pushError();
+        });
 }
 
 /// length_mm：XZ 折线总长度，单位毫米。
 int length_mm(lua_State *state)
 {
-    LuaBinding lua_binding(state);
-    LuaPath   *path = nullptr;
-    if (!lua_binding.readUserdata(1, kPathMeta, path))
-    {
-        return lua_binding.pushError();
-    }
-    return lua_binding.returnValues(path->path.length_mm());
+    return LuaBinding::invoke(state,
+                              [state]() -> int
+                              {
+                                  LuaBinding lua_binding(state);
+                                  LuaPath   *path = nullptr;
+                                  if (!lua_binding.readUserdata(1, kPathMeta, path))
+                                  {
+                                      return lua_binding.pushError();
+                                  }
+                                  return lua_binding.returnValues(path->path.length_mm());
+                              });
 }
 
 /// status：查询终点 reached/partial，不代表单位已走完路径。
 int status(lua_State *state)
 {
-    LuaBinding binding(state);
-    LuaPath   *path = nullptr;
-    if (!binding.readUserdata(1, kPathMeta, path))
-    {
-        return binding.pushError();
-    }
-    return binding.returnValues(path->path.status());
+    return LuaBinding::invoke(state,
+                              [state]() -> int
+                              {
+                                  LuaBinding binding(state);
+                                  LuaPath   *path = nullptr;
+                                  if (!binding.readUserdata(1, kPathMeta, path))
+                                  {
+                                      return binding.pushError();
+                                  }
+                                  return binding.returnValues(path->path.status());
+                              });
 }
 
 // 在当前 State 注册一次类型与方法；方法表和 metatable 都是普通 LuaTable。
@@ -1151,42 +1249,45 @@ template <int (*Callback)(lua_State *)> int airBoundary(lua_State *state)
 }
 int load_map(lua_State *state)
 {
-    return airBoundary<loadMap>(state);
+    return LuaBinding::invoke(state, [state]() -> int { return airBoundary<loadMap>(state); });
 }
 
 int new_context(lua_State *state)
 {
-    return airBoundary<newContext>(state);
+    return LuaBinding::invoke(state, [state]() -> int { return airBoundary<newContext>(state); });
 }
 
 int set_air_obstacle(lua_State *state)
 {
-    return airBoundary<setAirObstacle>(state);
+    return LuaBinding::invoke(state,
+                              [state]() -> int { return airBoundary<setAirObstacle>(state); });
 }
 
 int remove_air_obstacle(lua_State *state)
 {
-    return airBoundary<removeAirObstacle>(state);
+    return LuaBinding::invoke(state,
+                              [state]() -> int { return airBoundary<removeAirObstacle>(state); });
 }
 
 int sweep_air(lua_State *state)
 {
-    return airBoundary<sweepAir>(state);
+    return LuaBinding::invoke(state, [state]() -> int { return airBoundary<sweepAir>(state); });
 }
 
 int find_air_path(lua_State *state)
 {
-    return airBoundary<findAirPath>(state);
+    return LuaBinding::invoke(state, [state]() -> int { return airBoundary<findAirPath>(state); });
 }
 
 int move_air(lua_State *state)
 {
-    return airBoundary<moveAir>(state);
+    return LuaBinding::invoke(state, [state]() -> int { return airBoundary<moveAir>(state); });
 }
 
 int advance_air_path(lua_State *state)
 {
-    return airBoundary<advanceAirPath>(state);
+    return LuaBinding::invoke(state,
+                              [state]() -> int { return airBoundary<advanceAirPath>(state); });
 }
 
 bool registerContext(LuaBinding &lua_binding)
@@ -1222,19 +1323,24 @@ bool registerContext(LuaBinding &lua_binding)
 
 extern "C" int luaopen_flywow_navigation_native(lua_State *state)
 {
-    LuaBinding lua_binding(state);
-    if (!registerContext(lua_binding) || !registerPath(lua_binding))
-    {
-        return lua_binding.pushError();
-    }
-    auto  module = lua_binding.newTable();
-    void *maps   = &MapRegistry::Instance(); // closure 只借用，单例 owner 覆盖所有 State。
-    if (!module.setFunction("load_navigation_profiles", &load_navigation_profiles) ||
-        !module.setFunction("load_map", &load_map, maps) ||
-        !module.setFunction("query_cell", &query_cell, maps) ||
-        !module.setFunction("new_context", &new_context, maps))
-    {
-        return lua_binding.pushError();
-    }
-    return lua_binding.returnValues(module);
+    return LuaBinding::invokeModule(
+        state,
+        [state]() -> int
+        {
+            LuaBinding lua_binding(state);
+            if (!registerContext(lua_binding) || !registerPath(lua_binding))
+            {
+                return lua_binding.pushError();
+            }
+            auto  module = lua_binding.newTable();
+            void *maps   = &MapRegistry::Instance(); // closure 只借用，单例 owner 覆盖所有 State。
+            if (!module.setFunction("load_navigation_profiles", &load_navigation_profiles) ||
+                !module.setFunction("load_map", &load_map, maps) ||
+                !module.setFunction("query_cell", &query_cell, maps) ||
+                !module.setFunction("new_context", &new_context, maps))
+            {
+                return lua_binding.pushError();
+            }
+            return lua_binding.returnValues(module);
+        });
 }

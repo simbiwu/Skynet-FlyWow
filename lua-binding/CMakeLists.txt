@@ -4,7 +4,7 @@
 # 输出：静态库和测试程序位于 CMake 构建目录，不生成独立运行时 .so。
 # 修改指引：新增实现文件更新 flywow_lua_binding；新增测试更新测试目标并用 add_test 注册。
 # 修改指引：新增依赖同步目标链接项；不自动搜索或链接系统 Lua。
-# 修改指引：改静态目标名时同步更新所有链接它的 Navigation、WordFilter 和 HotUpgrade 目标。
+# 修改指引：改静态目标名时同步更新所有链接它的 Gateway、Navigation、WordFilter 和 HotUpgrade 目标。
 cmake_minimum_required(VERSION 3.16)
 project(flywow_lua_binding LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)

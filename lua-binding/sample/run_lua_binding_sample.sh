@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # 通过固定 Skynet Lua ABI 编译并运行一个真实 LuaBinding 回调。
+# 参数为已构建的 Skynet 根目录；先执行统一 ABI 回归，产物写入 FlyWow build/lua-binding-sample。
+# 编译、运行或断言失败立即退出，不启动 Server，也不链接 Native 专用的 Skynet allocator。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
@@ -16,5 +18,8 @@ SKYNET_LUA="$SKYNET_ROOT/3rd/lua"
 bash "$FRAMEWORK_DIR/scripts/build_flywow.sh" "$SKYNET_ROOT" lua_binding
 mkdir -p "$RUNTIME_ROOT"
 
-"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror     -I"$FRAMEWORK_DIR/lua-binding" -I"$SKYNET_LUA"     "$SCRIPT_DIR/lua_binding_sample.cpp" "$LIBRARY" "$SKYNET_LUA/liblua.a"     -ldl -lm -pthread -o "$RUNTIME_ROOT/lua_binding_sample"
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror \
+    -I"$FRAMEWORK_DIR/lua-binding" -I"$SKYNET_LUA" \
+    "$SCRIPT_DIR/lua_binding_sample.cpp" "$LIBRARY" "$SKYNET_LUA/liblua.a" \
+    -ldl -lm -pthread -o "$RUNTIME_ROOT/lua_binding_sample"
 "$RUNTIME_ROOT/lua_binding_sample"

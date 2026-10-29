@@ -36,7 +36,7 @@ class LuaValue
         return binding_->readAt(index_, output);
     }
     /// 将本轮 Table 值变为独立 registry 引用；句柄仍限当前 Binding 回调。
-    /// @param output 输出 table 借用句柄；失败时保留原句柄。
+    /// @param output 成功时拥有独立 registry 引用并借用当前 Binding；失败保留原句柄。
     /// @return 当前值为 table 且引用创建成功时返回 true。
     bool readTable(LuaTable &output) const;
     /// 显式 Lua 真值读取，nil/false 为假；失败不改 output。
@@ -46,10 +46,10 @@ class LuaValue
 
   private:
     friend class LuaTable;
-    LuaValue(LuaBinding *binding, int index) : binding_(binding), index_(index)
+    LuaValue(LuaBinding *lua_binding, int index) : binding_(lua_binding), index_(index)
     {
     }
-    LuaBinding *binding_; // 当前 visitor 的 owner。
+    LuaBinding *binding_; // 借用拥有本轮遍历的 Binding；视图不持有任何 registry 引用。
     int         index_;   // 固定绝对索引；嵌套压栈不会改变目标。
 };
 } // namespace flywow_lua_binding
