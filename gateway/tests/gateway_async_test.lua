@@ -4,7 +4,9 @@
 -- 生命周期：每场景重建 Lua State 模块状态；不启动网络，不冒充真实集成验证。
 -- 不负责：不验证 Protobuf 字节或真实 Skynet 调度，它们由宿主集成测试覆盖。
 local root = assert(arg[1]) -- 被测 FlyWow 根路径；由测试入口显式传入。
-package.path = root .. "/gateway/lualib/?.lua;" .. package.path
+package.path = root .. "/common/lualib/?.lua;" ..
+    root .. "/gateway/lualib/?.lua;" .. package.path
+local flywow_result = require "flywow_result"
 
 -- 创建独立的可控场景；overrides 为配置覆盖，无 I/O；返回由测试拥有的控制对象。
 ---@param overrides table|nil 可覆盖 TCP/WebSocket 模式等本场景启动配置；不会修改调用方的 table。
@@ -246,10 +248,10 @@ local function scenario(overrides)
     -- 提供只读测试索引。
     ---@return table 提供一个命令的只读测试索引。
     function registry.build_index()
-        return
+        return flywow_result.success(
         {
             count = 1, -- 测试索引只暴露一个命令。
-        }
+        })
     end
 
     -- 只登记 command=1001。
@@ -271,31 +273,35 @@ local function scenario(overrides)
     local codec = {} -- 只模拟 Envelope/body 编解码边界，不验证 Protobuf wire bytes。
     -- payload 的数字只用于构造可重复的测试 request data。
     ---@param payload string 测试用 Envelope bytes。
-    ---@return table 解码得到的 Envelope record；bad 输入抛出模拟解码错误。
+    ---@return FlyWowResult<table> 解码得到的 Envelope record；bad 输入返回模拟解码失败。
     function codec.decode_envelope(payload)
-        assert(payload ~= "bad", "malformed envelope")
-        return
+        if payload == "bad" then
+            return flywow_result.failure("TEST_DECODE", "malformed envelope")
+        end
+        return flywow_result.success(
         {
             protocol_version = 4,
             command          = 1001,
             body             = "",
-        }
+        })
     end
 
     -- 请求 body 替身，与业务无关。
-    ---@return table 固定的业务 request record。
+    ---@return FlyWowResult<table> 固定的业务 request record。
     function codec.decode_request()
-        return { test_id = 1, map_id = 1001 }
+        return flywow_result.success({ test_id = 1, map_id = 1001 })
     end
 
     -- 响应结果编码为文本，fail 注入编码异常。
     ---@param definition table Registry 中的 response 定义。
     ---@param version integer 当前 Gateway 协议版本。
     ---@param response table handler 返回的 response record。
-    ---@return string 固定响应值编码；fail 字段触发模拟编码错误。
+    ---@return FlyWowResult<string> 固定响应值编码；fail 字段触发模拟编码错误。
     function codec.encode_response(definition, version, response)
-        assert(not response.fail, "encode failure")
-        return tostring(response.result)
+        if response.fail then
+            return flywow_result.failure("TEST_ENCODE", "encode failure")
+        end
+        return flywow_result.success(tostring(response.result))
     end
 
     -- 安装依赖替身后加载真实 Gateway 源码；本场景不访问文件或网络。
@@ -307,7 +313,7 @@ local function scenario(overrides)
     package.loaded["codec"] =
     {
         new = function() -- 为 Gateway 返回本场景创建的 codec 替身。
-            return codec
+            return flywow_result.success(codec)
         end,
     }
     package.loaded["flywow_gateway_crypto"] = {}
@@ -315,11 +321,11 @@ local function scenario(overrides)
     {
         -- 每个连接使用独立替身上下文；真实密码学握手由 Native 测试覆盖。
         new = function() -- Gateway 每个连接创建独立握手上下文。
-            return
+            local manager =
             {
-                ---@return table 测试握手上下文；调用方负责在连接结束时关闭。
+                ---@return FlyWowResult<table> 测试握手上下文；调用方负责在连接结束时关闭。
                 accept = function()
-                    return {}
+                    return flywow_result.success({})
                 end,
                 ---@return nil 释放测试握手上下文。
                 close = function()
@@ -332,7 +338,16 @@ local function scenario(overrides)
                 expired = function()
                     return false
                 end,
+                -- 纯业务场景不应调用握手 receive；意外调用时显式失败供断言捕获。
+                receive = function()
+                    return flywow_result.failure("TEST_HANDSHAKE", "unexpected handshake")
+                end,
+                -- 测试握手确认无副作用，只返回空成功结果。
+                confirm = function()
+                    return flywow_result.success()
+                end,
             }
+            return flywow_result.success(manager)
         end,
     }
     dofile(root .. "/gateway/service/gateway/flywow_gateway.lua")
@@ -341,6 +356,7 @@ local function scenario(overrides)
     -- 传入当前场景配置建立真实 Service 运行状态；覆盖项因此能驱动 TCP/WS 分支。
     config.handler_service = ".test_handler"
     e.dispatch(1, 8, "start", config)
+    assert(e.result.ok and e.result.value.port == config.port, "start must return FlyWowResult")
     return e
 end
 

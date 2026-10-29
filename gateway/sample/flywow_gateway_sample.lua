@@ -3,8 +3,8 @@ local skynet = require "skynet"
 require "skynet.manager"
 
 local SAMPLE_HANDLER_SERVICE = ".flywow_gateway_sample_handler" -- 本进程注册的 handler 名称，显式传给 Gateway 配置。
-local SAMPLE_PORT = assert(tonumber(os.getenv("FLYWOW_GATEWAY_SAMPLE_PORT"))) -- Shell 为本次运行选取的 loopback 端口。
-local SAMPLE_MODE = assert(os.getenv("FLYWOW_GATEWAY_SAMPLE_MODE")) -- Shell 选定的 sample 传输模式。
+local SAMPLE_PORT = tonumber(os.getenv("FLYWOW_GATEWAY_SAMPLE_PORT")) -- Shell 为本次运行选取的 loopback 端口。
+local SAMPLE_MODE = os.getenv("FLYWOW_GATEWAY_SAMPLE_MODE") -- Shell 选定的 sample 传输模式。
 local SAMPLE_TRANSPORT = SAMPLE_MODE == "websocket" and "websocket" or "tcp" -- 将样例启动模式映射为 Gateway 支持的传输名。
 
 local module_state =
@@ -15,11 +15,23 @@ local module_state =
 }
 
 skynet.start(function()
+    if not SAMPLE_PORT or SAMPLE_PORT < 1 or SAMPLE_PORT > 65535 or
+        (SAMPLE_MODE ~= "tcp" and SAMPLE_MODE ~= "websocket") then
+        skynet.error("FLYWOW_GATEWAY_SAMPLE_FAILED invalid mode or port")
+        skynet.abort()
+        return
+    end
+
     skynet.name(SAMPLE_HANDLER_SERVICE, skynet.self())
     skynet.dispatch("lua", function(session, _, command, message)
         if command == "send_data" then
-            assert(message.command_id == 1101 and message.data.scenario_id == 1)
-            assert(message.data.battle_id == 0 and message.data.simulation_version == 1)
+            if type(message) ~= "table" or message.command_id ~= 1101 or
+                type(message.data) ~= "table" or message.data.scenario_id ~= 1 or
+                message.data.battle_id ~= 0 or message.data.simulation_version ~= 1 then
+                skynet.error("FLYWOW_GATEWAY_SAMPLE_FAILED invalid FrameJoin request")
+                skynet.abort()
+                return
+            end
             module_state.request_received = true
             skynet.error("FLYWOW_GATEWAY_SAMPLE_REQUEST_RECEIVED mode=" .. SAMPLE_MODE)
 
@@ -53,7 +65,9 @@ skynet.start(function()
         elseif command == "gateway_disconnect" then
             module_state.connection_closed = true
         else
-            error("unexpected Gateway command: " .. tostring(command))
+            skynet.error("FLYWOW_GATEWAY_SAMPLE_FAILED unexpected command=", tostring(command))
+            skynet.abort()
+            return
         end
 
         if session ~= 0 then
@@ -72,20 +86,39 @@ skynet.start(function()
     gateway_config.max_clients = 4
     gateway_config.max_pending_handshakes = 4
 
-    local gateway_start_result = skynet.call(module_state.gateway_service_handle, "lua", "start", gateway_config) -- Gateway start 的真实 RPC 结果，用于确认绑定地址、传输与命令索引。
-    assert(gateway_start_result.address == "127.0.0.1" and gateway_start_result.port == SAMPLE_PORT)
-    assert(gateway_start_result.transport == SAMPLE_TRANSPORT and gateway_start_result.command_count > 0)
+    local gateway_start_result = skynet.call(module_state.gateway_service_handle, "lua", "start", gateway_config) -- Gateway start 返回的 FlyWowResult。
+    if not gateway_start_result.ok then
+        skynet.error("FLYWOW_GATEWAY_SAMPLE_FAILED gateway start: ", gateway_start_result.code)
+        skynet.abort()
+        return
+    end
+    local gateway_info = gateway_start_result.value -- 实际监听地址、传输类型和命令数。
+    if gateway_info.address ~= "127.0.0.1" or gateway_info.port ~= SAMPLE_PORT or
+        gateway_info.transport ~= SAMPLE_TRANSPORT or gateway_info.command_count <= 0 then
+        skynet.error("FLYWOW_GATEWAY_SAMPLE_FAILED unexpected Gateway start result")
+        skynet.abort()
+        return
+    end
     skynet.error("FLYWOW_GATEWAY_READY transport=" .. SAMPLE_TRANSPORT)
     print(string.format("Gateway 已监听 %s://%s:%d",
         SAMPLE_TRANSPORT == "websocket" and "ws" or "tcp",
-        gateway_start_result.address,
-        gateway_start_result.port))
+        gateway_info.address,
+        gateway_info.port))
 
     skynet.fork(function()
         for _ = 1, 2000 do
             if module_state.connection_closed then
-                assert(module_state.request_received, "客户端关闭前没有发送 FrameJoin")
-                assert(type(skynet.call(module_state.gateway_service_handle, "lua", "stop").closed_connections) == "number")
+                if not module_state.request_received then
+                    skynet.error("FLYWOW_GATEWAY_SAMPLE_FAILED client closed before FrameJoin")
+                    skynet.abort()
+                    return
+                end
+                local stop_result = skynet.call(module_state.gateway_service_handle, "lua", "stop")
+                if not stop_result.ok or type(stop_result.value.closed_connections) ~= "number" then
+                    skynet.error("FLYWOW_GATEWAY_SAMPLE_FAILED gateway stop")
+                    skynet.abort()
+                    return
+                end
                 print("Gateway 已停止并释放连接")
                 print("FLYWOW_GATEWAY_SAMPLE_OK mode=" .. SAMPLE_MODE)
                 io.stdout:flush()

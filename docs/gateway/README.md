@@ -31,7 +31,12 @@ Navigation独立使用`flywow_navigation`；不因命名接近而建立模块依
         options[key] = value
     end
     options.handler_service = ".my_gateway_handler"
-    skynet.call(gateway, "lua", "start", options)
+    local start_result = skynet.call(gateway, "lua", "start", options)
+    if not start_result.ok then
+        skynet.error("Gateway 启动失败：", start_result.code, " ", start_result.message)
+        skynet.abort()
+        return
+    end
 
 Gateway 每次发送时由 Skynet 按名称解析当前注册的 Service；名称未注册期间发送会失败，不排队、不重试。
 Gateway 不校验 send_data/close 的回复来源身份；宿主负责控制本地服务访问边界。

@@ -4,6 +4,7 @@
 // 不负责：不访问 Socket、Skynet、业务、登录或文件；私钥和 secret 不返回 Lua 字符串。
 #include "lua_binding.h"
 #include "lua_table.h"
+#include <exception>
 #include <array>
 #include <cstring>
 #include <memory>
@@ -248,10 +249,16 @@ int createCryptoContext(lua_State *state)
     {
         response = buildChallenge(context, hello.data());
     }
-    catch (const std::runtime_error &error)
+    catch (const std::exception &error)
     {
         clearCryptoContext(context);
         lua_binding.setError(error.what(), error.what());
+        return lua_binding.pushError();
+    }
+    catch (...)
+    {
+        clearCryptoContext(context);
+        lua_binding.setError("CRYPTO_FAILURE", "unknown native handshake failure");
         return lua_binding.pushError();
     }
 
@@ -298,10 +305,16 @@ int verify(lua_State *state)
         clearCryptoContext(context);
         return lua_binding.returnValues(response);
     }
-    catch (const std::runtime_error &error)
+    catch (const std::exception &error)
     {
         clearCryptoContext(context);
         lua_binding.setError(error.what(), error.what());
+        return lua_binding.pushError();
+    }
+    catch (...)
+    {
+        clearCryptoContext(context);
+        lua_binding.setError("CRYPTO_FAILURE", "unknown native handshake failure");
         return lua_binding.pushError();
     }
 }

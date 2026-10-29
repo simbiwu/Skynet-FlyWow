@@ -23,7 +23,7 @@
 -- 运行时调用者和时机：
 --   flywow_gateway Service 是本配置的唯一运行时读取者；每个 Service/Lua State 各自读取一次。
 --   handler_service 是 start 调用方提供的运行时本地 Skynet 服务名，不能写入静态配置；宿主须预先注册该名称。
---   start 失败时配置、协议产物或资源上限校验失败会直接返回错误，不发布 Gateway 就绪状态。
+--   start 返回 FlyWowResult；配置、协议产物、Native 依赖或监听失败时 ok=false，不发布 Gateway 就绪状态。
 --   当前没有配置热重载；修改文件后必须重启对应 Gateway Service。
 --
 -- 协议生成顺序（在 Server 仓库根目录执行）：
