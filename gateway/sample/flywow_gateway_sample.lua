@@ -16,7 +16,7 @@ local module_state =
 
 skynet.start(function()
     if not SAMPLE_PORT or SAMPLE_PORT < 1 or SAMPLE_PORT > 65535 or
-        (SAMPLE_MODE ~= "tcp" and SAMPLE_MODE ~= "websocket") then
+        (SAMPLE_MODE ~= "websocket" and SAMPLE_MODE ~= "protobuf" and SAMPLE_MODE ~= "binary") then
         skynet.error("FLYWOW_GATEWAY_SAMPLE_FAILED invalid mode or port")
         skynet.abort()
         return

@@ -85,6 +85,28 @@ function M.new(codec_config)
         )
     end
 
+    -- 在监听前核对 Registry 所引用的消息类型，拒绝不匹配的 descriptor。
+    local required_types = { codec_config.registry.envelope_type }
+    for _, definition in pairs(codec_config.registry.by_id) do
+        if definition.request_type then
+            required_types[#required_types + 1] = definition.request_type
+        end
+        if definition.response_type then
+            required_types[#required_types + 1] = definition.response_type
+        end
+    end
+
+    -- 类型清单已由 Registry 收集，逐项确认已加载的 descriptor 能解析对应消息。
+    for _, type_name in ipairs(required_types) do
+        if pb.type(type_name) == nil then
+            return flywow_result.failure(
+                "GATEWAY_DESCRIPTOR_INVALID",
+                "descriptor is missing a registry message type",
+                { descriptor_path = codec_config.descriptor_path, message_type = type_name }
+            )
+        end
+    end
+
     -- descriptor 已注册，下面创建只捕获已验证配置的本地 codec。
     local codec = {} -- 当前 Gateway Service 独占的编解码入口，闭包读取本次配置。
 

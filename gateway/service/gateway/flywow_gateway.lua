@@ -475,6 +475,11 @@ local function close_transport(connection, code, reason)
     -- 在任何底层 close/yield 前记录已提交，其他关闭协程看到它后不会重复操作 fd。
     connection.close_requested = true
 
+    -- 背压超限时丢弃积压的底层发送队列；正常关闭仍允许排空。
+    if reason == "write backpressure" and not socket.invalid(connection.fd) then
+        socket.shutdown(connection.fd)
+    end
+
     -- 按连接接管状态选择 WebSocket close、已登记 Socket close 或未登记 fd 的 close_fd。
     if connection.transport == "websocket" and not websocket.is_close(connection.fd) then
         websocket.close(connection.fd, code or 1001, reason or "closed")
@@ -639,8 +644,8 @@ local function dispatch_payload(connection, payload)
         inbound_request
     )
 
-    -- pinned Skynet send 返回 true 才算进入 handler mailbox；异常或 false 都拒绝当前帧。
-    if not call_succeeded or send_result_or_error ~= true then
+    -- pinned Skynet 普通 send 成功返回 0；nil 或 false 表示投递失败。
+    if not call_succeeded or send_result_or_error == false or send_result_or_error == nil then
         log_event(
         {
             kind          = "error",

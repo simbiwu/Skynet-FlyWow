@@ -4,18 +4,17 @@
 // 不负责：不模拟握手；示例命令1001只演示调用，由宿主提供.proto。
 import { connectGateway } from "./handshake.mjs";
 
-// 示例只校验Envelope数值字段；Protobuf字段顺序不固定，不能按前两个字节判断。
-function validEnvelope(bytes)
+// 只解析此示例需要的 Protobuf varint 与 bytes 字段；截断和未知 wire type 会拒绝响应。
+function decodeFields(bytes)
 {
     let offset = 0;
     const fields = new Map();
-    // 读取示例使用的有限正整数varint；损坏或过大字段立即失败。
     const integer = () =>
     {
         let value = 0;
         for (let n = 0; n < 5; ++n)
         {
-            if (offset >= bytes.length) throw new Error("TRUNCATED_ENVELOPE");
+            if (offset >= bytes.length) throw new Error("TRUNCATED_PROTOBUF");
             const b = bytes[offset++];
             value += (b & 127) * 2 ** (7 * n);
             if (b < 128) return value;
@@ -29,12 +28,31 @@ function validEnvelope(bytes)
         else if ((tag & 7) === 2)
         {
             const size = integer();
-            if (offset + size > bytes.length) return false;
+            if (offset + size > bytes.length) throw new Error("TRUNCATED_PROTOBUF");
+            fields.set(tag >>> 3, bytes.slice(offset, offset + size));
             offset += size;
         }
-        else return false;
+        else throw new Error("UNSUPPORTED_WIRE_TYPE");
     }
-    return fields.get(1) === 3 && fields.get(2) === 1001 && fields.get(3) === 2;
+    return fields;
+}
+
+// 当前 Lesson 2 响应必须是版本 4 的 QueryCellResponse，且来自本示例查询的地图。
+function validEnvelope(bytes)
+{
+    try
+    {
+        const envelope = decodeFields(bytes);
+        const body = envelope.get(3);
+        if (envelope.get(1) !== 4 || envelope.get(2) !== 1001 || !(body instanceof Uint8Array))
+            return false;
+        const response = decodeFields(body);
+        return Number.isInteger(response.get(1)) && response.get(3) === 1001 && response.get(4) === 1;
+    }
+    catch
+    {
+        return false;
+    }
 }
 
 // 使用公开SDK接入；URL由调用者注入，不将开发绝对路径写入Runtime。
@@ -58,8 +76,8 @@ export async function queryExample(url)
     const timer = setTimeout(() => fail(new Error("RESPONSE_TIMEOUT")), 3000);
     try
     {
-        // version=3, command=1001, QueryCell(map_id=1001,map_version=1)。
-        connection.send(new Uint8Array([8,3,16,233,7,26,5,8,233,7,16,1]));
+        // version=4, command=1001, QueryCell(map_id=1001,map_version=1,position=0/0/0 mm)。
+        connection.send(new Uint8Array([8,4,16,233,7,26,7,8,233,7,16,1,26,0]));
         await result;
     }
     finally

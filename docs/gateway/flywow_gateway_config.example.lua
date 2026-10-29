@@ -15,10 +15,16 @@
 --   cp server/third_party/skynet-flywow/docs/gateway/flywow_gateway_config.example.lua \
 --      server/config/gateway_lesson_02.lua
 --   # 按宿主目录和协议修改 descriptor_path、registry_module、port 等字段。
---   skynet.call(gateway, "lua", "start",
---   {
---       handler_service = ".my_gateway_handler",
---   })
+--   local options = {}
+--   for key, value in pairs(require "config.gateway_lesson_02") do
+--       options[key] = value
+--   end
+--   options.handler_service = ".my_gateway_handler"
+--   local start_result = skynet.call(gateway, "lua", "start", options)
+--   if not start_result.ok then
+--       skynet.error("Gateway 启动失败：", start_result.code)
+--       skynet.abort()
+--   end
 --
 -- 运行时调用者和时机：
 --   flywow_gateway Service 是本配置的唯一运行时读取者；每个 Service/Lua State 各自读取一次。

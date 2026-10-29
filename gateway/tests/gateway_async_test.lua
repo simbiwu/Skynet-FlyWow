@@ -21,6 +21,7 @@ local function scenario(overrides)
         started = {},
         writes  = {},
         closed  = {},
+        shutdown = {}, -- 记录背压时强制释放的底层 fd。
     }
     local config = -- Gateway 的测试启动配置副本；overrides 只作用于当前场景。
     {
@@ -42,15 +43,15 @@ local function scenario(overrides)
         error("Gateway must never call handler")
     end
 
-    -- 固定签名记录本地异步消息；返回值模拟 pinned Skynet 的成功标志。
+    -- 固定签名记录本地异步消息；返回值模拟 pinned Skynet 普通 send 成功时的 session=0。
     ---@param address string 测试目标服务名。
     ---@param protocol string Skynet 消息协议名。
     ---@param command string Lua 命令名。
     ---@param message table 发送的 Gateway 消息记录。
-    ---@return boolean 测试消息成功入队时返回 true。
+    ---@return integer 测试消息成功入队时返回 0。
     function skynet.send(address, protocol, command, message)
         e.sends[#e.sends + 1] = { address, command, message }
-        return true
+        return 0
     end
 
     -- 注册但不抢先执行任务；测试自行控制协程推进，无 OS 线程。
@@ -192,6 +193,15 @@ local function scenario(overrides)
     function socket.close_fd(fd)
         assert(not e.started[fd], "close_fd is only valid before socket.start")
         e.closed[fd] = true
+    end
+
+    -- 背压关闭必须立即丢弃待发送队列，不能只从 Gateway 索引摘除连接。
+    ---@param fd integer 达到写缓冲上限的连接 fd。
+    ---@return nil 标记底层 fd 已被强制关闭。
+    function socket.shutdown(fd)
+        e.shutdown[fd] = true
+        e.closed[fd] = true
+        e.started[fd] = nil
     end
 
     -- 与 pinned socket_pool ownership 保持一致。
@@ -488,4 +498,11 @@ e.accept(12, "peer")
 resume(e.forks[2])
 assert(e.closed[12], "WebSocket accept exceptions must release the accepted fd")
 assert(e.sends[1][2] == "gateway_disconnect", "failed WebSocket accept must detach its connection")
+-- 慢客户端达到写缓冲阈值时，关闭必须使用底层强制释放路径。
+e = scenario({ write_warning_close_kb = 1 })
+e.accept(10, "slow-peer")
+resume(e.forks[2])
+e.warning(10, 1)
+assert(e.shutdown[10] and e.closed[10], "backpressure must force-close the socket")
+
 print("GATEWAY_ASYNC_UNIT_OK")

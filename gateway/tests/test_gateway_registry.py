@@ -109,6 +109,12 @@ message FrameJoinResponse {}
                 )
             )
 
+    def test_unsupported_enum_entry_fails_instead_of_disappearing(self) -> None:
+        """枚举选项不能让当前生成器静默漏掉一个业务命令。"""
+        source = self.valid_proto().replace("ECHO = 42;", "ECHO = 42 [deprecated = true];")
+        with self.assertRaisesRegex(ValueError, "unsupported CommandId"):
+            MODULE.parse_proto(source)
+
     def test_one_way_command_is_supported(self) -> None:
         """没有 XxxResponse 的命令必须生成 nil response_type。"""
         proto = self.valid_proto().replace("message EchoResponse\n{}\n", "")

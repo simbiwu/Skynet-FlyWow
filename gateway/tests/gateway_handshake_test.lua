@@ -10,15 +10,24 @@ local flywow_result = require "flywow_result"
 local now, closed = 0, 0
 local crypto = {}
 -- 替身保持Native对象合同，失败可控；不执行I/O。
+---@param hello string Gateway 输入的完整 HELLO 字节；替身只用它创建密码对象。
+---@return userdata, string 测试用 userdata 与固定 SERVER_CHALLENGE 字节。
 function crypto.new(hello)
-    local native = {}
-    -- 仅一个固定证明通过；验证失败抛错交给状态机关闭。
-    function native:verify(bytes)
-        assert(bytes == string.char(3) .. string.rep("p", 32))
-        return string.char(4) .. string.rep("r", 32)
-    end
-    -- 记录释放次数，manager必须只调用一次。
-    function native:close() closed = closed + 1 end
+    -- 使用独占文件 userdata 模拟 Native 类型；替身只验证状态机，不执行密码运算。
+    local native = assert(io.tmpfile())
+    local close_file = native.close
+    local file_metatable = debug.getmetatable(native)
+    debug.setmetatable(native, { __index = { -- 为测试 userdata 提供与 Native 相同的 verify/close 方法。
+        verify = function(_, bytes) -- 接收测试 proof，返回固定的服务端证明。
+            assert(bytes == string.char(3) .. string.rep("p", 32))
+            return string.char(4) .. string.rep("r", 32)
+        end,
+        close = function(self) -- 关闭本测试持有的文件 userdata 并记录释放次数。
+            closed = closed + 1
+            debug.setmetatable(self, file_metatable)
+            close_file(self)
+        end,
+    } })
     return native, string.char(2, 1) .. string.rep("c", 97)
 end
 local manager_result = factory.new(

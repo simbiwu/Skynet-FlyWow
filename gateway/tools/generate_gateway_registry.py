@@ -84,6 +84,12 @@ def parse_protos(sources: list[str]) -> tuple[str, list[dict[str, str | int | No
     seen_ids: set[int] = set()  # 已扫描的数字命令号，拒绝 Protobuf 枚举别名。
     seen_names: set[str] = set()  # 已接受的消息前缀，拒绝转换后同名的枚举项。
 
+    # 不支持的枚举写法必须明确失败，不能静默遗漏命令。
+    enum_body = enum_match.group("body")
+    parsed_body = ENUM_VALUE_RE.sub("", enum_body)
+    if parsed_body.strip():
+        raise ValueError("unsupported CommandId enum entry")
+
     for match in ENUM_VALUE_RE.finditer(enum_match.group("body")):
         enum_name = match.group("name")  # CommandId 中的稳定协议枚举名。
         command_id = int(match.group("id"))  # 运行时 Envelope 使用的数值命令号。
