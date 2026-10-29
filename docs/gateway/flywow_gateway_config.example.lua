@@ -76,14 +76,14 @@ return
     handshake_timeout_ticks       = 1000,
     -- TCP 定长读取或 WebSocket Upgrade 的单次读取期限，单位为 10ms tick。
     read_timeout_ticks            = 3000,
-    -- WebSocket 完整消息之间的空闲期限，单位为 10ms tick。
+    -- 客户端完整业务消息空闲期限，单位 10ms tick；WebSocket ping/pong 和服务端 Push 不重置。
     idle_timeout_ticks            = 30000,
-    -- 单个业务 Envelope 最大字节数；TCP uint16 framing 上限为 65535。
+    -- 单个业务 Envelope 最大字节数；TCP uint16 framing 上限为 65535；不限制底层传输接收内存。
     max_frame_bytes               = 65535,
     -- 每连接一秒最多接纳 200 个业务请求；超限关闭该来源连接。
     max_requests_per_second       = 200,
     -- 整个 Gateway 一秒最多接纳 10000 个请求；超限关闭触发上限的连接。
     max_total_requests_per_second = 10000,
-    -- 写缓冲告警关闭阈值，单位 KB；慢连接达到阈值后关闭，限制内存增长。
+    -- 收到 Skynet 写缓冲 warning 后，回调 size 达到此 KB 值时关闭；底层从 1 MiB 起按告警粒度通知，不是精确内存上限。
     write_warning_close_kb        = 1024,
 }

@@ -42,3 +42,77 @@ jobs:
             base_ref="origin/main"
           fi
           python scripts/quality/check_repository.py --base-ref "$base_ref"
+
+  gateway-runtime:
+    name: Gateway 运行时、Native 与传输 Sample
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: host/server/third_party/skynet-flywow
+    steps:
+      - name: 检出宿主 Server 源码
+        uses: actions/checkout@v4
+        with:
+          repository: simbiwu/skynet-battle-navigation-commercial-learning
+          ref: main
+          path: host
+          submodules: false
+
+      - name: 检出固定 Skynet v1.8.0 及其固定子模块
+        uses: actions/checkout@v4
+        with:
+          repository: cloudwu/skynet
+          ref: v1.8.0
+          path: host/server/third_party/skynet
+          submodules: recursive
+
+      - name: 检出本次 FlyWow 提交
+        uses: actions/checkout@v4
+        with:
+          path: host/server/third_party/skynet-flywow
+          fetch-depth: 0
+
+      - name: 配置 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 配置 Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 构建固定 Skynet Lua 与运行时
+        working-directory: host
+        run: bash server/scripts/linux/build_skynet.sh
+
+      - name: 构建 Gateway Native
+        working-directory: host
+        run: bash server/third_party/skynet-flywow/scripts/build_flywow.sh server/third_party/skynet gateway
+
+      - name: 构建 Lua protobuf 运行时
+        working-directory: host
+        run: bash server/scripts/linux/build_lua_protobuf.sh
+
+      - name: 生成固定 Lesson 3 协议产物
+        working-directory: host
+        run: bash server/protocol/build_protocol_lesson_03_frame_sync.sh
+
+      - name: 运行 Gateway Python 合同测试
+        env:
+          SKYNET_LUA: ${{ github.workspace }}/host/server/third_party/skynet/3rd/lua/lua
+          SKYNET_LUACLIB: ${{ github.workspace }}/host/server/third_party/skynet-flywow/build/native
+          LD_PRELOAD: ${{ github.workspace }}/host/server/third_party/skynet/3rd/jemalloc/lib/libjemalloc.so.2
+        run: python -m unittest gateway.tests.test_gateway_async gateway.tests.test_gateway_registry gateway.tests.test_gateway_handshake.HandshakeTests.test_state_machine -v
+
+      - name: 运行独立 H5 Node SDK 测试
+        run: node gateway/tests/gateway_handshake_sdk_test.mjs
+
+      - name: 运行 WebSocket Gateway Sample
+        run: bash gateway/sample/websocket/run.sh ../skynet
+
+      - name: 运行 TCP Protobuf Gateway Sample
+        run: bash gateway/sample/tcp_protobuf/run.sh ../skynet
+
+      - name: 运行 TCP Binary Gateway Sample
+        run: bash gateway/sample/tcp_binary/run.sh ../skynet

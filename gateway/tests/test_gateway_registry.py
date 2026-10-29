@@ -124,7 +124,8 @@ message FrameJoinResponse {}
 
     def test_course_registry_does_not_require_local_envelope(self) -> None:
         """课程 Registry 只解析本课程命令与消息，Envelope 由 Gateway 配置指定。"""
-        source = self.valid_proto().replace("message Envelope\\n{}\\n", "")
+        source = self.valid_proto().replace("message Envelope\n{}\n", "")
+        self.assertNotIn("message Envelope", source)
         package, commands = MODULE.parse_proto(source)
         output = MODULE.render(package, commands).replace(
             f'envelope_type = ".{package}.Envelope",',

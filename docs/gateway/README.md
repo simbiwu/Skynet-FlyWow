@@ -96,7 +96,11 @@ Gateway 只处理本地传输结果：
 
 ## Transport
 
-TCP 使用 uint16 big-endian 长度和 Envelope bytes。WebSocket 使用 Skynet 固定 http.websocket，复用相同 Envelope 和 registry。WebSocket 的 ping/pong、fragment 和 close frame 由底层 transport 处理；TCP 应用层心跳由宿主协议按 command 定义。
+TCP 使用 uint16 big-endian 长度和 Envelope bytes；Gateway 在读取完整 body 前校验 TCP 长度头。`max_frame_bytes` 限制单条业务 Envelope 的大小，不限制底层传输层接收内存，也不提供传输内存硬上限。WebSocket 使用 Skynet 固定 http.websocket，复用相同 Envelope 和 registry。WebSocket 的 ping/pong、fragment 和 close frame 由底层 transport 处理；TCP 应用层心跳由宿主协议按 command 定义。
+
+写缓冲关闭阈值只在 Skynet warning 回调到达后判断：回调 `size` 非零且达到 `write_warning_close_kb` 时关闭连接，`size=0` 表示发送缓冲恢复并被忽略。Skynet 首次在 1 MiB 缓冲量时告警，后续按底层告警粒度递增，因此该配置不是精确内存上限。
+
+`idle_timeout_ticks` 限制客户端完整业务消息之间的空闲时间。WebSocket ping/pong 与服务端 Push 不重置该计时；TCP 正在读取定长数据时使用独立的 `read_timeout_ticks`。
 
 ## 连接广播
 

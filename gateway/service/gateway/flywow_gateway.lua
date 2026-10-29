@@ -22,7 +22,7 @@ local handshake_module = require "handshake"
 ---@field close_requested boolean 是否已经提交底层关闭，避免并发关闭重复操作。
 ---@field closed boolean 是否已从连接表摘除。
 ---@field read_started integer|nil 当前 TCP 定长读取或 WebSocket Upgrade 的起始 tick；nil 表示没有等待中的读取。
----@field last_message integer 最近一次成功处理完整消息的 tick；作为空闲超时起点。
+---@field last_message integer idle_timeout_ticks 的计时点；客户端完整业务消息会刷新，WebSocket ping/pong 和服务端 Push 不刷新。
 ---@field rate_started integer 本连接当前一秒接纳窗口的起点 tick。
 ---@field rate_count integer 本连接当前窗口已接纳的业务请求数；用于判断单连接速率上限。
 local module_state =
@@ -80,7 +80,7 @@ local function normalize_config(startup_config)
     end
 
     -- 校验传输选择和监听地址；默认地址只接受本机连接，外部绑定须由宿主显式指定。
-    local host = startup_config.host or "127.0.0.1" -- 宿主配置的监听地址；缺省只绑定回环接口。
+    local host = startup_config.host == nil and "127.0.0.1" or startup_config.host -- 缺省只绑定回环接口；显式 false 保留给类型检查拒绝。
     if type(host) ~= "string" or host == "" then
         return flywow_result.failure(
             "GATEWAY_CONFIG_INVALID",
@@ -90,7 +90,7 @@ local function normalize_config(startup_config)
     end
 
     -- 监听地址通过后选择本实例固定的传输协议。
-    local transport = startup_config.transport or "tcp" -- 本实例固定使用的传输类型，后续选择监听路径。
+    local transport = startup_config.transport == nil and "tcp" or startup_config.transport -- 仅 nil 使用 tcp 默认值；显式 false 由传输类型校验拒绝。
     if transport ~= "tcp" and transport ~= "websocket" then
         return flywow_result.failure(
             "GATEWAY_CONFIG_INVALID",
@@ -110,7 +110,7 @@ local function normalize_config(startup_config)
     -- 每项数值配置分别通过公共 integer 检查；首个错误作为本次启动结果返回。
     -- 传输协议与 WebSocket 选项通过后校验帧长和各资源上限。
     local max_frame_result = validate_integer_config(
-        startup_config.max_frame_bytes or 65535,
+        startup_config.max_frame_bytes == nil and 65535 or startup_config.max_frame_bytes,
         "max_frame_bytes",
         1,
         0xffff
@@ -123,7 +123,7 @@ local function normalize_config(startup_config)
     local max_frame_bytes = max_frame_result.value -- 入站与出站 Envelope 的共同字节上限。
 
     local max_clients_result = validate_integer_config(
-        startup_config.max_clients or 1024,
+        startup_config.max_clients == nil and 1024 or startup_config.max_clients,
         "max_clients",
         1,
         1000000
@@ -137,7 +137,7 @@ local function normalize_config(startup_config)
 
     -- 连接容量通过后校验写缓冲关闭阈值。
     local write_warning_result = validate_integer_config(
-        startup_config.write_warning_close_kb or 1024,
+        startup_config.write_warning_close_kb == nil and 1024 or startup_config.write_warning_close_kb,
         "write_warning_close_kb",
         1,
         0x7fffffff
@@ -158,7 +158,7 @@ local function normalize_config(startup_config)
 
     local port = port_result.value -- 宿主要求绑定的 TCP/WS 端口。
 
-    local backlog_result = validate_integer_config(startup_config.backlog or 128, "backlog", 1, 65535)
+    local backlog_result = validate_integer_config(startup_config.backlog == nil and 128 or startup_config.backlog, "backlog", 1, 65535)
     if not backlog_result.ok then
         return backlog_result
     end
@@ -178,7 +178,7 @@ local function normalize_config(startup_config)
 
     -- Envelope 版本通过后校验读取、空闲和请求速率限制。
     local read_timeout_result = validate_integer_config(
-        startup_config.read_timeout_ticks or 3000,
+        startup_config.read_timeout_ticks == nil and 3000 or startup_config.read_timeout_ticks,
         "read_timeout_ticks",
         1,
         360000
@@ -192,7 +192,7 @@ local function normalize_config(startup_config)
 
     -- 单次读取期限通过后校验 WebSocket 空闲期限。
     local idle_timeout_result = validate_integer_config(
-        startup_config.idle_timeout_ticks or 30000,
+        startup_config.idle_timeout_ticks == nil and 30000 or startup_config.idle_timeout_ticks,
         "idle_timeout_ticks",
         1,
         360000
@@ -202,11 +202,11 @@ local function normalize_config(startup_config)
     end
     -- 空闲期限通过后保存配置，再校验入站速率上限。
 
-    local idle_timeout_ticks = idle_timeout_result.value -- WebSocket 完整消息之间的空闲期限，单位 10ms tick。
+    local idle_timeout_ticks = idle_timeout_result.value -- 客户端完整业务消息空闲期限，单位 10ms tick；不由 ping/pong 或服务端 Push 刷新。
 
     -- 空闲期限通过后分别限制连接级与实例级入站速率。
     local requests_per_second_result = validate_integer_config(
-        startup_config.max_requests_per_second or 200,
+        startup_config.max_requests_per_second == nil and 200 or startup_config.max_requests_per_second,
         "max_requests_per_second",
         1,
         100000
@@ -220,7 +220,7 @@ local function normalize_config(startup_config)
 
     -- 连接级速率通过后限制整个实例的总接纳速率。
     local total_requests_per_second_result = validate_integer_config(
-        startup_config.max_total_requests_per_second or 10000,
+        startup_config.max_total_requests_per_second == nil and 10000 or startup_config.max_total_requests_per_second,
         "max_total_requests_per_second",
         1,
         1000000
@@ -234,7 +234,7 @@ local function normalize_config(startup_config)
 
     -- 实例请求预算通过后限制同时持有 Native 握手上下文的连接。
     local max_pending_result = validate_integer_config(
-        startup_config.max_pending_handshakes or math.min(128, max_clients),
+        startup_config.max_pending_handshakes == nil and math.min(128, max_clients) or startup_config.max_pending_handshakes,
         "max_pending_handshakes",
         1,
         max_clients
@@ -248,7 +248,7 @@ local function normalize_config(startup_config)
 
     -- 握手名额通过后校验绝对握手期限。
     local handshake_timeout_result = validate_integer_config(
-        startup_config.handshake_timeout_ticks or 1000,
+        startup_config.handshake_timeout_ticks == nil and 1000 or startup_config.handshake_timeout_ticks,
         "handshake_timeout_ticks",
         1,
         360000
@@ -299,13 +299,13 @@ local function normalize_config(startup_config)
         protocol_version              = protocol_version, -- Envelope uint32 兼容版本。
         max_frame_bytes               = max_frame_bytes, -- 单个 Envelope bytes 上限，TCP 长度前缀不计，单位 byte。
         read_timeout_ticks            = read_timeout_ticks, -- 单次 TCP 读取或 WS Upgrade 上限，单位 10ms tick。
-        idle_timeout_ticks            = idle_timeout_ticks, -- WebSocket 完整消息空闲上限，单位 10ms tick。
+        idle_timeout_ticks            = idle_timeout_ticks, -- 客户端完整业务消息空闲上限，单位 10ms tick。
         max_requests_per_second       = max_requests_per_second, -- 单连接一秒窗口的业务请求上限。
         max_total_requests_per_second = max_total_requests_per_second, -- 本 Gateway 一秒窗口的业务请求上限。
         max_pending_handshakes        = max_pending_handshakes, -- 尚未完成应用握手的连接上限。
         handshake_timeout_ticks       = handshake_timeout_ticks, -- 应用握手总期限，单位 10ms tick。
         max_clients                   = max_clients, -- 当前 Gateway 最大在线连接数。
-        write_warning_close_kb        = write_warning_close_kb, -- 写缓冲 warning 达到此 KB 时关闭连接。
+        write_warning_close_kb        = write_warning_close_kb, -- Skynet warning 回调大小达到此 KB 时关闭连接。
     })
 end
 
@@ -460,8 +460,9 @@ end
 ---@param connection GatewayConnection 由 Gateway 持有的连接上下文。
 ---@param code integer|nil WebSocket close code；TCP 路径忽略。
 ---@param reason string|nil 不含业务数据的关闭原因。
+---@param force_shutdown boolean|nil true 时先强制释放底层发送队列，再清理 Socket/WS 对象。
 ---@return nil 关闭提交完成或无需重复关闭。
-local function close_transport(connection, code, reason)
+local function close_transport(connection, code, reason, force_shutdown)
     if connection.close_requested then
         return
     end
@@ -475,8 +476,8 @@ local function close_transport(connection, code, reason)
     -- 在任何底层 close/yield 前记录已提交，其他关闭协程看到它后不会重复操作 fd。
     connection.close_requested = true
 
-    -- 背压超限时丢弃积压的底层发送队列；正常关闭仍允许排空。
-    if reason == "write backpressure" and not socket.invalid(connection.fd) then
+    -- 调用方仅在背压超限时要求丢弃底层发送队列；其他关闭继续按原合同排空。
+    if force_shutdown and not socket.invalid(connection.fd) then
         socket.shutdown(connection.fd)
     end
 
@@ -636,7 +637,7 @@ local function dispatch_payload(connection, payload)
         command_id    = definition.id, -- 由 registry 验证过的业务命令号。
         data          = request, -- 已按 registry 请求类型解码的业务内容。
     }
-    local call_succeeded, send_result_or_error = pcall( -- Skynet send 是否抛错及其 true/false 投递结果。
+    local call_succeeded, send_result_or_error = pcall( -- 捕获 Skynet send 异常；正常返回值 0 表示成功，nil/false 表示失败。
         skynet.send,
         module_state.gateway_config.handler_service,
         "lua",
@@ -933,7 +934,7 @@ end
 
 --- 运行一个已登记 TCP 连接；本协程串行读取和投递，直到 EOF、错误或 Service 停止。
 --- connection 由 Gateway 状态表持有并提供 fd；frame 为 2 byte uint16 big-endian 长度头 + Envelope bytes，长度不含头。
---- 先检查长度再读取 body，防止按不可信长度分配/缓存过量数据；限制 socket 缓冲区以施加背压。
+--- 先校验长度再读取 body；max_frame_bytes 限制业务 Envelope，不是底层传输接收内存硬上限。
 --- 读取 Socket 时 yield；投递不等待业务。所有退出路径都 detach 并关闭 fd。
 ---@param connection GatewayConnection Gateway 独占的 TCP 连接。
 ---@return nil 直到 EOF、协议错误、超时或 Server 停止后退出并清理连接。
@@ -943,7 +944,7 @@ local function run_tcp(connection)
         return
     end
 
-    -- 启动 TCP fd，限制接收缓冲；另用 warning 回调处理写缓冲积压。
+    -- 启动 TCP fd；业务帧长度在读取完整 body 前校验，写队列积压另由 warning 回调处理。
     local fd = connection.fd -- 当前协程操作的连接 fd；由连接记录持有。
     local opened, open_error = socket.start(fd) -- Skynet 原生接口的返回值；成功为原 fd，失败为 nil 和诊断文本。
 
@@ -966,9 +967,12 @@ local function run_tcp(connection)
         return
     end
 
-    -- Socket 已接管 fd 后设置单帧缓冲上限和写队列告警。
-    socket.limit(fd, module_state.gateway_config.max_frame_bytes + 2)
+    -- Socket 接管 fd 后仅注册写队列告警；帧大小由长度头和业务 Envelope 上限校验。
     socket.warning(fd, function(_, size)
+        if size == 0 then
+            return
+        end
+
         log_event(
         {
             kind          = "warning",
@@ -980,7 +984,7 @@ local function run_tcp(connection)
 
         if size >= module_state.gateway_config.write_warning_close_kb then
             detach_connection(connection, "write backpressure")
-            close_transport(connection, 1013, "write backpressure")
+            close_transport(connection, 1013, "write backpressure", true)
         end
     end)
 
@@ -1123,12 +1127,17 @@ function ws_handler.error(id, message)
     detach_connection(connection, "websocket error")
 end
 
---- 处理 WebSocket 写队列增长通知；Skynet 的 size 单位是 KB，达到阈值时关闭慢连接。
---- ws_object 提供底层 connection id；只对仍登记的连接发事件，达到 write_warning_close_kb 时关闭以限制队列增长。无返回值。
+--- 处理 Skynet WebSocket 写队列告警；size 单位是 KB，清空通知为 0 并直接忽略。
+--- 非零告警先记录；只有回调 size 达到 write_warning_close_kb 才关闭，阈值受 Skynet 告警粒度影响。无返回值。
 ---@param ws_object table Skynet WebSocket 对象；id 用于找到 Gateway 连接。
----@param size integer Skynet write buffer 大小，单位 KB。
----@return nil 记录缓冲告警；达到配置上限时关闭连接。
+---@param size integer Skynet write buffer 告警大小，单位 KB；0 表示发送缓冲已清空并被忽略。
+---@return nil 记录非零缓冲告警；回调大小达到配置阈值时关闭连接。
 function ws_handler.warning(ws_object, size)
+    if size == 0 then
+        return
+    end
+
+    -- 恢复通知不属于积压事件；非零回调才查找仍登记的连接并记录告警。
     local connection = module_state.connections_by_fd[ws_object.id] -- warning 所属的 Gateway 连接；已摘除时忽略。
     if connection then
         log_event(
@@ -1142,7 +1151,7 @@ function ws_handler.warning(ws_object, size)
 
         if size >= module_state.gateway_config.write_warning_close_kb then
             detach_connection(connection, "write backpressure")
-            close_transport(connection, 1013, "server backpressure")
+            close_transport(connection, 1013, "server backpressure", true)
         end
     end
 end
@@ -1238,7 +1247,7 @@ end
 --- 无参数；最多扫描 max_clients 个连接，tick 回绕用模运算；detach 后关闭会 yield。
 ---@return nil Service 停止后退出；运行期间每 100 ms 扫描并关闭超时连接。
 local function timeout_loop()
-    -- 定时检查握手期限、TCP 读超时和 WebSocket 空闲期限。
+    -- 定时检查握手期限、TCP 读超时和客户端完整业务消息空闲期限。
     while module_state.phase == "running" do
         skynet.sleep(10)
 
@@ -1277,15 +1286,15 @@ end
 ---@field descriptor_path string 宿主构建生成的 Protobuf descriptor 文件路径。
 ---@field registry_module string 已生成的协议 registry 模块名。
 ---@field protocol_version integer Envelope 使用的协议版本。
----@field max_frame_bytes? integer 单条 Envelope bytes 上限；TCP 的 uint16 长度前缀不计。
+---@field max_frame_bytes? integer 单条业务 Envelope bytes 上限；TCP 长度头不计，不构成底层传输内存硬上限。
 ---@field read_timeout_ticks? integer 读取超时，单位 10 ms tick。
----@field idle_timeout_ticks? integer WebSocket 空闲超时，单位 10 ms tick。
+---@field idle_timeout_ticks? integer 客户端完整业务消息空闲超时，单位 10 ms tick；WebSocket ping/pong 和服务端 Push 不重置。
 ---@field max_requests_per_second? integer 单连接每秒接纳的业务请求上限。
 ---@field max_total_requests_per_second? integer 当前实例每秒接纳的业务请求上限。
 ---@field max_pending_handshakes? integer 尚未完成握手的连接上限。
 ---@field handshake_timeout_ticks? integer 握手总期限，单位 10 ms tick。
 ---@field max_clients? integer 当前实例最大在线连接数。
----@field write_warning_close_kb? integer 写缓冲达到此 KB 后关闭连接。
+---@field write_warning_close_kb? integer Skynet warning 回调的 size 达到此 KB 时关闭；受底层告警粒度影响。
 
 ---@class GatewayStartResult
 ---@field address string 实际监听地址。

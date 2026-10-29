@@ -10,18 +10,25 @@ local flywow_result = require "flywow_result"
 
 -- 创建独立的可控场景；overrides 为配置覆盖，无 I/O；返回由测试拥有的控制对象。
 ---@param overrides table|nil 可覆盖 TCP/WebSocket 模式等本场景启动配置；不会修改调用方的 table。
+---@param expect_start_failure boolean|nil true 时要求启动以配置错误失败，用于验证显式非法值。
 ---@return table 包含替身状态、注入入口和已注册 Service 命令回调的测试场景。
-local function scenario(overrides)
+local function scenario(overrides, expect_start_failure)
     local e = -- 当前场景的可控观测状态，由替身写入并由断言读取。
     {
         now     = 0,
-        sends   = {},
-        forks   = {},
-        streams = {},
-        started = {},
-        writes  = {},
-        closed  = {},
-        shutdown = {}, -- 记录背压时强制释放的底层 fd。
+        sends                = {}, -- 测试 Service 收到的异步业务消息。
+        logs                 = {}, -- 捕获 Skynet 日志参数，验证零值恢复通知不产生日志。
+        send_result_override = false, -- 测试时覆盖 send_data 的底层返回值，包括 nil。
+        send_result          = nil, -- 被覆盖时从 Skynet send 返回的测试值。
+        forks                = {}, -- 测试手动调度的 Gateway 协程。
+        streams              = {}, -- 按 fd 提供给 TCP socket.read 的未消费字节。
+        started = {}, -- 已进入测试 Socket pool 的 fd。
+        writes  = {}, -- 从 TCP/WS transport 发出的完整消息。
+        closed  = {}, -- 已通过测试 transport 关闭接口释放的 fd。
+        shutdown       = {}, -- 记录背压时强制释放的底层 fd。
+        shutdown_count = 0,  -- 记录每个场景实际发出的强制关闭次数。
+        ws_closed      = {}, -- 记录 WebSocket pool 对象是否已单独清理。
+        ws_close_count = 0,  -- 确认 WebSocket 对象只通过关闭接口清理一次。
     }
     local config = -- Gateway 的测试启动配置副本；overrides 只作用于当前场景。
     {
@@ -51,6 +58,9 @@ local function scenario(overrides)
     ---@return integer 测试消息成功入队时返回 0。
     function skynet.send(address, protocol, command, message)
         e.sends[#e.sends + 1] = { address, command, message }
+        if command == "send_data" and e.send_result_override then
+            return e.send_result
+        end
         return 0
     end
 
@@ -85,9 +95,17 @@ local function scenario(overrides)
         return 12345
     end
 
-    -- 忽略诊断日志；结果通过状态断言检查。
-    ---@return nil 忽略诊断日志，测试只检查可观察状态。
-    function skynet.error()
+    -- 捕获诊断日志参数；测试可区分 warning 与 size=0 的恢复通知。
+    ---@param ... any Skynet error 收到的格式化片段；替身只将其拼成可断言文本。
+    ---@return nil 保存格式化后的日志文本供测试断言。
+    function skynet.error(...)
+        local parts = {}
+        for index = 1, select("#", ...) do
+            parts[index] = tostring(select(index, ...))
+        end
+
+        -- 完整日志行保存后，测试按数量判断 warning 是否被记录。
+        e.logs[#e.logs + 1] = table.concat(parts)
     end
 
     -- 捕获管理调用返回 record。
@@ -134,9 +152,10 @@ local function scenario(overrides)
         return fd
     end
 
-    -- 缓冲限制由真实集成验证；替身保持签名。
-    ---@return nil 测试不验证真实写缓冲限制。
+    -- Gateway 的业务帧上限不依赖 socket.limit 的传输缓冲行为。
+    ---@return nil 若 Gateway 调用该接口则说明重新引入了无效限制。
     function socket.limit()
+        error("Gateway must not use socket.limit for max_frame_bytes")
     end
 
     -- 警告回调无需触发，真实集成另测写队列。
@@ -200,6 +219,7 @@ local function scenario(overrides)
     ---@return nil 标记底层 fd 已被强制关闭。
     function socket.shutdown(fd)
         e.shutdown[fd] = true
+        e.shutdown_count = e.shutdown_count + 1
         e.closed[fd] = true
         e.started[fd] = nil
     end
@@ -223,7 +243,8 @@ local function scenario(overrides)
             error("injected websocket accept failure")
         end
 
-        -- Upgrade 通过后回调 Gateway，并挂起以模拟 WebSocket session 存续。
+        -- Upgrade 通过后 Skynet 已将 fd 接管到 Socket pool，再回调 Gateway。
+        e.started[fd] = true
         e.ws = handler
         handler.handshake(fd, {}, "/")
         handler.message(fd, "1", "binary")
@@ -243,6 +264,8 @@ local function scenario(overrides)
     ---@param fd integer WebSocket 连接编号。
     ---@return nil 记录测试中的传输关闭。
     function websocket.close(fd)
+        e.ws_close_count = e.ws_close_count + 1
+        e.ws_closed[fd] = true
         e.closed[fd] = true
     end
 
@@ -250,7 +273,7 @@ local function scenario(overrides)
     ---@param id integer WebSocket 连接编号。
     ---@return boolean 测试 WebSocket 尚未建立或已被关闭时为 true。
     function websocket.is_close(id)
-        return e.ws == nil or e.closed[id] == true
+        return e.ws == nil or e.ws_closed[id] == true
     end
 
     -- 提供单个 request/response command，供请求解码和主动下发路径共用。
@@ -366,7 +389,12 @@ local function scenario(overrides)
     -- 传入当前场景配置建立真实 Service 运行状态；覆盖项因此能驱动 TCP/WS 分支。
     config.handler_service = ".test_handler"
     e.dispatch(1, 8, "start", config)
-    assert(e.result.ok and e.result.value.port == config.port, "start must return FlyWowResult")
+    if expect_start_failure then
+        assert(not e.result.ok and e.result.code == "GATEWAY_CONFIG_INVALID",
+            "invalid explicit config value must return GATEWAY_CONFIG_INVALID")
+    else
+        assert(e.result.ok and e.result.value.port == config.port, "start must return FlyWowResult")
+    end
     return e
 end
 
@@ -386,12 +414,33 @@ local function frame(id)
     return string.pack(">I2", #payload) .. payload
 end
 
+local invalid_optional_configs =
+{
+    { host = false },
+    { transport = false },
+    { websocket_protocol = false, transport = "websocket" },
+    { max_frame_bytes = false },
+    { max_clients = false },
+    { write_warning_close_kb = false },
+    { backlog = false },
+    { read_timeout_ticks = false },
+    { idle_timeout_ticks = false },
+    { max_requests_per_second = false },
+    { max_total_requests_per_second = false },
+    { max_pending_handshakes = false },
+    { handshake_timeout_ticks = false },
+}
+for _, invalid_config in ipairs(invalid_optional_configs) do
+    scenario(invalid_config, true)
+end
+
 local e = scenario()
 e.streams[10] = frame(1) .. frame(2)
 e.accept(10, "peer")
 resume(e.forks[2])
 
 assert(#e.sends == 2)
+assert(not e.closed[10], "Skynet send result 0 must mean the asynchronous message was accepted")
 assert(e.sends[1][1] == ".test_handler", "Gateway must send to the configured service name")
 assert(e.sends[1][2] == "send_data")
 assert(e.sends[1][3].connection_id == 1)
@@ -499,10 +548,76 @@ resume(e.forks[2])
 assert(e.closed[12], "WebSocket accept exceptions must release the accepted fd")
 assert(e.sends[1][2] == "gateway_disconnect", "failed WebSocket accept must detach its connection")
 -- 慢客户端达到写缓冲阈值时，关闭必须使用底层强制释放路径。
-e = scenario({ write_warning_close_kb = 1 })
+e = scenario({ write_warning_close_kb = 2 })
 e.accept(10, "slow-peer")
 resume(e.forks[2])
+local tcp_log_count = #e.logs
+e.warning(10, 0)
+assert(#e.logs == tcp_log_count and not e.closed[10], "TCP recovery notification must be ignored")
 e.warning(10, 1)
-assert(e.shutdown[10] and e.closed[10], "backpressure must force-close the socket")
+assert(#e.logs == tcp_log_count + 1 and not e.closed[10],
+    "TCP nonzero warning below the configured threshold must be logged without closing")
+e.warning(10, 2)
+e.warning(10, 2)
+assert(e.shutdown[10] and e.closed[10], "TCP warning at the configured threshold must force-close the socket")
+assert(e.shutdown_count == 1, "repeated TCP warnings must shut down only once")
+assert(e.sends[#e.sends][2] == "gateway_disconnect", "TCP backpressure must release the connection")
+
+-- skynet.send 的普通成功值 0 合法；nil 和 false 则都必须关闭来源连接。
+for _, failure_result in ipairs({ false, "nil" }) do
+    e = scenario()
+    e.send_result_override = true
+    if failure_result == "nil" then
+        e.send_result = nil
+    else
+        e.send_result = failure_result
+    end
+    e.streams[10] = frame(1)
+    e.accept(10, "send-failure-peer")
+    resume(e.forks[2])
+    assert(e.closed[10], "skynet.send nil/false must close the originating connection")
+    assert(e.sends[#e.sends][2] == "gateway_disconnect", "send failure must still release the connection")
+end
+
+-- WebSocket warning uses a different reason string; the explicit force flag must still shut down.
+e = scenario({ transport = "websocket", write_warning_close_kb = 2 })
+e.accept(11, "slow-ws-peer")
+resume(e.forks[2])
+local ws_log_count = #e.logs
+e.ws.warning({ id = 11 }, 0)
+assert(#e.logs == ws_log_count and not e.closed[11], "WebSocket recovery notification must be ignored")
+e.ws.warning({ id = 11 }, 1)
+assert(#e.logs == ws_log_count + 1 and not e.closed[11],
+    "WebSocket nonzero warning below the configured threshold must be logged without closing")
+e.ws.warning({ id = 11 }, 2)
+e.ws.warning({ id = 11 }, 2)
+assert(e.shutdown[11] and e.closed[11], "WebSocket warning at the configured threshold must force-close the socket")
+assert(e.shutdown_count == 1 and e.ws_close_count == 1,
+    "repeated WebSocket warnings must release transport objects only once")
+assert(e.sends[#e.sends][2] == "gateway_disconnect", "WebSocket backpressure must detach the connection")
+
+-- 完整客户端业务帧刷新空闲期限；服务端 Push 和底层 ping/pong 不刷新该时钟。
+e = scenario({ transport = "websocket", idle_timeout_ticks = 2 })
+e.accept(13, "idle-ws-peer")
+resume(e.forks[2])
+assert(e.ws.ping == nil and e.ws.pong == nil, "Gateway must not track transport ping/pong callbacks")
+local timeout_co = e.forks[1]
+resume(timeout_co)
+e.now = 1
+e.ws.message(13, "2", "binary")
+e.dispatch(0, 7, "send_data",
+{
+    gateway_epoch = e.sends[1][3].gateway_epoch, -- 当前场景身份，确保 Push 被 Gateway 接受。
+    connection_id = 13, -- 超时前主动下发的目标连接。
+    command_id    = 1001, -- 测试 Registry 中可编码的命令。
+    data          = { result = 4 }, -- 测试编码器接受的业务响应。
+})
+e.now = 2
+resume(timeout_co)
+assert(not e.closed[13], "a complete client business message must refresh the idle timeout")
+e.now = 3
+resume(timeout_co)
+assert(e.closed[13] and e.ws_close_count == 1, "idle timeout must release the WebSocket transport object")
+assert(e.sends[#e.sends][2] == "gateway_disconnect", "idle timeout must detach the Gateway connection")
 
 print("GATEWAY_ASYNC_UNIT_OK")
