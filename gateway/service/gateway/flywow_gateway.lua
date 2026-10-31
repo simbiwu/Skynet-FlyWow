@@ -7,7 +7,6 @@ local skynet = require "skynet"
 local flywow_result = require "flywow_result"
 local socket = require "skynet.socket"
 local websocket = require "http.websocket"
-local registry_api = require "registry"
 local codec_module = require "codec"
 local handshake_module = require "handshake"
 
@@ -29,7 +28,7 @@ local module_state =
 {
     phase              = "created", -- Service 生命周期；created/starting/running/stopping/stopped。
     gateway_config     = nil,       -- 通过 start 校验后的只读配置；由 start 一次写入，后续运行阶段读取。
-    registry           = nil,       -- 生成 registry 的只读索引；生命周期覆盖整个运行期。
+    registry           = nil,       -- 构建期生成的协议表；启动校验后由 Gateway 与 codec 只读共享。
     handshake          = nil,       -- 独立握手manager；Gateway只调用，不解析密码协议。
     codec              = nil,       -- 当前 Lua State 独占的 descriptor codec。
     listen_fd          = nil,       -- 监听 Socket fd；关闭后清空。
@@ -554,7 +553,7 @@ local function dispatch_payload(connection, payload)
 
     -- 用 wire 字段 Envelope.command 查 registry；跨 Service 记录再使用 command_id。
     -- 只按生成 registry 中的 command 定义解释 body，不从客户端输入推导消息类型。
-    local definition = registry_api.find_command(module_state.registry, envelope.command) -- 当前命令对应的已验证请求/响应类型定义。
+    local definition = module_state.registry.commands[envelope.command] -- 当前命令对应的已验证请求/响应类型定义。
     if definition == nil then
         log_event(
         {
@@ -573,7 +572,7 @@ local function dispatch_payload(connection, payload)
 
     -- 已找到命令后才解码其 request body；Protobuf 错误在当前网络消息边界转换为稳定结果。
     local request_result =
-        module_state.codec.decode_request(definition, envelope.body) -- 解码后的业务 record 或 codec 错误。
+        module_state.codec.decode_request(envelope.command, definition, envelope.body) -- 解码后的业务 record 或 codec 错误。
     if not request_result.ok then
         log_event(
         {
@@ -586,7 +585,7 @@ local function dispatch_payload(connection, payload)
         return flywow_result.failure(
             "REQUEST_DECODE",
             request_result.message,
-            { cause_code = request_result.code, command_id = definition.id }
+            { cause_code = request_result.code, command_id = envelope.command }
         )
     end
 
@@ -634,7 +633,7 @@ local function dispatch_payload(connection, payload)
         connection_id = connection.id, -- 使用逻辑连接号，不暴露底层 fd。
         peer          = connection.peer, -- 连接建立时记录的对端地址，仅供宿主诊断。
         transport     = connection.transport, -- 标明该连接使用 TCP 还是 WebSocket。
-        command_id    = definition.id, -- 由 registry 验证过的业务命令号。
+        command_id    = envelope.command, -- 由 registry 验证过的业务命令号。
         data          = request, -- 已按 registry 请求类型解码的业务内容。
     }
     local call_succeeded, send_result_or_error = pcall( -- 捕获 Skynet send 异常；正常返回值 0 表示成功，nil/false 表示失败。
@@ -736,13 +735,14 @@ local function deliver_outbound_message(outbound_message)
 
     -- 从 registry 取得该命令的 response 类型，并把业务 table 编码成完整 Envelope。
     -- 消息字段有效后查找响应类型；单向命令没有 response_type，不能用于此入口。
-    local definition = registry_api.find_command(module_state.registry, outbound_message.command_id) -- 出站消息声明的响应类型。
+    local definition = module_state.registry.commands[outbound_message.command_id] -- 出站消息声明的响应类型。
     if not definition or definition.response_type == nil then
         return
     end
 
     -- codec 将 schema 或业务记录错误作为结果返回；出站消息入口记录并丢弃失败响应。
     local encode_result = module_state.codec.encode_response(
+        outbound_message.command_id,
         definition,
         module_state.gateway_config.protocol_version,
         outbound_message.data
@@ -1296,6 +1296,36 @@ end
 ---@field max_clients? integer 当前实例最大在线连接数。
 ---@field write_warning_close_kb? integer Skynet warning 回调的 size 达到此 KB 时关闭；受底层告警粒度影响。
 
+--- Gateway 启动时校验宿主指定的生成文件结构，不建立第二份命令索引。
+---@param generated table require 返回的协议表；只读。
+---@return FlyWowResult<integer> 成功值是命令数量，失败为 GATEWAY_REGISTRY_INVALID。
+local function validate_generated_registry(generated)
+    if type(generated) ~= "table" or
+        type(generated.envelope_type) ~= "string" or generated.envelope_type == "" or
+        type(generated.commands) ~= "table" then
+        return flywow_result.failure("GATEWAY_REGISTRY_INVALID", "gateway registry structure is invalid")
+    end
+
+    local count = 0
+    for command_id, definition in pairs(generated.commands) do
+        if type(command_id) ~= "number" or command_id % 1 ~= 0 or
+            command_id < 1 or command_id > 0xffffffff or type(definition) ~= "table" or
+            (definition.request_type ~= nil and
+                (type(definition.request_type) ~= "string" or definition.request_type == "")) or
+            (definition.response_type ~= nil and
+                (type(definition.response_type) ~= "string" or definition.response_type == "")) then
+            return flywow_result.failure("GATEWAY_REGISTRY_INVALID", "gateway command definition is invalid",
+                { command_id = command_id })
+        end
+        count = count + 1
+    end
+
+    if count == 0 then
+        return flywow_result.failure("GATEWAY_REGISTRY_INVALID", "gateway registry must contain at least one command")
+    end
+    return flywow_result.success(count)
+end
+
 ---@class GatewayStartResult
 ---@field address string 实际监听地址。
 ---@field port integer 实际监听端口。
@@ -1330,17 +1360,17 @@ local function start(startup_config)
     end
 
     -- 命令表加载成功后验证其字段和命令 ID，防止无效协议索引进入运行状态。
-    local registry_result = registry_api.build_index(generated) -- 验证命令定义并建立本实例索引。
+    local registry_result = validate_generated_registry(generated) -- 只读校验生成表并计算命令数。
     if not registry_result.ok then
         return registry_result
     end
 
-    -- registry 通过后读取 descriptor 并构造本 Lua State 独占的 codec。
-    local registry = registry_result.value -- codec 和请求路由共同读取的已验证索引。
+    local registry = generated -- Gateway 与 codec 直接共用构建产物，不再复制索引。
+    local command_count = registry_result.value -- 启动日志和统计使用的命令数量。
     local codec_result = codec_module.new(
         {
             descriptor_path = gateway_config.descriptor_path, -- 宿主生成的 Protobuf descriptor 文件。
-            registry        = registry, -- 已通过结构校验的命令索引。
+            registry        = registry, -- 已通过结构校验的生成表。
         }
     )
     if not codec_result.ok then
@@ -1435,7 +1465,7 @@ local function start(startup_config)
         ":",
         port,
         " commands=",
-        registry.count
+        command_count
     )
 
     return flywow_result.success(
@@ -1443,7 +1473,7 @@ local function start(startup_config)
             address       = address, -- Socket Driver 实际绑定的监听地址。
             port          = port, -- Socket Driver 实际绑定的端口。
             transport     = gateway_config.transport, -- 启动配置选择的 TCP 或 WebSocket。
-            command_count = registry.count, -- 已验证协议 registry 中的命令数量。
+            command_count = command_count, -- 已验证协议 registry 中的命令数量。
         }
     )
 end

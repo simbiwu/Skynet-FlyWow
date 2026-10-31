@@ -156,25 +156,19 @@ def render(
         "-- 生命周期：协议生成后随 Server 产物发布；Gateway 启动时加载并校验。",
         "-- 不负责：不实现业务 handler、不读取 Socket、不动态解析 .proto。",
         "local command_ids =",
-        "    {",
+        "{",
     ]
-
     for command in sorted(commands, key=lambda item: str(item["enum_name"])):
-        lines.append(
-            f'        {command["enum_name"]} = {command["id"]},'
-        )
-
-    lines.extend(
-        [
-            "    }",
-            "return",
-            "{",
-            f'    envelope_type = ".{package}.Envelope",',
-            "    command_ids   = command_ids,",
-            "    commands      =",
-            "    {",
-        ]
-    )
+        lines.append(f'    {command["enum_name"]} = {command["id"]},')
+    lines.extend([
+        "}",
+        "return",
+        "{",
+        f'    envelope_type = ".{package}.Envelope",',
+        "    command_ids   = command_ids,",
+        "    commands      =",
+        "    {",
+    ])
 
     for command in sorted(commands, key=lambda item: int(item["id"])):
         request = (
@@ -189,9 +183,8 @@ def render(
         )
         lines.extend(
             [
-                f'        [command_ids.{command["enum_name"]}] =',
+                f'        [{command["id"]}] =',
                 "        {",
-                f'            name          = "{command["name"]}",',
                 f"            request_type  = {request},",
                 f"            response_type = {response},",
                 "        },",

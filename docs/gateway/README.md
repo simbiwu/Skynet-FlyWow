@@ -15,7 +15,7 @@ Gateway 不保存业务请求，不创建 pending，不生成 route_token，不�
 
 ## 模块入口
 
-Gateway内部Lua模块位于`gateway/lualib/`，分别以模块名 `handshake`、`codec` 和 `registry` 加载。
+Gateway内部Lua模块位于`gateway/lualib/`，以模块名 `handshake` 和 `codec` 加载。
 Service为`flywow_gateway`；协议registry由宿主唯一Proto源生成。
 Navigation独立使用`flywow_navigation`；不因命名接近而建立模块依赖。
 
@@ -75,7 +75,7 @@ connection_id 大于 0 时发送给指定连接，等于 0 时广播给当前 Ga
 
 客户端只根据 command 选择消息类型。协议不定义 request_id，也不要求 Gateway 保存请求响应关联。
 
-registry 由构建阶段根据 CommandId 和消息定义生成：
+registry 由构建阶段根据 CommandId 和消息定义生成，Gateway 启动时直接校验并使用其中按数字 command ID 索引的 `commands`，不再建立第二份索引；生成文件仍提供 `command_ids`，供宿主业务代码按枚举名称引用命令号：
 
 - XxxRequest 与 XxxResponse 都存在：请求-响应命令
 - 只有 XxxRequest：单向请求命令

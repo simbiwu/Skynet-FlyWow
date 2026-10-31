@@ -19,3 +19,16 @@
 Gateway 当前支持 TCP/WebSocket 两种传输；Envelope 和业务消息都使用 Protobuf。二进制帧 sample 展示线上 framing，不代表独立原始二进制 codec。
 
 flywow_gateway_sample.lua 启动 handler 和 Gateway。请求命令 1101 FrameJoin；服务端回包使用命令 1101，主动下发使用命令 1103 FramePush。两者都通过 send_data 定向发送到当前连接，客户端实际接收并校验。
+
+
+## Master Course TCP/WebSocket 示例
+
+先准备固定依赖，再选择传输方式运行：
+
+```bash
+bash gateway/sample/master_course/run.sh prepare
+bash gateway/sample/master_course/run.sh websocket client
+bash gateway/sample/master_course/run.sh tcp client
+```
+
+`prepare` 会调用课程目录中的 `bootstrap.sh`，复用 Server 固定版本准备脚本，按需构建 Skynet、lua-protobuf 和 Gateway Crypto。运行脚本会在启动前生成本课程的 Descriptor 和 Registry。需要单独以前台启动服务时运行 `bash gateway/sample/master_course/run.sh websocket server`。

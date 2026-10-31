@@ -277,30 +277,14 @@ local function scenario(overrides, expect_start_failure)
     end
 
     -- 提供单个 request/response command，供请求解码和主动下发路径共用。
-    local registry = {} -- 为场景提供单一命令定义的 registry 替身。
-    -- 提供只读测试索引。
-    ---@return table 提供一个命令的只读测试索引。
-    function registry.build_index()
-        return flywow_result.success(
+    local registry =
+    {
+        envelope_type = ".demo.Envelope",
+        commands =
         {
-            count = 1, -- 测试索引只暴露一个命令。
-        })
-    end
-
-    -- 只登记 command=1001。
-    ---@param index table 测试 registry 索引。
-    ---@param command integer 要查询的 command id。
-    ---@return table|nil command 为 1001 时返回测试定义，其他值返回 nil。
-    function registry.find_command(index, command)
-        if command == 1001 then
-            return
-            {
-                id            = 1001, -- 唯一测试命令 ID。
-                name          = "QueryCell", -- 测试请求名称。
-                response_type = ".demo.QueryCellResponse", -- 测试响应类型。
-            }
-        end
-    end
+            [1001] = { request_type = ".demo.QueryCellRequest", response_type = ".demo.QueryCellResponse" },
+        },
+    }
 
     -- 用最小 codec 替身验证 Gateway 转发；Protobuf 字节由真实集成测试覆盖。
     local codec = {} -- 只模拟 Envelope/body 编解码边界，不验证 Protobuf wire bytes。
@@ -330,7 +314,7 @@ local function scenario(overrides, expect_start_failure)
     ---@param version integer 当前 Gateway 协议版本。
     ---@param response table handler 返回的 response record。
     ---@return FlyWowResult<string> 固定响应值编码；fail 字段触发模拟编码错误。
-    function codec.encode_response(definition, version, response)
+    function codec.encode_response(command_id, definition, version, response)
         if response.fail then
             return flywow_result.failure("TEST_ENCODE", "encode failure")
         end
@@ -341,8 +325,7 @@ local function scenario(overrides, expect_start_failure)
     package.loaded["skynet"] = skynet
     package.loaded["skynet.socket"] = socket
     package.loaded["http.websocket"] = websocket
-    package.loaded["test.registry"] = {}
-    package.loaded["registry"] = registry
+    package.loaded["test.registry"] = registry
     package.loaded["codec"] =
     {
         new = function() -- 为 Gateway 返回本场景创建的 codec 替身。

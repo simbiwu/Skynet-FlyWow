@@ -1,14 +1,32 @@
 #!/usr/bin/env bash
+# 第一行 shebang 告诉系统用 Bash 解释本文件；也可显式运行 bash 加脚本路径。
+# 调用：可从任意当前工作目录启动；脚本按自身路径定位工程目录。外部相对路径参数按调用时目录解析，建议传绝对路径。
+# 示例：bash /absolute/path/to/checkout/server/third_party/skynet-flywow/hotupgrade/sample/master_course/run.sh [按本文件头部说明填写参数]
 # 让系统通过 PATH 查找 Bash 来解释本文件；这样调用者不必写死 Bash 的安装路径。
 # 运行本课程的一个独立实验；每次都会从 host_v1 重建运行目录。
 set -euo pipefail
+# Bash 语法速读：只解释本脚本实际使用的 Bash 写法；流程注释说明每一步为什么执行。
+#   set -euo pipefail：-e 遇到未处理的失败通常退出，但条件判断、&& 和 || 等位置有例外，关键失败仍应显式检查；-u 遇到未设置变量时报错（提供默认值展开时除外）；pipefail 让管道任一步失败都能向外报告。
+#   双引号中的 "$NAME" 把变量值作为一个完整参数；路径含空格时不会拆成多个参数。
+#   $(命令)运行命令并用标准输出替换当前位置；命令在子 Shell 中运行，里面的 cd 不改变主脚本目录。
+#   NAME:-默认值展开：变量未设置或为空字符串时使用默认值。
+#   NAME:?错误说明展开：必需变量未设置或为空时显示说明并以非零状态失败。
+#   NAME^^展开：把字符串中的小写字母转为大写。
+#   $#表示参数个数，$1/$2依次表示传入的第一个/第二个参数。
+#   [[ 条件 ]]执行 Bash 条件判断；-d检查目录，-x检查可执行文件，-s检查非空文件，-e检查存在的路径。
+#   case ... in 按输入匹配分支；分支以 ) 开始、;;结束，*)是兜底分支。
+#   单竖线 | 把左侧标准输出交给右侧；它不同于条件运算符 ||。
+#   >把输出写入并覆盖文件；2>&1把标准错误接到标准输出当前去向。
+#   PIPESTATUS 按顺序保存上一条管道中各命令的退出码；必须紧接管道读取。
+#   export 把变量加入子进程环境；普通赋值默认只在当前 Shell 中可见。
+#   set +e 暂时关闭命令失败即退出；代码读取失败状态后再用 set -e 恢复。
 # -e：普通命令失败时立即退出；后面执行 Skynet 的管道会临时关闭它，以便读取退出码。
 # -u：使用未设置的变量时立即报错，避免路径或参数为空后继续操作。
 # -o pipefail：管道中任一命令失败，整个管道都视为失败；Skynet 与 tee 的状态另用 PIPESTATUS 区分。
 
 # COURSE_DIR 最终保存本 run.sh 所在的 master_course 目录的绝对路径，不是启动脚本时的当前目录。
 # $0 是 Bash 收到的脚本路径；若它是相对路径，dirname 的结果会相对于调用脚本时的当前目录解释。
-# 例：从 FlyWow 根目录运行 bash hotupgrade/sample/master_course/run.sh ...，
+# 例：bash /path/to/skynet-flywow/hotupgrade/sample/master_course/run.sh /absolute/path/to/skynet normal；从任意目录都可用绝对路径启动。
 # $0 是相对路径，dirname 得到 hotupgrade/sample/master_course，pwd 最终输出该目录的绝对路径。
 # 若从 /tmp 用 run.sh 的绝对路径调用，dirname 直接得到绝对目录，最终 COURSE_DIR 仍是同一个目录。
 # dirname -- 取出目录部分；-- 表示选项结束，避免以 - 开头的路径被误当成选项。
@@ -25,10 +43,11 @@ FRAMEWORK_DIR="$(cd -- "$COURSE_DIR/../../.." && pwd)"
 # 双引号确保路径（即使含空格）整体作为一个参数；-- 告诉 realpath 后续内容不是它的选项。
 # realpath 将输入路径解析为绝对路径；若 $1 是相对路径，则相对于启动脚本时的当前目录解析。
 # 外层 $(...) 捕获 realpath 输出，赋给 SKYNET_ROOT；之后脚本统一使用这个绝对路径。
+# $1 必须是 Skynet 根目录；${1:?说明} 在缺失或为空时立即报错。例：run.sh /opt/skynet 会把该绝对路径规范化后存入 SKYNET_ROOT。
 SKYNET_ROOT="$(realpath -- "${1:?用法: run.sh SKYNET_ROOT [v1|normal|queue|forward]}")"
 
 # 第二个位置参数 $2 指定要运行的课程场景。
-# ${2:-v1} 表示 $2 未设置或为空时使用默认值 v1。
+# $2 是可选实验场景；${2:-v1} 在缺省或为空时使用 v1。例：run.sh /opt/skynet queue 会选 queue，不给第二个参数则选 v1。
 SCENARIO="${2:-v1}"
 
 # 本课程专用的生成目录；脚本会删除并重建它，不会清理课程源码目录。

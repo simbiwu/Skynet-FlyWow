@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
+# 第一行 shebang 告诉系统用 Bash 解释本文件；也可显式运行 bash 加脚本路径。
+# 调用：可从任意当前工作目录启动；脚本按自身路径定位工程目录。外部相对路径参数按调用时目录解析，建议传绝对路径。
+# 示例：bash /absolute/path/to/checkout/server/third_party/skynet-flywow/scripts/build_flywow.sh [按本文件头部说明填写参数]
 # 职责：按模块构建 FlyWow Native，并运行该模块配置的 CTest。
 # 边界：负责构建编排与产物汇总；不启动业务 Server、不安装依赖、不生成运行时配置。
-# 推荐完整构建：从 Server 根目录运行 ./scripts/linux/run_server.sh build。
-# 单独构建模块：从 Server 根目录运行 bash third_party/skynet-flywow/scripts/build_flywow.sh third_party/skynet <模块>。
-# 也可从 FlyWow 根目录运行 bash scripts/build_flywow.sh <Skynet目录> <模块>。
+# 推荐完整构建：可从任意目录运行 bash /path/to/server/scripts/linux/run_server.sh build。
+# 单独构建模块：可从任意目录运行 bash /path/to/skynet-flywow/scripts/build_flywow.sh /absolute/path/to/skynet <模块>。
+# SKYNET_ROOT 是必需的 Skynet 根目录；为避免依赖调用时目录，建议传绝对路径。
 # 参数：第 1 个位置参数是 Skynet 根目录；第 2 个是模块名，省略时构建 all。
 # 可选模块：gateway、navigation、logger、word_filter、hotupgrade、lua_binding、all。
 # 环境变量：BUILD_TYPE 选择 CMake 构建类型，默认 RelWithDebInfo；CXX 在 Gateway 首次配置时选择编译器。
@@ -16,19 +19,32 @@
 # 修改指引：新增 C++ 源文件时更新对应模块 CMakeLists.txt；Gateway 源文件清单位于 gateway/native/CMakeLists.txt。
 # 修改指引：调整最终产物目录时改 NATIVE_DIR，并确认各模块的 FLYWOW_NATIVE_OUTPUT_DIR 与产物检查一致。
 # 修改指引：改 Native 模块名或 .so 文件名时同步更新目标链接、产物检查及 Lua 加载名称。
-# 示例：bash scripts/build_flywow.sh /path/to/skynet navigation
-# 示例：BUILD_TYPE=Debug bash scripts/build_flywow.sh /path/to/skynet navigation
-# 示例：bash scripts/build_flywow.sh /path/to/skynet all
-# 示例：从 Server 根目录单独构建导航：bash third_party/skynet-flywow/scripts/build_flywow.sh third_party/skynet navigation
+# 示例：bash /path/to/skynet-flywow/scripts/build_flywow.sh /path/to/skynet navigation
+# 示例：BUILD_TYPE=Debug bash /path/to/skynet-flywow/scripts/build_flywow.sh /path/to/skynet navigation
+# 示例：bash /path/to/skynet-flywow/scripts/build_flywow.sh /path/to/skynet all
+# 示例：bash /path/to/skynet-flywow/scripts/build_flywow.sh /absolute/path/to/skynet navigation
 set -euo pipefail
 
+# Bash 语法速读：只解释本脚本实际使用的 Bash 写法；流程注释说明每一步为什么执行。
+#   set -euo pipefail：-e 遇到未处理的失败通常退出，但条件判断、&& 和 || 等位置有例外，关键失败仍应显式检查；-u 遇到未设置变量时报错（提供默认值展开时除外）；pipefail 让管道任一步失败都能向外报告。
+#   双引号中的 "$NAME" 把变量值作为一个完整参数；路径含空格时不会拆成多个参数。
+#   $(命令)运行命令并用标准输出替换当前位置；命令在子 Shell 中运行，里面的 cd 不改变主脚本目录。
+#   NAME:-默认值展开：变量未设置或为空字符串时使用默认值。
+#   NAME:?错误说明展开：必需变量未设置或为空时显示说明并以非零状态失败。
+#   $#表示参数个数，$1/$2依次表示传入的第一个/第二个参数。
+#   [[ 条件 ]]执行 Bash 条件判断；-f检查普通文件，-s检查非空文件。
+#   case ... in 按输入匹配分支；分支以 ) 开始、;;结束，*)是兜底分支。
+#   单竖线 | 把左侧标准输出交给右侧；它不同于条件运算符 ||。
+#   >把输出写入并覆盖文件；2>&1把标准错误接到标准输出当前去向。
 # 以下是 Bash 变量，不是 CMake 变量；SCRIPT_DIR 从脚本文件位置计算，因此不依赖当前目录。
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 # FlyWow 仓库根目录；脚本位于 scripts/ 下，所以向上一级得到根目录。
 FRAMEWORK_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 # 把第 1 个参数解析成绝对路径，后续依赖检查和 CMake 都使用同一个 Skynet 目录。
+# $1 必须是 Skynet 根目录；${1:?说明} 在缺失或空值时直接报错。例：传 /opt/skynet 后 realpath 得到规范路径。
 SKYNET_ROOT="$(realpath -- "${1:?用法: build_flywow.sh SKYNET_ROOT [gateway|navigation|logger|word_filter|hotupgrade|lua_binding|all]}")"
 # 未提供第 2 个参数时构建全部模块；模块名必须与下面的 case 和构建分支一致。
+# $2 是可选构建模块；${2:-all} 在缺省或空值时构建 all。例：传 gateway 只构建 Gateway，不传第二个参数则构建全部模块。
 MODULE="${2:-all}"
 # 两个输出路径集中定义：修改这里可统一调整中间目录和最终 .so 目录。
 BUILD_ROOT="$FRAMEWORK_DIR/build"
@@ -100,7 +116,8 @@ if [[ "$MODULE" == gateway || "$MODULE" == all ]]; then
     # CXX 仅在首次配置缓存时选编译器；Skynet 路径固定 Lua ABI，输出路径匹配 Gateway lua_cpath。
     cmake -S "$FRAMEWORK_DIR/gateway/native" -B "$BUILD_ROOT/cmake/gateway" \
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-        -DCMAKE_CXX_COMPILER="${CXX:-c++}" \
+        # CXX 未设置或为空时用 c++；例如 CXX=clang++ 会令 CMake 使用 clang++。
+            -DCMAKE_CXX_COMPILER="${CXX:-c++}" \
         -DSKYNET_ROOT="$SKYNET_ROOT" \
         -DFLYWOW_NATIVE_OUTPUT_DIR="$NATIVE_DIR"
 

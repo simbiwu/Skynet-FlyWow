@@ -87,7 +87,7 @@ function M.new(codec_config)
 
     -- 在监听前核对 Registry 所引用的消息类型，拒绝不匹配的 descriptor。
     local required_types = { codec_config.registry.envelope_type }
-    for _, definition in pairs(codec_config.registry.by_id) do
+    for _, definition in pairs(codec_config.registry.commands) do
         if definition.request_type then
             required_types[#required_types + 1] = definition.request_type
         end
@@ -140,10 +140,11 @@ function M.new(codec_config)
     end
 
     --- 按已验证 registry 的 request_type 解码 Envelope.body。
+    ---@param command_id integer 当前命令号，来自生成表的 key。
     ---@param definition table registry 中由 command id 找到的只读命令定义。
     ---@param body string Envelope 中的 request Protobuf bytes。
     ---@return FlyWowResult<table> 成功 value 为业务 request；schema 或 body 错误返回 GATEWAY_REQUEST_DECODE_FAILED。
-    function codec.decode_request(definition, body)
+    function codec.decode_request(command_id, definition, body)
         if type(definition) ~= "table" or type(definition.request_type) ~= "string" then
             return flywow_result.failure(
                 "GATEWAY_REQUEST_DECODE_FAILED",
@@ -154,7 +155,7 @@ function M.new(codec_config)
             return flywow_result.failure(
                 "GATEWAY_REQUEST_DECODE_FAILED",
                 "request body must be a byte string",
-                { command_id = definition.id }
+                { command_id = command_id }
             )
         end
 
@@ -164,7 +165,7 @@ function M.new(codec_config)
             return flywow_result.failure(
                 "GATEWAY_REQUEST_DECODE_FAILED",
                 tostring(request_or_error),
-                { command_id = definition.id, request_type = definition.request_type }
+                { command_id = command_id, request_type = definition.request_type }
             )
         end
 
@@ -173,11 +174,12 @@ function M.new(codec_config)
     end
 
     --- 按 registry response_type 编码业务 response，再封装共享 Envelope。
+    ---@param command_id integer 当前命令号，来自生成表的 key。
     ---@param definition table registry 中由 command id 找到的只读命令定义。
     ---@param version integer 当前 Gateway 配置的 Envelope 协议版本。
     ---@param response table handler 返回的业务响应；本函数只读。
     ---@return FlyWowResult<string> 成功 value 为完整 Envelope bytes；类型、schema 或编码错误返回 GATEWAY_RESPONSE_ENCODE_FAILED。
-    function codec.encode_response(definition, version, response)
+    function codec.encode_response(command_id, definition, version, response)
         if type(definition) ~= "table" or type(definition.response_type) ~= "string" then
             return flywow_result.failure(
                 "GATEWAY_RESPONSE_ENCODE_FAILED",
@@ -188,7 +190,7 @@ function M.new(codec_config)
             return flywow_result.failure(
                 "GATEWAY_RESPONSE_ENCODE_FAILED",
                 "protocol version and response table are required",
-                { command_id = definition.id }
+                { command_id = command_id }
             )
         end
 
@@ -199,7 +201,7 @@ function M.new(codec_config)
             return flywow_result.failure(
                 "GATEWAY_RESPONSE_ENCODE_FAILED",
                 tostring(body_or_error),
-                { command_id = definition.id, response_type = definition.response_type }
+                { command_id = command_id, response_type = definition.response_type }
             )
         end
 
@@ -207,7 +209,7 @@ function M.new(codec_config)
         local envelope =
         {
             protocol_version = version, -- 宿主指定的 Envelope 兼容版本。
-            command          = definition.id, -- 与业务响应类型对应的 registry 命令号。
+            command          = command_id, -- 与业务响应类型对应的 registry 命令号。
             body             = body_or_error, -- 编码后的业务消息，作为 Envelope 的不透明载荷。
         }
         -- Envelope 编码失败时保留错误结果，不返回半成品 bytes。

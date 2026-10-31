@@ -1,0 +1,26 @@
+syntax = "proto3";
+package flywow.gateway.course;
+
+enum CommandId
+{
+  COMMAND_UNSPECIFIED = 0;
+  ENTER_WORLD = 1001;
+  SYSTEM_NOTICE = 1002;
+}
+
+message EnterWorldRequest
+{
+  uint32 player_id = 1;
+}
+
+message EnterWorldResponse
+{
+  uint32 player_id = 1;
+  uint32 scene_id = 2;
+  uint32 online_count = 3;
+}
+
+message SystemNoticeResponse
+{
+  string content = 1;
+}
