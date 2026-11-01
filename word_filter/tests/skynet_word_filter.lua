@@ -11,9 +11,10 @@ local TEST_COMMAND = "run"
 ---@type 'worker'|nil
 local role = ... --- Skynet 启动参数；此处仅取固定的第一个参数，不向业务转发 varargs。
 
---- 在当前 Lua State 创建并查询词库；同步、无 I/O、无 yield，成功返回 true。
+--- 在当前 Lua State 创建并查询词库；同步、无 I/O、无 yield。
+---@return boolean 所有创建、查询及 UTF-8 错误断言通过时为 true。
 local function verify_public_api()
-    local filter = assert(word_filter.new(
+    local filter = assert(word_filter.create_filter(
     {
         keywords = {"外挂", "bad"},
         compact  = true,
@@ -24,6 +25,8 @@ local function verify_public_api()
         local result, error_code = filter:find("\255")
         assert(result == nil and error_code == "invalid_utf8", "非法 UTF-8 不应返回部分命中")
     end
+
+    -- 查询断言结束后触发一次完整 GC，验证短期 Native 词库可由 userdata 回收。
     collectgarbage("collect")
     return true
 end

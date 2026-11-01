@@ -210,13 +210,12 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
     return response;
 }
 
-/// Lua handshake manager 在 hello 阶段调用 new，创建独占密码上下文及挑战。
+/// Lua 握手模块 在 hello 阶段调用 create_context，创建独占密码上下文及挑战。
 /// @param state 栈索引 1 是完整 HELLO 字节串；由 LuaBinding 校验参数。
 /// @return Lua 返回 userdata、challenge；参数或密码操作失败返回 nil、错误记录。
-// Lua 名称 new 是 C++ 保留字，回调使用 createCryptoContext；不改变公开 Lua 名称。
 // [hello] -> [hello, userdata]；userdata 构造和 __gc 由 LuaBinding 管理。
 // 失败时清理其密钥，userdata 内存仍由 Lua GC 回收，不手工析构两次。
-int createCryptoContext(lua_State *state)
+int create_context(lua_State *state)
 {
     LuaBinding  lua_binding(state);
     std::string hello; // 从参数复制的完整 CLIENT_HELLO，校验后才用于密钥派生。
@@ -259,7 +258,7 @@ int createCryptoContext(lua_State *state)
     return lua_binding.returnValues(context, response);
 }
 
-/// Lua handshake manager 在 proof 阶段验证客户端证明并生成服务端证明。
+/// Lua 握手模块 在 proof 阶段验证客户端证明并生成服务端证明。
 /// @param state 索引 1 为本模块 userdata，索引 2 为 33 字节 CLIENT_PROOF。
 /// @return 成功返回 33 字节 SERVER_READY；失败返回 nil、错误记录。
 // 只借用栈中的 userdata；returnValues 追加输出，LuaBinding 负责错误结果与栈平衡。
@@ -345,7 +344,7 @@ extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
         {nullptr, nullptr},
     };
     static const luaL_Reg functions[] = {
-        {"new", &LuaBinding::nativeCallback<createCryptoContext>},
+        {"create_context", &LuaBinding::nativeCallback<create_context>},
         {nullptr, nullptr},
     };
     LuaBinding::registerUserdata<CryptoContext>(state, kCryptoMetatable, methods);

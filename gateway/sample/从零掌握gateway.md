@@ -216,7 +216,7 @@ sed -n '1,80p' gateway/sample/master_course/generated/world_registry.lua
 
 ### 1.5 源码精读：生成物为什么能决定网关该解哪种消息
 
-这一步先看构建期生成器，再看 Gateway 启动时的只读校验。请打开 `gateway/tools/generate_gateway_registry.py` 的 `parse_protos()` 和 `render()`，再打开 `gateway/lualib/codec.lua` 的 `new()`。生成文件就是 Gateway 查询的命令表，不再复制第二份索引。
+这一步先看构建期生成器，再看 Gateway 启动时的只读校验。请打开 `gateway/tools/generate_gateway_registry.py` 的 `parse_protos()` 和 `render()`，再打开 `gateway/lualib/codec.lua` 的 `init()`。生成文件就是 Gateway 查询的命令表，不再复制第二份索引。
 
 **【真实源码局部：`gateway/tools/generate_gateway_registry.py` / `parse_protos()`，省略输入列表的 package 验证】**
 
@@ -253,11 +253,11 @@ commands =
 
 Gateway 启动时只读校验每个数字 key 与消息类型，并计算命令数量；`dispatch_payload()` 随后直接用 Codec 内部的 `registry.commands[envelope.command]` 找到定义。`1001` 是表的 key，不在命令定义中重复保存。生成文件还保留 `command_ids.ENTER_WORLD` 等名称到数字的映射，供宿主业务代码引用协议命令号；Gateway 查表本身不使用这组名称。这个协议表属于 Gateway Service，与 WorldService 的 `state.players` 无关。
 
-`Descriptor` 则提供每一个字段的 wire type 和类型结构；Registry 只是**选择**具体类型。若有 Registry，却没有包含消息定义的 `.pb`，`codec_module.new()` 会在 Gateway 启动时拒绝，而不会等客户端首个请求才发现。
+`Descriptor` 则提供每一个字段的 wire type 和类型结构；Registry 只是**选择**具体类型。若有 Registry，却没有包含消息定义的 `.pb`，`codec_module.init()` 会在 Gateway 启动时拒绝，而不会等客户端首个请求才发现。
 
 **验证实验**：生成产物后，打开 `generated/world_registry.lua` 并记录两条 command；然后在第二阶段 `start()` 前把 `registry_module` 临时改成一个不存在的模块名，观察 `GATEWAY_REGISTRY_LOAD_FAILED`。恢复原值、重新启动。由此确认 Python 生成器不参与运行时消息收发，Gateway 只消费文件结果。
 
-**返回主线**：第一阶段只有两种静态产物；接下来进入 WorldService 启动 Gateway，观察它们何时进入 `module_state.codec`。
+**返回主线**：第一阶段只有两种静态产物；接下来进入 WorldService 启动 Gateway，观察 Codec 模块何时完成初始化。
 
 ---
 
@@ -626,9 +626,9 @@ Gateway Service 自己的 Lua State
   -> start(config)
        -> normalize_config(config)
        -> require("world_registry")
-       -> codec_module.new(...)     [读取 .pb，pb.load，校验消息类型]
+       -> codec_module.init(...)     [读取 .pb，pb.load，校验消息类型]
        -> require("flywow_gateway_crypto")
-       -> handshake_module.new(...)
+       -> handshake_module.init(...)
        -> socket.listen(host, port, backlog)
        -> socket.start(listen_fd, accept_client)
        -> module_state.phase = "running"
@@ -640,7 +640,7 @@ WorldService 的原调用协程被唤醒，继续检查 result.ok/value
 
 这里必须注意两个不同的 `start`：`skynet.start` 是 **Service 入口初始化回调**；Gateway 的 `start(config)` 是**宿主发送的业务命令处理函数**。`skynet.call` 等待应答，不能把它与后面的请求投递 `skynet.send` 混淆。
 
-`normalize_config` 先处理所有必需字段和默认值；例如 `transport="websocket"` 合法，`host=false` 不会被当成缺省地址。`codec_module.new` 只读校验生成表、统计命令并在当前 Gateway Lua State 里加载 Descriptor；Handshake manager 在本 Service 里持有握手名额，**此时还没有一个客户端连接**。
+`normalize_config` 先处理所有必需字段和默认值；例如 `transport="websocket"` 合法，`host=false` 不会被当成缺省地址。`codec_module.init` 只读校验生成表、统计命令并在当前 Gateway Lua State 里加载 Descriptor；Handshake 握手模块 在本 Service 里持有握手名额，**此时还没有一个客户端连接**。
 
 **回到主线**：只有 listener 创建且 `socket.start` 成功后才进入 `running`。`WorldService` 收到 Result 后才打印课程 READY；下一阶段才会发生 accept 和握手。
 
@@ -676,8 +676,8 @@ local module_state =
 | -------------------- | -------------------- | ------------------------------- | ---------------------- |
 | `phase`              | `start`/`stop`       | `accept_client`、超时与出站入口 | 当前 Gateway Service   |
 | `gateway_config`     | `start` 校验后设置   | 网络、握手、限流入口            | 启动后到停止           |
-| `codec` | `start` 装载         | `dispatch_payload` / 出站编码   | 当前 Gateway Lua State |
-| `handshake`          | `start` 构造 manager | 每个连接的握手与 detach         | 当前 Gateway Service   |
+
+
 | `listen_fd`          | 监听成功后持有       | `stop`                          | 监听期                 |
 | `connections`        | 创建/摘除连接        | 出站单播、广播、超时、stop      | 每条连接登记期         |
 | `connections_by_fd`  | 创建/摘除连接        | WS 回调、关闭安全检查           | 每条连接登记期         |
@@ -707,15 +707,15 @@ if not generated_ok then
         { module = gateway_config.registry_module }
     )
 end
--- generated 在下一步交给 codec_module.new 统一校验；Gateway 不保存 Registry。
+-- generated 在下一步交给 codec_module.init 统一校验；Gateway 不保存 Registry。
 ```
 
-`startup_config` 是从 WorldService 通过 Skynet RPC 传过来的**配置副本值**；`config_result.value` 才是 Gateway 通过 `normalize_config()` 验证过的配置记录。`generated` 是 `require("world_registry")` 返回的构建产物 table；Codec 在初始化时验证 `generated` 并提供 `codec.command_count`；Gateway 不保存 Registry 或建立第二份查询索引。
+`startup_config` 是从 WorldService 通过 Skynet RPC 传过来的**配置副本值**；`config_result.value` 才是 Gateway 通过 `normalize_config()` 验证过的配置记录。`generated` 是 `require("world_registry")` 返回的构建产物 table；Codec 在初始化时验证 `generated` 并提供 `codec_result.value`；Gateway 不保存 Registry 或建立第二份查询索引。
 
 后续并不是三个“传位置参数”的调用。花括号表示传给函数的一张 Lua 配置表；真实调用会把字段名写出来：
 
 ```lua
-local codec_result = codec_module.new(
+local codec_result = codec_module.init(
 {
     descriptor_path = gateway_config.descriptor_path,
     registry        = generated,
@@ -730,7 +730,7 @@ if not crypto_ok then
     return flywow_result.failure("GATEWAY_CRYPTO_LOAD_FAILED", tostring(crypto))
 end
 
-local handshake_result = handshake_module.new(
+local handshake_result = handshake_module.init(
 {
     crypto        = crypto,
     now           = skynet.now,
@@ -742,22 +742,21 @@ if not handshake_result.ok then
     return handshake_result
 end
 
-local codec = codec_result.value
-local handshake = handshake_result.value
+local command_count = codec_result.value
 ```
 
-这三步按顺序发生在 `socket.listen()` 之前。它们分别准备 Protobuf 编解码器、加载 Native 握手模块、创建一个尚未接纳任何客户端的握手管理器。只有三步都成功，Gateway 才把结果放进自己的 `module_state`，然后创建 listener。
+这三步按顺序发生在 `socket.listen()` 之前。它们分别准备 Protobuf 编解码器、加载 Native 握手模块、初始化当前 Service 的握手模块。只有三步都成功，Gateway 才把结果放进自己的 `module_state`，然后创建 listener。
 
 #### 第一步：加载并核对 Descriptor
 
-`codec_module.new()` 接收一张配置表，而不是两个位置参数：
+`codec_module.init()` 接收一张配置表，而不是两个位置参数：
 
 - `descriptor_path` 是运行时 FileDescriptorSet（本例的 `world.pb`）的文件路径。路径按 Skynet/Server 进程的工作目录解析。该文件由之前的 `protoc` 构建步骤生成；Gateway 运行时不解析 `.proto`。
 - `registry` 是前面加载并通过结构检查的 Lua 命令表。它告诉 Gateway：Envelope 的完整类型名是什么，每个 `command` 对应哪个 Request 和 Response。传递的是现有表，由 codec 持有并查询，Gateway 不再保存它，也不复制第二份索引。
 
 codec 先检查这两个字段的类型，再打开 `descriptor_path` 读取全部字节并关闭文件句柄。读取成功后，它调用宿主的 `lua-protobuf` 的 `pb.load()`，把 Descriptor 中的消息定义注册到**当前 Gateway Lua State 的 protobuf 运行时**。接着它遍历 Registry 引用的类型名（Envelope、非空的 Request/Response），逐个调用 `pb.type(type_name)`。这样可以在开始监听前发现“Registry 指向了 Descriptor 中不存在的消息”这一类部署错误。
 
-成功时返回 `FlyWowResult.success(codec)`；启动代码从 `codec_result.value` 取得 codec，供后续入站解码和出站编码使用。预期失败通过 Result 返回：
+成功时返回 `FlyWowResult.success(command_count)`；Gateway 从 `codec_result.value` 取得命令数，运行时直接调用 Codec 模块函数。预期失败通过 Result 返回：
 
 | 错误码 | 含义 |
 | --- | --- |
@@ -774,34 +773,34 @@ codec 先检查这两个字段的类型，再打开 `descriptor_path` 读取全�
 1. `require` 按 Lua 的 C 模块搜索路径加载 `flywow_gateway_crypto.so`。Skynet Lua 调用该模块的 `luaopen_flywow_gateway_crypto` 入口；入口注册 Native userdata 的 `verify`、`close` 方法，并返回带有 `new` 函数的模块表。
 2. `pcall` 捕获加载过程中的 Lua 错误。成功时其返回值是 `true, crypto_module`；失败时是 `false, error`。因此局部变量 `crypto` 接到的是模块接口表，不是某个玩家的密码上下文。
 
-这里的“加载 Native 模块”不等于已经为连接生成密钥。模块加载失败（例如 Native 产物缺失、动态库依赖无法加载或 Lua C 模块初始化失败）会被转换为 `GATEWAY_CRYPTO_LOAD_FAILED` 并终止本次启动。Native 的 `new(hello)` 要等到 listener 已经接纳客户端、握手管理器收到合法 HELLO 后才会调用；它创建的是该连接独占的 userdata。
+这里的“加载 Native 模块”不等于已经为连接生成密钥。模块加载失败（例如 Native 产物缺失、动态库依赖无法加载或 Lua C 模块初始化失败）会被转换为 `GATEWAY_CRYPTO_LOAD_FAILED` 并终止本次启动。Native 的 `create_context(hello)` 要等到 listener 已经接纳客户端、握手模块收到合法 HELLO 后才会调用；它创建的是该连接独占的 userdata。
 
-#### 第三步：创建握手管理器
+#### 第三步：初始化握手模块
 
-`handshake_module.new()` 收到的四个具名字段是：
+`handshake_module.init()` 收到的四个具名字段是：
 
 | 字段 | 本次传入值 | 用途 |
 | --- | --- | --- |
-| `crypto` | 上一步 `require` 返回的模块表 | 管理器验证 HELLO 时调用其 `new(hello)`，并通过返回的 userdata 执行 proof 验证和释放 |
+| `crypto` | 上一步 `require` 返回的模块表 | 握手模块验证 HELLO 时调用其 `create_context(hello)`，并通过返回的 userdata 执行 proof 验证和释放 |
 | `now` | `skynet.now` 函数本身 | 管理器需要判断期限时再读取当前时钟；这里没有写 `skynet.now()`，所以传入的不是一个固定 tick 数值 |
 | `max_pending` | `max_pending_handshakes` 配置值 | 限制本 Gateway 同时持有的待完成握手上下文数量 |
 | `timeout_ticks` | `handshake_timeout_ticks` 配置值 | 从某连接开始握手时起算的绝对期限，单位是 Skynet 的 10ms tick；例如配置值 `1000` 约为 10 秒，后续握手消息不会延长它 |
 
-构造函数会检查 Native 模块是否提供 `new`、时钟是否为函数、两个上限是否为合法正整数。全部通过后，它创建一个 manager，并将内部待处理计数初始化为 0；此时没有连接上下文，也没有为客户端创建 Native userdata。构造成功时返回 `FlyWowResult.success(manager)`，之后 Gateway 从 `handshake_result.value` 取得它。参数无效时返回 `HANDSHAKE_CONFIG_INVALID`。
+初始化函数检查 Native 的 new 接口、时钟与容量/期限。校验通过后保存当前 Service 的依赖和配置，返回空成功 Result；参数无效返回 HANDSHAKE_CONFIG_INVALID。pending 在模块加载时初始化为 0，init 不创建实例表，也不创建连接或 Native userdata。
 
-listener 开始工作后，连接回调才会调用 manager 的 `accept()` 申请名额；合法 HELLO 到达后，manager 才调用 `crypto.new(hello)` 创建该连接的 Native userdata。连接关闭或握手失败时，manager 负责归还名额并关闭该 userdata。也就是说，manager 是当前 Gateway Service 独占的握手状态机；它不写 Socket、不启动协程，也不预先分配所有客户端的密码状态。
+listener 开始工作后，连接回调才会调用 握手模块的 `accept()` 申请名额；合法 HELLO 到达后，握手模块才调用 `crypto.create_context(hello)` 创建该连接的 Native userdata。连接关闭或握手失败时，握手模块负责归还名额并关闭该 userdata。也就是说，握手模块是当前 Gateway Service 独占的握手状态机；它不写 Socket、不启动协程，也不预先分配所有客户端的密码状态。
 
 #### 把三个步骤连成启动时间线
 
 ```text
 WorldService 调用 Gateway start(config)
   -> 校验配置并加载/校验生成 Registry
-  -> codec_module.new({descriptor_path=..., registry=...})
+  -> codec_module.init({descriptor_path=..., registry=...})
        读取 world.pb -> pb.load -> 核对 Registry 中的类型名
   -> pcall(require, "flywow_gateway_crypto")
        加载 Native Lua 模块 -> 得到 crypto 模块表
-  -> handshake_module.new({crypto=..., now=..., max_pending=..., timeout_ticks=...})
-       校验依赖和上限 -> 创建 pending=0 的握手 manager
+  -> handshake_module.init({crypto=..., now=..., max_pending=..., timeout_ticks=...})
+       校验依赖和上限 -> 发布本 Service 的握手依赖与上限
   -> 所有步骤成功后发布启动状态
   -> socket.listen() / socket.start()
   -> 才能接纳客户端并创建逐连接的握手 context
@@ -813,9 +812,9 @@ WorldService 调用 Gateway start(config)
 
 下面摘取的是实现中的关键语句，用来跟踪数据和 ownership；省略部分已明确标出。它们是源码阅读片段，不是可复制替换的完整函数。阅读时分别打开 `gateway/lualib/codec.lua`、`gateway/native/gateway_crypto.cpp`、`gateway/lualib/handshake.lua`；三者由 Gateway 的 `start()` 按上一张时间线依次调用。
 
-##### 1. 在 `codec.lua / M.new()` 中，Descriptor 如何成为可用 codec
+##### 1. 在 `codec.lua / M.init()` 中，Descriptor 如何成为可用 codec
 
-**【真实源码局部：`gateway/lualib/codec.lua` / `M.new()`】**
+**【真实源码局部：`gateway/lualib/codec.lua` / `M.init()`】**
 
 ```lua
 -- descriptor_result 已通过 read_descriptor() 读取并关闭文件句柄。
@@ -855,7 +854,7 @@ local codec = {}
 return flywow_result.success(codec)
 ```
 
-这段实现把“Descriptor 能加载”和“Descriptor 与 Registry 相匹配”分成两次检查。`pb.load` 成功只说明字节能被 lua-protobuf 接受；随后逐项 `pb.type` 才确认 Gateway 需要的 Envelope、Request、Response 确实都在其中。任一类型缺失时，`M.new()` 返回错误 Result，不创建可交付的 codec。全部通过后，codec 方法闭包读取传入的同一张 Registry 表，`success(codec)` 中的 codec 才交给 Gateway 保存。
+pb.load 注册 descriptor 后，逐项 pb.type 核对 Registry 引用的消息；全部通过才将 Registry 发布到模块私有变量并返回命令数。失败不覆盖已有 Registry；pb.load 自身对当前 Lua State 的类型注册仍是既有副作用。运行时直接调用模块函数。
 
 ##### 2. Native 模块入口如何直接注册 API
 
@@ -875,7 +874,7 @@ extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
     };
     static const luaL_Reg functions[] =
     {
-        {"new", &LuaBinding::nativeCallback<createCryptoContext>},
+        {"create_context", &LuaBinding::nativeCallback<create_context>},
         {nullptr, nullptr},
     };
     LuaBinding::registerUserdata<CryptoContext>(state, kCryptoMetatable, methods);
@@ -959,9 +958,9 @@ int callbackFailure(lua_State *state, const char *message)
 
 这不是“所有 Lua 错误都会被 C++ try/catch 捕获”：Lua 的 `lua_error`/longjmp 不是 C++ exception。封装把可能分配的常规 table 操作放在保护调用里；直接使用 Lua C API 的模块入口仍需遵守 Lua 加载错误合同，并避免在可能 longjmp 的调用周围持有需要析构的 C++ 资源。
 
-回到 Gateway 主线：require 成功后返回 crypto 模块表，其中 crypto.new 对应 createCryptoContext。此时仍然没有客户端密码对象；只有后续握手收到合法 HELLO 时，Lua manager 才调用 crypto.new(bytes)。
+回到 Gateway 主线：require 成功后返回 crypto 模块表，其中 crypto.create_context 对应 create_context。此时仍然没有客户端密码对象；只有后续握手收到合法 HELLO 时，Lua 握手模块才调用 crypto.create_context(bytes)。
 
-**【真实源码局部：同一文件 / `createCryptoContext()`】**
+**【真实源码局部：同一文件 / `create_context()`】**
 
 ```cpp
 if (hello.size() != 67 || hello[0] != 1 || hello[1] != 1 ||
@@ -992,23 +991,22 @@ catch (const std::exception &error)
 return lua_binding.returnValues(context, response);
 ```
 
-这段不是在 Gateway 启动时执行，而是握手进行到 HELLO 阶段后，由 Lua 侧调用 `crypto.new(bytes)` 才执行。Native 再次校验 HELLO 的固定长度和头部，成功后创建一个由 Lua userdata 持有的 `CryptoContext`，生成 challenge，并一次返回 userdata 与 challenge。异常路径清理刚创建的密码材料，再向 Lua 返回 Binding 错误；Lua manager 接到错误后会关闭该握手上下文并归还 pending 名额。由此可以区分：
+这段不是在 Gateway 启动时执行，而是握手进行到 HELLO 阶段后，由 Lua 侧调用 `crypto.create_context(bytes)` 才执行。Native 再次校验 HELLO 的固定长度和头部，成功后创建一个由 Lua userdata 持有的 `CryptoContext`，生成 challenge，并一次返回 userdata 与 challenge。异常路径清理刚创建的密码材料，再向 Lua 返回 Binding 错误；Lua 握手模块接到错误后会关闭该握手上下文并归还 pending 名额。由此可以区分：
 
 | 对象 | 创建时机 | owner | 生命周期结束 |
 | --- | --- | --- | --- |
 | `crypto` 模块表 | Gateway 启动时 `require` | 当前 Gateway Lua State | Lua State 结束 |
-| 每连接 `CryptoContext` userdata | 收到合法 HELLO 后调用 `crypto.new` | 该连接的 handshake context | 握手关闭/失败时 `close()`；遗漏时还有 `__gc` 兜底 |
+| 每连接 `CryptoContext` userdata | 收到合法 HELLO 后调用 `crypto.create_context` | 该连接的 handshake context | 握手关闭/失败时 `close()`；遗漏时还有 `__gc` 兜底 |
 
-##### 3. 在 `handshake.lua / M.new()` 中，manager 创建时为什么没有连接
+##### 3. 在 `handshake.lua / M.init()` 中，模块初始化时为什么没有连接
 
-**【真实源码局部：`gateway/lualib/handshake.lua` / `M.new()`】**
+**【真实源码局部：`gateway/lualib/handshake.lua` / `M.init()`】**
 
 ```lua
--- 上面的参数校验已确认 crypto.new、now 和两个正整数上限有效。
+-- pending 位于模块作用域；init 在接受连接前发布已验证配置。
 local pending = 0
-local manager = {}
 
-function manager.accept()
+function M.accept()
     if pending >= max_pending then
         return flywow_result.failure(
             "HANDSHAKE_CAPACITY",
@@ -1026,16 +1024,16 @@ function manager.accept()
 end
 ```
 
-这里的 `pending` 是由这一次 `M.new()` 创建的 manager 闭包独占的计数，不是全局计数。调用 `M.new()` 只把它设成 0；只有 listener 接纳新连接后调用 `manager.accept()` 才加一并创建握手 context。容量已满返回 `HANDSHAKE_CAPACITY`，成功则把当前 tick 记为绝对起点，并先把 `crypto` 设为 `nil`：这说明 accept 尚未创建 Native 密码对象。
+pending 是 handshake 模块在当前 Service Lua State 中持有的私有计数。模块加载时为 0；init 只在接受连接前配置依赖，不重置名额。accept 增加名额并创建连接 context；close 在活动阶段释放一次。
 
-manager 后续处理 HELLO 时，`manager.receive()` 才调用 Native 模块：
+握手模块 后续处理 HELLO 时，`M.receive()` 才调用 Native 模块：
 
 ```lua
 local call_succeeded, native_or_error, challenge_or_error =
-    pcall(crypto.new, bytes)
+    pcall(crypto.create_context, bytes)
 if not call_succeeded or native_or_error == nil or
     type(challenge_or_error) ~= "string" then
-    manager.close(context)
+    M.close(context)
     local native_error = call_succeeded and challenge_or_error or native_or_error
     return flywow_result.failure(
         "HANDSHAKE_CRYPTO",
@@ -1057,9 +1055,9 @@ return flywow_result.success(
 })
 ```
 
-`pcall` 同时接住 Binding 可能抛出的 Lua 错误和 Native Binding 返回的失败值。创建成功后，第一返回值 userdata 被保存进连接 context，第二返回值 challenge 作为本阶段输出；状态从 `hello` 推进到 `proof`。失败时先走 `manager.close(context)`，释放名额和已有 Native 资源，再返回稳定的 `HANDSHAKE_CRYPTO`。
+`pcall` 同时接住 Binding 可能抛出的 Lua 错误和 Native Binding 返回的失败值。创建成功后，第一返回值 userdata 被保存进连接 context，第二返回值 challenge 作为本阶段输出；状态从 `hello` 推进到 `proof`。失败时先走 `M.close(context)`，释放名额和已有 Native 资源，再返回稳定的 `HANDSHAKE_CRYPTO`。
 
-连接关闭时的释放由同一个 manager 完成：
+连接关闭时的释放由同一个 握手模块 完成：
 
 ```lua
 context.phase = "closed"
@@ -1070,15 +1068,13 @@ if context.crypto then
 end
 ```
 
-仅 `hello/proof/confirm` 阶段占有 pending；关闭时转入 `closed`，重复关闭按终态直接返回。Native userdata 存在时调用它的 `close()` 并清空引用。这样，名额由 manager 持有和归还，密钥由 Native userdata 持有和擦除，Gateway 则继续拥有 Socket fd 与连接记录。三个 owner 不应混为一个。
+仅 `hello/proof/confirm` 阶段占有 pending；关闭时转入 `closed`，重复关闭按终态直接返回。Native userdata 存在时调用它的 `close()` 并清空引用。这样，名额由握手模块持有和归还，密钥由 Native userdata 持有和擦除，Gateway 则继续拥有 Socket fd 与连接记录。三个 owner 不应混为一个。
 
 **【真实源码局部：同一 `start()` / 监听和发布运行状态】**：
 
 ```lua
 module_state.gateway_config = gateway_config
 -- Registry 仅由 codec 持有，Gateway 不保存第二个引用。
-module_state.codec = codec
-module_state.handshake = handshake
 module_state.epoch = tostring(skynet.self()) .. ":" .. tostring(skynet.hpc())
 module_state.phase = "starting"
 
@@ -1546,7 +1542,7 @@ Server 日志（位于 `build/gateway-master-course/websocket/server.log`）**�
 **【真实源码】**：
 
 - `gateway/service/gateway/flywow_gateway.lua`：`accept_client(fd,peer)` → `websocket.accept(fd,ws_handler,"ws",peer)` → `ws_handler.handshake`/`ws_handler.message`。
-- `gateway/lualib/handshake.lua`：`new`、`accept`、`receive`、`confirm`、`ready`、`close`。
+- `gateway/lualib/handshake.lua`：`init`、`accept`、`receive`、`confirm`、`ready`、`close`。
 - `gateway/native/gateway_crypto.cpp`：真实 P-256 ECDH、HKDF-SHA256、HMAC-SHA256。
 - `gateway/clients/h5/handshake.mjs`：`HandshakeClient.begin/respond/complete` 和 `connectGateway`。
 - 固定 Skynet `lualib/http/websocket.lua`：`M.accept`、`resolve_accept`、`read_frame`。
@@ -1599,12 +1595,12 @@ end
 
 #### 4.5.2 两张连接索引为什么都存在
 
-进入 `create_connection`（真实路径仍为 `gateway/service/gateway/flywow_gateway.lua`），按顺序做三件事：检查 `client_count` 和 `next_connection_id` 上限、通过 `module_state.handshake.accept()` 占一个握手名额、构造 `connection` 并同时登记两张索引。
+进入 `create_connection`（真实路径仍为 `gateway/service/gateway/flywow_gateway.lua`），按顺序做三件事：检查 `client_count` 和 `next_connection_id` 上限、通过 `handshake_module.accept()` 占一个握手名额、构造 `connection` 并同时登记两张索引。
 
 **【真实源码局部：`create_connection()`，省略容量拒绝与日志分支】**：
 
 ```lua
-local handshake_result = module_state.handshake.accept()
+local handshake_result = handshake_module.accept()
 if not handshake_result.ok then
     return nil
 end
@@ -1674,7 +1670,7 @@ end
 
 #### 4.5.4 Handshake 的状态不是一个 ready 布尔值
 
-**【真实源码：`gateway/lualib/handshake.lua` / `M.new()` 返回的 manager】**。`manager.accept()` 由 `create_connection` 调用；`manager.receive()` 由 `process_handshake` 调用；`manager.confirm()` 由 Gateway 在 SERVER_READY 写成功之后调用；`manager.close()` 在确认 ready 或连接 detach 时释放资源。
+**【真实源码：`gateway/lualib/handshake.lua` / `M.init()` 模块函数】**。`M.accept()` 由 `create_connection` 调用；`M.receive()` 由 `process_handshake` 调用；`M.confirm()` 由 Gateway 在 SERVER_READY 写成功之后调用；`M.close()` 在确认 ready 或连接 detach 时释放资源。
 
 | `context.phase` | 客户端下一条消息     | 状态变更                                     | Native/名额状态                   |
 | --------------- | -------------------- | -------------------------------------------- | --------------------------------- |
@@ -1684,26 +1680,26 @@ end
 | `ready`         | 业务 Envelope        | `ready()` 返回 true                          | 不再持有 Native 密钥              |
 | `closed`        | 无                   | 失败释放/关闭                                | 令牌释放，拒绝继续推进            |
 
-`pending` 是 `handshake.new()` 创建的**manager 闭包局部变量**，不是 `module_state.client_count`：
+pending 是 handshake 模块在当前 Service Lua State 中持有的私有计数。模块加载时为 0；init 只在接受连接前配置依赖，不重置名额。accept 增加名额并创建连接 context；close 在活动阶段释放一次。
 
 - `client_count` 统计已经登记的连接，包括 ready 和未 ready。
 - `pending` 统计仍占用握手名额的连接；握手成功时即释放，连接可能继续在线很久。
 - `phase` 是握手名额的权威状态：`hello/proof/confirm` 占用 pending，`ready/closed` 不占用；转入终态后重复 close 不会重复扣减。
 
-**【真实源码局部：`gateway/lualib/handshake.lua` / `manager.receive()`，HELLO 分支】**：
+**【真实源码局部：`gateway/lualib/handshake.lua` / `M.receive()`，HELLO 分支】**：
 
 ```lua
 if context.phase == "hello" then
     if bytes:byte(1) ~= 1 or bytes:byte(2) ~= 1 then
-        manager.close(context)
+        M.close(context)
         return flywow_result.failure(
             "HANDSHAKE_VERSION",
             "unsupported handshake message type or version"
         )
     end
     local call_succeeded, native_or_error, challenge_or_error =
-        pcall(crypto.new, bytes)
-    -- 失败后 manager.close(context)，返回 HANDSHAKE_CRYPTO。
+        pcall(crypto.create_context, bytes)
+    -- 失败后 M.close(context)，返回 HANDSHAKE_CRYPTO。
     -- 成功分支如下：
     context.crypto = native_or_error
     context.phase = "proof"
@@ -1715,9 +1711,9 @@ if context.phase == "hello" then
 end
 ```
 
-这里的 `crypto.new` 对应 Native 的公开 `new(hello)`，**不是 Lua 的 `handshake.new()`**。它返回 userdata 加 99 字节 challenge。失败时 Lua 状态机转换为 `FlyWowResult`，不会把 OpenSSL 异常作为业务响应抛给客户端。
+这里的 `crypto.create_context` 对应 Native 的公开 `create_context(hello)`，**不是 Lua 的 `handshake.init()`**。它返回 userdata 加 99 字节 challenge。失败时 Lua 状态机转换为 `FlyWowResult`，不会把 OpenSSL 异常作为业务响应抛给客户端。
 
-**【真实源码局部：`gateway/lualib/handshake.lua` / `manager.receive()`，PROOF 分支与 `confirm()`】**：
+**【真实源码局部：`gateway/lualib/handshake.lua` / `M.receive()`，PROOF 分支与 `confirm()`】**：
 
 ```lua
 context.phase = "confirm"
@@ -1728,7 +1724,7 @@ return flywow_result.success(
 })
 ```
 
-上面发生在 `context.crypto.verify(...)` 验证成功之后。`manager.confirm()` 必须在确认仍为 `confirm`、未过期后才设置 `context.phase="ready"` 并调用 `manager.close(context)`，归还名额。这个顺序对应真实网络行为：**客户端看到的 SERVER_READY 证明已经被本地发送接口接受，Gateway 才允许业务包进入**。
+上面发生在 `context.crypto.verify(...)` 验证成功之后。`M.confirm()` 必须在确认仍为 `confirm`、未过期后先调用 `M.close(context)` 释放名额，再设置 `context.phase="ready"`，归还名额。这个顺序对应真实网络行为：**客户端看到的 SERVER_READY 证明已经被本地发送接口接受，Gateway 才允许业务包进入**。
 
 #### 4.5.5 Gateway 是怎样决定何时调用 `confirm()` 的
 
@@ -1737,7 +1733,7 @@ return flywow_result.success(
 **【真实源码局部：`gateway/service/gateway/flywow_gateway.lua` / `process_handshake()`】**：
 
 ```lua
-local handshake_result = module_state.handshake.receive(
+local handshake_result = handshake_module.receive(
 {
     context = connection.handshake,
     bytes   = bytes,
@@ -1751,7 +1747,7 @@ local response_bytes = handshake_output.response_bytes
 -- 若写入失败或连接已摘除，返回 HANDSHAKE_WRITE_FAILED。
 connection.last_message = skynet.now()
 if handshake_output.needs_confirmation then
-    local confirm_result = module_state.handshake.confirm(connection.handshake)
+    local confirm_result = handshake_module.confirm(connection.handshake)
     if not confirm_result.ok then
         return confirm_result
     end
@@ -1765,7 +1761,7 @@ return flywow_result.success()
 
 #### 4.5.6 Native 层究竟保存了什么，又什么时候释放
 
-打开 `gateway/native/gateway_crypto.cpp`。入口是 `luaopen_flywow_gateway_crypto()`，它向 Lua 注册模块 `new` 以及 userdata 的 `verify/close`；不是直接向 Skynet 注册 Service。Lua 调用 `crypto.new(bytes)` 进入 C++ `createCryptoContext(lua_State*)`，成功时创建独占的 `CryptoContext`，调用 `buildChallenge()`。
+打开 `gateway/native/gateway_crypto.cpp`。入口是 `luaopen_flywow_gateway_crypto()`，它向 Lua 注册模块 `create_context` 以及 userdata 的 `verify/close`；不是直接向 Skynet 注册 Service。Lua 调用 `crypto.create_context(bytes)` 进入 C++ `create_context(lua_State*)`，成功时创建独占的 `CryptoContext`，调用 `buildChallenge()`。
 
 **【真实源码局部：`gateway/native/gateway_crypto.cpp`】**：
 
@@ -1794,9 +1790,9 @@ READY    = 04 + HMAC-SHA256(K,"server-ready" || T)
 
 这段是**协议推导式，不是 C++ 源码**。`Z` 的作用域使用 RAII `SharedSecret` 析构时擦除；`server_key` 由 `buildChallenge` 的局部 RAII owner 持有，正常返回和异常退出都会释放，不保存在 userdata 中。此后 userdata 保存 `proof_key`、`transcript_hash` 和 `active=true`，等待客户端 proof。
 
-客户端发回 PROOF 后，C++ `verify()` 用 `CRYPTO_memcmp` 比较客户端 HMAC，构造 READY，调用 `clearCryptoContext()` 擦除 `proof_key`/`transcript_hash` 并设置 `active=false`。`manager.confirm()` 再调用 `manager.close(context)`，将 userdata 引用清空、释放握手名额。
+客户端发回 PROOF 后，C++ `verify()` 用 `CRYPTO_memcmp` 比较客户端 HMAC，构造 READY，调用 `clearCryptoContext()` 擦除 `proof_key`/`transcript_hash` 并设置 `active=false`。`M.confirm()` 再调用 `M.close(context)`，将 userdata 引用清空、释放握手名额。
 
-**正常与失败路径的清理必须区分**：正常情况下密钥在 `verify()` 成功时已经擦除，`confirm()` 负责转 ready 和释放 Lua 持有关系；非法公钥、错误 proof 或超时时，`manager.close()`/Native close 走失败清理。C++ userdata 的内存最终由 Lua GC 回收，`__gc` 的重复清理是幂等的；不能把“清理内部密钥”误说成“立即释放 Lua userdata 内存”。
+**正常与失败路径的清理必须区分**：正常情况下密钥在 `verify()` 成功时已经擦除，`confirm()` 负责转 ready 和释放 Lua 持有关系；非法公钥、错误 proof 或超时时，`M.close()`/Native close 走失败清理。C++ userdata 的内存最终由 Lua GC 回收，`__gc` 的重复清理是幂等的；不能把“清理内部密钥”误说成“立即释放 Lua userdata 内存”。
 
 最后返回客户端：`gateway/clients/h5/handshake.mjs` 的 `HandshakeClient.complete()` 用 Web Crypto 验证服务器证明，成功后把自身阶段切 `ready` 并清掉密钥引用；`connectGateway()` Promise 随后 resolve。**服务端 ready 与客户端 SDK ready 是两次不同的确认动作**。
 
@@ -1815,7 +1811,7 @@ bash scripts/build_flywow.sh /path/to/skynet lua_binding
 保持现有客户端代码不变，先执行正常 WS 流程，再使用第六阶段实验 A 的错误 HELLO：
 
 1. 正常流程中，观察 `FLYWOW_GATEWAY_OPEN`、`FLYWOW_GATEWAY_READY` 及第一条 `COURSE_ENTER` 的先后关系。前者的 `READY` 在真实日志里有 Gateway 监听 ready 与连接 ready 两类上下文，必须读出具体字段与时间，不应只按字符串混为一类。
-2. 错误 HELLO `Uint8Array([99])`：它只有 1 字节，会在 `manager.receive` 的**长度检查**阶段得到 `HANDSHAKE_FRAME`，不会执行 `crypto.new`；若要验证 `HANDSHAKE_VERSION`，应先发送**67 字节**、但类型/版本不符的消息。这两个实验的触发位置完全不同。
+2. 错误 HELLO `Uint8Array([99])`：它只有 1 字节，会在 `M.receive` 的**长度检查**阶段得到 `HANDSHAKE_FRAME`，不会执行 `crypto.create_context`；若要验证 `HANDSHAKE_VERSION`，应先发送**67 字节**、但类型/版本不符的消息。这两个实验的触发位置完全不同。
 3. 根据错误路径画出 `accept → handshake.accept → receive失败 → detach → handshake.close → transport close`，检查从未进入 WorldService 的请求也会触发 `gateway_disconnect`。
 
 **返回主线**：A 握手后 `ws_handler.message` 返回 Skynet 的 WS 读循环，下一条完整 binary message 才进入 `dispatch_payload`。下面继续从这条入站业务包追踪到 WorldService。
@@ -1829,9 +1825,9 @@ bash scripts/build_flywow.sh /path/to/skynet lua_binding
 **【真实源码】** `gateway/service/gateway/flywow_gateway.lua`：`ws_handler.message` → `dispatch_payload(connection,payload)`：
 
 1. `#payload` 检查 `max_frame_bytes`；不是 Skynet 接收内存的硬上限。
-2. `module_state.codec.decode_envelope(payload)` → `gateway/lualib/codec.lua` 中 `pb.decode(Envelope,bytes)`；得到版本 4、command 1001、三字节 body。
+2. `codec_module.decode_envelope(payload)` → `gateway/lualib/codec.lua` 中 `pb.decode(Envelope,bytes)`；得到版本 4、command 1001、三字节 body。
 3. Codec 内部的 `registry.commands[1001]` → 直接查询生成表；得到 `.flywow.gateway.course.EnterWorldRequest`。
-4. `module_state.codec.decode_request(command_id,body)` → `pb.decode`，获得 `{player_id=1001}`。
+4. `codec_module.decode_request(command_id,body)` → `pb.decode`，获得 `{player_id=1001}`。
 5. 检查连接级/实例级每秒速率，刷新成功接纳的业务消息活动时间。
 6. 构造 `inbound_request = {gateway_epoch,connection_id,command_id,data}`，以 `skynet.send(handler_service,"lua","send_data",inbound_request)` 异步投递。
 
@@ -1880,7 +1876,7 @@ Gateway 接收新的消息 <-------------------------+
 当前执行上下文仍为 **Gateway Service** 的 WebSocket 会话协程，文件 `gateway/service/gateway/flywow_gateway.lua`，函数 `ws_handler.message(id,payload,"binary")`。它取 `module_state.connections_by_fd[id]`，再判断：
 
 ```lua
-if module_state.handshake.ready(connection.handshake) then
+if handshake_module.ready(connection.handshake) then
     frame_result = dispatch_payload(connection, payload)
 else
     frame_result = process_handshake(connection, payload)
@@ -1899,7 +1895,7 @@ if connection.closed or #payload == 0 or
     -- 记录 FRAME_LIMIT 并返回失败结果，原文件包含完整 log_event 构造。
 end
 
-local envelope_result = module_state.codec.decode_envelope(payload)
+local envelope_result = codec_module.decode_envelope(payload)
 if not envelope_result.ok then
     -- 返回 ENVELOPE_DECODE，details.cause_code 保留 Codec 错误类别。
 end
@@ -1918,11 +1914,11 @@ end
 **【真实源码局部：同一 `dispatch_payload()`】**：
 
 ```lua
-if not module_state.codec.has_command(envelope.command) then
+if not codec_module.has_command(envelope.command) then
     -- 记录 UNKNOWN_COMMAND 并返回失败 Result。
 end
 
-local request_result = module_state.codec.decode_request(
+local request_result = codec_module.decode_request(
     envelope.command, envelope.body
 )
 if not request_result.ok then
@@ -2008,10 +2004,10 @@ if not module_state.gateway_config or type(outbound_message) ~= "table" or
     return
 end
 
-if not module_state.codec.has_response(outbound_message.command_id) then
+if not codec_module.has_response(outbound_message.command_id) then
     return
 end
-local encode_result = module_state.codec.encode_response(
+local encode_result = codec_module.encode_response(
     outbound_message.command_id,
     module_state.gateway_config.protocol_version,
     outbound_message.data
@@ -2026,7 +2022,7 @@ local encode_result = module_state.codec.encode_response(
 if outbound_message.connection_id == 0 then
     for _, connection in pairs(module_state.connections) do
         if not connection.closed and
-            module_state.handshake.ready(connection.handshake) then
+            handshake_module.ready(connection.handshake) then
             write_connection(connection, encoded)
         end
     end
@@ -2035,7 +2031,7 @@ end
 
 local connection = module_state.connections[outbound_message.connection_id]
 if not connection or connection.closed or
-    not module_state.handshake.ready(connection.handshake) then
+    not handshake_module.ready(connection.handshake) then
     return
 end
 write_connection(connection, encoded)
@@ -2188,7 +2184,7 @@ skynet.fork(function()
 end)
 ```
 
-`detach_connection` 是**当前 Gateway Service 内部的同步状态更改**，它先标记 `connection.closed=true`，释放握手 manager 对这条连接的引用，把 `connections[id]` 和 `connections_by_fd[fd]` 都删除，减少 `client_count`，最后异步投递 `gateway_disconnect` 给 WorldService。它本身不做 `socket.close`；出站路径从此立即查不到 B 了。
+`detach_connection` 是**当前 Gateway Service 内部的同步状态更改**，它先标记 `connection.closed=true`，释放握手 握手模块 对这条连接的引用，把 `connections[id]` 和 `connections_by_fd[fd]` 都删除，减少 `client_count`，最后异步投递 `gateway_disconnect` 给 WorldService。它本身不做 `socket.close`；出站路径从此立即查不到 B 了。
 
 **【真实源码局部：同一文件 / `detach_connection()`】**：
 
@@ -2197,7 +2193,7 @@ if connection == nil or connection.closed then
     return false
 end
 connection.closed = true
-module_state.handshake.close(connection.handshake)
+handshake_module.close(connection.handshake)
 module_state.connections[connection.id] = nil
 module_state.connections_by_fd[connection.fd] = nil
 module_state.client_count = module_state.client_count - 1
@@ -2406,8 +2402,8 @@ while not connection.closed and module_state.phase == "running" do
         break
     end
     local size = string.unpack(">I2", header)
-    local ready = module_state.handshake.ready(connection.handshake)
-    if (not ready and size ~= module_state.handshake.expected_size(connection.handshake)) or
+    local ready = handshake_module.ready(connection.handshake)
+    if (not ready and size ~= handshake_module.expected_size(connection.handshake)) or
         (ready and (size < 1 or size > module_state.gateway_config.max_frame_bytes)) then
         -- 记录 FRAME_LIMIT 并 break。
     end
@@ -2589,7 +2585,7 @@ ws.onerror = () => console.log("传输层观察到错误");
 JS
 ```
 
-**执行链**：`http.websocket` 完成 HTTP Upgrade → `ws_handler.message(id, bytes, "binary")` → `process_handshake` → `handshake.receive({context,bytes})`。此时固定 HELLO 必须是 67 字节、类型 1、版本 1；传入的 `[99]` 被握手状态机拒绝，Gateway 摘除连接，`close_transport` 关闭 WS。Handshake manager 释放该连接的 Native/握手名额。
+**执行链**：`http.websocket` 完成 HTTP Upgrade → `ws_handler.message(id, bytes, "binary")` → `process_handshake` → `handshake.receive({context,bytes})`。此时固定 HELLO 必须是 67 字节、类型 1、版本 1；传入的 `[99]` 被握手状态机拒绝，Gateway 摘除连接，`close_transport` 关闭 WS。Handshake 握手模块 释放该连接的 Native/握手名额。
 
 **观察**：客户端连接被关闭；WorldService 的 `on_enter_world` 不应被调用；可能收到 `gateway_disconnect`，但因它没有进入过业务，`state.players` 不存在相应记录，因此在线人数保持 0。用真实日志判断具体失败错误码，不把这里的客户端提示文本冒充框架稳定错误码。
 
@@ -2758,7 +2754,7 @@ while module_state.phase == "running" do
         local limit = connection.read_started
             and module_state.gateway_config.read_timeout_ticks
             or module_state.gateway_config.idle_timeout_ticks
-        if module_state.handshake.expired(connection.handshake) or
+        if handshake_module.expired(connection.handshake) or
             (now - since) % 0x100000000 >= limit then
             expired[#expired + 1] = connection
         end
@@ -2773,7 +2769,7 @@ end
 
 这是原函数完整控制流程的去注释版；逐字段说明应以真实源码为准。两个超时条件不同：
 
-1. `module_state.handshake.expired(context)`：从 `handshake.accept()` 记录的 `context.started` 起算，直到 confirm/close 归还名额之前都是**绝对握手期限**；中间收到 HELLO 并回复 CHALLENGE 也不重置。
+1. `handshake_module.expired(context)`：从 `handshake.accept()` 记录的 `context.started` 起算，直到 confirm/close 归还名额之前都是**绝对握手期限**；中间收到 HELLO 并回复 CHALLENGE 也不重置。
 2. `read_started`/`last_message`：若正在一次 TCP 定长读取或 WS HTTP Upgrade，使用读取起点及 `read_timeout_ticks`；否则使用最近完整消息活动时刻及 `idle_timeout_ticks`。
 
 假设 WebSocket 已在 tick 0 完成应用握手，之后一直没有业务包，`idle_timeout_ticks=50`。在 tick 10、20、30、40 的扫描都还没超时；在 tick 50 才满足 `(50-0) >= 50`，执行 detach 和 transport close。**这是按源码推导的理想化时间线**：实际执行会受到 Skynet 消息调度、计时起点与网络收包时刻影响，不应声称毫秒级精确。
@@ -2893,8 +2889,8 @@ module_state.phase = "stopped"
 | 资源/记录                                | 真实 owner                     | 创建或登记                          | 正常释放入口                                       | 异常释放入口                               |
 | ---------------------------------------- | ------------------------------ | ----------------------------------- | -------------------------------------------------- | ------------------------------------------ |
 | GatewayConnection / 双索引               | Gateway Service `module_state` | `create_connection`                 | `detach_connection`                                | 协议失败/超时/stop 调用 detach             |
-| HandshakeContext / pending 名额          | Gateway 中的 Handshake manager | `manager.accept`                    | `manager.confirm` 归还名额；连接 detach 也 close   | `manager.receive` 失败/过期时 close        |
-| Native CryptoContext userdata 的内部密钥 | 每连接 userdata                | `crypto.new`                        | Native `verify` 清理敏感数据；Lua manager 清除引用 | Native 失败与 `manager.close`/`__gc`       |
+| HandshakeContext / pending 名额          | Gateway 中的 Handshake 握手模块 | `M.accept`                    | `M.confirm` 归还名额；连接 detach 也 close   | `M.receive` 失败/过期时 close        |
+| Native CryptoContext userdata 的内部密钥 | 每连接 userdata                | `crypto.create_context`                        | Native `verify` 清理敏感数据；Lua 握手模块清除引用 | Native 失败与 `M.close`/`__gc`       |
 | Socket pool / WS pool 对象               | 固定 Skynet transport          | `socket.start` / `websocket.accept` | `socket.close` / `websocket.close`                 | 关闭协程/协议 error/stop                   |
 | `state.players[connection_id]`           | WorldService                   | `on_enter_world`                    | `on_disconnect`                                    | 任何 Gateway detach 发出的 disconnect 通知 |
 
@@ -2922,7 +2918,7 @@ module_state.phase = "stopped"
 | -------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `gateway/service/gateway/flywow_gateway.lua` | 启动、接收请求、回包、关闭  | `start/normalize_config/accept_client/run_tcp/read_exact/ws_handler.message/dispatch_payload/deliver_outbound_message/request_close/detach_connection/close_transport/timeout_loop/stop` 的调用顺序 |
 | `gateway/tools/generate_gateway_registry.py` | 第一阶段生成协议表 | 直接输出按数字 command ID 查询的消息类型映射 |
-| `gateway/lualib/codec.lua`                   | 第一条业务请求              | `new/decode_envelope/decode_request/encode_response`：Descriptor 与 pb 编解码                                                                                                                       |
+| `gateway/lualib/codec.lua`                   | 第一条业务请求              | `init/decode_envelope/decode_request/encode_response`：Descriptor 与 pb 编解码                                                                                                                       |
 | `gateway/lualib/handshake.lua`               | 连接握手                    | `accept/receive/confirm/ready/expired/close` 和握手上下文所有权                                                                                                                                     |
 | `gateway/native/gateway_crypto.cpp`          | 握手源码深挖                | P-256、随机 challenge、HKDF/HMAC 和 Native userdata 生命周期                                                                                                                                        |
 | `gateway/clients/h5/handshake.mjs`           | WebSocket、TCP 客户端       | H5 SDK 的 `connectGateway` 与 `HandshakeClient` 的状态、异步密码学流程                                                                                                                              |
@@ -2937,7 +2933,7 @@ module_state.phase = "stopped"
 1. 客户端 A 的 TCP HELLO 长度头已到，body 还差 10 字节。此时 `run_tcp` 停在哪个函数？Socket Driver 再收到 10 字节，Skynet 怎样唤醒哪条协程？
 2. WebSocket HTTP Upgrade 已成功，但 A 的 `HandshakeContext.phase="proof"`。A 此时发 `EnterWorldRequest`，Gateway 会把它交给 WorldService 吗？依据哪个具体分支？
 3. 两名玩家的底层 fd 是 `18` 和 `21`，业务逻辑 ID 是 `1` 和 `2`。为什么 Gateway 既保存 `connections` 又保存 `connections_by_fd`？哪条入口分别读取？
-4. `crypto.new()` 创建的 C++ userdata 与 Lua `HandshakeContext` 是不是同一对象？派生密钥在 proof 验证完毕、Gateway confirm、连接断开这三个时刻分别发生什么？
+4. `crypto.create_context()` 创建的 C++ userdata 与 Lua `HandshakeContext` 是不是同一对象？派生密钥在 proof 验证完毕、Gateway confirm、连接断开这三个时刻分别发生什么？
 5. 同一条 WS 连接只发底层 ping/pong，从不发业务 Envelope，为什么 `idle_timeout_ticks` 仍会触发？`last_message` 实际在哪些代码分支更新？
 6. Gateway 接受第一条 A 请求后执行 `skynet.send(WorldService,...)`。它随后等待的是 WorldService 回包，还是下一个 WS frame？如果 WorldService 迟迟不处理，Gateway 自己保留了哪些 pending 状态？
 7. B 刚 detach，但底层 WS close 正在 yield。WorldService 又发一次旧 B 的单播和 close，哪个路径拒绝？`closed` 和 `close_requested` 的职责分别是什么？

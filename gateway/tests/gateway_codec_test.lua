@@ -65,14 +65,14 @@ end
 local function failed(result, code)
     assert(not result.ok and result.code == code, result.code)
 end
-failed(codec_module.new({ descriptor_path = "/dev/null", registry = false }), "GATEWAY_REGISTRY_INVALID")
-failed(codec_module.new({ descriptor_path = "/dev/null", registry = { envelope_type = "", commands = {} } }),
+failed(codec_module.init({ descriptor_path = "/dev/null", registry = false }), "GATEWAY_REGISTRY_INVALID")
+failed(codec_module.init({ descriptor_path = "/dev/null", registry = { envelope_type = "", commands = {} } }),
     "GATEWAY_REGISTRY_INVALID")
-failed(codec_module.new({ descriptor_path = "/dev/null", registry = registry({}) }),
+failed(codec_module.init({ descriptor_path = "/dev/null", registry = registry({}) }),
     "GATEWAY_REGISTRY_INVALID")
-failed(codec_module.new({ descriptor_path = "/dev/null", registry = registry({ [0] = {} }) }),
+failed(codec_module.init({ descriptor_path = "/dev/null", registry = registry({ [0] = {} }) }),
     "GATEWAY_REGISTRY_INVALID")
-failed(codec_module.new({ descriptor_path = "/dev/null", registry = registry({ [7] = { request_type = "" } }) }),
+failed(codec_module.init({ descriptor_path = "/dev/null", registry = registry({ [7] = { request_type = "" } }) }),
     "GATEWAY_REGISTRY_INVALID")
 local commands =
 {
@@ -84,10 +84,10 @@ available_types[".demo.Envelope"] = true
 available_types[".demo.Request"] = true
 available_types[".demo.Response"] = true
 available_types[".demo.Push"] = true
-local result = codec_module.new({ descriptor_path = "/dev/null", registry = registry(commands) })
+local result = codec_module.init({ descriptor_path = "/dev/null", registry = registry(commands) })
 assert(result.ok, result.message)
-local codec = result.value
-assert(codec.command_count == 3)
+local codec = codec_module
+assert(result.value == 3)
 assert(codec.has_command(7) and codec.has_command(8) and not codec.has_command(10))
 assert(codec.has_response(7) and codec.has_response(8) and not codec.has_response(9))
 assert(codec.decode_envelope("envelope").ok)
@@ -116,5 +116,5 @@ assert(encoded_calls[4].value.body == ".demo.Push")
 failed(codec.encode_response(9, 4, {}), "GATEWAY_RESPONSE_ENCODE_FAILED")
 failed(codec.encode_response(7, 4.5, {}), "GATEWAY_RESPONSE_ENCODE_FAILED")
 local missing = registry({ [7] = { request_type = ".demo.Missing" } })
-failed(codec_module.new({ descriptor_path = "/dev/null", registry = missing }), "GATEWAY_DESCRIPTOR_INVALID")
+failed(codec_module.init({ descriptor_path = "/dev/null", registry = missing }), "GATEWAY_DESCRIPTOR_INVALID")
 print("GATEWAY_CODEC_UNIT_OK")

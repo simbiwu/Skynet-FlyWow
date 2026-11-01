@@ -7,14 +7,14 @@ local dictionary_path = os.tmpname()
 local dictionary_file = assert(io.open(dictionary_path, "wb"))
 dictionary_file:write("外挂\r\nhe\n\nshe\n")
 assert(dictionary_file:close())
-local file_filter, file_error = word_filter.new({file = dictionary_path})
+local file_filter, file_error = word_filter.create_filter({file = dictionary_path})
 os.remove(dictionary_path)
 assert(file_filter and not file_error)
 assert(file_filter:contains("SHE"))
-local missing_filter, missing_error = word_filter.new({file = dictionary_path})
+local missing_filter, missing_error = word_filter.create_filter({file = dictionary_path})
 assert(missing_filter == nil and missing_error == "dictionary_io")
 
-local filter = assert(word_filter.new(
+local filter = assert(word_filter.create_filter(
 {
     keywords = {"外挂", "he", "she", "bad"},
 }))
@@ -47,18 +47,18 @@ value, error_code = filter:find(string.rep("a", 65537))
 assert(value == nil and error_code == "text_limit")
 value, error_code = filter:find(string.rep("bad", 4097))
 assert(value == nil and error_code == "match_limit")
-value, error_code = word_filter.new({keywords = {""}})
+value, error_code = word_filter.create_filter({keywords = {""}})
 assert(value == nil and error_code == "invalid_keyword")
-value, error_code = word_filter.new({keywords = {"ok", "\255"}})
+value, error_code = word_filter.create_filter({keywords = {"ok", "\255"}})
 assert(value == nil and error_code == "invalid_keyword")
-value, error_code = word_filter.new({keywords = {[2] = "gap"}})
+value, error_code = word_filter.create_filter({keywords = {[2] = "gap"}})
 assert(value == nil and error_code == "invalid_keyword")
 value, error_code = filter:replace("bad", "\255")
 assert(value == nil and error_code == "invalid_replacement")
-assert(word_filter.new({keywords = {}}):contains("bad") == false)
+assert(word_filter.create_filter({keywords = {}}):contains("bad") == false)
 
 --- compact 开关只改变输入匹配方式，跨度上限仍按原文 bytes 计算。
-local compact_filter = assert(word_filter.new(
+local compact_filter = assert(word_filter.create_filter(
 {
     keywords = {"外挂"},
     compact  = true,
@@ -68,7 +68,7 @@ assert(compact_filter:contains("外" .. string.rep(" ", 256) .. "挂") == false)
 
 --- 临时创建的过滤对象在失去引用后由 GC 清理。
 for _ = 1, 100 do
-    assert(word_filter.new({keywords = {"bad"}}):contains("BAD"))
+    assert(word_filter.create_filter({keywords = {"bad"}}):contains("BAD"))
 end
 collectgarbage("collect")
 
@@ -77,9 +77,9 @@ local too_many_keywords = {}
 for index = 1, 16385 do
     too_many_keywords[index] = "a"
 end
-value, error_code = word_filter.new({keywords = too_many_keywords})
+value, error_code = word_filter.create_filter({keywords = too_many_keywords})
 assert(value == nil and error_code == "dictionary_limit")
-value, error_code = word_filter.new({keywords = {string.rep("a", 4097)}})
+value, error_code = word_filter.create_filter({keywords = {string.rep("a", 4097)}})
 assert(value == nil and error_code == "dictionary_limit")
 
 --- 重复长词不增加很多节点，但会超过原词库 1 MiB 总字节上限。
@@ -87,7 +87,7 @@ local oversized_dictionary = {}
 for index = 1, 257 do
     oversized_dictionary[index] = string.rep("a", 4096)
 end
-value, error_code = word_filter.new({keywords = oversized_dictionary})
+value, error_code = word_filter.create_filter({keywords = oversized_dictionary})
 assert(value == nil and error_code == "dictionary_limit")
 
 --- 16000 个短后缀复制到长词节点，专门触发后缀输出项上限。
@@ -96,7 +96,7 @@ for index = 1, 16000 do
     dense_suffixes[index] = "a"
 end
 dense_suffixes[16001] = string.rep("a", 1000)
-value, error_code = word_filter.new({keywords = dense_suffixes})
+value, error_code = word_filter.create_filter({keywords = dense_suffixes})
 assert(value == nil and error_code == "dictionary_limit")
 
 --- 不同前缀的长词在 1 MiB 以内，却需要超过 262144 个 trie 节点。
@@ -104,7 +104,7 @@ local many_node_keywords = {}
 for index = 1, 70 do
     many_node_keywords[index] = tostring(index) .. string.rep("x", 4090)
 end
-value, error_code = word_filter.new({keywords = many_node_keywords})
+value, error_code = word_filter.create_filter({keywords = many_node_keywords})
 assert(value == nil and error_code == "dictionary_limit")
 collectgarbage("collect")
 print("FLYWOW_WORD_FILTER_LUA_OK")

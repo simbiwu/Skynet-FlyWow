@@ -12,7 +12,7 @@ local crypto = {}
 -- 替身保持Native对象合同，失败可控；不执行I/O。
 ---@param hello string Gateway 输入的完整 HELLO 字节；替身只用它创建密码对象。
 ---@return userdata, string 测试用 userdata 与固定 SERVER_CHALLENGE 字节。
-function crypto.new(hello)
+function crypto.create_context(hello)
     -- 使用独占文件 userdata 模拟 Native 类型；替身只验证状态机，不执行密码运算。
     local native = assert(io.tmpfile())
     local close_file = native.close
@@ -30,7 +30,7 @@ function crypto.new(hello)
     } })
     return native, string.char(2, 1) .. string.rep("c", 97)
 end
-local manager_result = factory.new(
+local manager_result = factory.init(
 {
     crypto        = crypto,
     now           = function() return now end,
@@ -39,7 +39,7 @@ local manager_result = factory.new(
 }
 )
 assert(manager_result.ok, manager_result.message)
-local manager = manager_result.value
+local manager = factory
 local hello = string.char(1, 1, 4) .. string.rep("a", 64)
 local proof = string.char(3) .. string.rep("p", 32)
 local a_result = manager.accept()

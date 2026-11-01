@@ -197,11 +197,11 @@ extern "C" int luaopen_flywow_word_filter_native(lua_State *state)
         {nullptr, nullptr},
     };
     static const luaL_Reg functions[] = {
-        {"new", &LuaBinding::nativeCallback<create_filter>},
+        {"create_filter", &LuaBinding::nativeCallback<create_filter>},
         {"find", &LuaBinding::nativeCallback<find>},
         {nullptr, nullptr},
     };
-    LuaBinding::registerUserdata<LuaFilter>(state, kFilterMeta, methods);
+    LuaBinding::registerUserdata<LuaFilter>(state, kFilterMeta.c_str(), methods);
     luaL_newlib(state, functions);
     return 1;
 }

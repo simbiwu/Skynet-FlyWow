@@ -1,8 +1,10 @@
 -- 用公开 Lua API 演示内存词库、命中位置及文本替换。
 local skynet = require "skynet"
+--- 创建公开词库并打印查询命中与替换结果；任一 API 错误会由外层 xpcall 作为 Sample 失败报告。
+---@return nil 结果通过 stdout 展示，不返回业务值。
 local function run_word_filter_sample()
     local word_filter = require "flywow_word_filter"
-    local filter, create_error = word_filter.new({keywords = {"外挂", "she"}})
+    local filter, create_error = word_filter.create_filter({keywords = {"外挂", "she"}})
     assert(filter, create_error)
     assert(filter:contains("普通聊天") == false)
     local matches, find_error = filter:find("前外挂后")

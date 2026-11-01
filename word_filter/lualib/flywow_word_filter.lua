@@ -52,7 +52,7 @@ end
 ---@param word_filter_config flywow_word_filter_config 宿主提供的词库来源；从 keywords 数组或 file 路径读取，并按 compact 选项构建 Native 词库。
 ---@return flywow_word_filter? 成功时返回持有只读词库的 Filter 对象。
 ---@return flywow_word_filter_error? 选项、词库、文件或容量不合法时返回稳定错误码。
-function M.new(word_filter_config)
+function M.create_filter(word_filter_config)
     if type(word_filter_config) ~= "table" then
         return nil, "invalid_options"
     end
@@ -117,7 +117,7 @@ function M.new(word_filter_config)
     end
 
     -- Native 成功后由 Filter 持有词库，输入数组不再参与后续查询。
-    local native_handle, error_value = word_filter_native.new(keywords, word_filter_config.compact == true)
+    local native_handle, error_value = word_filter_native.create_filter(keywords, word_filter_config.compact == true)
     if not native_handle then
         return nil, native_error_code(error_value)
     end

@@ -28,8 +28,6 @@ local module_state =
 {
     phase              = "created", -- Service 生命周期；created/starting/running/stopping/stopped。
     gateway_config     = nil,       -- 通过 start 校验后的只读配置；由 start 一次写入，后续运行阶段读取。
-    handshake          = nil,       -- 独立握手manager；Gateway只调用，不解析密码协议。
-    codec              = nil,       -- 当前 Lua State 独占的 descriptor codec。
     listen_fd          = nil,       -- 监听 Socket fd；关闭后清空。
     connections        = {},        -- connection_id -> connection context；只由 Gateway 修改。
     connections_by_fd  = {},        -- fd -> connection context；仅用于 WebSocket 回调反查。
@@ -354,12 +352,12 @@ local function create_connection(fd, peer, transport)
     end
 
     -- 每个连接在登记前先占用握手名额；容量不足时不会把 fd 加入连接索引。
-    local handshake_result = module_state.handshake.accept() -- 为新连接申请握手名额；容量不足时返回稳定错误结果。
+    local handshake_result = handshake_module.accept() -- 为新连接申请握手名额；容量不足时返回稳定错误结果。
     if not handshake_result.ok then
         log_event(
         {
             kind    = "error",
-            code    = handshake_result.code, -- 把握手管理器的稳定拒绝码带入 Gateway 事件。
+            code    = handshake_result.code, -- 把握手模块的稳定拒绝码带入 Gateway 事件。
             message = handshake_result.message, -- 原始诊断只供日志定位，不能作为流程判断。
         }
         )
@@ -420,7 +418,7 @@ local function detach_connection(connection, reason)
 
     -- 先标记并释放本连接握手资源，再移除两个索引和在线计数；重复回调此后会直接返回。
     connection.closed = true
-    module_state.handshake.close(connection.handshake)
+    handshake_module.close(connection.handshake)
     module_state.connections[connection.id] = nil
     module_state.connections_by_fd[connection.fd] = nil
     module_state.client_count = module_state.client_count - 1
@@ -507,7 +505,7 @@ local function dispatch_payload(connection, payload)
     end
 
     -- 先把不可信 Protobuf bytes 解为 Envelope；codec 失败以结果返回，不用 pcall 包内部模块。
-    local envelope_result = module_state.codec.decode_envelope(payload) -- 解码结果；失败时含 codec 错误码与诊断。
+    local envelope_result = codec_module.decode_envelope(payload) -- 解码结果；失败时含 codec 错误码与诊断。
     if not envelope_result.ok then
         log_event(
         {
@@ -542,7 +540,7 @@ local function dispatch_payload(connection, payload)
 
     -- 用 wire 字段 Envelope.command 查 registry；跨 Service 记录再使用 command_id。
     -- 只按生成 registry 中的 command 定义解释 body，不从客户端输入推导消息类型。
-    if not module_state.codec.has_command(envelope.command) then
+    if not codec_module.has_command(envelope.command) then
         log_event(
         {
             kind          = "error",
@@ -560,7 +558,7 @@ local function dispatch_payload(connection, payload)
 
     -- 已找到命令后才解码其 request body；Protobuf 错误在当前网络消息边界转换为稳定结果。
     local request_result =
-        module_state.codec.decode_request(envelope.command, envelope.body) -- 解码后的业务 record 或 codec 错误。
+        codec_module.decode_request(envelope.command, envelope.body) -- 解码后的业务 record 或 codec 错误。
     if not request_result.ok then
         log_event(
         {
@@ -721,12 +719,12 @@ local function deliver_outbound_message(outbound_message)
 
     -- 从 registry 取得该命令的 response 类型，并把业务 table 编码成完整 Envelope。
     -- 消息字段有效后查找响应类型；单向命令没有 response_type，不能用于此入口。
-    if not module_state.codec.has_response(outbound_message.command_id) then
+    if not codec_module.has_response(outbound_message.command_id) then
         return
     end
 
     -- codec 将 schema 或业务记录错误作为结果返回；出站消息入口记录并丢弃失败响应。
-    local encode_result = module_state.codec.encode_response(
+    local encode_result = codec_module.encode_response(
         outbound_message.command_id,
         module_state.gateway_config.protocol_version,
         outbound_message.data
@@ -761,7 +759,7 @@ local function deliver_outbound_message(outbound_message)
     if outbound_message.connection_id == 0 then
         for _, connection in pairs(module_state.connections) do
             if not connection.closed and
-                module_state.handshake.ready(connection.handshake) then
+                handshake_module.ready(connection.handshake) then
                 write_connection(connection, encoded)
             end
         end
@@ -772,7 +770,7 @@ local function deliver_outbound_message(outbound_message)
     -- 单播只查当前连接索引；连接已关闭或握手未完成时不能写入。
     local connection = module_state.connections[outbound_message.connection_id] -- 当前实例拥有的目标连接；广播已在前一分支处理。
     if not connection or connection.closed or
-        not module_state.handshake.ready(connection.handshake) then
+        not handshake_module.ready(connection.handshake) then
         return
     end
 
@@ -847,7 +845,7 @@ end
 ---@param bytes string 一条完整握手消息；不跨调用保存。
 ---@return FlyWowResult<nil> 成功表示响应已写出且所需 ready 状态已提交；失败返回握手或传输错误。
 local function process_handshake(connection, bytes)
-    local handshake_result = module_state.handshake.receive(
+    local handshake_result = handshake_module.receive(
     {
         context = connection.handshake, -- 本连接独占的握手状态；receive 只改这个 context。
         bytes   = bytes, -- 当前完整网络帧；借用到本次同步解码结束，不保存。
@@ -899,7 +897,7 @@ local function process_handshake(connection, bytes)
     connection.last_message = skynet.now()
 
     if handshake_output.needs_confirmation then
-        local confirm_result = module_state.handshake.confirm(connection.handshake)
+        local confirm_result = handshake_module.confirm(connection.handshake)
         if not confirm_result.ok then
             return confirm_result
         end
@@ -981,9 +979,9 @@ local function run_tcp(connection)
 
         --- >I2 表示网络字节序 uint16；先拒绝 0 或超限长度，再按该值读取 body。
         local size = string.unpack(">I2", header) -- 网络序长度前缀给出的帧体字节数，先校验再读取。
-        local ready = module_state.handshake.ready(connection.handshake) -- 决定使用握手固定长度还是业务帧上限校验。
+        local ready = handshake_module.ready(connection.handshake) -- 决定使用握手固定长度还是业务帧上限校验。
 
-        if (not ready and size ~= module_state.handshake.expected_size(connection.handshake)) or
+        if (not ready and size ~= handshake_module.expected_size(connection.handshake)) or
             (ready and (size < 1 or size > module_state.gateway_config.max_frame_bytes)) then
             log_event(
             {
@@ -1052,7 +1050,7 @@ function ws_handler.message(id, payload, opcode)
 
     -- ready 前的 binary message 属于握手；ready 后才按业务 Envelope 解码并投递。
     local frame_result -- 当前握手帧或业务帧的结果；失败时摘除该连接。
-    if module_state.handshake.ready(connection.handshake) then
+    if handshake_module.ready(connection.handshake) then
         frame_result = dispatch_payload(connection, payload)
     else
         frame_result = process_handshake(connection, payload)
@@ -1244,7 +1242,7 @@ local function timeout_loop()
                 and module_state.gateway_config.read_timeout_ticks
                 or module_state.gateway_config.idle_timeout_ticks
 
-            if module_state.handshake.expired(connection.handshake) or
+            if handshake_module.expired(connection.handshake) or
                 (now - since) % 0x100000000 >= limit then
                 expired[#expired + 1] = connection
             end
@@ -1287,7 +1285,7 @@ end
 
 --- 校验启动配置、加载协议 descriptor/registry 并开始监听，最后才发布 running 状态。
 --- handler_service 必须是已注册的本地 Skynet 服务名。配置、文件或 bind 失败返回稳定错误，不宣告就绪。
---- 执行文件 I/O、创建 codec 和监听 Socket，socket.listen 可能 yield；只允许从 created 启动一次。
+--- 执行文件 I/O、初始化协议模块和监听 Socket，socket.listen 可能 yield；只允许从 created 启动一次。
 ---@param startup_config GatewayStartConfig 宿主提交的完整启动配置。
 ---@return FlyWowResult<GatewayStartResult> 成功 value 为实际监听信息；失败返回稳定错误，可能 yield。
 local function start(startup_config)
@@ -1314,7 +1312,7 @@ local function start(startup_config)
 
     -- 命令表加载成功后验证其字段和命令 ID，防止无效协议索引进入运行状态。
     -- 生成表由 codec 独占校验与查询；Gateway 只传递构建产物。
-    local codec_result = codec_module.new(
+    local codec_result = codec_module.init(
         {
             descriptor_path = gateway_config.descriptor_path, -- 宿主生成的 Protobuf descriptor 文件。
             registry        = generated, -- 构建生成的协议表，由 codec 校验并持有。
@@ -1330,8 +1328,8 @@ local function start(startup_config)
         return flywow_result.failure("GATEWAY_CRYPTO_LOAD_FAILED", tostring(crypto))
     end
 
-    -- Native 模块加载成功后建立本 Service 独占的握手管理器和容量限制。
-    local handshake_result = handshake_module.new(
+    -- Native 模块加载成功后初始化本 Service 的握手模块和容量限制。
+    local handshake_result = handshake_module.init(
         {
             crypto        = crypto, -- 执行本连接 ECDH/HMAC 的 Native 模块。
             now           = skynet.now, -- 握手期限使用的 10 ms 时钟。
@@ -1343,13 +1341,9 @@ local function start(startup_config)
         return handshake_result
     end
 
-    -- 所有依赖都通过校验后一次性发布运行对象，再进入异步 listener 阶段。
-    local codec = codec_result.value -- 当前 Lua State 独占的 Protobuf codec。
-    local command_count = codec.command_count -- codec 校验并统计的命令数。
-    local handshake = handshake_result.value -- 管理握手名额与每连接 Native userdata 的状态机。
+    -- 所有依赖都通过校验后发布 Gateway 运行状态，再进入异步 listener 阶段。
+    local command_count = codec_result.value -- 模块初始化时校验并统计的命令数。
     module_state.gateway_config = gateway_config
-    module_state.codec = codec
-    module_state.handshake = handshake
     module_state.epoch = tostring(skynet.self()) .. ":" .. tostring(skynet.hpc())
     module_state.rate_started = skynet.now()
     module_state.rate_count = 0

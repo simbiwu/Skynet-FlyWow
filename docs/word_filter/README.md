@@ -43,7 +43,7 @@ Wrapper flywow_word_filter.lua 加载 flywow_word_filter_native.so。
 
 ~~~lua
 local word_filter = require "flywow_word_filter"
-local filter, err = word_filter.new(
+local filter, err = word_filter.create_filter(
 {
     file    = "config/word_filter.txt",
     compact  = false,

@@ -343,19 +343,15 @@ local function scenario(overrides, expect_start_failure)
     package.loaded["skynet.socket"] = socket
     package.loaded["http.websocket"] = websocket
     package.loaded["test.registry"] = registry
-    package.loaded["codec"] =
-    {
-        new = function() -- 为 Gateway 返回本场景创建的 codec 替身。
-            return flywow_result.success(codec)
-        end,
-    }
+    -- 模块初始化只报告命令数；运行操作直接使用本场景替身模块。
+    codec.init = function() return flywow_result.success(codec.command_count) end
+    package.loaded["codec"] = codec
     package.loaded["flywow_gateway_crypto"] = {}
     package.loaded["handshake"] =
     {
         -- 每个连接使用独立替身上下文；真实密码学握手由 Native 测试覆盖。
-        new = function() -- Gateway 每个连接创建独立握手上下文。
-            local manager =
-            {
+        init = function() return flywow_result.success() end,
+
                 ---@return FlyWowResult<table> 测试握手上下文；调用方负责在连接结束时关闭。
                 accept = function()
                     return flywow_result.success({})
@@ -379,9 +375,6 @@ local function scenario(overrides, expect_start_failure)
                 confirm = function()
                     return flywow_result.success()
                 end,
-            }
-            return flywow_result.success(manager)
-        end,
     }
     dofile(root .. "/gateway/service/gateway/flywow_gateway.lua")
     -- Gateway 不再隐式加载宿主 config.gateway；测试显式传入运行所需配置。
