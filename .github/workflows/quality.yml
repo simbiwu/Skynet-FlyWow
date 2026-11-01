@@ -93,6 +93,10 @@ jobs:
         working-directory: host
         run: bash server/third_party/skynet-flywow/scripts/build_flywow.sh server/third_party/skynet gateway
 
+      - name: 准备固定协议工具源码
+        working-directory: host
+        run: bash server/scripts/linux/bootstrap_protocol_tools.sh
+
       - name: 构建 Lua protobuf 运行时
         working-directory: host
         run: bash server/scripts/linux/build_lua_protobuf.sh
