@@ -1028,7 +1028,7 @@ function M.accept()
     {
         phase   = "hello",
         started = read_tick(),
-        crypto  = nil,
+        crypto_context = nil,
     })
 end
 ```
@@ -1039,7 +1039,7 @@ pending 是 handshake 模块在当前 Service Lua State 中持有的私有计数
 
 ```lua
 local call_succeeded, native_or_error, challenge_or_error =
-    pcall(crypto.create_context, bytes)
+    pcall(crypto_module.create_context, bytes)
 if not call_succeeded or native_or_error == nil or
     type(challenge_or_error) ~= "string" then
     M.close(context)
@@ -1055,7 +1055,7 @@ if not call_succeeded or native_or_error == nil or
     )
 end
 
-context.crypto = native_or_error
+context.crypto_context = native_or_error
 context.phase = "proof"
 return flywow_result.success(
 {
@@ -1071,9 +1071,9 @@ return flywow_result.success(
 ```lua
 context.phase = "closed"
 pending = pending - 1
-if context.crypto then
-    context.crypto:close()
-    context.crypto = nil
+if context.crypto_context then
+    context.crypto_context:close()
+    context.crypto_context = nil
 end
 ```
 
@@ -1707,10 +1707,10 @@ if context.phase == "hello" then
         )
     end
     local call_succeeded, native_or_error, challenge_or_error =
-        pcall(crypto.create_context, bytes)
+        pcall(crypto_module.create_context, bytes)
     -- 失败后 M.close(context)，返回 HANDSHAKE_CRYPTO。
     -- 成功分支如下：
-    context.crypto = native_or_error
+    context.crypto_context = native_or_error
     context.phase = "proof"
     return flywow_result.success(
     {
@@ -1733,7 +1733,7 @@ return flywow_result.success(
 })
 ```
 
-上面发生在 `context.crypto.verify(...)` 验证成功之后。`M.confirm()` 必须在确认仍为 `confirm`、未过期后先调用 `M.close(context)` 释放名额，再设置 `context.phase="ready"`，归还名额。这个顺序对应真实网络行为：**客户端看到的 SERVER_READY 证明已经被本地发送接口接受，Gateway 才允许业务包进入**。
+上面发生在 `context.crypto_context.verify(...)` 验证成功之后。`M.confirm()` 必须在确认仍为 `confirm`、未过期后先调用 `M.close(context)` 释放名额，再设置 `context.phase="ready"`，归还名额。这个顺序对应真实网络行为：**客户端看到的 SERVER_READY 证明已经被本地发送接口接受，Gateway 才允许业务包进入**。
 
 #### 4.5.5 Gateway 是怎样决定何时调用 `confirm()` 的
 

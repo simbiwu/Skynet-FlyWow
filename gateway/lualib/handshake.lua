@@ -1,19 +1,20 @@
 --- 职责：管理 Gateway 连接的 P-256 挑战握手状态、并发名额和绝对期限。
 --- 边界：FlyWow Gateway Runtime Module；不写 Socket、不创建 Service/协程、不处理业务消息。
---- 生命周期：模块在当前 Service 内独占 pending 计数；每条连接 context 持有一个名额和临时 Native userdata。
+--- 生命周期：模块在当前 Service 内独占 pending 计数；Gateway connection record 为每条连接保存 HandshakeContext 表，本模块通过该表追踪握手阶段并引用对应 Native 密码 userdata。
 --- 失败：可预期失败返回 FlyWowResult；Native Lua Binding 的 nil/error record 在本模块转换为稳定结果。
 local flywow_result = require "flywow_result"
 local flywow_common = require "flywow_common"
 
 local M = {}
-local crypto, read_tick -- 当前 Service 注入的 Native 接口与时钟。
+local crypto_module, read_tick -- 当前 Service 注入的 Native 模块表与时钟。
 local max_pending, timeout_ms -- 当前 Service 的握手容量及毫秒期限。
 local pending = 0 -- 当前 Service 占用的握手名额；accept 增加，close 释放。
 
 ---@class HandshakeContext
+--- Gateway connection record 为单条连接保存的握手状态表。
 ---@field phase "hello"|"proof"|"confirm"|"ready"|"closed" 当前握手阶段。
 ---@field started integer 绝对起始 tick；消息不会刷新总期限。
----@field crypto userdata|nil Native userdata；私钥和 secret 不进入 Lua 字符串。
+---@field crypto_context userdata|nil M.receive 在 HELLO 成功后保存的 Native userdata；它持有 proof key 和 transcript 摘要，M.close 负责关闭并清空。
 
 ---@class HandshakeOutput
 ---@field response_bytes string 当前阶段需写回客户端的完整握手消息。
@@ -31,11 +32,12 @@ function M.init(handshake_config)
     end
 
     -- 配置表形状有效后读取各依赖；下面验证 Native 接口、时钟和资源边界。
-    local candidate_crypto = handshake_config.crypto -- Gateway 注入的 Native 密码接口，提供 create_context 与 userdata verify/close。
+    local candidate_crypto_module = handshake_config.crypto -- Gateway 注入的 Native 模块表；创建连接 userdata 并提供 verify/close。
     local candidate_read_tick = handshake_config.now -- Gateway 注入的 10ms tick 时钟；每次读取当前值。
     local candidate_max_pending = handshake_config.max_pending -- 本 Service 可同时持有的握手上下文数量上限。
     local candidate_timeout_ms = handshake_config.timeout_ms -- 从 accept 起算的握手总期限，单位为毫秒。
-    if type(candidate_crypto) ~= "table" or type(candidate_crypto.create_context) ~= "function" or
+    if type(candidate_crypto_module) ~= "table" or
+        type(candidate_crypto_module.create_context) ~= "function" or
         type(candidate_read_tick) ~= "function" then
         return flywow_result.failure(
             "HANDSHAKE_CONFIG_INVALID",
@@ -57,7 +59,7 @@ function M.init(handshake_config)
     end
 
     -- 依赖全部通过校验后发布配置；Gateway 只在接受连接前初始化，不重置活动名额。
-    crypto, read_tick = candidate_crypto, candidate_read_tick
+    crypto_module, read_tick = candidate_crypto_module, candidate_read_tick
     max_pending, timeout_ms = candidate_max_pending, candidate_timeout_ms
     return flywow_result.success()
 end
@@ -73,9 +75,9 @@ function M.close(context)
     -- 只有活动阶段占用名额；先转 closed，重复 close 即由阶段拒绝二次释放。
     context.phase = "closed"
     pending = pending - 1
-    if context.crypto then
-        context.crypto:close()
-        context.crypto = nil
+    if context.crypto_context then
+        context.crypto_context:close()
+        context.crypto_context = nil
     end
 
 end
@@ -96,7 +98,7 @@ function M.accept()
     {
         phase   = "hello", -- hello/proof/confirm 阶段占用 pending；终态不占名额。
         started = read_tick(), -- 握手绝对起点；后续消息不能刷新期限。
-        crypto  = nil, -- Native userdata 在验证 HELLO 后创建，跨调用保存证明密钥和 transcript 摘要；私钥由 challenge 构建函数局部持有。
+        crypto_context = nil, -- 收到合法 HELLO 后创建的 Native userdata；跨调用保存证明密钥和 transcript 摘要，私钥由 challenge 构建函数局部持有。
     })
 end
 
@@ -184,7 +186,7 @@ function M.receive(handshake_input)
 
         -- Binding 可能抛 Lua 错误，也可能返回 nil/error record；两种形式在此统一处理。
         local call_succeeded, native_or_error, challenge_or_error =
-            pcall(crypto.create_context, bytes)
+            pcall(crypto_module.create_context, bytes)
         if not call_succeeded or native_or_error == nil or
             type(challenge_or_error) ~= "string" then
             M.close(context)
@@ -202,7 +204,7 @@ function M.receive(handshake_input)
         end
 
         -- Native 成功后把 userdata 交给连接 context，再推进到 proof 阶段。
-        context.crypto = native_or_error
+        context.crypto_context = native_or_error
         context.phase = "proof"
         return flywow_result.success(
         {
@@ -214,7 +216,7 @@ function M.receive(handshake_input)
     -- proof 阶段验证客户端 HMAC；只有 SERVER_READY 写出后才允许进入 ready。
     -- HELLO 响应返回后，下一条合法帧必须是 CLIENT_PROOF。
     if context.phase == "proof" then
-        if type(context.crypto) ~= "userdata" then
+        if type(context.crypto_context) ~= "userdata" then
             M.close(context)
             return flywow_result.failure(
                 "HANDSHAKE_STATE",
@@ -224,7 +226,8 @@ function M.receive(handshake_input)
 
         -- 验证失败会清理 Native key；保留 Native 错误码供诊断。
         local call_succeeded, ready_or_error, native_error =
-            pcall(context.crypto.verify, context.crypto, bytes)
+            pcall(
+                context.crypto_context.verify, context.crypto_context, bytes)
         if not call_succeeded or ready_or_error == nil or type(ready_or_error) ~= "string" then
             M.close(context)
             local failure = call_succeeded and native_error or ready_or_error -- Native nil/error record 或 Binding 抛出的异常。
