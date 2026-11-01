@@ -1,4 +1,4 @@
-// 职责：table 引用、遍历和元表操作；每次操作自动恢复临时栈。
+// 职责：管理 table registry 引用并验证稠密数组；每次操作恢复临时栈。
 #include "lua_table.h"
 #include <algorithm>
 
@@ -62,55 +62,6 @@ void LuaTable::push() const
     lua_rawgeti(binding_->state_, LUA_REGISTRYINDEX, reference_);
 }
 
-// 同步遍历只保留本轮 key/value；visitor 异常由 StackRestore 恢复栈后向外传播。
-bool LuaTable::forEach(const std::function<bool(const LuaValue &, const LuaValue &)> &visitor) const
-{
-    if (!valid())
-        return false;
-    if (!visitor)
-    {
-        binding_->setError("INVALID_ARGUMENT", "table visitor must not be empty");
-        return false;
-    }
-    detail::StackRestore stack(binding_->state_);
-    push();
-    const int table_index = lua_gettop(binding_->state_);
-    detail::ensureStack(binding_->state_, 2);
-    lua_pushnil(binding_->state_);
-    // visitor 合同禁止修改源表；保留 lua_next 返回的原 key，不把数字 key 原位转为字符串。
-    while (lua_next(binding_->state_, table_index))
-    {
-        const int           iteration_top = lua_gettop(binding_->state_);
-        const std::uint64_t revision      = binding_->error_revision_;
-        const LuaValue      key(binding_, iteration_top - 1);
-        const LuaValue      value(binding_, iteration_top);
-        if (!visitor(key, value))
-        {
-            if (revision == binding_->error_revision_)
-                binding_->setError("INTERNAL_ERROR",
-                                   "table visitor failed without recording error");
-            return false;
-        }
-        lua_settop(binding_->state_, iteration_top);
-        lua_pop(binding_->state_, 1);
-    }
-    return true;
-}
-
-bool LuaTable::arrayLength(std::size_t &output) const
-{
-    if (!valid())
-    {
-        return false;
-    }
-    detail::StackRestore stack(binding_->state_);
-    push();
-    // 不改变 [S, table]，不调用 __len；返回数组边界，不证明数组无空洞。
-    // 稀疏表可能有多个合法边界；出口由保护器移除临时 table，恢复 [S]。
-    output = lua_rawlen(binding_->state_, -1);
-    return true;
-}
-
 bool LuaTable::denseArrayLength(std::size_t &output) const
 {
     if (!valid())
@@ -152,105 +103,6 @@ bool LuaTable::denseArrayLength(std::size_t &output) const
     }
     output = entries; // 空表 max_index/entries 均为 0，是否允许空由业务决定。
     return true;
-}
-
-bool LuaTable::setMetatable(const LuaTable &meta)
-{
-    if (!valid())
-        return false;
-    if (!meta.valid() || meta.binding_ != binding_)
-    {
-        binding_->setError("INVALID_ARGUMENT", "table must belong to this Binding callback");
-        return false;
-    }
-    detail::StackRestore stack(binding_->state_);
-    struct Arguments
-    {
-        int target; ///< 目标表的 registry 引用编号。
-        int meta;   ///< 要设置的元表 registry 引用编号。
-    } args{reference_, meta.reference_};
-    const bool ok = detail::protectedCall(
-        binding_->state_,
-        [](lua_State *state) noexcept -> int
-        {
-            auto *data = static_cast<Arguments *>(lua_touserdata(state, 1));
-            lua_rawgeti(state, LUA_REGISTRYINDEX, data->target);
-            lua_rawgeti(state, LUA_REGISTRYINDEX, data->meta);
-            lua_setmetatable(state, -2);
-            return 0;
-        },
-        &args, 0, 0);
-    return binding_->completeCall(ok);
-}
-
-bool LuaTable::readMetatable(LuaTable &output) const
-{
-    if (!valid())
-        return false;
-    detail::StackRestore stack(binding_->state_);
-    struct Arguments
-    {
-        int         table;                 ///< 本次操作的目标表句柄；registry 编号不代表栈位置。
-        int         reference = LUA_NOREF; ///< 成功时建立的 registry 引用；外层接管或释放。
-        const char *failure   = nullptr;   ///< 失败时由原生操作写入的常量原因；外层随后记录诊断。
-    } args{reference_};
-    const bool ok = detail::protectedCall(
-        binding_->state_,
-        [](lua_State *state) noexcept -> int
-        {
-            auto *data = static_cast<Arguments *>(lua_touserdata(state, 1));
-            lua_rawgeti(state, LUA_REGISTRYINDEX, data->table);
-            if (!lua_getmetatable(state, -1))
-            {
-                data->failure = "table has no metatable";
-                return 0;
-            }
-            data->reference = luaL_ref(state, LUA_REGISTRYINDEX);
-            return 0;
-        },
-        &args, 0, 0);
-    if (!binding_->completeCall(ok, args.failure))
-        return false;
-    output = LuaTable(binding_, args.reference);
-    return true;
-}
-
-LuaType LuaValue::type() const
-{
-    // 查看本轮固定槽，不压栈或转换原 key，保证后续 lua_next 可以继续。
-    switch (lua_type(binding_->state_, index_))
-    {
-    case LUA_TBOOLEAN:
-        return LuaType::kBoolean;
-    case LUA_TNUMBER:
-        return LuaType::kNumber;
-    case LUA_TSTRING:
-        return LuaType::kString;
-    case LUA_TTABLE:
-        return LuaType::kTable;
-    case LUA_TFUNCTION:
-        return LuaType::kFunction;
-    case LUA_TUSERDATA:
-        return LuaType::kUserdata;
-    case LUA_TLIGHTUSERDATA:
-        return LuaType::kLightUserdata;
-    case LUA_TTHREAD:
-        return LuaType::kThread;
-    default:
-        return LuaType::kNil;
-    }
-}
-bool LuaValue::isNil() const
-{
-    return lua_isnil(binding_->state_, index_);
-}
-bool LuaValue::readTable(LuaTable &output) const
-{
-    return binding_->readTableAt(index_, output);
-}
-bool LuaValue::readTruth(bool &output) const
-{
-    return binding_->readTruthAt(index_, output);
 }
 
 } // namespace flywow_lua_binding

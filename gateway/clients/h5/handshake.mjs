@@ -143,7 +143,6 @@ export function connectGateway(url, { onmessage, timeoutMs = 10000 } = {})
         const socket = new WebSocket(url); // connectGateway 创建并独占关闭的传输连接。
         socket.binaryType = "arraybuffer";
         let chain = Promise.resolve(); // 串行化异步握手与消息处理，保持收到消息的顺序。
-        let ready = false; // complete 成功后才允许把后续消息交给业务回调。
         // 统一失败路径只拒绝一次Promise；握手状态关闭阻止异步结果复活。
         const fail = error =>
         {
@@ -164,7 +163,7 @@ export function connectGateway(url, { onmessage, timeoutMs = 10000 } = {})
                 if (handshake.phase === "closed") return;
                 if (!(event.data instanceof ArrayBuffer)) throw new Error("BINARY_REQUIRED");
                 const bytes = new Uint8Array(event.data); // 当前完整 WebSocket binary message 的只读视图。
-                if (ready)
+                if (handshake.phase === "ready")
                 {
                     onmessage?.(bytes);
                     return;
@@ -174,7 +173,6 @@ export function connectGateway(url, { onmessage, timeoutMs = 10000 } = {})
                 {
                     await handshake.complete(bytes);
                     clearTimeout(timer);
-                    ready = true;
                     resolve(
                     {
                         // 原有Envelope bytes直接发送，SDK已完成握手；不泄露原始Socket。

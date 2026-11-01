@@ -949,7 +949,7 @@ int status(lua_State *state)
     return binding.returnValues(path->path.status());
 }
 
-// 在当前 State 注册一次类型与方法；方法表和 metatable 都是普通 LuaTable。
+// 在当前 State 注册一次类型与方法；由静态注册接口建立受托管析构保护的 metatable。
 void registerPath(lua_State *state)
 {
     static const luaL_Reg methods[] = {
@@ -959,7 +959,7 @@ void registerPath(lua_State *state)
         {"length_mm", &LuaBinding::nativeCallback<length_mm>},
         {nullptr, nullptr},
     };
-    LuaBinding::registerUserdata<LuaPath>(state, kPathMeta, methods);
+    LuaBinding::registerUserdata<LuaPath>(state, kPathMeta.c_str(), methods);
 }
 
 // 空中入口全部使用具名 record；这里只转换合同，不维护第二套 Context/Path 类型。
@@ -1235,7 +1235,7 @@ void registerContext(lua_State *state)
         {"close", &LuaBinding::nativeCallback<close>},
         {nullptr, nullptr},
     };
-    LuaBinding::registerUserdata<LuaNavigationContext>(state, kContextMeta, methods);
+    LuaBinding::registerUserdata<LuaNavigationContext>(state, kContextMeta.c_str(), methods);
 }
 
 // Registry 是进程级只读地图集合；可变 context/scratch 不共享。

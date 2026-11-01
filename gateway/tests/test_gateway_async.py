@@ -10,6 +10,17 @@ import unittest
 
 
 class GatewayAsyncTests(unittest.TestCase):
+    # Codec 独占 Registry 的结构、类型和查询合同；使用可控 pb 替身，不启动 Gateway。
+    def test_codec_registry_contract(self):
+        lua = os.environ.get("SKYNET_LUA")
+        if not lua:
+            self.skipTest("需要显式设置 SKYNET_LUA 为 pinned Skynet 的 Lua")
+        root = Path(__file__).resolve().parents[2]
+        result = subprocess.run([lua, str(root / "gateway/tests/gateway_codec_test.lua"), str(root)],
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("GATEWAY_CODEC_UNIT_OK", result.stdout)
+
     # 使用宿主固定版本解释器；必须显式注入，不猜测开发机路径。
     def test_async_contract(self):
         lua = os.environ.get("SKYNET_LUA")

@@ -16,8 +16,6 @@ extern "C"
 
 using flywow_lua_binding::LuaBinding;
 using flywow_lua_binding::LuaTable;
-using flywow_lua_binding::LuaType;
-using flywow_lua_binding::LuaValue;
 
 namespace
 {
@@ -71,7 +69,6 @@ int Tiny::destroyed = 0;
 constexpr const char *kTracked    = "flywow_binding_test.Tracked";
 constexpr const char *kTiny       = "flywow_binding_test.Tiny";
 constexpr const char *kStaticTiny = "flywow_binding_test.StaticTiny";
-constexpr const char *kDuplicate  = "flywow_binding_test.Duplicate";
 
 // 从测试注册的第一个 upvalue 取出当前 State 的计数 owner；它覆盖该 State 的完整生命周期。
 TestEnvironment *readTestEnvironment(LuaBinding &lua_binding)
@@ -194,7 +191,7 @@ int table_operations(lua_State *state)
     const int  top = lua_gettop(env->state);           // 本操作入口栈高，供结束或异常后核对恢复。
     LuaTable   input;                                  // Lua 传入的原表，后续移动只转移句柄所有权。
     LuaTable   child; // 从当前字段取得的子表引用，检查嵌套访问及独立存活。
-    require(lua_binding.readTable(input), "implicit top table read failed");
+    require(lua_binding.readTable(1, input), "implicit top table read failed");
     require(input.readTable("child", child), "child read failed");
     std::uint32_t map_id = 0; // 请求或子表中的地图编号，0 也可读取成功。
     require(child.readValue("map_id", map_id) && map_id == 17, "nested field read failed");
@@ -252,9 +249,9 @@ int drop_temporary(lua_State *state)
     return lua_binding.returnValues();
 }
 
-/// 比较 raw 边界与稠密长度，验证稀疏失败不覆盖长度哨兵。
+/// 验证稠密长度和稀疏输入失败时的输出保留。
 /// @param state 参数 1 是待检查的数组或混合 key 表，空表也属于合法输入。
-/// @return 成功依次返回 raw 边界与稠密长度；稀疏数组返回 nil/error。
+/// @return 成功返回稠密长度；稀疏数组返回 nil/error。
 int array_lengths(lua_State *state)
 {
     LuaBinding lua_binding(state); // 本回调的错误与短期引用 owner，不跨调用保存。
@@ -263,121 +260,13 @@ int array_lengths(lua_State *state)
     {
         return lua_binding.pushError();
     }
-    std::size_t raw   = 0;  // rawlen 的数组边界，不承诺没有空洞。
     std::size_t dense = 99; // 失败后必须仍为此哨兵值。
-    require(table.arrayLength(raw), "raw length failed");
     if (!table.denseArrayLength(dense))
     {
         require(dense == 99, "dense length changed on failure");
         return lua_binding.pushError();
     }
-    return lua_binding.returnValues(raw, dense);
-}
-
-/// 验证原 key 不变形、嵌套遍历、错误序号及 visitor 异常后的栈恢复。
-/// @param state 参数 1 是含数字 key 和子表的混合表；upvalue 1 提供栈高观测环境。
-/// @return 依次返回数字 key 计数与子表字段总数。
-int iterate(lua_State *state)
-{
-    LuaBinding lua_binding(state); // 本回调的错误与短期引用 owner，不跨调用保存。
-    auto      *env = readTestEnvironment(lua_binding); // 第一个业务 upvalue 指向的独立计数环境。
-    const int  top = lua_gettop(env->state);           // 本操作入口栈高，供结束或异常后核对恢复。
-    LuaTable   table;
-    require(lua_binding.readTable(1, table), "iterate input missing");
-    int numeric_keys = 0; // 本轮统计到的数字 key 数量。
-    int children     = 0; // 嵌套子表中访问到的字段总数。
-    require(table.forEach(
-                [&](const LuaValue &key, const LuaValue &value)
-                {
-                    if (key.type() == LuaType::kNumber)
-                    {
-                        std::int64_t integer = 0; // 数字 key 的整数回读，验证原 key 不被转换。
-                        require(key.readValue(integer), "numeric key lost");
-                        std::string unchanged =
-                            "unchanged"; // 错误读取的字符串哨兵，失败不能覆盖它。
-                        require(!key.readValue(unchanged) && unchanged == "unchanged",
-                                "numeric key mutated");
-                    }
-                    if (value.type() == LuaType::kTable)
-                    {
-                        LuaTable child; // 从当前字段取得的子表引用，检查嵌套访问及独立存活。
-                        require(value.readTable(child), "visitor table read failed");
-                        require(child.forEach(
-                                    [&](const LuaValue &, const LuaValue &)
-                                    {
-                                        ++children;
-                                        return true;
-                                    }),
-                                "nested iteration failed");
-                    }
-                    else if (key.type() == LuaType::kNumber)
-                    {
-                        ++numeric_keys;
-                    }
-                    return true; // 已处理 key 的类型错误不应令成功遍历自动失败。
-                }),
-            "iteration failed");
-    require(lua_gettop(env->state) == top, "iteration changed stack");
-
-    lua_binding.setError("OLD_ERROR", "previously handled");
-    require(!table.forEach([](const LuaValue &, const LuaValue &) { return false; }),
-            "silent visitor failure accepted");
-    require(lua_binding.errorCode() == "INTERNAL_ERROR", "visitor reused stale error");
-    require(!table.forEach(
-                [&](const LuaValue &, const LuaValue &)
-                {
-                    lua_binding.setError("VISITOR_FAILED", "explicit failure");
-                    return false;
-                }),
-            "explicit failure accepted");
-    require(lua_binding.errorCode() == "VISITOR_FAILED", "visitor error overwritten");
-    try
-    {
-        table.forEach([](const LuaValue &, const LuaValue &) -> bool
-                      { throw std::runtime_error("visitor exception"); });
-        require(false, "visitor exception missing");
-    }
-    catch (const std::runtime_error &)
-    {
-        require(lua_gettop(env->state) == top, "exception left iteration stack");
-    }
-    return lua_binding.returnValues(numeric_keys, children);
-}
-
-/// 返回固定值，供元表身份测试观察真实 __index 调用。
-/// @param state Lua __index 传入目标表与缺失 key，本用例不读取两项参数。
-/// @return 固定返回 23，供缺省字段访问断言。
-int count_metamethod(lua_State *state)
-{
-    LuaBinding lua_binding(state); // 本回调的错误与短期引用 owner，不跨调用保存。
-    return lua_binding.returnValues(23);
-}
-
-/// 设置和重读同一元表，验证句柄身份与实际元方法行为。
-/// @param state 当前测试 State 的回调栈，无位置参数。
-/// @return 返回带有真实 __index 元方法的表。
-int metatables(lua_State *state)
-{
-    LuaBinding lua_binding(state); // 本回调的错误与短期引用 owner，不跨调用保存。
-    LuaTable   meta;               // 本用例的具名或普通元表引用。
-    if (!lua_binding.newTable(meta))
-    {
-        return lua_binding.pushError();
-    }
-    // __index 是 C++ 保留标识符，回调使用合法的 count_metamethod。
-    require(meta.setFunction<count_metamethod>("__index"), "metamethod registration");
-    LuaTable table;
-    if (!lua_binding.newTable(table))
-    {
-        return lua_binding.pushError();
-    }
-    require(table.setMetatable(meta), "setmetatable failed");
-    LuaTable read_meta; // 重读的元表句柄，应与原 meta 指向同一表。
-    require(table.readMetatable(read_meta), "readmetatable failed");
-    require(read_meta.writeValue("marker", 11), "meta write failed");
-    int marker = 0; // 回读 marker 字段，验证表身份或失败输出保留。
-    require(meta.readValue("marker", marker) && marker == 11, "metatable identity lost");
-    return lua_binding.returnValues(table);
+    return lua_binding.returnValues(dense);
 }
 
 /// 按参数选择构造成功或抛错，供 Lua 脚本核对构造与析构次数。
@@ -450,54 +339,15 @@ int userdata_gc_idempotent(lua_State *state)
 int userdata_errors(lua_State *state)
 {
     LuaBinding lua_binding(state); // 本回调的错误与短期引用 owner，不跨调用保存。
-    LuaTable   meta;               // 本用例的具名或普通元表引用。
-    require(lua_binding.registerUserdata<Tracked>(kDuplicate, meta),
-            "first userdata registration failed");
-    const int stack_top = lua_gettop(state); // 注册检查前的栈高，临时元表操作后恢复。
-    // 取回原 collector 并记录身份：[S, meta] -> [S, meta, gc]；
-    // tocfunction 只读函数指针，settop 随后移除新增项，恢复入口栈高。
-    luaL_getmetatable(state, kDuplicate);
-    lua_getfield(state, -1, "__gc");
-    const lua_CFunction original_collector =
-        lua_tocfunction(state, -1); // 注册完成时的析构函数地址，用来比较重复注册是否改写它。
+    const int stack_top = lua_gettop(state);
+    luaL_getmetatable(state, kTracked);
+    LuaTable meta;
+    require(lua_binding.readTable(-1, meta), "managed metatable missing");
     lua_settop(state, stack_top);
-
-    LuaTable duplicate; // 重复注册的输出句柄，拒绝后应保持失效。
-    require(!lua_binding.registerUserdata<Tracked>(kDuplicate, duplicate),
-            "duplicate same-type registration accepted");
-    require(lua_binding.errorCode() == "INVALID_ARGUMENT" && !duplicate.valid(),
-            "same-type duplicate changed its output/error contract");
-    require(!lua_binding.registerUserdata<Tiny>(kDuplicate, duplicate),
-            "duplicate different-type registration accepted");
-    require(lua_binding.errorCode() == "INVALID_ARGUMENT" && !duplicate.valid(),
-            "different-type duplicate changed its output/error contract");
-
-    // 重读元表字段并与原函数地址比较；此段压入 meta/gc 两项，末尾 settop 会统一清理。
-    luaL_getmetatable(state, kDuplicate);
-    lua_getfield(state, -1, "__gc");
-    const bool collector_unchanged =
-        lua_tocfunction(state, -1) == original_collector; // 重读 GC 后与原函数地址比较的结果。
-    lua_settop(state, stack_top);
-    require(original_collector != nullptr && collector_unchanged,
-            "duplicate registration replaced the original collector");
-    require(!meta.setFunction<count_metamethod>("__gc") && !meta.writeValue("__gc", nullptr),
-            "managed collector could be overwritten");
-    luaL_getmetatable(state, kDuplicate);
-    LuaTable meta_alias;
-    require(lua_binding.readTable(-1, meta_alias), "managed metatable alias missing");
-    lua_pop(state, 1);
-    require(!meta_alias.writeValue("__gc", nullptr),
-            "managed collector protection depended on a single handle");
-    luaL_getmetatable(state, kDuplicate);
-    lua_getfield(state, -1, "__gc");
-    require(lua_tocfunction(state, -1) == original_collector,
-            "rejected field writes still changed the managed collector");
-    lua_settop(state, stack_top);
+    require(!meta.writeValue("__gc", nullptr), "managed collector could be overwritten");
     LuaTable ordinary;
-    if (!lua_binding.newTable(ordinary))
-        return lua_binding.pushError();
-    require(ordinary.setFunction<count_metamethod>("__gc") && ordinary.writeValue("__gc", nullptr),
-            "ordinary table field was incorrectly reserved");
+    require(lua_binding.newTable(ordinary) && ordinary.writeValue("__gc", nullptr),
+            "ordinary field incorrectly reserved");
     Tracked *pointer = nullptr; // 闭包或测试宿主传入的外部借用地址，不归 Lua 释放。
     require(!lua_binding.newUserdata("missing.Type", pointer, readTestEnvironment(lua_binding)),
             "unregistered construction accepted");
@@ -578,58 +428,6 @@ int counters(lua_State *state)
     return lua_binding.returnValues(env->constructed, env->destroyed, Tiny::destroyed);
 }
 
-/// 读取四种业务 upvalue 并更新计数，验证保护调用没有改变原生编号。
-/// @param state 无位置参数；四个 upvalue 依次为计数、表、外部指针和 Tracked 对象。
-/// @return 依次返回更新前的计数值与原 Tracked userdata。
-int run(lua_State *state)
-{
-    LuaBinding lua_binding(state); // 本回调的错误与短期引用 owner，不跨调用保存。
-    int        counter = 0;        // 闭包捕获的调用计数，成功后写回递增值。
-    LuaTable   captured;           // 闭包强引用的表，检查 GC 后字段仍存在。
-    void      *pointer = nullptr;  // 闭包或测试宿主传入的外部借用地址，不归 Lua 释放。
-    Tracked   *object  = nullptr;  // 当前 Binding 内借用的 userdata 地址，由 Lua GC 负责释放。
-    if (!lua_binding.readUpvalue(1, counter) || !lua_binding.readUpvalueTable(2, captured) ||
-        !lua_binding.readUpvalue(3, pointer) ||
-        !lua_binding.readUpvalueUserdata(4, kTracked, object))
-    {
-        return lua_binding.pushError();
-    }
-    int marker = 0; // 回读 marker 字段，验证表身份或失败输出保留。
-    require(captured.readValue("marker", marker) && marker == 17, "captured table lost");
-    require(object->owner == pointer, "borrowed pointer changed");
-    require(lua_binding.writeUpvalue(1, counter + 1), "upvalue update failed");
-    require(!lua_binding.readUpvalue(0, marker) && !lua_binding.readUpvalue(5, marker),
-            "invalid business upvalue accepted");
-    return lua_binding.returnValues(counter, object);
-}
-
-/// 捕获 table、外部指针和 userdata，供 GC 测试验证强引用持有与释放。
-/// @param state 无位置参数；upvalue 1 借用计数环境，创建出的闭包将继续引用它。
-/// @return 返回包含 run 闭包的表。
-int make_closure(lua_State *state)
-{
-    LuaBinding lua_binding(state); // 本回调的错误与短期引用 owner，不跨调用保存。
-    auto      *env    = readTestEnvironment(lua_binding); // 第一个业务 upvalue 指向的独立计数环境。
-    Tracked   *object = nullptr; // 当前 Binding 内借用的 userdata 地址，由 Lua GC 负责释放。
-    require(lua_binding.newUserdata(kTracked, object, env), "captured object creation");
-    LuaTable captured; // 闭包强引用的表，检查 GC 后字段仍存在。
-    if (!lua_binding.newTable(captured))
-    {
-        return lua_binding.pushError();
-    }
-    require(captured.writeValue("marker", 17), "captured table setup");
-    LuaTable functions; // 保存业务闭包的返回表，供 Lua 验证捕获值。
-    if (!lua_binding.newTable(functions))
-    {
-        return lua_binding.pushError();
-    }
-    require(functions.setFunction<run>("run", 0, captured, static_cast<void *>(env), object),
-            "closure registration failed");
-    return lua_binding.returnValues(functions);
-}
-
-/// 通过封装读取真实 request.map_id，作为固定形态性能对照。
-/// @param state 参数 1 为请求表，本用例读取其 uint32 map_id 字段。
 /// @return 成功返回 map_id，字段或类型错误返回 nil/error。
 int read_map(lua_State *state)
 {
@@ -670,30 +468,7 @@ int many_upvalues(lua_State *state)
     return lua_binding.returnValues(last);
 }
 
-// 构造真实 64-upvalue 闭包，既检查临时压栈容量，也检查创建后编号未偏移。
-template <std::size_t... Index>
-bool registerManyUpvalues(LuaTable &functions, std::index_sequence<Index...>)
-{
-    return functions.setFunction<many_upvalues>("many_upvalues", Index...);
-}
-
-/// Lua 测试获取大型闭包并执行，覆盖多于最低栈槽数的函数注册。
-/// @param state 当前同步测试调用栈。
-/// @return 包含 many_upvalues 的函数表。
-int make_large_closure(lua_State *state)
-{
-    LuaBinding lua_binding(state); // 本回调的错误与短期引用 owner，不跨调用保存。
-    LuaTable   functions;          // 以真实表字段保持闭包存活。
-    if (!lua_binding.newTable(functions))
-    {
-        return lua_binding.pushError();
-    }
-    require(registerManyUpvalues(functions, std::make_index_sequence<64>{}),
-            "large closure setup failed");
-    return lua_binding.returnValues(functions);
-}
-
-/// 验证非法编号不会读取 registry、改写不存在的 upvalue，失败也保留表句柄。
+/// 验证非法 upvalue 编号不会读取 registry，失败保留读取输出和已有表句柄。
 /// @param state 此闭包只有一个业务 upvalue，值为 42。
 /// @return 所有编号、输出保留及合法值检查通过时返回 true。
 int upvalue_boundaries(lua_State *state)
@@ -711,19 +486,15 @@ int upvalue_boundaries(lua_State *state)
         int value = 19; // 每轮读取失败后必须保留的整数哨兵。
         require(!lua_binding.readUpvalue(index, value) && value == 19,
                 "invalid upvalue read accepted");
-        require(!lua_binding.readUpvalueTable(index, preserved), "invalid upvalue table accepted");
         Tracked *object = nullptr; // 非法编号不能读取 registry 或改变借用输出。
         require(!lua_binding.readUpvalueUserdata(index, kTracked, object) && object == nullptr,
                 "invalid userdata upvalue accepted");
-        require(!lua_binding.writeUpvalue(index, 99), "invalid upvalue write accepted");
     }
     int marker = 0; // 仍应从原表读取，而不是从 registry 或新表读取。
-    int value  = 0; // 合法业务 upvalue 必须仍为初始值，证明非法写入没有污染它。
+    int value  = 0; // 合法业务 upvalue 必须仍为初始值，证明非法读取没有污染它。
     require(preserved.readValue("marker", marker) && marker == 17,
             "upvalue failure changed table output");
     require(lua_binding.readUpvalue(1, value) && value == 42, "upvalue failure changed closure");
-    require(lua_binding.writeUpvalue(1, nullptr), "valid nil upvalue write failed");
-    require(lua_binding.writeUpvalue(1, 42), "existing nil upvalue was mistaken for missing");
     return lua_binding.returnValues(true);
 }
 
@@ -746,7 +517,7 @@ int failing_module(lua_State *state)
 {
     // 托管类型注册拒绝覆盖析构方法；按原生 Lua 模块加载错误传播。
     static const luaL_Reg methods[] = {
-        {"__gc", &count_metamethod},
+        {"__gc", &LuaBinding::nativeCallback<native_exception>},
         {nullptr, nullptr},
     };
     LuaBinding::registerUserdata<Tracked>(state, "binding.Invalid", methods);
@@ -798,47 +569,71 @@ int allocation_failure(lua_State *state)
 /// @return 返回注册完成的测试模块表。
 int registerTestModule(lua_State *state)
 {
-    LuaBinding lua_binding(state); // 本回调的错误与短期引用 owner，不跨调用保存。
-    void      *pointer = nullptr;  // 闭包或测试宿主传入的外部借用地址，不归 Lua 释放。
-    require(lua_binding.readValue(1, pointer), "test setup pointer missing");
-    LuaTable module; // 当前 State 独占的测试函数表，注册完成后才返回。
-    if (!lua_binding.newTable(module))
+    LuaBinding::registerUserdata<Tracked>(state, kTracked, nullptr);
+    LuaBinding::registerUserdata<Tiny>(state, kTiny, nullptr);
+    lua_newtable(state);
+    luaL_checkstack(state, 64, "test closure upvalues");
+    for (int index = 0; index < 64; ++index)
     {
-        return lua_binding.pushError();
+        lua_pushinteger(state, index);
     }
-    LuaTable meta; // 本用例的具名或普通元表引用。
-    require(lua_binding.registerUserdata<Tracked>(kTracked, meta), "tracked registration failed");
-    require(lua_binding.registerUserdata<Tiny>(kTiny, meta), "tiny registration failed");
-    // signed/float 是 C++ 关键字，使用合法回调名；Lua 测试 API 保持原名。
-    require(module.setFunction<uint>("uint") && module.setFunction<uint64>("uint64") &&
-                module.setFunction<signed_value>("signed") && module.setFunction<byte>("byte") &&
-                module.setFunction<boolean>("boolean") && module.setFunction<string>("string") &&
-                module.setFunction<float_value>("float"),
-            "scalar registration failed");
-    require(module.setFunction<conversion_boundaries>("conversion_boundaries", pointer) &&
-                module.setFunction<invalid_return>("invalid_return") &&
-                module.setFunction<table_operations>("table_operations", pointer) &&
-                module.setFunction<drop_temporary>("drop_temporary") &&
-                module.setFunction<array_lengths>("array_lengths") &&
-                module.setFunction<iterate>("iterate", pointer) &&
-                module.setFunction<metatables>("metatables") &&
-                module.setFunction<new_tracked>("new_tracked", pointer) &&
-                module.setFunction<read_tracked>("read_tracked") &&
-                module.setFunction<userdata_errors>("userdata_errors", pointer) &&
-                module.setFunction<userdata_gc_idempotent>("userdata_gc_idempotent") &&
-                module.setFunction<new_tiny>("new_tiny") &&
-                module.setFunction<counters>("counters", pointer) &&
-                module.setFunction<make_closure>("make_closure", pointer) &&
-                module.setFunction<read_map>("read_map"),
-            "operation registration failed");
-    require(module.setFunction<many_values>("many_values") &&
-                module.setFunction<make_large_closure>("make_large_closure") &&
-                module.setFunction<upvalue_boundaries>("upvalue_boundaries", 42) &&
-                module.setFunction<native_exception>("native_exception") &&
-                module.setFunction<failing_module>("failing_module") &&
-                module.setFunction<open_static_module>("open_static_module"),
-            "boundary regression registration failed");
-    return lua_binding.returnValues(module);
+    lua_pushcclosure(state, &LuaBinding::nativeCallback<many_upvalues>, 64);
+    lua_setfield(state, -2, "many_upvalues");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<uint>);
+    lua_setfield(state, -2, "uint");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<uint64>);
+    lua_setfield(state, -2, "uint64");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<signed_value>);
+    lua_setfield(state, -2, "signed");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<byte>);
+    lua_setfield(state, -2, "byte");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<boolean>);
+    lua_setfield(state, -2, "boolean");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<string>);
+    lua_setfield(state, -2, "string");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<float_value>);
+    lua_setfield(state, -2, "float");
+    lua_pushvalue(state, 1);
+    lua_pushcclosure(state, &LuaBinding::nativeCallback<conversion_boundaries>, 1);
+    lua_setfield(state, -2, "conversion_boundaries");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<invalid_return>);
+    lua_setfield(state, -2, "invalid_return");
+    lua_pushvalue(state, 1);
+    lua_pushcclosure(state, &LuaBinding::nativeCallback<table_operations>, 1);
+    lua_setfield(state, -2, "table_operations");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<drop_temporary>);
+    lua_setfield(state, -2, "drop_temporary");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<array_lengths>);
+    lua_setfield(state, -2, "array_lengths");
+    lua_pushvalue(state, 1);
+    lua_pushcclosure(state, &LuaBinding::nativeCallback<new_tracked>, 1);
+    lua_setfield(state, -2, "new_tracked");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<read_tracked>);
+    lua_setfield(state, -2, "read_tracked");
+    lua_pushvalue(state, 1);
+    lua_pushcclosure(state, &LuaBinding::nativeCallback<userdata_errors>, 1);
+    lua_setfield(state, -2, "userdata_errors");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<userdata_gc_idempotent>);
+    lua_setfield(state, -2, "userdata_gc_idempotent");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<new_tiny>);
+    lua_setfield(state, -2, "new_tiny");
+    lua_pushvalue(state, 1);
+    lua_pushcclosure(state, &LuaBinding::nativeCallback<counters>, 1);
+    lua_setfield(state, -2, "counters");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<read_map>);
+    lua_setfield(state, -2, "read_map");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<many_values>);
+    lua_setfield(state, -2, "many_values");
+    lua_pushinteger(state, 42);
+    lua_pushcclosure(state, &LuaBinding::nativeCallback<upvalue_boundaries>, 1);
+    lua_setfield(state, -2, "upvalue_boundaries");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<native_exception>);
+    lua_setfield(state, -2, "native_exception");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<failing_module>);
+    lua_setfield(state, -2, "failing_module");
+    lua_pushcfunction(state, &LuaBinding::nativeCallback<open_static_module>);
+    lua_setfield(state, -2, "open_static_module");
+    return 1;
 }
 
 // 对照基线仅用于测量同一个固定参数的 raw 读取，不作为生产模块或新公开接口。
@@ -956,19 +751,16 @@ local weak = setmetatable({}, {__mode="v"})
 binding.drop_temporary(weak)
 collectgarbage("collect")
 assert(weak[1] == nil, "temporary registry reference leaked")
-local _, length = binding.array_lengths({})
+local length = binding.array_lengths({})
 assert(length == 0)
-_, length = binding.array_lengths({[0]=7,[-1]=8,[1]=9,[2]=10,source="config",[1.5]="ignored"})
+length = binding.array_lengths({[0]=7,[-1]=8,[1]=9,[2]=10,source="config",[1.5]="ignored"})
 assert(length == 2)
-_, length = binding.array_lengths(setmetatable({1,2}, {
+length = binding.array_lengths(setmetatable({1,2}, {
     __len = function() error("raw length invoked __len") end,
 }))
 assert(length == 2)
 local sparse, err = binding.array_lengths({[1]=7,[3]=8})
 assert(sparse == nil and err.code == "INVALID_ARGUMENT")
-local numeric, children = binding.iterate({[0]=1,[1]=2,word=false,child={x=1,y=2}})
-assert(numeric == 2 and children == 2)
-assert(binding.metatables().unknown == 23, "registered metamethod missing")
 )lua";
 
 const char *kUserdataTests = R"lua(
@@ -985,15 +777,19 @@ tiny = nil
 collectgarbage("collect")
 local created, destroyed, tiny_destroyed = binding.counters()
 assert(created == 1 and destroyed == 1 and tiny_destroyed == 1, "duplicate or missing destructor")
-local closure = binding.make_closure()
+local closure
+ do
+    local captured = binding.new_tracked(false)
+    closure = function() return binding.read_tracked(captured) end
+ end
 collectgarbage("collect")
-assert(closure.run() == 0 and closure.run() == 1)
+assert(closure() == 7)
 created, destroyed = binding.counters()
 assert(created == 2 and destroyed == 1, "closure did not retain userdata")
 closure = nil
 collectgarbage("collect")
 created, destroyed = binding.counters()
-assert(created == 2 and destroyed == 2, "closure registry reference leaked")
+assert(created == 2 and destroyed == 2, "closure userdata leaked")
 local finalized = binding.new_tracked(false)
 assert(binding.userdata_gc_idempotent(finalized))
 local collector = getmetatable(finalized).__gc
@@ -1163,7 +959,7 @@ int main()
         runScript(first.get(), R"lua(
             local values = table.pack(binding.many_values())
             assert(values.n == 64 and values[1] == 0 and values[64] == 63)
-            assert(binding.make_large_closure().many_upvalues() == 63)
+            assert(binding.many_upvalues() == 63)
             assert(binding.upvalue_boundaries())
             for _, mode in ipairs({true, false}) do
                 local ok, value, err = pcall(binding.native_exception, mode)

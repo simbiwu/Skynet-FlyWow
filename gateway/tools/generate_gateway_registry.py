@@ -147,8 +147,10 @@ def parse_protos(sources: list[str]) -> tuple[str, list[dict[str, str | int | No
 def render(
     package: str,
     commands: list[dict[str, str | int | None]],
+    envelope_type: str | None = None,
 ) -> str:
     """将命令记录渲染为确定性 Lua table。"""
+    resolved_envelope_type = envelope_type or f".{package}.Envelope"
     lines = [
         "-- 职责：由 proto CommandId 和 Request/Response 消息生成的 FlyWow Gateway command registry。",
         "-- 边界：Build Artifact；运行时只读加载，不手工注册 command。",
@@ -167,7 +169,7 @@ def render(
         "}",
         "return",
         "{",
-        f'    envelope_type = ".{package}.Envelope", -- lua-protobuf 解码和编码外层 Envelope 时使用。',
+        f'    envelope_type = "{resolved_envelope_type}", -- lua-protobuf 解码和编码外层 Envelope 时使用。',
         "    command_ids   = command_ids, -- 宿主业务代码按协议枚举名称引用命令号。",
         "    commands      = -- Gateway 按 Envelope.command 选择消息类型。",
         "    {",
@@ -245,14 +247,9 @@ def main() -> int:
     package, commands = parse_protos(
         [path.read_text(encoding="utf-8") for path in args.proto],
     )
-    content = render(package, commands)  # 按稳定顺序生成的完整 Lua registry 文本。
-    if args.envelope_type:
-        if not args.envelope_type.startswith("."):
-            parser.error("--envelope-type 必须是以点开头的完整 Protobuf 类型名")
-        content = content.replace(
-            f'envelope_type = ".{package}.Envelope",',
-            f'envelope_type = "{args.envelope_type}",',
-        )
+    if args.envelope_type and not args.envelope_type.startswith("."):
+        parser.error("--envelope-type 必须是以点开头的完整 Protobuf 类型名")
+    content = render(package, commands, args.envelope_type)  # 直接渲染最终 Envelope 类型，保持确定性。
     write_if_changed(args.output, content)
     return 0
 

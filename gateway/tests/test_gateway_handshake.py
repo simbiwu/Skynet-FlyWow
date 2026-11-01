@@ -37,15 +37,26 @@ class HandshakeTests(unittest.TestCase):
     def test_native_interop(self):
         lua = os.environ.get("SKYNET_LUA")
         lib = os.environ.get("SKYNET_LUACLIB")
-        if not lua or not lib:
-            self.skipTest("需要SKYNET_LUA和SKYNET_LUACLIB")
+        jemalloc = os.environ.get("SKYNET_JEMALLOC")
+        if not lua or not lib or not jemalloc:
+            self.skipTest("需要SKYNET_LUA、SKYNET_LUACLIB和SKYNET_JEMALLOC")
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.kdf.hkdf import HKDF
         root = Path(__file__).resolve().parents[2]
         private = ec.generate_private_key(ec.SECP256R1())
         hello = b"\x01\x01" + private.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
-        child = subprocess.Popen([lua, str(root / "gateway/tests/gateway_crypto_driver.lua"), lib], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        env = os.environ.copy()
+        preload = env.get("LD_PRELOAD")
+        env["LD_PRELOAD"] = jemalloc + (":" + preload if preload else "")
+        child = subprocess.Popen(
+            [lua, str(root / "gateway/tests/gateway_crypto_driver.lua"), lib],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
         try:
             child.stdin.write(hello.hex() + "\n")
             child.stdin.flush()

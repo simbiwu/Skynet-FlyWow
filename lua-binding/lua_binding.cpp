@@ -174,15 +174,10 @@ void LuaBinding::setError(const std::string &code, const std::string &message)
 {
     error_code_    = code;
     error_message_ = message;
-    ++error_revision_;
 }
 const std::string &LuaBinding::errorCode() const
 {
     return error_code_;
-}
-const std::string &LuaBinding::errorMessage() const
-{
-    return error_message_;
 }
 
 // Lua 错误对象在失败时仍位于栈顶；先复制诊断，再弹出。
@@ -221,7 +216,7 @@ int LuaBinding::pushError()
 
 int LuaBinding::pushError(const std::string &code, const std::string &message)
 {
-    // 先复制以支持调用者传入 errorCode()/errorMessage() 本身。
+    // 先复制以支持调用者传入 errorCode() 本身。
     const std::string code_copy(code);
     const std::string message_copy(message);
     setError(code_copy, message_copy);
@@ -265,10 +260,6 @@ bool LuaBinding::readTable(int index, LuaTable &output)
 {
     return validIndex(index) && readTableAt(index, output);
 }
-bool LuaBinding::readTable(LuaTable &output)
-{
-    return readTable(-1, output);
-}
 
 bool LuaBinding::newTable(LuaTable &output)
 {
@@ -290,10 +281,6 @@ bool LuaBinding::newTable(LuaTable &output)
     return true;
 }
 
-bool LuaBinding::readUpvalueTable(int index, LuaTable &output)
-{
-    return validUpvalue(index) && readTableAt(lua_upvalueindex(index), output);
-}
 bool LuaBinding::readTruthAt(int index, bool &output)
 {
     output = lua_toboolean(state_, index) != 0;
@@ -325,11 +312,6 @@ bool LuaBinding::pushRaw(lua_State *state, std::nullptr_t, const char **)
     lua_pushnil(state);
     return true;
 }
-bool LuaBinding::pushRaw(lua_State *state, void *value, const char **)
-{
-    lua_pushlightuserdata(state, value);
-    return true;
-}
 bool LuaBinding::pushObject(lua_State *state, const void *object, const char **reason)
 {
     for (const auto &entry : userdata_refs_)
@@ -343,17 +325,6 @@ bool LuaBinding::pushObject(lua_State *state, const void *object, const char **r
     *reason = "pointer is not a userdata held by this callback";
     return false;
 }
-
-namespace
-{
-struct TypeArguments
-{
-    const char   *name;                  ///< 借用本次字段/类型名称，不在保护回调中构造字符串。
-    lua_CFunction collector;             ///< 此类型的 noexcept 析构回调。
-    int           reference = LUA_NOREF; ///< 成功时建立的 registry 引用；外层接管或释放。
-    const char   *failure   = nullptr;   ///< 失败时由原生操作写入的常量原因；外层随后记录诊断。
-};
-} // namespace
 
 // 检查实际 table 与其析构闭包身份，别名句柄也遵守同一保护规则。
 // 只读取 Lua 值并恢复临时栈；调用方已在 pcall 中，不创建 C++ 资源。
@@ -409,40 +380,6 @@ void LuaBinding::registerType(lua_State *state, const char *name, lua_CFunction 
         luaL_setfuncs(state, methods, 0);
     lua_setfield(state, -2, "__index");
     lua_pop(state, 1);
-}
-
-bool LuaBinding::registerUserdataType(const std::string &name, lua_CFunction collector,
-                                      LuaTable &output)
-{
-    if (name.empty())
-    {
-        setError("INVALID_ARGUMENT", "metatable needs a name");
-        return false;
-    }
-    detail::StackRestore stack(state_);
-    TypeArguments        args{name.c_str(), collector};
-    const bool           ok = detail::protectedCall(
-        state_,
-        [](lua_State *inner) noexcept -> int
-        {
-            auto *data = static_cast<TypeArguments *>(lua_touserdata(inner, 1));
-            if (!luaL_newmetatable(inner, data->name))
-            {
-                data->failure = "userdata metatable name is already registered";
-                return 0;
-            }
-            lua_pushvalue(inner, -1);
-            lua_pushinteger(inner, detail::kManagedGcTag);
-            lua_pushcclosure(inner, data->collector, 2);
-            lua_setfield(inner, -2, "__gc");
-            data->reference = luaL_ref(inner, LUA_REGISTRYINDEX);
-            return 0;
-        },
-        &args, 0, 0);
-    if (!completeCall(ok, args.failure))
-        return false;
-    output = LuaTable(this, args.reference);
-    return true;
 }
 
 namespace

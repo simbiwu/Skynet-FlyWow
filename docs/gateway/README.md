@@ -9,7 +9,7 @@
 
 ## 职责边界
 
-FlyWow Gateway 是业务无关的 Skynet 接入 Service，负责 TCP/WebSocket 接入、握手、心跳、连接生命周期、Envelope 编解码、send_data 转发、指定连接发送、广播和 close 控制。
+FlyWow Gateway 是业务无关的 Skynet 接入 Service，负责 TCP/WebSocket 接入、握手、连接生命周期、Envelope 编解码、send_data 转发、指定连接发送、广播和 close 控制。WebSocket ping/pong 由 transport 处理；TCP 心跳由宿主协议定义；idle timeout 按客户端完整业务消息计时。
 
 Gateway 不保存业务请求，不创建 pending，不生成 route_token，不等待 Battle 结果，不判断业务成功、失败或超时，不解释业务错误。
 
@@ -46,13 +46,11 @@ handler Service 接收 send_data：
     {
         gateway_epoch = "...",
         connection_id = 123,
-        peer = "127.0.0.1:52000",
-        transport = "tcp",
         command_id = 1001,
         data = {...},
     }
 
-Gateway 解码客户端请求后发送 send_data；peer 与 transport 是连接上下文，供宿主诊断使用。宿主处理完成后，也通过同一个 send_data 把数据发回 Gateway。Gateway 不区分请求响应和服务端主动下发。
+Gateway 解码客户端请求后发送仅含 `gateway_epoch`、`connection_id`、`command_id`、`data` 四个字段的 `send_data`。宿主处理完成后，也通过同一个 send_data 把数据发回 Gateway。Gateway 不区分请求响应和服务端主动下发。
 
 连接控制使用 close：
 
@@ -75,7 +73,7 @@ connection_id 大于 0 时发送给指定连接，等于 0 时广播给当前 Ga
 
 客户端只根据 command 选择消息类型。协议不定义 request_id，也不要求 Gateway 保存请求响应关联。
 
-registry 由构建阶段根据 CommandId 和消息定义生成，Gateway 启动时直接校验并使用其中按数字 command ID 索引的 `commands`，不再建立第二份索引；生成文件仍提供 `command_ids`，供宿主业务代码按枚举名称引用命令号：
+registry 由构建阶段根据 CommandId 和消息定义生成，Codec 初始化时校验并独占查询其中按数字 command ID 索引的 `commands`，不再建立第二份索引；生成文件仍提供 `command_ids`，供宿主业务代码按枚举名称引用命令号：
 
 - XxxRequest 与 XxxResponse 都存在：请求-响应命令
 - 只有 XxxRequest：单向请求命令
@@ -96,7 +94,7 @@ Gateway 只处理本地传输结果：
 
 ## Transport
 
-TCP 使用 uint16 big-endian 长度和 Envelope bytes；Gateway 在读取完整 body 前校验 TCP 长度头。`max_frame_bytes` 限制单条业务 Envelope 的大小，不限制底层传输层接收内存，也不提供传输内存硬上限。WebSocket 使用 Skynet 固定 http.websocket，复用相同 Envelope 和 registry。WebSocket 的 ping/pong、fragment 和 close frame 由底层 transport 处理；TCP 应用层心跳由宿主协议按 command 定义。
+TCP 使用 uint16 big-endian 长度和 Envelope bytes；Gateway 在读取完整 body 前校验 TCP 长度头。`max_frame_bytes` 限制单条业务 Envelope 的大小，不限制底层传输层接收内存，也不提供传输内存硬上限。WebSocket 使用明文 `ws`，TLS/WSS 由宿主外部终止；底层使用 Skynet 固定 http.websocket，复用相同 Envelope 和 registry。WebSocket 的 ping/pong、fragment 和 close frame 由底层 transport 处理；TCP 应用层心跳由宿主协议按 command 定义。
 
 写缓冲关闭阈值只在 Skynet warning 回调到达后判断：回调 `size` 非零且达到 `write_warning_close_kb` 时关闭连接，`size=0` 表示发送缓冲恢复并被忽略。Skynet 首次在 1 MiB 缓冲量时告警，后续按底层告警粒度递增，因此该配置不是精确内存上限。
 

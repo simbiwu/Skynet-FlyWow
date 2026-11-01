@@ -22,7 +22,6 @@ namespace flywow_lua_binding
 {
 class LuaBinding;
 class LuaTable;
-class LuaValue;
 using Callback = lua_CFunction;
 
 namespace detail
@@ -266,8 +265,6 @@ class LuaBinding
     /// @param output 成功时获得同一表的独立引用，必须早于 Binding 析构。
     /// @return 成功 true；类型或 Lua 操作失败 false，输出保持不变。
     bool readTable(int index, LuaTable &output);
-    /// 从调用瞬间的栈顶读取表，输出合同与带 index 的重载相同。
-    bool readTable(LuaTable &output);
     // 创建表并建立独立引用；已进入保护调用的 Lua 失败返回 false，不覆盖 output。
     // 建立保护边界、C++ 字符串复制和保存诊断仍可能抛异常，由注册入口处理。
     /// @param output 成功才接管新表引用；不允许超过本 Binding 生命周期。
@@ -281,23 +278,6 @@ class LuaBinding
     {
         return validUpvalue(index) && readAt(lua_upvalueindex(index), output);
     }
-    /// 读取业务 upvalue 中的表；成功建立独立引用，失败保持输出。
-    bool readUpvalueTable(int index, LuaTable &output);
-    // 只替换已有业务槽；不增加任何隐藏 upvalue。
-    /// @param index 已存在的业务 upvalue，编号从 1 开始。
-    /// @param value 要保存的值；table/userdata 保持原对象身份。
-    /// @return 更新成功 true；编号、类型或 Lua 操作失败 false。
-    template <typename T> bool writeUpvalue(int index, const T &value)
-    {
-        if (!validUpvalue(index))
-            return false;
-        detail::StackRestore stack(state_);
-        if (!pushOne(value))
-            return false;
-        lua_replace(state_, lua_upvalueindex(index));
-        return true;
-    }
-
     // 一次受保护调用压入全部结果；失败改为 nil/error。调用后立即 return。
     /// @param values 顺序交给 Lua 的零个或多个结果。
     /// @return 成功为结果数；转换失败为 nil/error 的两个结果。
@@ -325,18 +305,6 @@ class LuaBinding
     /// 只更新本回调诊断，不压栈；业务 parser 失败时供上层 pushError 使用。
     void setError(const std::string &code, const std::string &message);
     const std::string &errorCode() const;
-    const std::string &errorMessage() const;
-
-    // 回调内的显式类型注册，供动态注册场景使用；失败保持 output 不变。
-    /// @param name 当前 State 唯一的精确类型名。
-    /// @param output 成功接收元表引用；失败保持原句柄。
-    /// @return 注册成功 true；空名、重名或 Lua 操作失败 false。
-    template <typename T> bool registerUserdata(const std::string &name, LuaTable &output)
-    {
-        static_assert(alignof(T) <= alignof(detail::UserdataAlignment));
-        static_assert(std::is_nothrow_destructible_v<T>);
-        return registerUserdataType(name, &collectUserdata<T>, output);
-    }
 
     // Lua 分配和类型挂接一次完成；C++ 构造在 pcall 外执行，构造后才启用 __gc。
     /// @param name 此 State 已注册且精确对应 T 的类型名。
@@ -390,7 +358,6 @@ class LuaBinding
 
   private:
     friend class LuaTable;
-    friend class LuaValue;
     struct UserdataReference
     {
         void *object;    ///< 本回调借用的 C++ 地址；用于找回原 userdata。
@@ -458,13 +425,6 @@ class LuaBinding
             arguments->values);
         return ok ? sizeof...(Values) : 0;
     }
-    template <typename T> bool pushOne(const T &value)
-    {
-        ValueArguments<T> arguments{this, std::tie(value), nullptr};
-        const bool        ok = detail::protectedCall(state_, &pushResults<T>, &arguments, 0, 1);
-        return completeCall(ok, arguments.failure);
-    }
-
     // 仅供受保护的 C 回调使用；不分配 C++ 对象，失败只记录常量原因。
     template <typename T> bool pushRaw(lua_State *state, const T &value, const char **reason)
     {
@@ -482,7 +442,6 @@ class LuaBinding
     bool pushRaw(lua_State *state, const LuaTable &value, const char **reason);
     bool pushRaw(lua_State *state, const char *value, const char **reason);
     bool pushRaw(lua_State *state, std::nullptr_t, const char **reason);
-    bool pushRaw(lua_State *state, void *value, const char **reason);
     bool pushObject(lua_State *state, const void *object, const char **reason);
 
     template <typename T> bool readAt(int index, T &output)
@@ -509,21 +468,19 @@ class LuaBinding
     bool readTableAt(int index, LuaTable &output);
     bool readTruthAt(int index, bool &output);
     bool retainUserdata(void *object, int reference);
-    bool registerUserdataType(const std::string &name, lua_CFunction collector, LuaTable &output);
+    // 托管析构闭包的元表字段保护；保留以阻止 __gc 被写入路径替换。
+    static bool canWriteField(lua_State *state, int table_index, int key_index) noexcept;
     bool allocateUserdata(const std::string &name, std::size_t bytes, void *&storage,
                           int &reference);
     void *checkUserdata(int index, const std::string &name);
     static void *inspectUserdata(lua_State *state, int index, const char *name, int &reference,
                                  const char **failure);
-    // 仅在受保护写操作中调用；普通表允许 __gc，识别到托管析构闭包则拒绝改写。
-    static bool canWriteField(lua_State *state, int table_index, int key_index) noexcept;
     static void registerType(lua_State *state, const char *name, lua_CFunction collector,
                              const luaL_Reg *methods);
 
     lua_State                     *state_;              // 借用当前 VM，不负责关闭。
     std::string                    error_code_;         // 最近错误码；成功不清除，pushError 读取。
     std::string                    error_message_;      // 与错误码配对的诊断。
-    std::uint64_t                  error_revision_ = 0; // 遍历时区分 visitor 新记录的错误。
     std::vector<UserdataReference> userdata_refs_;      // 回调内保活对象及其 registry 引用。
 };
 } // namespace flywow_lua_binding

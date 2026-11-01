@@ -3,8 +3,6 @@
 // 栈预留或 C++ 分配异常由注册处 nativeCallback 处理；bool 不表示 noexcept。
 #pragma once
 #include "lua_binding.h"
-#include "lua_value.h"
-#include <functional>
 
 namespace flywow_lua_binding
 {
@@ -118,69 +116,9 @@ class LuaTable
         return binding_->completeCall(ok, args.field.failure);
     }
 
-    // visitor 的 key/value 仅在本轮有效；不能修改源表或 yield。
-    // false 传播失败；未提供诊断时补 INTERNAL_ERROR。异常会先恢复栈再向外展开。
-    bool forEach(const std::function<bool(const LuaValue &, const LuaValue &)> &visitor) const;
-    /// 输出 rawlen 边界，不保证无空洞；失败保持 output 并返回 false。
-    bool arrayLength(std::size_t &output) const;
     /// 验证正整数 key 为连续 1..N，忽略其他 key；空数组输出 0，失败保持输出。
     bool denseArrayLength(std::size_t &output) const;
 
-    // 编译期选择异常边界，不占用业务 upvalue。注册失败不写字段。
-    /// @tparam Function 实际 Native 函数，注册处接入异常边界。
-    /// @param name Lua 可见函数名。
-    /// @param upvalues 顺序保存的业务值，编号从 1 开始；void* 仅借用。
-    /// @return 成功 true；值转换或 Lua 操作失败 false，不更新字段。
-    template <Callback Function, typename... Values>
-    bool setFunction(const std::string &name, const Values &...upvalues)
-    {
-        static_assert(sizeof...(Values) <= detail::kMaxUpvalues);
-        if (!valid())
-            return false;
-        detail::StackRestore stack(binding_->state_);
-        struct Arguments
-        {
-            LuaTable          *table; ///< 本次操作的目标表句柄；registry 编号不代表栈位置。
-            const std::string &name;  ///< 借用本次字段/类型名称，不在保护回调中构造字符串。
-            std::tuple<const Values &...>
-                        values; ///< 借用待写入的实参，顺序就是 Lua 返回值或 upvalue 顺序。
-            const char *failure = nullptr; ///< 失败时由原生操作写入的常量原因；外层随后记录诊断。
-        } args{this, name, std::tie(upvalues...)};
-        const bool ok = detail::protectedCall(
-            binding_->state_,
-            [](lua_State *state) noexcept -> int
-            {
-                auto *data = static_cast<Arguments *>(lua_touserdata(state, 1));
-                luaL_checkstack(state, sizeof...(Values) + 4,
-                                "Native upvalues exceed stack capacity");
-                lua_rawgeti(state, LUA_REGISTRYINDEX, data->table->reference_);
-                lua_pushlstring(state, data->name.data(), data->name.size());
-                if (!LuaBinding::canWriteField(state, -2, -1))
-                {
-                    data->failure = "__gc is managed by userdata registration";
-                    return 0;
-                }
-                const bool pushed = std::apply(
-                    [&](const auto &...values)
-                    {
-                        return (data->table->binding_->pushRaw(state, values, &data->failure) &&
-                                ...);
-                    },
-                    data->values);
-                if (!pushed)
-                    return 0;
-                lua_pushcclosure(state, &LuaBinding::nativeCallback<Function>, sizeof...(Values));
-                lua_rawset(state, -3);
-                return 0;
-            },
-            &args, 0, 0);
-        return binding_->completeCall(ok, args.failure);
-    }
-
-    /// 设置同一 Binding 的有效元表，保持两表身份；失败 false 并记录诊断。
-    bool setMetatable(const LuaTable &meta);
-    /// 成功获得独立元表引用；无元表或操作失败 false，保持 output。
-    bool readMetatable(LuaTable &output) const;
     /// @param key 含托管 userdata 的字段。
     /// @param name 精确注册类型名。
     /// @param output 本回调借用的 T*，失败保持原值。

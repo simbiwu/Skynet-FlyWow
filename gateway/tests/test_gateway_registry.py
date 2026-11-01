@@ -127,10 +127,7 @@ message FrameJoinResponse {}
         source = self.valid_proto().replace("message Envelope\n{}\n", "")
         self.assertNotIn("message Envelope", source)
         package, commands = MODULE.parse_proto(source)
-        output = MODULE.render(package, commands).replace(
-            f'envelope_type = ".{package}.Envelope",',
-            'envelope_type = ".battle.transport.v1.Envelope",',
-        )
+        output = MODULE.render(package, commands, ".battle.transport.v1.Envelope")
         self.assertIn('envelope_type = ".battle.transport.v1.Envelope"', output)
         with self.assertRaisesRegex(ValueError, "CommandId"):
             MODULE.parse_proto(source.replace("enum CommandId", "enum OtherId"))

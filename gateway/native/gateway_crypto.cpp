@@ -1,9 +1,8 @@
 // 职责：使用 OpenSSL 3 EVP 执行 Gateway P-256/HKDF/HMAC 握手，不实现自有密码算法。
 // 边界：FlyWow Native Lua Binding；输入固定握手字节，输出 challenge/ready 或 nil,error。
-// 生命周期：每个 Lua userdata 独占临时密钥和派生密钥；close/__gc 擦除并释放，不共享可变 scratch。
+// 生命周期：challenge 构建函数局部持有并释放私钥；Lua userdata 独占证明密钥和摘要，close/__gc 擦除，不共享可变 scratch。
 // 不负责：不访问 Socket、Skynet、业务、登录或文件；私钥和 secret 不返回 Lua 字符串。
 #include "lua_binding.h"
-#include "lua_table.h"
 #include <array>
 #include <cstring>
 #include <exception>
@@ -22,11 +21,9 @@ namespace flywow_gateway
 namespace
 {
 using flywow_lua_binding::LuaBinding;
-using flywow_lua_binding::LuaTable;
 constexpr const char *kCryptoMetatable = "flywow.gateway.crypto";
 struct CryptoContext
 {
-    EVP_PKEY                     *server_key      = nullptr; ///< 派生完成即释放的服务端密钥。
     std::array<unsigned char, 32> proof_key       = {};      ///< 验证结束或关闭时擦除的证明密钥。
     std::array<unsigned char, 32> transcript_hash = {};      ///< 双向证明共用的 transcript 摘要。
     bool                          active          = false;   ///< 是否仍允许验证一次客户端证明。
@@ -51,8 +48,6 @@ void requireCryptoSuccess(bool ok, const char *code)
 /// @return 无返回值，不执行 I/O 或 yield。
 void clearCryptoContext(CryptoContext *crypto_context)
 {
-    EVP_PKEY_free(crypto_context->server_key);
-    crypto_context->server_key = nullptr;
     crypto_context->active     = false;
     OPENSSL_cleanse(crypto_context->proof_key.data(), crypto_context->proof_key.size());
     OPENSSL_cleanse(crypto_context->transcript_hash.data(), crypto_context->transcript_hash.size());
@@ -110,11 +105,12 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
     OSSL_PARAM group_params[] = {
         OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, group, 0),
         OSSL_PARAM_construct_end()};
-    requireCryptoSuccess(EVP_PKEY_keygen_init(keygen_context.get()) == 1 &&
-                             EVP_PKEY_CTX_set_params(keygen_context.get(), group_params) == 1 &&
-                             EVP_PKEY_generate(keygen_context.get(), &crypto_context->server_key) ==
-                                 1,
-                         "CRYPTO_KEYGEN");
+    EVP_PKEY *raw_server_key = nullptr; // keygen 产生的服务端私钥，立即交给本函数的 RAII owner。
+    const bool key_generated = EVP_PKEY_keygen_init(keygen_context.get()) == 1 &&
+        EVP_PKEY_CTX_set_params(keygen_context.get(), group_params) == 1 &&
+        EVP_PKEY_generate(keygen_context.get(), &raw_server_key) == 1;
+    CryptoHandle<EVP_PKEY, EVP_PKEY_free> server_key(raw_server_key, EVP_PKEY_free);
+    requireCryptoSuccess(key_generated && bool(server_key), "CRYPTO_KEYGEN");
 
     // import_context 把 HELLO 中的公钥字节导入为 EVP 公钥对象。
     CryptoHandle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> import_context(
@@ -147,7 +143,7 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
     response[1] = 1;
     size_t size = 0; // 接收 OpenSSL 写入的服务端 P-256 公钥长度，协议要求恰为 65 字节。
     requireCryptoSuccess(EVP_PKEY_get_octet_string_param(
-                             crypto_context->server_key, OSSL_PKEY_PARAM_PUB_KEY,
+                             server_key.get(), OSSL_PKEY_PARAM_PUB_KEY,
                              reinterpret_cast<unsigned char *>(&response[2]), 65, &size) == 1 &&
                              size == 65,
                          "CRYPTO_PUBLIC_KEY");
@@ -156,7 +152,7 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
 
     // derive_context 使用服务端私钥和客户端公钥计算原始 ECDH Z。
     CryptoHandle<EVP_PKEY_CTX, EVP_PKEY_CTX_free> derive_context(
-        EVP_PKEY_CTX_new(crypto_context->server_key, nullptr), EVP_PKEY_CTX_free);
+        EVP_PKEY_CTX_new(server_key.get(), nullptr), EVP_PKEY_CTX_free);
     requireCryptoSuccess(bool(derive_context), "CRYPTO_ALLOC");
     struct SharedSecret
     {
@@ -210,8 +206,6 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
                              1,
                          "CRYPTO_HKDF");
 
-    EVP_PKEY_free(crypto_context->server_key);
-    crypto_context->server_key = nullptr;
     crypto_context->active     = true;
     return response;
 }

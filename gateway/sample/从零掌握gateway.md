@@ -216,7 +216,7 @@ sed -n '1,80p' gateway/sample/master_course/generated/world_registry.lua
 
 ### 1.5 源码精读：生成物为什么能决定网关该解哪种消息
 
-这一步先看构建期生成器，再看 Gateway 启动时的只读校验。请打开 `gateway/tools/generate_gateway_registry.py` 的 `parse_protos()` 和 `render()`，再打开 `gateway/service/gateway/flywow_gateway.lua` 的 `validate_generated_registry()`。生成文件就是 Gateway 查询的命令表，不再复制第二份索引。
+这一步先看构建期生成器，再看 Gateway 启动时的只读校验。请打开 `gateway/tools/generate_gateway_registry.py` 的 `parse_protos()` 和 `render()`，再打开 `gateway/lualib/codec.lua` 的 `new()`。生成文件就是 Gateway 查询的命令表，不再复制第二份索引。
 
 **【真实源码局部：`gateway/tools/generate_gateway_registry.py` / `parse_protos()`，省略输入列表的 package 验证】**
 
@@ -251,13 +251,13 @@ commands =
 }
 ```
 
-Gateway 启动时只读校验每个数字 key 与消息类型，并计算命令数量；`dispatch_payload()` 随后直接用 `module_state.registry.commands[envelope.command]` 找到定义。`1001` 是表的 key，不在命令定义中重复保存。生成文件还保留 `command_ids.ENTER_WORLD` 等名称到数字的映射，供宿主业务代码引用协议命令号；Gateway 查表本身不使用这组名称。这个协议表属于 Gateway Service，与 WorldService 的 `state.players` 无关。
+Gateway 启动时只读校验每个数字 key 与消息类型，并计算命令数量；`dispatch_payload()` 随后直接用 Codec 内部的 `registry.commands[envelope.command]` 找到定义。`1001` 是表的 key，不在命令定义中重复保存。生成文件还保留 `command_ids.ENTER_WORLD` 等名称到数字的映射，供宿主业务代码引用协议命令号；Gateway 查表本身不使用这组名称。这个协议表属于 Gateway Service，与 WorldService 的 `state.players` 无关。
 
 `Descriptor` 则提供每一个字段的 wire type 和类型结构；Registry 只是**选择**具体类型。若有 Registry，却没有包含消息定义的 `.pb`，`codec_module.new()` 会在 Gateway 启动时拒绝，而不会等客户端首个请求才发现。
 
 **验证实验**：生成产物后，打开 `generated/world_registry.lua` 并记录两条 command；然后在第二阶段 `start()` 前把 `registry_module` 临时改成一个不存在的模块名，观察 `GATEWAY_REGISTRY_LOAD_FAILED`。恢复原值、重新启动。由此确认 Python 生成器不参与运行时消息收发，Gateway 只消费文件结果。
 
-**返回主线**：第一阶段只有两种静态产物；接下来进入 WorldService 启动 Gateway，观察它们何时进入 `module_state.registry` 和 `module_state.codec`。
+**返回主线**：第一阶段只有两种静态产物；接下来进入 WorldService 启动 Gateway，观察它们何时进入 `module_state.codec`。
 
 ---
 
@@ -626,7 +626,6 @@ Gateway Service 自己的 Lua State
   -> start(config)
        -> normalize_config(config)
        -> require("world_registry")
-       -> validate_generated_registry(generated)
        -> codec_module.new(...)     [读取 .pb，pb.load，校验消息类型]
        -> require("flywow_gateway_crypto")
        -> handshake_module.new(...)
@@ -641,7 +640,7 @@ WorldService 的原调用协程被唤醒，继续检查 result.ok/value
 
 这里必须注意两个不同的 `start`：`skynet.start` 是 **Service 入口初始化回调**；Gateway 的 `start(config)` 是**宿主发送的业务命令处理函数**。`skynet.call` 等待应答，不能把它与后面的请求投递 `skynet.send` 混淆。
 
-`normalize_config` 先处理所有必需字段和默认值；例如 `transport="websocket"` 合法，`host=false` 不会被当成缺省地址。`validate_generated_registry` 只读校验生成表；`codec_module.new` 在当前 Gateway Lua State 里加载 Descriptor；Handshake manager 在本 Service 里持有握手名额，**此时还没有一个客户端连接**。
+`normalize_config` 先处理所有必需字段和默认值；例如 `transport="websocket"` 合法，`host=false` 不会被当成缺省地址。`codec_module.new` 只读校验生成表、统计命令并在当前 Gateway Lua State 里加载 Descriptor；Handshake manager 在本 Service 里持有握手名额，**此时还没有一个客户端连接**。
 
 **回到主线**：只有 listener 创建且 `socket.start` 成功后才进入 `running`。`WorldService` 收到 Result 后才打印课程 READY；下一阶段才会发生 accept 和握手。
 
@@ -658,7 +657,6 @@ local module_state =
 {
     phase              = "created",
     gateway_config     = nil,
-    registry           = nil,
     handshake          = nil,
     codec              = nil,
     listen_fd          = nil,
@@ -678,7 +676,7 @@ local module_state =
 | -------------------- | -------------------- | ------------------------------- | ---------------------- |
 | `phase`              | `start`/`stop`       | `accept_client`、超时与出站入口 | 当前 Gateway Service   |
 | `gateway_config`     | `start` 校验后设置   | 网络、握手、限流入口            | 启动后到停止           |
-| `registry` / `codec` | `start` 装载         | `dispatch_payload` / 出站编码   | 当前 Gateway Lua State |
+| `codec` | `start` 装载         | `dispatch_payload` / 出站编码   | 当前 Gateway Lua State |
 | `handshake`          | `start` 构造 manager | 每个连接的握手与 detach         | 当前 Gateway Service   |
 | `listen_fd`          | 监听成功后持有       | `stop`                          | 监听期                 |
 | `connections`        | 创建/摘除连接        | 出站单播、广播、超时、stop      | 每条连接登记期         |
@@ -709,13 +707,10 @@ if not generated_ok then
         { module = gateway_config.registry_module }
     )
 end
-local registry_result = validate_generated_registry(generated)
-if not registry_result.ok then
-    return registry_result
-end
+-- generated 在下一步交给 codec_module.new 统一校验；Gateway 不保存 Registry。
 ```
 
-`startup_config` 是从 WorldService 通过 Skynet RPC 传过来的**配置副本值**；`config_result.value` 才是 Gateway 通过 `normalize_config()` 验证过的配置记录。`generated` 是 `require("world_registry")` 返回的构建产物 table；`registry_result.value` 是校验时计算的命令数量；Gateway 与 Codec 直接共享 `generated`，不建立第二份查询索引。
+`startup_config` 是从 WorldService 通过 Skynet RPC 传过来的**配置副本值**；`config_result.value` 才是 Gateway 通过 `normalize_config()` 验证过的配置记录。`generated` 是 `require("world_registry")` 返回的构建产物 table；Codec 在初始化时验证 `generated` 并提供 `codec.command_count`；Gateway 不保存 Registry 或建立第二份查询索引。
 
 后续并不是三个“传位置参数”的调用。花括号表示传给函数的一张 Lua 配置表；真实调用会把字段名写出来：
 
@@ -723,7 +718,7 @@ end
 local codec_result = codec_module.new(
 {
     descriptor_path = gateway_config.descriptor_path,
-    registry        = registry,
+    registry        = generated,
 }
 )
 if not codec_result.ok then
@@ -758,7 +753,7 @@ local handshake = handshake_result.value
 `codec_module.new()` 接收一张配置表，而不是两个位置参数：
 
 - `descriptor_path` 是运行时 FileDescriptorSet（本例的 `world.pb`）的文件路径。路径按 Skynet/Server 进程的工作目录解析。该文件由之前的 `protoc` 构建步骤生成；Gateway 运行时不解析 `.proto`。
-- `registry` 是前面加载并通过结构检查的 Lua 命令表。它告诉 Gateway：Envelope 的完整类型名是什么，每个 `command` 对应哪个 Request 和 Response。传递的是现有表，Gateway 和 codec 共用它，不再复制第二份索引。
+- `registry` 是前面加载并通过结构检查的 Lua 命令表。它告诉 Gateway：Envelope 的完整类型名是什么，每个 `command` 对应哪个 Request 和 Response。传递的是现有表，由 codec 持有并查询，Gateway 不再保存它，也不复制第二份索引。
 
 codec 先检查这两个字段的类型，再打开 `descriptor_path` 读取全部字节并关闭文件句柄。读取成功后，它调用宿主的 `lua-protobuf` 的 `pb.load()`，把 Descriptor 中的消息定义注册到**当前 Gateway Lua State 的 protobuf 运行时**。接着它遍历 Registry 引用的类型名（Envelope、非空的 Request/Response），逐个调用 `pb.type(type_name)`。这样可以在开始监听前发现“Registry 指向了 Descriptor 中不存在的消息”这一类部署错误。
 
@@ -1026,7 +1021,6 @@ function manager.accept()
     {
         phase   = "hello",
         started = read_tick(),
-        held    = true,
         crypto  = nil,
     })
 end
@@ -1068,7 +1062,7 @@ return flywow_result.success(
 连接关闭时的释放由同一个 manager 完成：
 
 ```lua
-context.held = false
+context.phase = "closed"
 pending = pending - 1
 if context.crypto then
     context.crypto:close()
@@ -1076,13 +1070,13 @@ if context.crypto then
 end
 ```
 
-`held` 先置为 false，确保重复关闭不会重复扣减；Native userdata 存在时调用它的 `close()` 并清空引用。这样，名额由 manager 持有和归还，密钥由 Native userdata 持有和擦除，Gateway 则继续拥有 Socket fd 与连接记录。三个 owner 不应混为一个。
+仅 `hello/proof/confirm` 阶段占有 pending；关闭时转入 `closed`，重复关闭按终态直接返回。Native userdata 存在时调用它的 `close()` 并清空引用。这样，名额由 manager 持有和归还，密钥由 Native userdata 持有和擦除，Gateway 则继续拥有 Socket fd 与连接记录。三个 owner 不应混为一个。
 
 **【真实源码局部：同一 `start()` / 监听和发布运行状态】**：
 
 ```lua
 module_state.gateway_config = gateway_config
-module_state.registry = registry
+-- Registry 仅由 codec 持有，Gateway 不保存第二个引用。
 module_state.codec = codec
 module_state.handshake = handshake
 module_state.epoch = tostring(skynet.self()) .. ":" .. tostring(skynet.hpc())
@@ -1643,7 +1637,7 @@ module_state.client_count = module_state.client_count + 1
 module_state.connections[1] -----------+
                                        +--> connectionA {id=1, fd=18, ...}
 module_state.connections_by_fd[18] ----+
-connectionA.handshake ----------------------> handshakeContextA {phase="hello", held=true}
+connectionA.handshake ----------------------> handshakeContextA {phase="hello"}
 ```
 
 这里没有复制两个对象；两张索引用于不同入口：WorldService 的出站命令拿的是 `connection_id`，所以查 `connections[1]`；WebSocket 回调给的是 `fd`，所以查 `connections_by_fd[18]`。将 `player_id=1001` 塞进这两张表会跨越网关与业务的职责边界。
@@ -1694,7 +1688,7 @@ end
 
 - `client_count` 统计已经登记的连接，包括 ready 和未 ready。
 - `pending` 统计仍占用握手名额的连接；握手成功时即释放，连接可能继续在线很久。
-- `context.held` 是令牌所有权标记，防止超时、出错和 Socket 断开重复扣减 `pending`。
+- `phase` 是握手名额的权威状态：`hello/proof/confirm` 占用 pending，`ready/closed` 不占用；转入终态后重复 close 不会重复扣减。
 
 **【真实源码局部：`gateway/lualib/handshake.lua` / `manager.receive()`，HELLO 分支】**：
 
@@ -1778,7 +1772,6 @@ return flywow_result.success()
 ```cpp
 struct CryptoContext
 {
-    EVP_PKEY *server_key = nullptr;
     std::array<unsigned char, 32> proof_key = {};
     std::array<unsigned char, 32> transcript_hash = {};
     bool active = false;
@@ -1799,7 +1792,7 @@ PROOF    = 03 + HMAC-SHA256(K,"client-proof" || T)
 READY    = 04 + HMAC-SHA256(K,"server-ready" || T)
 ```
 
-这段是**协议推导式，不是 C++ 源码**。`Z` 的作用域使用 RAII `SharedSecret` 析构时擦除；`server_key` 在 `buildChallenge` 成功后立即释放。此后 userdata 保存 `proof_key`、`transcript_hash` 和 `active=true`，等待客户端 proof。
+这段是**协议推导式，不是 C++ 源码**。`Z` 的作用域使用 RAII `SharedSecret` 析构时擦除；`server_key` 由 `buildChallenge` 的局部 RAII owner 持有，正常返回和异常退出都会释放，不保存在 userdata 中。此后 userdata 保存 `proof_key`、`transcript_hash` 和 `active=true`，等待客户端 proof。
 
 客户端发回 PROOF 后，C++ `verify()` 用 `CRYPTO_memcmp` 比较客户端 HMAC，构造 READY，调用 `clearCryptoContext()` 擦除 `proof_key`/`transcript_hash` 并设置 `active=false`。`manager.confirm()` 再调用 `manager.close(context)`，将 userdata 引用清空、释放握手名额。
 
@@ -1837,10 +1830,10 @@ bash scripts/build_flywow.sh /path/to/skynet lua_binding
 
 1. `#payload` 检查 `max_frame_bytes`；不是 Skynet 接收内存的硬上限。
 2. `module_state.codec.decode_envelope(payload)` → `gateway/lualib/codec.lua` 中 `pb.decode(Envelope,bytes)`；得到版本 4、command 1001、三字节 body。
-3. `module_state.registry.commands[1001]` → 直接查询生成表；得到 `.flywow.gateway.course.EnterWorldRequest`。
-4. `module_state.codec.decode_request(definition,body)` → `pb.decode`，获得 `{player_id=1001}`。
+3. Codec 内部的 `registry.commands[1001]` → 直接查询生成表；得到 `.flywow.gateway.course.EnterWorldRequest`。
+4. `module_state.codec.decode_request(command_id,body)` → `pb.decode`，获得 `{player_id=1001}`。
 5. 检查连接级/实例级每秒速率，刷新成功接纳的业务消息活动时间。
-6. 构造 `inbound_request = {gateway_epoch,connection_id,peer,transport,command_id,data}`，以 `skynet.send(handler_service,"lua","send_data",inbound_request)` 异步投递。
+6. 构造 `inbound_request = {gateway_epoch,connection_id,command_id,data}`，以 `skynet.send(handler_service,"lua","send_data",inbound_request)` 异步投递。
 
 **重要区分**：
 
@@ -1925,13 +1918,12 @@ end
 **【真实源码局部：同一 `dispatch_payload()`】**：
 
 ```lua
-local definition = module_state.registry.commands[envelope.command]
-if definition == nil then
+if not module_state.codec.has_command(envelope.command) then
     -- 记录 UNKNOWN_COMMAND 并返回失败 Result。
 end
 
 local request_result = module_state.codec.decode_request(
-    envelope.command, definition, envelope.body
+    envelope.command, envelope.body
 )
 if not request_result.ok then
     -- 记录 REQUEST_DECODE 并返回失败 Result。
@@ -1962,8 +1954,6 @@ local inbound_request =
 {
     gateway_epoch = module_state.epoch,
     connection_id = connection.id,
-    peer          = connection.peer,
-    transport     = connection.transport,
     command_id    = envelope.command,
     data          = request,
 }
@@ -1974,7 +1964,7 @@ local call_succeeded, send_result_or_error = pcall(
 )
 ```
 
-`inbound_request` 是**跨 Service 消息**，不是网络上的 Protobuf Envelope。此刻它装有 `data={player_id=1001}` 和 Gateway 分配的逻辑连接身份；`peer`、`transport` 供业务定位来源，但不代表玩家已经通过身份认证。
+`inbound_request` 是**跨 Service 消息**，不是网络上的 Protobuf Envelope。此刻它只装有 `gateway_epoch`、`connection_id`、`command_id` 和已解码的 `data={player_id=1001}`；连接 peer/transport 保留在 Gateway 内部，不进入业务消息。
 
 接着代码判断 `not call_succeeded` 或 `send_result_or_error==nil/false`：失败记录 `HANDLER_SEND` 并返回失败 Result；成功时普通 Skynet `send` 返回 `0`，`dispatch_payload` 返回 `FlyWowResult.success()`。**成功只表示本地异步投递被 Skynet 接受**；业务还没完成，可能连 WorldService 的消息回调都还没执行。
 
@@ -2018,13 +2008,11 @@ if not module_state.gateway_config or type(outbound_message) ~= "table" or
     return
 end
 
-local definition = module_state.registry.commands[outbound_message.command_id]
-if not definition or definition.response_type == nil then
+if not module_state.codec.has_response(outbound_message.command_id) then
     return
 end
 local encode_result = module_state.codec.encode_response(
     outbound_message.command_id,
-    definition,
     module_state.gateway_config.protocol_version,
     outbound_message.data
 )

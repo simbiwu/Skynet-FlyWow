@@ -9,7 +9,6 @@ local M = {}
 ---@class HandshakeContext
 ---@field phase "hello"|"proof"|"confirm"|"ready"|"closed" 当前握手阶段。
 ---@field started integer 绝对起始 tick；消息不会刷新总期限。
----@field held boolean 是否占用 pending 握手名额。
 ---@field crypto table|nil Native userdata；私钥和 secret 不进入 Lua 字符串。
 
 ---@class HandshakeManager
@@ -70,22 +69,18 @@ function M.new(handshake_config)
     ---@param context HandshakeContext|nil Gateway 为连接持有的独占握手上下文。
     ---@return nil 不返回业务值；已释放或 nil context 都是幂等完成。
     function manager.close(context)
-        if type(context) ~= "table" or not context.held then
+        if type(context) ~= "table" or context.phase == "ready" or context.phase == "closed" then
             return
         end
 
-        -- 已持有名额的 context 只释放一次，再关闭其 Native userdata。
-        context.held = false
+        -- 只有活动阶段占用名额；先转 closed，重复 close 即由阶段拒绝二次释放。
+        context.phase = "closed"
         pending = pending - 1
         if context.crypto then
             context.crypto:close()
             context.crypto = nil
         end
 
-        -- ready context 保留最终阶段标记；其他关闭连接转为 closed。
-        if context.phase ~= "ready" then
-            context.phase = "closed"
-        end
     end
 
     --- 为新连接申请一个握手名额；成功时创建 hello 阶段 context。
@@ -102,10 +97,9 @@ function M.new(handshake_config)
         pending = pending + 1
         return flywow_result.success(
         {
-            phase   = "hello", -- 只由本 manager 推进的握手阶段。
+            phase   = "hello", -- hello/proof/confirm 阶段占用 pending；终态不占名额。
             started = read_tick(), -- 握手绝对起点；后续消息不能刷新期限。
-            held    = true, -- 本连接占有的 pending 令牌，只由 close 释放一次。
-            crypto  = nil, -- Native userdata 在验证 HELLO 后创建，持有临时私钥和派生密钥。
+            crypto  = nil, -- Native userdata 在验证 HELLO 后创建，跨调用保存证明密钥和 transcript 摘要；私钥由 challenge 构建函数局部持有。
         })
     end
 
@@ -113,8 +107,8 @@ function M.new(handshake_config)
     ---@param context HandshakeContext|nil 由 accept 返回、由 Gateway 连接记录持有的上下文。
     ---@return boolean context 仍占用名额且已超过绝对期限时为 true。
     function manager.expired(context)
-        return type(context) == "table" and context.held and
-            (read_tick() - context.started) % 0x100000000 >= timeout_ticks
+        return type(context) == "table" and context.phase ~= "ready" and
+            context.phase ~= "closed" and (read_tick() - context.started) % 0x100000000 >= timeout_ticks
     end
 
     --- 返回当前握手阶段的精确帧体长度；TCP 在读取 body 前使用。
@@ -151,7 +145,7 @@ function M.new(handshake_config)
         -- 输入容器有效后读取连接独占状态和本次借用帧。
         local context = handshake_input.context -- Gateway 为来源连接保存的独占状态，本次按 phase 推进。
         local bytes = handshake_input.bytes -- 当前完整握手帧；仅在本次同步处理期间借用。
-        if type(context) ~= "table" or not context.held then
+        if type(context) ~= "table" or context.phase == "ready" or context.phase == "closed" then
             return flywow_result.failure(
                 "HANDSHAKE_STATE",
                 "handshake context is not active"
@@ -265,7 +259,7 @@ function M.new(handshake_config)
     ---@param context HandshakeContext Gateway 当前连接的独占握手上下文。
     ---@return FlyWowResult<nil> 成功表示 ready 已提交；阶段错误或期限过期时返回失败结果。
     function manager.confirm(context)
-        if type(context) ~= "table" or not context.held or context.phase ~= "confirm" then
+        if type(context) ~= "table" or context.phase ~= "confirm" then
             return flywow_result.failure(
                 "HANDSHAKE_STATE",
                 "handshake is not waiting for transport confirmation"
@@ -282,8 +276,8 @@ function M.new(handshake_config)
         end
 
         -- 确认仍有效后开放业务，并通过幂等 close 归还 pending 名额。
-        context.phase = "ready"
         manager.close(context)
+        context.phase = "ready"
         return flywow_result.success()
     end
 

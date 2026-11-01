@@ -60,9 +60,16 @@ assert(not manager.ready(a), "must wait for successful transport write")
 assert(manager.confirm(a).ok and manager.ready(a))
 manager.close(a)
 assert(closed == 1, "double close must not free twice")
-local c = manager.accept().value
+local c_result = manager.accept()
+assert(c_result.ok, "confirm must release exactly one pending slot")
+assert(not manager.accept().ok, "ready and active contexts must not exceed pending capacity")
+local c = c_result.value
 assert(not manager.receive({ context = c, bytes = hello:sub(1, 66) }).ok)
 manager.close(c)
+manager.close(c)
+local replacement = manager.accept()
+assert(replacement.ok, "repeated close must release exactly one pending slot")
+manager.close(replacement.value)
 assert(not manager.receive({ context = b, bytes = string.char(1, 2) .. string.rep("a", 65) }).ok)
 local d = manager.accept().value
 assert(manager.receive({ context = d, bytes = hello }).ok)

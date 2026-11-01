@@ -303,6 +303,23 @@ local function scenario(overrides, expect_start_failure)
         })
     end
 
+    -- 查询 API 使用同一 Registry；下游 Gateway 按其结果决定是否解码或编码消息。
+    codec.command_count = 1 -- 本场景 Registry 声明一个命令。
+    --- 按本场景 Registry 查询命令。
+    ---@param command_id integer 入站命令号。
+    ---@return boolean found 命令是否存在。
+    function codec.has_command(command_id)
+        return registry.commands[command_id] ~= nil
+    end
+
+    --- 判断本场景命令是否有响应类型。
+    ---@param command_id integer 出站命令号。
+    ---@return boolean supported 是否可编码响应。
+    function codec.has_response(command_id)
+        local definition = registry.commands[command_id]
+        return definition ~= nil and definition.response_type ~= nil
+    end
+
     -- 请求 body 替身，与业务无关。
     ---@return FlyWowResult<table> 固定的业务 request record。
     function codec.decode_request()
@@ -311,11 +328,10 @@ local function scenario(overrides, expect_start_failure)
 
     -- 响应结果编码为文本，fail 注入编码异常。
     ---@param command_id integer Gateway 根据出站消息携带的命令号查到的 key。
-    ---@param definition table Registry 中的 response 定义。
     ---@param version integer 当前 Gateway 协议版本。
     ---@param response table handler 返回的 response record。
     ---@return FlyWowResult<string> 固定响应值编码；fail 字段触发模拟编码错误。
-    function codec.encode_response(command_id, definition, version, response)
+    function codec.encode_response(command_id, version, response)
         if response.fail then
             return flywow_result.failure("TEST_ENCODE", "encode failure")
         end
@@ -402,7 +418,6 @@ local invalid_optional_configs =
 {
     { host = false },
     { transport = false },
-    { websocket_protocol = false, transport = "websocket" },
     { max_frame_bytes = false },
     { max_clients = false },
     { write_warning_close_kb = false },
@@ -427,6 +442,15 @@ assert(#e.sends == 2)
 assert(not e.closed[10], "Skynet send result 0 must mean the asynchronous message was accepted")
 assert(e.sends[1][1] == ".test_handler", "Gateway must send to the configured service name")
 assert(e.sends[1][2] == "send_data")
+-- D008 是明确的公开四字段合同，禁止传输诊断字段泄漏到业务 record。
+for _, sent in ipairs(e.sends) do
+    local fields = 0 -- 本条业务 record 的真实字段数。
+    for key in pairs(sent[3]) do
+        assert(key == "gateway_epoch" or key == "connection_id" or key == "command_id" or key == "data")
+        fields = fields + 1
+    end
+    assert(fields == 4 and sent[3].peer == nil and sent[3].transport == nil)
+end
 assert(e.sends[1][3].connection_id == 1)
 assert(e.sends[2][3].connection_id == 1)
 assert(e.sends[1][3].request_id == nil and e.sends[2][3].request_id == nil)
