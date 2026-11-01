@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   quality:
-    name: 编码与 Lua 注释门禁
+    name: 编码与 Skill 结构门禁
     runs-on: ubuntu-latest
     steps:
       - name: 检出完整 Git 历史
@@ -26,6 +26,9 @@ jobs:
 
       - name: 运行门禁单测
         run: python -m unittest discover -s scripts/quality -p 'test_*.py'
+
+      - name: 检查 Skill 入口与 references
+        run: python scripts/quality/check_skill_structure.py
 
       - name: 检查当前提交的变更函数
         shell: bash

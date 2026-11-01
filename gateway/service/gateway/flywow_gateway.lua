@@ -1306,6 +1306,7 @@ local function validate_generated_registry(generated)
         return flywow_result.failure("GATEWAY_REGISTRY_INVALID", "gateway registry structure is invalid")
     end
 
+    -- 逐项验证数字命令键和可选消息类型；同一遍遍历同时计算启动状态对外报告的数量。
     local count = 0
     for command_id, definition in pairs(generated.commands) do
         if type(command_id) ~= "number" or command_id % 1 ~= 0 or
@@ -1365,6 +1366,7 @@ local function start(startup_config)
         return registry_result
     end
 
+    -- 生成表结构通过校验后直接交给 codec；接下来加载 descriptor 并核对其消息类型。
     local registry = generated -- Gateway 与 codec 直接共用构建产物，不再复制索引。
     local command_count = registry_result.value -- 启动日志和统计使用的命令数量。
     local codec_result = codec_module.new(

@@ -33,6 +33,20 @@ int pushNativeException(lua_State *state)
     return lua_binding.pushError("HU_NATIVE_EXCEPTION", "native operation failed");
 }
 
+// 当前 HotUpgrade 成功只有一个返回值，nil/error 两项明确表示失败。
+// Binding 改为 bool 失败后，在 Native 出口恢复旧的 Lua 操作失败码；参数和 HU_* 错误原样保留。
+/// @param binding 当前函数的诊断 owner；只读取本次失败码。
+/// @param results 已准备好的 Lua 结果数量；返回值位于当前栈顶。
+/// @return 原结果数，或追加 HU_NATIVE_EXCEPTION 错误后的两个结果。
+int mapNativeFailure(LuaBinding &binding, int results)
+{
+    if (results == 2 && binding.isNoneOrNil(-2) && binding.errorCode() == "INTERNAL_ERROR")
+    {
+        return binding.pushError("HU_NATIVE_EXCEPTION", "native operation failed");
+    }
+    return results;
+}
+
 struct FileList
 {
     // 接收整个发布目录扫描出的相对文件路径。
@@ -313,73 +327,69 @@ bool resolveFile(const std::string &root_argument, const std::string &relative, 
 /// @return 成功返回完整文件内容；文件不存在返回 false；失败返回 nil 和错误对象。
 int read_file(lua_State *state)
 {
-    return LuaBinding::invoke(
-        state,
-        [state]() -> int
+    try
+    {
+        LuaBinding  binding(state);
+        std::string root; // Controller 配置的正式文件根目录。
+        // 可选的根目录相对目录；用于限制解析范围。
+        std::string relative; // 本次完整 .lua 的根目录相对路径。
+        std::string path;     // 逐级校验后用于同步文件操作的绝对路径。
+        // 先读取正式文件根目录和目标文件相对路径，再按根目录边界校验文件路径。
+        if (!binding.readValue(1, root) || !binding.readValue(2, relative))
         {
-            try
+            return mapNativeFailure(binding, binding.pushError());
+        }
+
+        if (!resolveFile(root, relative, false, path))
+        {
+            return mapNativeFailure(binding, binding.pushError("HU_INVALID_PATH", relative));
+        }
+
+        // 路径确认后打开普通文件；缺失文件返回 false，其余读取错误返回 HU_ 错误。
+        FileHandle file{open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK)};
+        if (file.descriptor < 0)
+        {
+            if (errno == ENOENT)
             {
-                LuaBinding  binding(state);
-                std::string root; // Controller 配置的正式文件根目录。
-                // 可选的根目录相对目录；用于限制解析范围。
-                std::string relative; // 本次完整 .lua 的根目录相对路径。
-                std::string path;     // 逐级校验后用于同步文件操作的绝对路径。
-                // 先读取正式文件根目录和目标文件相对路径，再按根目录边界校验文件路径。
-                if (!binding.readValue(1, root) || !binding.readValue(2, relative))
-                {
-                    return binding.pushError();
-                }
-
-                if (!resolveFile(root, relative, false, path))
-                {
-                    return binding.pushError("HU_INVALID_PATH", relative);
-                }
-
-                // 路径确认后打开普通文件；缺失文件返回 false，其余读取错误返回 HU_ 错误。
-                FileHandle file{open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK)};
-                if (file.descriptor < 0)
-                {
-                    if (errno == ENOENT)
-                    {
-                        return binding.returnValues(false);
-                    }
-                    return binding.pushError("HU_FILE_READ_FAILED", relative);
-                }
-                struct stat attributes;
-                if (fstat(file.descriptor, &attributes) != 0 || !S_ISREG(attributes.st_mode))
-                {
-                    return binding.pushError("HU_INVALID_PATH", relative);
-                }
-
-                // 接收从正式文件读出的全部旧源码；读取完成后复制给 Lua。
-                std::string contents;
-                char        buffer[8192]; // 每次读取 8 KiB；只限制读取块，不限制文件总大小。
-                for (;;)
-                {
-                    const ssize_t count = read(file.descriptor, buffer, sizeof(buffer));
-                    if (count == 0)
-                    {
-                        break;
-                    }
-                    if (count < 0)
-                    {
-                        if (errno == EINTR)
-                        {
-                            continue;
-                        }
-                        return binding.pushError("HU_FILE_READ_FAILED", relative);
-                    }
-                    contents.append(buffer, static_cast<std::size_t>(count));
-                }
-
-                // returnValues 把完整字节复制到 Lua 字符串；C++ contents 随后正常释放。
-                return binding.returnValues(contents);
+                return mapNativeFailure(binding, binding.returnValues(false));
             }
-            catch (...)
+            return mapNativeFailure(binding, binding.pushError("HU_FILE_READ_FAILED", relative));
+        }
+        struct stat attributes;
+        if (fstat(file.descriptor, &attributes) != 0 || !S_ISREG(attributes.st_mode))
+        {
+            return mapNativeFailure(binding, binding.pushError("HU_INVALID_PATH", relative));
+        }
+
+        // 接收从正式文件读出的全部旧源码；读取完成后复制给 Lua。
+        std::string contents;
+        char        buffer[8192]; // 每次读取 8 KiB；只限制读取块，不限制文件总大小。
+        for (;;)
+        {
+            const ssize_t count = read(file.descriptor, buffer, sizeof(buffer));
+            if (count == 0)
             {
-                return pushNativeException(state);
+                break;
             }
-        });
+            if (count < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                return mapNativeFailure(binding,
+                                        binding.pushError("HU_FILE_READ_FAILED", relative));
+            }
+            contents.append(buffer, static_cast<std::size_t>(count));
+        }
+
+        // returnValues 把完整字节复制到 Lua 字符串；C++ contents 随后正常释放。
+        return mapNativeFailure(binding, binding.returnValues(contents));
+    }
+    catch (...)
+    {
+        return pushNativeException(state);
+    }
 }
 
 /// 将源码完整写入正式文件；nil 内容用于删除本批新增文件。
@@ -388,96 +398,92 @@ int read_file(lua_State *state)
 /// @note 先写同目录临时文件，再 rename 替换，避免写入未完成的内容成为正式文件。
 int replace_file(lua_State *state)
 {
-    return LuaBinding::invoke(
-        state,
-        [state]() -> int
+    std::string temporary; // 记录实际创建的临时路径，异常分支也用它删除未发布文件。
+    try
+    {
+        LuaBinding  binding(state);
+        std::string root;     // Controller 配置的正式文件根目录。
+        std::string relative; // 本次完整 .lua 的根目录相对路径。
+        std::string path;     // 逐级校验后用于同步文件操作的绝对路径。
+        std::string contents; // Controller 已冻结的新版源码，或恢复时传回的完整旧内容。
+        // lua_isnoneornil/readValue 均只读参数槽；returnValues 在原栈顶追加唯一结果。
+        // 第三个参数是否缺失或为 nil；是则删除本批新增文件而非写入源码。
+        const bool  removing = lua_isnoneornil(state, 3);
+        if (!binding.readValue(1, root) || !binding.readValue(2, relative) ||
+            (!removing && !binding.readValue(3, contents)))
         {
-            std::string temporary; // 记录实际创建的临时路径，异常分支也用它删除未发布文件。
-            try
+            return mapNativeFailure(binding, binding.pushError());
+        }
+        if (!resolveFile(root, relative, !removing, path))
+        {
+            return mapNativeFailure(binding, binding.pushError("HU_INVALID_PATH", relative));
+        }
+
+        // 恢复原先不存在的文件时删除部署文件；其他情况走临时文件替换。
+        if (removing)
+        {
+            if (unlink(path.c_str()) != 0 && errno != ENOENT)
             {
-                LuaBinding  binding(state);
-                std::string root;     // Controller 配置的正式文件根目录。
-                std::string relative; // 本次完整 .lua 的根目录相对路径。
-                std::string path;     // 逐级校验后用于同步文件操作的绝对路径。
-                std::string contents; // Controller 已冻结的新版源码，或恢复时传回的完整旧内容。
-                // lua_isnoneornil/readValue 均只读参数槽；returnValues 在原栈顶追加唯一结果。
-                // 第三个参数是否缺失或为 nil；是则删除本批新增文件而非写入源码。
-                const bool  removing = lua_isnoneornil(state, 3);
-                if (!binding.readValue(1, root) || !binding.readValue(2, relative) ||
-                    (!removing && !binding.readValue(3, contents)))
-                {
-                    return binding.pushError();
-                }
-                if (!resolveFile(root, relative, !removing, path))
-                {
-                    return binding.pushError("HU_INVALID_PATH", relative);
-                }
-
-                // 恢复原先不存在的文件时删除部署文件；其他情况走临时文件替换。
-                if (removing)
-                {
-                    if (unlink(path.c_str()) != 0 && errno != ENOENT)
-                    {
-                        return binding.pushError("HU_FILE_DEPLOY_FAILED", relative);
-                    }
-                    return binding.returnValues(true);
-                }
-
-                // 沿用原文件权限，把完整内容写入同目录临时文件后再替换正式文件。
-                struct stat attributes;
-                mode_t      mode = 0644; // 新代码文件默认可读、owner 可写；覆盖时沿用原文件权限。
-                if (lstat(path.c_str(), &attributes) == 0)
-                {
-                    mode = attributes.st_mode & 0777;
-                }
-                temporary = path.substr(0, path.find_last_of('/')) + "/.flywow-hotupgrade-XXXXXX";
-                // mkstemp 需要可写且以空字符结尾的同目录临时路径缓冲区。
-                std::vector<char> pattern(temporary.begin(), temporary.end());
-                pattern.push_back('\0');
-                FileHandle file{mkstemp(pattern.data())};
-                if (file.descriptor < 0)
-                {
-                    return binding.pushError("HU_FILE_DEPLOY_FAILED", relative);
-                }
-                temporary.assign(pattern.data());
-                // 临时文件权限设置和后续写入是否持续成功；失败时不替换正式文件。
-                bool        written = fchmod(file.descriptor, mode) == 0;
-                std::size_t offset  = 0;
-                while (written && offset < contents.size())
-                {
-                    const ssize_t count =
-                        write(file.descriptor, contents.data() + offset, contents.size() - offset);
-                    if (count < 0 && errno == EINTR)
-                    {
-                        continue;
-                    }
-                    if (count <= 0)
-                    {
-                        written = false;
-                        break;
-                    }
-                    offset += static_cast<std::size_t>(count);
-                }
-
-                // 临时文件描述符是否成功关闭；只有写入并关闭成功才执行 rename。
-                const bool closed = close(file.descriptor) == 0;
-                file.descriptor   = -1;
-                if (!written || !closed || rename(temporary.c_str(), path.c_str()) != 0)
-                {
-                    unlink(temporary.c_str());
-                    return binding.pushError("HU_FILE_DEPLOY_FAILED", relative);
-                }
-                return binding.returnValues(true);
+                return mapNativeFailure(binding,
+                                        binding.pushError("HU_FILE_DEPLOY_FAILED", relative));
             }
-            catch (...)
+            return mapNativeFailure(binding, binding.returnValues(true));
+        }
+
+        // 沿用原文件权限，把完整内容写入同目录临时文件后再替换正式文件。
+        struct stat attributes;
+        mode_t      mode = 0644; // 新代码文件默认可读、owner 可写；覆盖时沿用原文件权限。
+        if (lstat(path.c_str(), &attributes) == 0)
+        {
+            mode = attributes.st_mode & 0777;
+        }
+        temporary = path.substr(0, path.find_last_of('/')) + "/.flywow-hotupgrade-XXXXXX";
+        // mkstemp 需要可写且以空字符结尾的同目录临时路径缓冲区。
+        std::vector<char> pattern(temporary.begin(), temporary.end());
+        pattern.push_back('\0');
+        FileHandle file{mkstemp(pattern.data())};
+        if (file.descriptor < 0)
+        {
+            return mapNativeFailure(binding, binding.pushError("HU_FILE_DEPLOY_FAILED", relative));
+        }
+        temporary.assign(pattern.data());
+        // 临时文件权限设置和后续写入是否持续成功；失败时不替换正式文件。
+        bool        written = fchmod(file.descriptor, mode) == 0;
+        std::size_t offset  = 0;
+        while (written && offset < contents.size())
+        {
+            const ssize_t count =
+                write(file.descriptor, contents.data() + offset, contents.size() - offset);
+            if (count < 0 && errno == EINTR)
             {
-                if (!temporary.empty())
-                {
-                    unlink(temporary.c_str());
-                }
-                return pushNativeException(state);
+                continue;
             }
-        });
+            if (count <= 0)
+            {
+                written = false;
+                break;
+            }
+            offset += static_cast<std::size_t>(count);
+        }
+
+        // 临时文件描述符是否成功关闭；只有写入并关闭成功才执行 rename。
+        const bool closed = close(file.descriptor) == 0;
+        file.descriptor   = -1;
+        if (!written || !closed || rename(temporary.c_str(), path.c_str()) != 0)
+        {
+            unlink(temporary.c_str());
+            return mapNativeFailure(binding, binding.pushError("HU_FILE_DEPLOY_FAILED", relative));
+        }
+        return mapNativeFailure(binding, binding.returnValues(true));
+    }
+    catch (...)
+    {
+        if (!temporary.empty())
+        {
+            unlink(temporary.c_str());
+        }
+        return pushNativeException(state);
+    }
 }
 
 /// 解析已存在路径；提供相对目录时，校验其在根目录内并逐级拒绝链接。
@@ -485,58 +491,54 @@ int replace_file(lua_State *state)
 /// @return 成功返回规范化绝对路径；失败返回 nil 和错误对象。
 int resolve(lua_State *state)
 {
-    return LuaBinding::invoke(
-        state,
-        [state]() -> int
+    try
+    {
+        // 参数读取不改变原栈槽；成功压入路径，失败追加 nil/error 两个结果。
+        // [S, input, relative?] -> [..., canonical_path] 或 [..., nil, error]；VM 取回调返回数。
+        LuaBinding  binding(state);
+        // 从 Lua 第一个参数读取的待解析根路径或文件路径。
+        std::string input;
+        if (!binding.readValue(1, input))
         {
-            try
-            {
-                // 参数读取不改变原栈槽；成功压入路径，失败追加 nil/error 两个结果。
-                // [S, input, relative?] -> [..., canonical_path] 或 [..., nil, error]；VM 取回调返回数。
-                LuaBinding  binding(state);
-                // 从 Lua 第一个参数读取的待解析根路径或文件路径。
-                std::string input;
-                if (!binding.readValue(1, input))
-                {
-                    return binding.pushError();
-                }
+            return mapNativeFailure(binding, binding.pushError());
+        }
 
-                // 交给 Lua 的规范化绝对路径；有第二参数时是校验后的目录。
-                std::string output;
-                // 选择的路径解析分支是否成功。
-                bool        resolved = false;
-                if (lua_gettop(state) >= 2)
-                {
-                    std::string relative;
-                    std::string root;
-                    if (!binding.readValue(2, relative))
-                    {
-                        return binding.pushError();
-                    }
-                    resolved = resolveDirectory(input, relative, root, output);
-                }
-                else
-                {
-                    resolved = resolvePath(input, output);
-                }
-                if (!resolved)
-                {
-                    return binding.pushError((input.empty() || lua_gettop(state) >= 2)
-                                                 ? "HU_INVALID_PATH"
-                                                 : "HU_FILE_NOT_FOUND",
-                                             "path cannot be resolved");
-                }
-                return binding.returnValues(output);
-            }
-            catch (const std::exception &)
+        // 交给 Lua 的规范化绝对路径；有第二参数时是校验后的目录。
+        std::string output;
+        // 选择的路径解析分支是否成功。
+        bool        resolved = false;
+        if (lua_gettop(state) >= 2)
+        {
+            std::string relative;
+            std::string root;
+            if (!binding.readValue(2, relative))
             {
-                return pushNativeException(state);
+                return mapNativeFailure(binding, binding.pushError());
             }
-            catch (...)
-            {
-                return pushNativeException(state);
-            }
-        });
+            resolved = resolveDirectory(input, relative, root, output);
+        }
+        else
+        {
+            resolved = resolvePath(input, output);
+        }
+        if (!resolved)
+        {
+            return mapNativeFailure(binding,
+                                    binding.pushError((input.empty() || lua_gettop(state) >= 2)
+                                                          ? "HU_INVALID_PATH"
+                                                          : "HU_FILE_NOT_FOUND",
+                                                      "path cannot be resolved"));
+        }
+        return mapNativeFailure(binding, binding.returnValues(output));
+    }
+    catch (const std::exception &)
+    {
+        return pushNativeException(state);
+    }
+    catch (...)
+    {
+        return pushNativeException(state);
+    }
 }
 
 /// 枚举发布目录中的 Lua 文件和 Service Patch。
@@ -547,77 +549,65 @@ int resolve(lua_State *state)
 /// 将结果表压入返回栈。局部句柄析构时只释放 registry 引用，不会移除返回值。
 int list_lua(lua_State *state)
 {
-    return LuaBinding::invoke(
-        state,
-        [state]() -> int
+    try
+    {
+        // 两个 readValue 只读取原参数槽；临时 table 由 registry 引用持有，不占用工作栈。
+        // returnValues 压入 table 后：[S, patch_root, relative_patch_dir] -> [..., result_table]；
+        // 返回 1 时 VM 保留最顶层 table，LuaTable 析构 unref 不弹栈或移除它。
+        LuaBinding  binding(state);
+        std::string patch_root;
+        // Lua 传入的 Patch 根目录相对发布目录。
+        std::string relative_patch_dir;
+        if (!binding.readValue(1, patch_root) || !binding.readValue(2, relative_patch_dir))
         {
-            try
-            {
-                // 两个 readValue 只读取原参数槽；临时 table 由 registry 引用持有，不占用工作栈。
-                // returnValues 压入 table 后：[S, patch_root, relative_patch_dir] -> [..., result_table]；
-                // 返回 1 时 VM 保留最顶层 table，LuaTable 析构 unref 不弹栈或移除它。
-                LuaBinding  binding(state);
-                std::string patch_root;
-                // Lua 传入的 Patch 根目录相对发布目录。
-                std::string relative_patch_dir;
-                if (!binding.readValue(1, patch_root) || !binding.readValue(2, relative_patch_dir))
-                {
-                    return binding.pushError();
-                }
+            return mapNativeFailure(binding, binding.pushError());
+        }
 
-                std::vector<std::string> paths;
-                // 扫描发布目录的结果码；成功为 0，空目录为 1，其他情况为路径错误。
-                const int status = listLuaFiles(patch_root, relative_patch_dir, paths);
-                if (status != 0)
-                {
-                    return binding.pushError(status == 1 ? "HU_PATCH_EMPTY" : "HU_INVALID_PATH",
-                                             "patch Lua file list is invalid or empty");
-                }
-                LuaTable output = binding.newTable();
-                if (!output.valid())
-                {
-                    return binding.pushError();
-                }
-                for (std::size_t i = 0; i < paths.size(); ++i)
-                {
-                    if (!output.writeValue(static_cast<std::int64_t>(i + 1), paths[i]))
-                    {
-                        return binding.pushError();
-                    }
-                }
-                return binding.returnValues(output);
-            }
-            catch (const std::exception &)
+        std::vector<std::string> paths;
+        // 扫描发布目录的结果码；成功为 0，空目录为 1，其他情况为路径错误。
+        const int                status = listLuaFiles(patch_root, relative_patch_dir, paths);
+        if (status != 0)
+        {
+            return mapNativeFailure(
+                binding, binding.pushError(status == 1 ? "HU_PATCH_EMPTY" : "HU_INVALID_PATH",
+                                           "patch Lua file list is invalid or empty"));
+        }
+        LuaTable output;
+        if (!binding.newTable(output))
+        {
+            return mapNativeFailure(binding, binding.pushError());
+        }
+        for (std::size_t i = 0; i < paths.size(); ++i)
+        {
+            if (!output.writeValue(static_cast<std::int64_t>(i + 1), paths[i]))
             {
-                return pushNativeException(state);
+                return mapNativeFailure(binding, binding.pushError());
             }
-            catch (...)
-            {
-                return pushNativeException(state);
-            }
-        });
+        }
+        return mapNativeFailure(binding, binding.returnValues(output));
+    }
+    catch (const std::exception &)
+    {
+        return pushNativeException(state);
+    }
+    catch (...)
+    {
+        return pushNativeException(state);
+    }
 }
 
 } // namespace
 
-// 模块加载入口只创建并返回公开函数表。LuaTable 封装在局部作用域恢复临时栈项；
-// returnValues 最后压入模块 table 并返回 1，不把临时栈槽暴露给调用者。
+// 模块入口直接注册静态方法表；普通回调在注册处接入 C++ 异常边界。
 extern "C" int luaopen_flywow_hotupgrade_native(lua_State *state)
 {
-    return LuaBinding::invokeModule(state,
-                                    [state]() -> int
-                                    {
-                                        // newTable 的 registry 引用不改变原栈；returnValues 再压入模块 table 作为唯一返回值。
-                                        // [S] -> [S, module]；返回 1 后 VM 保留该 table，Binding 析构只释放临时引用。
-                                        LuaBinding binding(state);
-                                        LuaTable   module = binding.newTable();
-                                        if (!module.setFunction("resolve", resolve) ||
-                                            !module.setFunction("list_lua", list_lua) ||
-                                            !module.setFunction("read_file", read_file) ||
-                                            !module.setFunction("replace_file", replace_file))
-                                        {
-                                            return binding.pushError();
-                                        }
-                                        return binding.returnValues(module);
-                                    });
+    static const luaL_Reg functions[] = {
+        {"resolve", &LuaBinding::nativeCallback<resolve>},
+        {"list_lua", &LuaBinding::nativeCallback<list_lua>},
+        {"read_file", &LuaBinding::nativeCallback<read_file>},
+        {"replace_file", &LuaBinding::nativeCallback<replace_file>},
+        {nullptr, nullptr},
+    };
+    luaL_newlib(state, functions);
+    return 1;
 }

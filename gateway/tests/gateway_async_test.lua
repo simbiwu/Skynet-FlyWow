@@ -279,10 +279,10 @@ local function scenario(overrides, expect_start_failure)
     -- 提供单个 request/response command，供请求解码和主动下发路径共用。
     local registry =
     {
-        envelope_type = ".demo.Envelope",
-        commands =
+        envelope_type = ".demo.Envelope", -- 测试 codec 用它模拟外层类型配置。
+        commands = -- Gateway 用命令号查找测试消息类型。
         {
-            [1001] = { request_type = ".demo.QueryCellRequest", response_type = ".demo.QueryCellResponse" },
+            [1001] = { request_type = ".demo.QueryCellRequest", response_type = ".demo.QueryCellResponse" }, -- 同时覆盖入站解码与服务端编码。
         },
     }
 
@@ -310,6 +310,7 @@ local function scenario(overrides, expect_start_failure)
     end
 
     -- 响应结果编码为文本，fail 注入编码异常。
+    ---@param command_id integer Gateway 根据出站消息携带的命令号查到的 key。
     ---@param definition table Registry 中的 response 定义。
     ---@param version integer 当前 Gateway 协议版本。
     ---@param response table handler 返回的 response record。

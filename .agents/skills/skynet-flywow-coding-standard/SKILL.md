@@ -219,7 +219,7 @@ local local_module_engine -- 未注册 Service 使用的本地模块更新器。
 - 避免参数或局部变量遮蔽外层绑定，尤其不得用同名参数/局部变量遮蔽模块状态。同一层次不同语义的对象不能复用同一个含混名称。
 Lua 对外模块入口、Service 名和文件名遵守 FlyWow 已有命名合同。
 - Lua 可见的公开字段和函数名使用 snake_case。
-- 新增或本次任务修改的、直接注册为 Lua 模块函数或 userdata 方法的 C++ Binding 回调，函数标识符必须与 Lua 可见名称逐字符一致（包含大小写和下划线），注册语句也使用同名标识，例如 `module.setFunction("preload", preload)`、`methods.setFunction("step_frame", step_frame)`。这是对 C++ 自由函数和成员函数 `lowerCamelCase` 规则的窄范围例外；命名冲突时通过命名空间限定，不改回调名。
+- 新增或本次任务修改的、直接注册为 Lua 模块函数或 userdata 方法的 C++ Binding 回调，函数标识符必须与 Lua 可见名称逐字符一致（包含大小写和下划线），注册语句也使用同名标识，例如 `module.setFunction<preload>("preload")`、`methods.setFunction<step_frame>("step_frame")`。这是对 C++ 自由函数和成员函数 `lowerCamelCase` 规则的窄范围例外；命名冲突时通过命名空间限定，不改回调名。
 - Lua 名称若是 C++ 关键字（如 `new`、`signed`、`float`）或 C++ 保留标识符（如 `__index`），保留既有 Lua 合同，C++ 回调使用能说明操作的合法名称，并在注册处注明语言限制；命名空间不能解除关键字或保留标识符限制。
 - 此约束只作用于直接注册给 Lua 的回调，不约束其内部 C++ 辅助函数；辅助函数继续遵循 C++ 命名规则。已有 Lua API 保持公开名称不变；修改对应 Binding 时，通过调整 C++ 回调标识符实现名称一致。
 - luaopen_* 等 C ABI 符号遵守 Lua 加载合同。稳定协议字段、配置键或历史公开合同按其格式约定，不为统一代码风格而擅自重命名。

@@ -159,14 +159,17 @@ def render(
         "{",
     ]
     for command in sorted(commands, key=lambda item: str(item["enum_name"])):
-        lines.append(f'    {command["enum_name"]} = {command["id"]},')
+        lines.append(
+            f'    {command["enum_name"]} = {command["id"]},'
+            " -- 宿主可用此名称引用 proto 中分配的稳定命令号。"
+        )
     lines.extend([
         "}",
         "return",
         "{",
-        f'    envelope_type = ".{package}.Envelope",',
-        "    command_ids   = command_ids,",
-        "    commands      =",
+        f'    envelope_type = ".{package}.Envelope", -- lua-protobuf 解码和编码外层 Envelope 时使用。',
+        "    command_ids   = command_ids, -- 宿主业务代码按协议枚举名称引用命令号。",
+        "    commands      = -- Gateway 按 Envelope.command 选择消息类型。",
         "    {",
     ])
 
@@ -183,10 +186,10 @@ def render(
         )
         lines.extend(
             [
-                f'        [{command["id"]}] =',
+                f'        [{command["id"]}] = -- ID 来自 proto CommandId，作为 commands 的唯一查询键。',
                 "        {",
-                f"            request_type  = {request},",
-                f"            response_type = {response},",
+                f"            request_type  = {request}, -- Gateway 用于解码该命令的入站 Request；nil 表示客户端不能发送此命令。",
+                f"            response_type = {response}, -- Gateway 用于编码该命令的服务端 Response；nil 表示该命令没有响应消息。",
                 "        },",
             ]
         )

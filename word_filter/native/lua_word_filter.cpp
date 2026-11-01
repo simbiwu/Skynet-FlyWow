@@ -40,183 +40,168 @@ bool readFilter(LuaBinding &lua_binding, LuaFilter *&output)
 
 int create_filter(lua_State *state)
 {
-    return LuaBinding::invoke(
-        state,
-        [state]() -> int
+    LuaBinding lua_binding(state);
+    LuaTable   keywords;
+    if (!lua_binding.readTable(1, keywords))
+    {
+        return lua_binding.pushError();
+    }
+
+    bool compact_enabled = false;
+    if (!lua_binding.readValue(2, compact_enabled))
+    {
+        return lua_binding.pushError();
+    }
+
+    std::size_t keyword_count = 0;
+    if (!keywords.denseArrayLength(keyword_count))
+    {
+        return lua_binding.pushError();
+    }
+
+    if (keyword_count > flywow_word_filter::flywow_max_keywords)
+    {
+        setFilterError(lua_binding, "dictionary_limit");
+        return lua_binding.pushError();
+    }
+
+    LuaFilter *filter = nullptr;
+    if (!lua_binding.newUserdata(kFilterMeta, filter))
+    {
+        return lua_binding.pushError();
+    }
+    filter->compact_enabled = compact_enabled;
+
+    for (std::size_t index = 1; index <= keyword_count; ++index)
+    {
+        std::string keyword;
+        if (!keywords.readValue(index, keyword))
         {
-            LuaBinding lua_binding(state);
-            LuaTable   keywords;
-            if (!lua_binding.readTable(1, keywords))
+            return lua_binding.pushError();
+        }
+        if (keyword.size() > flywow_word_filter::flywow_max_keyword_bytes)
+        {
+            setFilterError(lua_binding, "dictionary_limit");
+            return lua_binding.pushError();
+        }
+        try
+        {
+            if (!filter->filter.add_keyword(keyword, static_cast<std::int32_t>(index)))
             {
+                setFilterError(lua_binding, "invalid_keyword");
                 return lua_binding.pushError();
             }
+        }
+        catch (const std::runtime_error &error)
+        {
+            setFilterError(lua_binding, error.what());
+            return lua_binding.pushError();
+        }
+    }
 
-            bool compact_enabled = false;
-            if (!lua_binding.readValue(2, compact_enabled))
-            {
-                return lua_binding.pushError();
-            }
+    try
+    {
+        filter->filter.build();
+    }
+    catch (const std::runtime_error &error)
+    {
+        setFilterError(lua_binding, error.what());
+        return lua_binding.pushError();
+    }
 
-            std::size_t keyword_count = 0;
-            if (!keywords.denseArrayLength(keyword_count))
-            {
-                return lua_binding.pushError();
-            }
-
-            if (keyword_count > flywow_word_filter::flywow_max_keywords)
-            {
-                setFilterError(lua_binding, "dictionary_limit");
-                return lua_binding.pushError();
-            }
-
-            LuaFilter *filter = nullptr;
-            if (!lua_binding.newUserdata(kFilterMeta, filter))
-            {
-                return lua_binding.pushError();
-            }
-            filter->compact_enabled = compact_enabled;
-
-            for (std::size_t index = 1; index <= keyword_count; ++index)
-            {
-                std::string keyword;
-                if (!keywords.readValue(index, keyword))
-                {
-                    return lua_binding.pushError();
-                }
-                if (keyword.size() > flywow_word_filter::flywow_max_keyword_bytes)
-                {
-                    setFilterError(lua_binding, "dictionary_limit");
-                    return lua_binding.pushError();
-                }
-                try
-                {
-                    if (!filter->filter.add_keyword(keyword, static_cast<std::int32_t>(index)))
-                    {
-                        setFilterError(lua_binding, "invalid_keyword");
-                        return lua_binding.pushError();
-                    }
-                }
-                catch (const std::runtime_error &error)
-                {
-                    setFilterError(lua_binding, error.what());
-                    return lua_binding.pushError();
-                }
-            }
-
-            try
-            {
-                filter->filter.build();
-            }
-            catch (const std::runtime_error &error)
-            {
-                setFilterError(lua_binding, error.what());
-                return lua_binding.pushError();
-            }
-
-            return lua_binding.returnValues(filter);
-        });
+    return lua_binding.returnValues(filter);
 }
 
 int find(lua_State *state)
 {
-    return LuaBinding::invoke(
-        state,
-        [state]() -> int
+    LuaBinding lua_binding(state);
+    LuaFilter *filter = nullptr;
+    if (!readFilter(lua_binding, filter))
+    {
+        return lua_binding.pushError();
+    }
+    std::string text;
+    if (!lua_binding.readValue(2, text))
+    {
+        return lua_binding.pushError();
+    }
+    if (text.size() > flywow_word_filter::flywow_max_text_bytes)
+    {
+        setFilterError(lua_binding, "text_limit");
+        return lua_binding.pushError();
+    }
+
+    bool found = false;
+    try
+    {
+        if (filter->compact_enabled)
         {
-            LuaBinding lua_binding(state);
-            LuaFilter *filter = nullptr;
-            if (!readFilter(lua_binding, filter))
-            {
-                return lua_binding.pushError();
-            }
-            std::string text;
-            if (!lua_binding.readValue(2, text))
-            {
-                return lua_binding.pushError();
-            }
-            if (text.size() > flywow_word_filter::flywow_max_text_bytes)
-            {
-                setFilterError(lua_binding, "text_limit");
-                return lua_binding.pushError();
-            }
+            flywow_word_filter::flywow_compact_options options;
+            options.max_source_span_bytes = flywow_word_filter::flywow_max_compact_span;
+            found                         = filter->filter.find_compact(text, filter->query_matches,
+                                                                        flywow_word_filter::flywow_normalize_options(),
+                                                                        options);
+        }
+        else
+        {
+            found = filter->filter.find(text, filter->query_matches,
+                                        flywow_word_filter::flywow_normalize_options());
+        }
+    }
+    catch (const std::runtime_error &error)
+    {
+        filter->query_matches.clear();
+        setFilterError(lua_binding, error.what());
+        return lua_binding.pushError();
+    }
 
-            bool found = false;
-            try
-            {
-                if (filter->compact_enabled)
-                {
-                    flywow_word_filter::flywow_compact_options options;
-                    options.max_source_span_bytes = flywow_word_filter::flywow_max_compact_span;
-                    found                         = filter->filter.find_compact(
-                        text, filter->query_matches, flywow_word_filter::flywow_normalize_options(),
-                        options);
-                }
-                else
-                {
-                    found = filter->filter.find(text, filter->query_matches,
-                                                flywow_word_filter::flywow_normalize_options());
-                }
-            }
-            catch (const std::runtime_error &error)
-            {
-                filter->query_matches.clear();
-                setFilterError(lua_binding, error.what());
-                return lua_binding.pushError();
-            }
+    if (!found)
+    {
+        filter->query_matches.clear();
+        setFilterError(lua_binding, "invalid_utf8");
+        return lua_binding.pushError();
+    }
 
-            if (!found)
-            {
-                filter->query_matches.clear();
-                setFilterError(lua_binding, "invalid_utf8");
-                return lua_binding.pushError();
-            }
-
-            LuaTable matches = lua_binding.newTable();
-            for (std::size_t index = 0; index < filter->query_matches.size(); ++index)
-            {
-                const flywow_match &match = filter->query_matches[index];
-                LuaTable            item  = lua_binding.newTable();
-                if (!item.writeValue("keyword_id", match.keyword_id) ||
-                    !item.writeValue("offset", match.source_byte_offset + 1) ||
-                    !item.writeValue("length", match.source_byte_length) ||
-                    !matches.writeValue(index + 1, item))
-                {
-                    filter->query_matches.clear();
-                    return lua_binding.pushError();
-                }
-            }
+    LuaTable matches;
+    if (!lua_binding.newTable(matches))
+    {
+        return lua_binding.pushError();
+    }
+    for (std::size_t index = 0; index < filter->query_matches.size(); ++index)
+    {
+        const flywow_match &match = filter->query_matches[index];
+        LuaTable            item;
+        if (!lua_binding.newTable(item))
+        {
+            return lua_binding.pushError();
+        }
+        if (!item.writeValue("keyword_id", match.keyword_id) ||
+            !item.writeValue("offset", match.source_byte_offset + 1) ||
+            !item.writeValue("length", match.source_byte_length) ||
+            !matches.writeValue(index + 1, item))
+        {
             filter->query_matches.clear();
-            return lua_binding.returnValues(matches);
-        });
+            return lua_binding.pushError();
+        }
+    }
+    filter->query_matches.clear();
+    return lua_binding.returnValues(matches);
 }
 
 } // namespace
 
 extern "C" int luaopen_flywow_word_filter_native(lua_State *state)
 {
-    return LuaBinding::invokeModule(
-        state,
-        [state]() -> int
-        {
-            LuaBinding lua_binding(state);
-            LuaTable   metatable;
-            if (!lua_binding.registerUserdata<LuaFilter>(kFilterMeta, metatable))
-            {
-                return lua_binding.pushError();
-            }
-
-            LuaTable methods = lua_binding.newTable();
-            if (!methods.setFunction("find", find) || !metatable.writeValue("__index", methods))
-            {
-                return lua_binding.pushError();
-            }
-
-            LuaTable module = lua_binding.newTable();
-            // new 是 C++ 关键字，Lua 名称保持不变，C++ 回调使用合法的 create_filter。
-            if (!module.setFunction("new", create_filter) || !module.setFunction("find", find))
-            {
-                return lua_binding.pushError();
-            }
-            return lua_binding.returnValues(module);
-        });
+    static const luaL_Reg methods[] = {
+        {"find", &LuaBinding::nativeCallback<find>},
+        {nullptr, nullptr},
+    };
+    static const luaL_Reg functions[] = {
+        {"new", &LuaBinding::nativeCallback<create_filter>},
+        {"find", &LuaBinding::nativeCallback<find>},
+        {nullptr, nullptr},
+    };
+    LuaBinding::registerUserdata<LuaFilter>(state, kFilterMeta, methods);
+    luaL_newlib(state, functions);
+    return 1;
 }

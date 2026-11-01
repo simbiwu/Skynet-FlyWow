@@ -1,0 +1,26 @@
+{
+  "baseline_commit": "f6935bc0975d1f0ba7cd15630089f1db2c326d26",
+  "package_type": "repository-root-overlay",
+  "note": "现有 Coding Standard 与 Teaching 主 Skill 保持原样；覆盖包只包含需要新增或替换的文件。",
+  "files": {
+    ".agents/skills/flywow-engineering-workflow/SKILL.md": "75a4e5bbc9b377d0ed6db47c5d10b3fc17adffb72a33fda39fda8dd16cbc11c7",
+    ".agents/skills/flywow-engineering-workflow/references/代码审计与复杂度审计.md": "182eb0fdccace7b52e8dcf51e673442b736e48ffdedaf7e6d07d6cfb9b74cd96",
+    ".agents/skills/flywow-engineering-workflow/references/分阶段实施.md": "670c3136a3b52465c9f6a22db619b01b2e2e3c34bc792916d19ca52697426af4",
+    ".agents/skills/flywow-engineering-workflow/references/反模式与架构重置.md": "88a983ef15a52d768a44773d9f70eeb64834809b63827a6a0f630226ee3782c7",
+    ".agents/skills/flywow-engineering-workflow/references/调试与根因分析.md": "b9828e066d404e5563c37391c4620a2c539005db12996c68e5d691e2fc38186f",
+    ".agents/skills/flywow-engineering-workflow/references/需求分析与方案设计.md": "90eb1fce40fe052160b5909e63e93e231830df6ab26153a3b5dc43362d89ef12",
+    ".agents/skills/skynet-flywow-coding-standard/references/C++与Native.md": "6896adcd8727dcff5a2b2e3ce9828d62568358c8de5fce2fb296249b8c3bd0b3",
+    ".agents/skills/skynet-flywow-coding-standard/references/Lua与Skynet.md": "8d2b1b1b4a93ee6ae2ccf531b45df10c25e606b738d8628fd39423b833ab5083",
+    ".agents/skills/skynet-flywow-coding-standard/references/Shell与验证.md": "86040d1961e89f689e54cdd4390ce6a9ffc7771c69bab36c4fa11c98b80ab980",
+    ".agents/skills/skynet-flywow-coding-standard/references/工程合同与最小设计.md": "412081fb0a96bed8d2e2a6e5be6f83d2038512015e094eac987617310f5690b1",
+    ".agents/skills/skynet-flywow-coding-standard/references/注释与可读性.md": "86be967241f951f6e81cf8fff4e6f252e5db6817ff90556171d46e207585edb4",
+    ".github/workflows/quality.yml": "f248a3c2d87c2269ef79f5c7c4b5f061e3e30bf4db763b2005eea9feb00d5649",
+    "AGENTS.md": "266a40ca37ca11eba9975ea8765e2c9d736f657d71507046f951968c23261146",
+    "docs/工程决策.md": "ad969457eafa5f83ada4a768b590d4ea83865e31c798755965e36cbcd64e5f5f",
+    "docs/规范体系升级审计报告.md": "1cfbd833e1dbf2639176d49769ef7d89856c947d1588e142b12bccaa47132556",
+    "docs/规范体系升级说明.md": "fcab5eea54181007963ce3c6a80f528f0bb65821358fcf052f44992a26179d8b",
+    "docs/质量门禁.md": "e0fa34e9a098c111209ee5a4b617bf65bc7a627a3479fa221da44558333d114c",
+    "scripts/quality/check_skill_structure.py": "202ee85924f8a2fc6a343aab35b70b8c81056d559b74cbbe753070ddc75d7de3",
+    "scripts/quality/test_skill_structure.py": "0ed9e74307ac2c749ac826c1aa7b7a001174365aa74071f14cdec6122f8d8fe5"
+  }
+}

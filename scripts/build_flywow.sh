@@ -114,10 +114,10 @@ fi
 if [[ "$MODULE" == gateway || "$MODULE" == all ]]; then
     # -S 选择 Gateway Native 源码；-B 隔离此模块 CMake 缓存。
     # CXX 仅在首次配置缓存时选编译器；Skynet 路径固定 Lua ABI，输出路径匹配 Gateway lua_cpath。
+    # CXX 未设置或为空时用 c++；例如 CXX=clang++ 会令 CMake 使用 clang++。
     cmake -S "$FRAMEWORK_DIR/gateway/native" -B "$BUILD_ROOT/cmake/gateway" \
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-        # CXX 未设置或为空时用 c++；例如 CXX=clang++ 会令 CMake 使用 clang++。
-            -DCMAKE_CXX_COMPILER="${CXX:-c++}" \
+        -DCMAKE_CXX_COMPILER="${CXX:-c++}" \
         -DSKYNET_ROOT="$SKYNET_ROOT" \
         -DFLYWOW_NATIVE_OUTPUT_DIR="$NATIVE_DIR"
 

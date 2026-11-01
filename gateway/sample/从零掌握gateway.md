@@ -4,7 +4,7 @@
 >
 > 源码基线：`simbiwu/Skynet-FlyWow` `7509b289fdd05a63b24c9c11b2a1eafc1e836a4a`（2026-10-29）。Skynet 固定 `v1.8.0`，Lua 使用该 Skynet 自带版本，协议版本 `4`；宿主协议工具固定版本以 `shared/protocol/VERSIONS.env` 为准。
 >
-> **代码身份**：标为「亲手新建」的是本课程的完整教学文件，不是仓库现存源码；标为「真实源码」的路径、函数、合同已在上述提交中核对；日志均为**预期现象，不是本课程实测结果**。本次只编写教程，不替学习者创建示例或修改仓库。
+> **代码身份**：标为「亲手新建」的是本课程的完整教学文件，不是仓库现存源码；标为「真实源码」的路径、函数、合同已在上述提交中核对；日志均为**预期现象，不是本课程实测结果**。课程中的运行日志为预期现象。LuaBinding 相关片段已同步本次工作区接口简化；本轮未编译或运行验证。
 
 ---
 
@@ -717,7 +717,366 @@ end
 
 `startup_config` 是从 WorldService 通过 Skynet RPC 传过来的**配置副本值**；`config_result.value` 才是 Gateway 通过 `normalize_config()` 验证过的配置记录。`generated` 是 `require("world_registry")` 返回的构建产物 table；`registry_result.value` 是校验时计算的命令数量；Gateway 与 Codec 直接共享 `generated`，不建立第二份查询索引。
 
-后续真实调用为 `codec_module.new({descriptor_path, registry})`、`require("flywow_gateway_crypto")`、`handshake_module.new({crypto, now, max_pending, timeout_ticks})`。分别在运行时验证 Descriptor、初始化 Native 模块、建立握手管理器。任一步失败都返回 `FlyWowResult`，**不会提前创建 listener**。
+后续并不是三个“传位置参数”的调用。花括号表示传给函数的一张 Lua 配置表；真实调用会把字段名写出来：
+
+```lua
+local codec_result = codec_module.new(
+{
+    descriptor_path = gateway_config.descriptor_path,
+    registry        = registry,
+}
+)
+if not codec_result.ok then
+    return codec_result
+end
+
+local crypto_ok, crypto = pcall(require, "flywow_gateway_crypto")
+if not crypto_ok then
+    return flywow_result.failure("GATEWAY_CRYPTO_LOAD_FAILED", tostring(crypto))
+end
+
+local handshake_result = handshake_module.new(
+{
+    crypto        = crypto,
+    now           = skynet.now,
+    max_pending   = gateway_config.max_pending_handshakes,
+    timeout_ticks = gateway_config.handshake_timeout_ticks,
+}
+)
+if not handshake_result.ok then
+    return handshake_result
+end
+
+local codec = codec_result.value
+local handshake = handshake_result.value
+```
+
+这三步按顺序发生在 `socket.listen()` 之前。它们分别准备 Protobuf 编解码器、加载 Native 握手模块、创建一个尚未接纳任何客户端的握手管理器。只有三步都成功，Gateway 才把结果放进自己的 `module_state`，然后创建 listener。
+
+#### 第一步：加载并核对 Descriptor
+
+`codec_module.new()` 接收一张配置表，而不是两个位置参数：
+
+- `descriptor_path` 是运行时 FileDescriptorSet（本例的 `world.pb`）的文件路径。路径按 Skynet/Server 进程的工作目录解析。该文件由之前的 `protoc` 构建步骤生成；Gateway 运行时不解析 `.proto`。
+- `registry` 是前面加载并通过结构检查的 Lua 命令表。它告诉 Gateway：Envelope 的完整类型名是什么，每个 `command` 对应哪个 Request 和 Response。传递的是现有表，Gateway 和 codec 共用它，不再复制第二份索引。
+
+codec 先检查这两个字段的类型，再打开 `descriptor_path` 读取全部字节并关闭文件句柄。读取成功后，它调用宿主的 `lua-protobuf` 的 `pb.load()`，把 Descriptor 中的消息定义注册到**当前 Gateway Lua State 的 protobuf 运行时**。接着它遍历 Registry 引用的类型名（Envelope、非空的 Request/Response），逐个调用 `pb.type(type_name)`。这样可以在开始监听前发现“Registry 指向了 Descriptor 中不存在的消息”这一类部署错误。
+
+成功时返回 `FlyWowResult.success(codec)`；启动代码从 `codec_result.value` 取得 codec，供后续入站解码和出站编码使用。预期失败通过 Result 返回：
+
+| 错误码 | 含义 |
+| --- | --- |
+| `GATEWAY_CODEC_CONFIG_INVALID` | 配置表、路径或 Registry 形状不正确 |
+| `GATEWAY_DESCRIPTOR_READ_FAILED` | 文件打不开、读取失败或关闭失败 |
+| `GATEWAY_DESCRIPTOR_INVALID` | Descriptor 无法加载，或缺少 Registry 引用的消息类型 |
+
+这些错误会从 Gateway 的 `start(config)` 直接返回给宿主。此时还没有创建 listener，因此客户端不会连到一个协议配置不完整的 Gateway。
+
+#### 第二步：加载 Native 模块，而不是创建某个连接的密钥
+
+`pcall(require, "flywow_gateway_crypto")` 有两层行为：
+
+1. `require` 按 Lua 的 C 模块搜索路径加载 `flywow_gateway_crypto.so`。Skynet Lua 调用该模块的 `luaopen_flywow_gateway_crypto` 入口；入口注册 Native userdata 的 `verify`、`close` 方法，并返回带有 `new` 函数的模块表。
+2. `pcall` 捕获加载过程中的 Lua 错误。成功时其返回值是 `true, crypto_module`；失败时是 `false, error`。因此局部变量 `crypto` 接到的是模块接口表，不是某个玩家的密码上下文。
+
+这里的“加载 Native 模块”不等于已经为连接生成密钥。模块加载失败（例如 Native 产物缺失、动态库依赖无法加载或 Lua C 模块初始化失败）会被转换为 `GATEWAY_CRYPTO_LOAD_FAILED` 并终止本次启动。Native 的 `new(hello)` 要等到 listener 已经接纳客户端、握手管理器收到合法 HELLO 后才会调用；它创建的是该连接独占的 userdata。
+
+#### 第三步：创建握手管理器
+
+`handshake_module.new()` 收到的四个具名字段是：
+
+| 字段 | 本次传入值 | 用途 |
+| --- | --- | --- |
+| `crypto` | 上一步 `require` 返回的模块表 | 管理器验证 HELLO 时调用其 `new(hello)`，并通过返回的 userdata 执行 proof 验证和释放 |
+| `now` | `skynet.now` 函数本身 | 管理器需要判断期限时再读取当前时钟；这里没有写 `skynet.now()`，所以传入的不是一个固定 tick 数值 |
+| `max_pending` | `max_pending_handshakes` 配置值 | 限制本 Gateway 同时持有的待完成握手上下文数量 |
+| `timeout_ticks` | `handshake_timeout_ticks` 配置值 | 从某连接开始握手时起算的绝对期限，单位是 Skynet 的 10ms tick；例如配置值 `1000` 约为 10 秒，后续握手消息不会延长它 |
+
+构造函数会检查 Native 模块是否提供 `new`、时钟是否为函数、两个上限是否为合法正整数。全部通过后，它创建一个 manager，并将内部待处理计数初始化为 0；此时没有连接上下文，也没有为客户端创建 Native userdata。构造成功时返回 `FlyWowResult.success(manager)`，之后 Gateway 从 `handshake_result.value` 取得它。参数无效时返回 `HANDSHAKE_CONFIG_INVALID`。
+
+listener 开始工作后，连接回调才会调用 manager 的 `accept()` 申请名额；合法 HELLO 到达后，manager 才调用 `crypto.new(hello)` 创建该连接的 Native userdata。连接关闭或握手失败时，manager 负责归还名额并关闭该 userdata。也就是说，manager 是当前 Gateway Service 独占的握手状态机；它不写 Socket、不启动协程，也不预先分配所有客户端的密码状态。
+
+#### 把三个步骤连成启动时间线
+
+```text
+WorldService 调用 Gateway start(config)
+  -> 校验配置并加载/校验生成 Registry
+  -> codec_module.new({descriptor_path=..., registry=...})
+       读取 world.pb -> pb.load -> 核对 Registry 中的类型名
+  -> pcall(require, "flywow_gateway_crypto")
+       加载 Native Lua 模块 -> 得到 crypto 模块表
+  -> handshake_module.new({crypto=..., now=..., max_pending=..., timeout_ticks=...})
+       校验依赖和上限 -> 创建 pending=0 的握手 manager
+  -> 所有步骤成功后发布启动状态
+  -> socket.listen() / socket.start()
+  -> 才能接纳客户端并创建逐连接的握手 context
+```
+
+任一步失败都会在 `socket.listen()` 之前返回失败 Result；不会打印 READY，也不会留下一个已开始接收连接的 Gateway。注意这里的 `crypto` 模块表在启动阶段只加载一次，而 Native userdata 是每个连接在握手期间按需创建的，两者的生命周期不同。
+
+#### 对照三个被调用模块的真实源码
+
+下面摘取的是实现中的关键语句，用来跟踪数据和 ownership；省略部分已明确标出。它们是源码阅读片段，不是可复制替换的完整函数。阅读时分别打开 `gateway/lualib/codec.lua`、`gateway/native/gateway_crypto.cpp`、`gateway/lualib/handshake.lua`；三者由 Gateway 的 `start()` 按上一张时间线依次调用。
+
+##### 1. 在 `codec.lua / M.new()` 中，Descriptor 如何成为可用 codec
+
+**【真实源码局部：`gateway/lualib/codec.lua` / `M.new()`】**
+
+```lua
+-- descriptor_result 已通过 read_descriptor() 读取并关闭文件句柄。
+local load_succeeded, loaded_or_error = pcall(pb.load, descriptor_result.value)
+if not load_succeeded or loaded_or_error ~= true then
+    return flywow_result.failure(
+        "GATEWAY_DESCRIPTOR_INVALID",
+        tostring(loaded_or_error),
+        { descriptor_path = codec_config.descriptor_path }
+    )
+end
+
+-- 先从 Registry 收集本次 Gateway 实际会使用的完整消息类型名。
+local required_types = { codec_config.registry.envelope_type }
+for _, definition in pairs(codec_config.registry.commands) do
+    if definition.request_type then
+        required_types[#required_types + 1] = definition.request_type
+    end
+    if definition.response_type then
+        required_types[#required_types + 1] = definition.response_type
+    end
+end
+
+-- Descriptor 已加载后，逐名确认 Registry 中的类型都能被 protobuf 解析。
+for _, type_name in ipairs(required_types) do
+    if pb.type(type_name) == nil then
+        return flywow_result.failure(
+            "GATEWAY_DESCRIPTOR_INVALID",
+            "descriptor is missing a registry message type",
+            { descriptor_path = codec_config.descriptor_path, message_type = type_name }
+        )
+    end
+end
+
+local codec = {}
+-- 此处省略 codec.decode_envelope / decode_request / encode_response 的定义。
+return flywow_result.success(codec)
+```
+
+这段实现把“Descriptor 能加载”和“Descriptor 与 Registry 相匹配”分成两次检查。`pb.load` 成功只说明字节能被 lua-protobuf 接受；随后逐项 `pb.type` 才确认 Gateway 需要的 Envelope、Request、Response 确实都在其中。任一类型缺失时，`M.new()` 返回错误 Result，不创建可交付的 codec。全部通过后，codec 方法闭包读取传入的同一张 Registry 表，`success(codec)` 中的 codec 才交给 Gateway 保存。
+
+##### 2. Native 模块入口如何直接注册 API
+
+执行现场仍在 Gateway 的 start() 中：Lua 的 C 模块加载器已经找到动态库，接下来调用下面的入口。入口只注册类型和静态方法，不创建连接或密钥。
+
+**【真实源码：gateway/native/gateway_crypto.cpp / luaopen_flywow_gateway_crypto()】**
+
+```cpp
+extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
+{
+    using namespace flywow_gateway;
+    static const luaL_Reg methods[] =
+    {
+        {"verify", &LuaBinding::nativeCallback<verify>},
+        {"close", &LuaBinding::nativeCallback<close>},
+        {nullptr, nullptr},
+    };
+    static const luaL_Reg functions[] =
+    {
+        {"new", &LuaBinding::nativeCallback<createCryptoContext>},
+        {nullptr, nullptr},
+    };
+    LuaBinding::registerUserdata<CryptoContext>(state, kCryptoMetatable, methods);
+    luaL_newlib(state, functions);
+    return 1;
+}
+```
+
+先拆函数签名：
+
+| 代码 | 含义 |
+| --- | --- |
+| `extern "C"` | 使用 C 链接名，供 Lua 加载器按固定符号名查找；函数体仍然使用 C++ |
+| `int` | Lua 返回值数量；成功时栈顶留下模块表并返回 1 |
+| `lua_State *state` | 当前 Gateway 的 Lua State 与调用栈，由加载器提供 |
+| `luaopen_flywow_gateway_crypto` | require("flywow_gateway_crypto") 对应的 Native 模块入口 |
+
+按源码顺序阅读：
+
+1. methods 是 userdata 的方法表，注册 verify 和 close；functions 是模块表，注册 new。二者均为静态 luaL_Reg 数组，末尾的空项标记结束。
+2. `nativeCallback<函数>` 位于注册处。正常调用直接进入业务函数，意外 C++ 异常在业务资源展开后转换成 nil/error。没有隐藏 upvalue，普通业务函数不需要编写入口 lambda。
+3. `registerUserdata<CryptoContext>` 安装类型元表和受控 __gc，并将 methods 作为 __index；普通 LuaTable 不再全局禁止 __gc 字段，托管元表的析构方法在注册和后续 LuaTable 写入时均受保护，普通数据表可以正常操作同名字段。
+4. `luaL_newlib` 创建模块表并注册 functions。此时栈顶就是将交给 require 的表；return 1 表示一个 Lua 返回值。
+5. 入口只使用静态数组、原生指针及 Lua 值。Lua 注册失败直接沿模块加载错误传播，Gateway 外层 `pcall(require, ...)` 收到失败，不再经过另一套模块结果转换。
+
+#### 注册处的 nativeCallback 怎样保护普通 C++ 回调
+
+上面的 `luaopen_flywow_gateway_crypto()` 把 `nativeCallback<verify>` 注册给 Lua。这里的模板参数 `verify` 在编译期确定实际函数；Lua 调用时，回调收到的仍是原来的 `lua_State *` 和业务参数栈。
+
+**【真实源码：`lua-binding/lua_binding.h` / `LuaBinding::nativeCallback()`】**
+
+~~~cpp
+template <Callback Function> static int nativeCallback(lua_State *state)
+{
+    const char *failure = "Unexpected Native exception";
+    try
+    {
+        return Function(state);
+    }
+    catch (const std::bad_alloc &)
+    {
+        failure = "Native allocation failed";
+    }
+    catch (...)
+    {
+        // 离开 catch 后再进入 Lua，保证异常对象也已析构。
+    }
+    return detail::callbackFailure(state, failure);
+}
+~~~
+
+逐步看这个边界：
+
+1. `Function` 是注册点指定的函数，例如 `verify`。成功时，模板直接返回 `verify(state)` 的返回数量；它不会复制参数、改变返回值，也不为包装器增加 upvalue。
+2. `verify()` 的局部 C++ 对象在正常返回时按普通 C++ 规则析构。若它抛出异常，栈展开会先销毁 `verify()` 内的局部资源，再进入对应 `catch`。
+3. `catch` 只记下静态错误文本，不在异常处理区调用 Lua API。退出 `catch` 后才调用 `callbackFailure()`，因此异常对象也已销毁。
+4. 业务可预期错误不应靠抛异常表达。`verify()` 等回调仍用 `setError()` / `pushError()` 返回既定的 `nil,{code,message}`；`nativeCallback` 只兜底意外 C++ 异常。
+
+**【真实源码局部：`lua-binding/lua_binding.cpp` / `detail::callbackFailure()`】**
+
+~~~cpp
+int callbackFailure(lua_State *state, const char *message)
+{
+    lua_settop(state, 0);
+    ErrorArguments args{"INTERNAL_ERROR", 14, message, std::strlen(message)};
+    try
+    {
+        if (protectedCall(state, &errorResult, &args, 0, 2))
+            return 2;
+    }
+    catch (...)
+    {
+        // 退出 catch 再跳转到 Lua，避免跳过异常对象析构。
+    }
+    lua_pushliteral(state, "Native operation failed while reporting an error");
+    return lua_error(state);
+}
+~~~
+
+进入 `callbackFailure()` 时，原业务参数栈和业务函数产生的临时 Lua 值都不再作为结果使用，所以 `lua_settop(state, 0)` 清空当前回调栈。`protectedCall()` 再尝试建立两个返回值 `nil` 和错误表；成功就返回 `2`。如果连错误表都无法构造，最后用预置字面量走 Lua 的错误出口，因为持续 OOM 时不可能保证再分配一个 `{code,message}` 表。
+
+这不是“所有 Lua 错误都会被 C++ try/catch 捕获”：Lua 的 `lua_error`/longjmp 不是 C++ exception。封装把可能分配的常规 table 操作放在保护调用里；直接使用 Lua C API 的模块入口仍需遵守 Lua 加载错误合同，并避免在可能 longjmp 的调用周围持有需要析构的 C++ 资源。
+
+回到 Gateway 主线：require 成功后返回 crypto 模块表，其中 crypto.new 对应 createCryptoContext。此时仍然没有客户端密码对象；只有后续握手收到合法 HELLO 时，Lua manager 才调用 crypto.new(bytes)。
+
+**【真实源码局部：同一文件 / `createCryptoContext()`】**
+
+```cpp
+if (hello.size() != 67 || hello[0] != 1 || hello[1] != 1 ||
+    static_cast<unsigned char>(hello[2]) != 4)
+{
+    lua_binding.setError("HANDSHAKE_HELLO", "invalid handshake hello");
+    return lua_binding.pushError();
+}
+
+CryptoContext *context = nullptr;
+if (!lua_binding.newUserdata(kCryptoMetatable, context))
+{
+    return lua_binding.pushError();
+}
+
+std::string response;
+try
+{
+    response = buildChallenge(context, hello.data());
+}
+catch (const std::exception &error)
+{
+    clearCryptoContext(context);
+    lua_binding.setError(error.what(), error.what());
+    return lua_binding.pushError();
+}
+// 其余异常清理分支省略；成功时把 userdata 和 challenge 一起返回。
+return lua_binding.returnValues(context, response);
+```
+
+这段不是在 Gateway 启动时执行，而是握手进行到 HELLO 阶段后，由 Lua 侧调用 `crypto.new(bytes)` 才执行。Native 再次校验 HELLO 的固定长度和头部，成功后创建一个由 Lua userdata 持有的 `CryptoContext`，生成 challenge，并一次返回 userdata 与 challenge。异常路径清理刚创建的密码材料，再向 Lua 返回 Binding 错误；Lua manager 接到错误后会关闭该握手上下文并归还 pending 名额。由此可以区分：
+
+| 对象 | 创建时机 | owner | 生命周期结束 |
+| --- | --- | --- | --- |
+| `crypto` 模块表 | Gateway 启动时 `require` | 当前 Gateway Lua State | Lua State 结束 |
+| 每连接 `CryptoContext` userdata | 收到合法 HELLO 后调用 `crypto.new` | 该连接的 handshake context | 握手关闭/失败时 `close()`；遗漏时还有 `__gc` 兜底 |
+
+##### 3. 在 `handshake.lua / M.new()` 中，manager 创建时为什么没有连接
+
+**【真实源码局部：`gateway/lualib/handshake.lua` / `M.new()`】**
+
+```lua
+-- 上面的参数校验已确认 crypto.new、now 和两个正整数上限有效。
+local pending = 0
+local manager = {}
+
+function manager.accept()
+    if pending >= max_pending then
+        return flywow_result.failure(
+            "HANDSHAKE_CAPACITY",
+            "pending handshake capacity reached"
+        )
+    end
+
+    pending = pending + 1
+    return flywow_result.success(
+    {
+        phase   = "hello",
+        started = read_tick(),
+        held    = true,
+        crypto  = nil,
+    })
+end
+```
+
+这里的 `pending` 是由这一次 `M.new()` 创建的 manager 闭包独占的计数，不是全局计数。调用 `M.new()` 只把它设成 0；只有 listener 接纳新连接后调用 `manager.accept()` 才加一并创建握手 context。容量已满返回 `HANDSHAKE_CAPACITY`，成功则把当前 tick 记为绝对起点，并先把 `crypto` 设为 `nil`：这说明 accept 尚未创建 Native 密码对象。
+
+manager 后续处理 HELLO 时，`manager.receive()` 才调用 Native 模块：
+
+```lua
+local call_succeeded, native_or_error, challenge_or_error =
+    pcall(crypto.new, bytes)
+if not call_succeeded or native_or_error == nil or
+    type(challenge_or_error) ~= "string" then
+    manager.close(context)
+    local native_error = call_succeeded and challenge_or_error or native_or_error
+    return flywow_result.failure(
+        "HANDSHAKE_CRYPTO",
+        "Native failed to create the challenge",
+        {
+            native_code = type(native_error) == "table" and native_error.code or nil,
+            native_message = type(native_error) == "table" and native_error.message or
+                tostring(native_error),
+        }
+    )
+end
+
+context.crypto = native_or_error
+context.phase = "proof"
+return flywow_result.success(
+{
+    response_bytes = challenge_or_error,
+    needs_confirmation = false,
+})
+```
+
+`pcall` 同时接住 Binding 可能抛出的 Lua 错误和 Native Binding 返回的失败值。创建成功后，第一返回值 userdata 被保存进连接 context，第二返回值 challenge 作为本阶段输出；状态从 `hello` 推进到 `proof`。失败时先走 `manager.close(context)`，释放名额和已有 Native 资源，再返回稳定的 `HANDSHAKE_CRYPTO`。
+
+连接关闭时的释放由同一个 manager 完成：
+
+```lua
+context.held = false
+pending = pending - 1
+if context.crypto then
+    context.crypto:close()
+    context.crypto = nil
+end
+```
+
+`held` 先置为 false，确保重复关闭不会重复扣减；Native userdata 存在时调用它的 `close()` 并清空引用。这样，名额由 manager 持有和归还，密钥由 Native userdata 持有和擦除，Gateway 则继续拥有 Socket fd 与连接记录。三个 owner 不应混为一个。
 
 **【真实源码局部：同一 `start()` / 监听和发布运行状态】**：
 
@@ -1449,6 +1808,16 @@ READY    = 04 + HMAC-SHA256(K,"server-ready" || T)
 最后返回客户端：`gateway/clients/h5/handshake.mjs` 的 `HandshakeClient.complete()` 用 Web Crypto 验证服务器证明，成功后把自身阶段切 `ready` 并清掉密钥引用；`connectGateway()` Promise 随后 resolve。**服务端 ready 与客户端 SDK ready 是两次不同的确认动作**。
 
 #### 4.5.7 本阶段动手验证什么
+
+本课程的端到端流程检查 Gateway、Native 加载、握手和客户端协议。LuaBinding 另有一组固定 Skynet Lua ABI 的 Native 回归测试，覆盖参数/table 操作、真实 upvalue 编号、异常边界、Lua 分配失败时的资源展开，以及动态和静态 userdata 注册与析构。新增的静态注册用例通过 Lua `package.preload` 调用模块入口，核对静态 `luaL_Reg` 方法表、userdata 方法和 GC；它不等同于加载真实 `.so` 或运行 Gateway 集成。
+
+从 FlyWow 根目录可运行该 Binding 回归（参数需指向已构建的 Skynet 根目录）：
+
+~~~bash
+bash scripts/build_flywow.sh /path/to/skynet lua_binding
+~~~
+
+该目标链接指定 Skynet 自带的 Lua 5.4.7，而不是系统 Lua。它用于验证 Binding 的 ABI 与生命周期合同，不能替代下方 WS/TCP 课程实验。
 
 保持现有客户端代码不变，先执行正常 WS 流程，再使用第六阶段实验 A 的错误 HELLO：
 
