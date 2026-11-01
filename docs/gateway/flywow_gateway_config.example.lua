@@ -72,12 +72,12 @@ return
     max_clients                   = 1024,
     -- 待握手连接上限；合法范围 1..max_clients，超过后拒绝新握手，避免握手资源无界增长。
     max_pending_handshakes        = 128,
-    -- 握手总期限，单位为 Skynet 10ms tick；1000 表示约 10 秒，合法范围 1..360000。
-    handshake_timeout_ticks       = 1000,
-    -- TCP 定长读取或 WebSocket Upgrade 的单次读取期限，单位为 10ms tick。
-    read_timeout_ticks            = 3000,
-    -- 客户端完整业务消息空闲期限，单位 10ms tick；WebSocket ping/pong 和服务端 Push 不重置。
-    idle_timeout_ticks            = 30000,
+    -- 握手总期限，单位毫秒；10000 表示 10 秒，合法范围 1..3600000。
+    handshake_timeout_ms          = 10000,
+    -- TCP 定长读取或 WebSocket Upgrade 的单次读取期限，单位毫秒；默认 30000（30 秒）。
+    read_timeout_ms               = 30000,
+    -- 客户端完整业务消息空闲期限，单位毫秒；默认 300000（5 分钟），WebSocket ping/pong 和服务端 Push 不重置。
+    idle_timeout_ms               = 300000,
     -- 单个业务 Envelope 最大字节数；TCP uint16 framing 上限为 65535；不限制底层传输接收内存。
     max_frame_bytes               = 65535,
     -- 每连接一秒最多接纳 200 个业务请求；超限关闭该来源连接。

@@ -98,7 +98,7 @@ TCP 使用 uint16 big-endian 长度和 Envelope bytes；Gateway 在读取完整 
 
 写缓冲关闭阈值只在 Skynet warning 回调到达后判断：回调 `size` 非零且达到 `write_warning_close_kb` 时关闭连接，`size=0` 表示发送缓冲恢复并被忽略。Skynet 首次在 1 MiB 缓冲量时告警，后续按底层告警粒度递增，因此该配置不是精确内存上限。
 
-`idle_timeout_ticks` 限制客户端完整业务消息之间的空闲时间。WebSocket ping/pong 与服务端 Push 不重置该计时；TCP 正在读取定长数据时使用独立的 `read_timeout_ticks`。
+`read_timeout_ms`、`idle_timeout_ms` 和 `handshake_timeout_ms` 均以毫秒配置。Skynet 时钟每 10ms 前进一步，Gateway 每 100ms 扫描超时连接，因此实际关闭可能晚于配置期限。`idle_timeout_ms` 限制客户端完整业务消息之间的空闲时间。WebSocket ping/pong 与服务端 Push 不重置该计时；TCP 正在读取定长数据时使用独立的 `read_timeout_ms`，同样以毫秒配置。旧的 `*_timeout_ticks` 配置字段会作为配置错误拒绝，需迁移到对应的 `*_timeout_ms` 字段。
 
 ## 连接广播
 

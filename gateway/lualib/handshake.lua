@@ -3,10 +3,11 @@
 --- 生命周期：模块在当前 Service 内独占 pending 计数；每条连接 context 持有一个名额和临时 Native userdata。
 --- 失败：可预期失败返回 FlyWowResult；Native Lua Binding 的 nil/error record 在本模块转换为稳定结果。
 local flywow_result = require "flywow_result"
+local flywow_common = require "flywow_common"
 
 local M = {}
 local crypto, read_tick -- 当前 Service 注入的 Native 接口与时钟。
-local max_pending, timeout_ticks -- 当前 Service 的握手容量及绝对期限。
+local max_pending, timeout_ms -- 当前 Service 的握手容量及毫秒期限。
 local pending = 0 -- 当前 Service 占用的握手名额；accept 增加，close 释放。
 
 ---@class HandshakeContext
@@ -19,7 +20,7 @@ local pending = 0 -- 当前 Service 占用的握手名额；accept 增加，clos
 ---@field needs_confirmation boolean true 表示 SERVER_READY 写成功后还须提交 ready。
 
 --- 初始化当前 Service 的握手模块；从 Gateway start 接收 Native 接口、时钟、名额上限和期限。
----@param handshake_config table 含 crypto/now/max_pending/timeout_ticks；值由 Gateway 已校验配置注入。
+---@param handshake_config table 含 crypto/now/max_pending/timeout_ms；期限由 Gateway 以毫秒传入。
 ---@return FlyWowResult<nil> 成功表示当前 Service 握手配置已就绪；配置无效时返回 HANDSHAKE_CONFIG_INVALID。
 function M.init(handshake_config)
     if type(handshake_config) ~= "table" then
@@ -33,7 +34,7 @@ function M.init(handshake_config)
     local candidate_crypto = handshake_config.crypto -- Gateway 注入的 Native 密码接口，提供 create_context 与 userdata verify/close。
     local candidate_read_tick = handshake_config.now -- Gateway 注入的 10ms tick 时钟；每次读取当前值。
     local candidate_max_pending = handshake_config.max_pending -- 本 Service 可同时持有的握手上下文数量上限。
-    local candidate_timeout_ticks = handshake_config.timeout_ticks -- 从 accept 起算的握手总期限，单位为 10ms tick。
+    local candidate_timeout_ms = handshake_config.timeout_ms -- 从 accept 起算的握手总期限，单位为毫秒。
     if type(candidate_crypto) ~= "table" or type(candidate_crypto.create_context) ~= "function" or
         type(candidate_read_tick) ~= "function" then
         return flywow_result.failure(
@@ -47,17 +48,17 @@ function M.init(handshake_config)
             "max_pending must be a positive integer"
         )
     end
-    if math.type(candidate_timeout_ticks) ~= "integer" or candidate_timeout_ticks < 1 or
-        candidate_timeout_ticks >= 0x80000000 then
+    if math.type(candidate_timeout_ms) ~= "integer" or candidate_timeout_ms < 1 or
+        candidate_timeout_ms >= 0x80000000 * 10 then
         return flywow_result.failure(
             "HANDSHAKE_CONFIG_INVALID",
-            "timeout_ticks must be in [1, 0x7fffffff]"
+            "timeout_ms must be a positive integer shorter than half a Skynet clock cycle"
         )
     end
 
     -- 依赖全部通过校验后发布配置；Gateway 只在接受连接前初始化，不重置活动名额。
     crypto, read_tick = candidate_crypto, candidate_read_tick
-    max_pending, timeout_ticks = candidate_max_pending, candidate_timeout_ticks
+    max_pending, timeout_ms = candidate_max_pending, candidate_timeout_ms
     return flywow_result.success()
 end
 
@@ -99,12 +100,17 @@ function M.accept()
     })
 end
 
---- 检查握手总期限；tick 回绕时仍按无符号差计算。
+--- 检查握手总期限；通过 common 的 elapsed_ms 处理回绕并按毫秒判断。
 ---@param context HandshakeContext|nil 由 accept 返回、由 Gateway 连接记录持有的上下文。
 ---@return boolean context 仍占用名额且已超过绝对期限时为 true。
 function M.expired(context)
-    return type(context) == "table" and context.phase ~= "ready" and
-        context.phase ~= "closed" and (read_tick() - context.started) % 0x100000000 >= timeout_ticks
+    if type(context) ~= "table" or context.phase == "ready" or context.phase == "closed" then
+        return false
+    end
+
+    -- common.elapsed_ms 处理 tick 回绕并返回毫秒；握手期限始终以配置毫秒保存。
+    local elapsed_ms = flywow_common.elapsed_ms(context.started, read_tick()) -- 从 accept 起算的回绕安全时长，单位毫秒。
+    return elapsed_ms >= timeout_ms
 end
 
 --- 返回当前握手阶段的精确帧体长度；TCP 在读取 body 前使用。

@@ -5,6 +5,7 @@
 --- 不负责：不注册业务 command、不理解 Battle/SLG DTO、不加载 .proto 源码、不保存业务状态。
 local skynet = require "skynet"
 local flywow_result = require "flywow_result"
+local flywow_common = require "flywow_common"
 local socket = require "skynet.socket"
 local websocket = require "http.websocket"
 local codec_module = require "codec"
@@ -20,8 +21,8 @@ local handshake_module = require "handshake"
 ---@field transport GatewayTransport 当前传输类型。
 ---@field close_requested boolean 是否已经提交底层关闭，避免并发关闭重复操作。
 ---@field closed boolean 是否已从连接表摘除。
----@field read_started integer|nil 当前 TCP 定长读取或 WebSocket Upgrade 的起始 tick；nil 表示没有等待中的读取。
----@field last_message integer idle_timeout_ticks 的计时点；客户端完整业务消息会刷新，WebSocket ping/pong 和服务端 Push 不刷新。
+---@field read_started integer|nil 当前 TCP 定长读取或 WebSocket Upgrade 的起始 Skynet tick；nil 表示没有等待中的读取。
+---@field last_message integer idle_timeout_ms 的起始 Skynet tick；客户端完整业务消息会刷新，WebSocket ping/pong 和服务端 Push 不刷新。
 ---@field rate_started integer 本连接当前一秒接纳窗口的起点 tick。
 ---@field rate_count integer 本连接当前窗口已接纳的业务请求数；用于判断单连接速率上限。
 local module_state =
@@ -96,6 +97,22 @@ local function normalize_config(startup_config)
     end
 
     -- 每项数值配置分别通过公共 integer 检查；首个错误作为本次启动结果返回。
+    -- 旧配置以 tick 为单位；迁移到毫秒后拒绝旧字段，避免旧值被忽略并静默套用默认期限。
+    for _, legacy_field in ipairs({ -- 当前 startup_config 中仍使用 tick 单位的旧字段名。
+        "read_timeout_ticks",
+        "idle_timeout_ticks",
+        "handshake_timeout_ticks",
+    }) do
+        if startup_config[legacy_field] ~= nil then
+            local replacement_field = legacy_field:gsub("_ticks$", "_ms") -- 旧字段统一只改变单位后缀。
+            return flywow_result.failure(
+                "GATEWAY_CONFIG_INVALID",
+                legacy_field .. " was replaced by " .. replacement_field,
+                { field = legacy_field }
+            )
+        end
+    end
+
     -- 传输协议与 WebSocket 选项通过后校验帧长和各资源上限。
     local max_frame_result = validate_integer_config(
         startup_config.max_frame_bytes == nil and 65535 or startup_config.max_frame_bytes,
@@ -166,31 +183,31 @@ local function normalize_config(startup_config)
 
     -- Envelope 版本通过后校验读取、空闲和请求速率限制。
     local read_timeout_result = validate_integer_config(
-        startup_config.read_timeout_ticks == nil and 3000 or startup_config.read_timeout_ticks,
-        "read_timeout_ticks",
+        startup_config.read_timeout_ms == nil and 30000 or startup_config.read_timeout_ms,
+        "read_timeout_ms",
         1,
-        360000
+        3600000
     )
     if not read_timeout_result.ok then
         return read_timeout_result
     end
     -- 读取期限通过后保存配置，再校验空闲期限。
 
-    local read_timeout_ticks = read_timeout_result.value -- TCP 定长读取与 WebSocket Upgrade 的单次等待期限，单位 10ms tick。
+    local read_timeout_ms = read_timeout_result.value -- TCP 定长读取与 WebSocket Upgrade 的单次等待期限，单位毫秒。
 
     -- 单次读取期限通过后校验 WebSocket 空闲期限。
     local idle_timeout_result = validate_integer_config(
-        startup_config.idle_timeout_ticks == nil and 30000 or startup_config.idle_timeout_ticks,
-        "idle_timeout_ticks",
+        startup_config.idle_timeout_ms == nil and 300000 or startup_config.idle_timeout_ms,
+        "idle_timeout_ms",
         1,
-        360000
+        3600000
     )
     if not idle_timeout_result.ok then
         return idle_timeout_result
     end
     -- 空闲期限通过后保存配置，再校验入站速率上限。
 
-    local idle_timeout_ticks = idle_timeout_result.value -- 客户端完整业务消息空闲期限，单位 10ms tick；不由 ping/pong 或服务端 Push 刷新。
+    local idle_timeout_ms = idle_timeout_result.value -- 客户端完整业务消息空闲期限，单位毫秒；不由 ping/pong 或服务端 Push 刷新。
 
     -- 空闲期限通过后分别限制连接级与实例级入站速率。
     local requests_per_second_result = validate_integer_config(
@@ -236,17 +253,17 @@ local function normalize_config(startup_config)
 
     -- 握手名额通过后校验绝对握手期限。
     local handshake_timeout_result = validate_integer_config(
-        startup_config.handshake_timeout_ticks == nil and 1000 or startup_config.handshake_timeout_ticks,
-        "handshake_timeout_ticks",
+        startup_config.handshake_timeout_ms == nil and 10000 or startup_config.handshake_timeout_ms,
+        "handshake_timeout_ms",
         1,
-        360000
+        3600000
     )
     if not handshake_timeout_result.ok then
         return handshake_timeout_result
     end
     -- 握手期限通过后保存配置，最后校验 handler 和协议产物。
 
-    local handshake_timeout_ticks = handshake_timeout_result.value -- 从连接登记起算的握手总期限，单位 10ms tick。
+    local handshake_timeout_ms = handshake_timeout_result.value -- 从连接登记起算的握手总期限，单位毫秒。
 
     -- 数值范围全部通过后校验 handler 与协议产物路径。
     -- handler 与协议产物由宿主显式提供；运行期间不会再 require 固定业务配置。
@@ -286,12 +303,12 @@ local function normalize_config(startup_config)
         registry_module               = startup_config.registry_module, -- 生成 registry 的 require 名称。
         protocol_version              = protocol_version, -- Envelope uint32 兼容版本。
         max_frame_bytes               = max_frame_bytes, -- 单个 Envelope bytes 上限，TCP 长度前缀不计，单位 byte。
-        read_timeout_ticks            = read_timeout_ticks, -- 单次 TCP 读取或 WS Upgrade 上限，单位 10ms tick。
-        idle_timeout_ticks            = idle_timeout_ticks, -- 客户端完整业务消息空闲上限，单位 10ms tick。
+        read_timeout_ms               = read_timeout_ms, -- 单次 TCP 读取或 WS Upgrade 上限，单位毫秒。
+        idle_timeout_ms               = idle_timeout_ms, -- 客户端完整业务消息空闲上限，单位毫秒。
         max_requests_per_second       = max_requests_per_second, -- 单连接一秒窗口的业务请求上限。
         max_total_requests_per_second = max_total_requests_per_second, -- 本 Gateway 一秒窗口的业务请求上限。
         max_pending_handshakes        = max_pending_handshakes, -- 尚未完成应用握手的连接上限。
-        handshake_timeout_ticks       = handshake_timeout_ticks, -- 应用握手总期限，单位 10ms tick。
+        handshake_timeout_ms          = handshake_timeout_ms, -- 应用握手总期限，单位毫秒。
         max_clients                   = max_clients, -- 当前 Gateway 最大在线连接数。
         write_warning_close_kb        = write_warning_close_kb, -- Skynet warning 回调大小达到此 KB 时关闭连接。
     })
@@ -1233,17 +1250,17 @@ local function timeout_loop()
     while module_state.phase == "running" do
         skynet.sleep(10)
 
-        local now = skynet.now() -- 当前 10ms tick，用于判断握手总期限与连接空闲期限。
+        local now = skynet.now() -- 当前 10ms tick；与连接起点交给 common 按毫秒期限比较。
         local expired = {} -- 本轮扫描判定超时的连接快照；关闭可能 yield，因此先完成扫描。
 
         for _, connection in pairs(module_state.connections) do
             local since = connection.read_started or connection.last_message -- 空闲计时起点：正在读取时取 read_started，否则取最近完整消息时间。
-            local limit = connection.read_started -- 正在等待定长数据时使用读取期限，否则使用连接空闲期限。
-                and module_state.gateway_config.read_timeout_ticks
-                or module_state.gateway_config.idle_timeout_ticks
-
-            if handshake_module.expired(connection.handshake) or
-                (now - since) % 0x100000000 >= limit then
+            local limit_ms = connection.read_started -- 正在等待定长数据时使用读取期限，否则使用连接空闲期限；配置单位始终是毫秒。
+                and module_state.gateway_config.read_timeout_ms
+                or module_state.gateway_config.idle_timeout_ms
+            -- common.elapsed_ms 统一处理 tick 回绕并返回毫秒；超时配置和阈值保持毫秒。
+            local elapsed_ms = flywow_common.elapsed_ms(since, now) -- 当前读取或业务空闲阶段已经过的毫秒数，内部处理 tick 回绕。
+            if handshake_module.expired(connection.handshake) or elapsed_ms >= limit_ms then
                 expired[#expired + 1] = connection
             end
         end
@@ -1268,12 +1285,12 @@ end
 ---@field registry_module string 已生成的协议 registry 模块名。
 ---@field protocol_version integer Envelope 使用的协议版本。
 ---@field max_frame_bytes? integer 单条业务 Envelope bytes 上限；TCP 长度头不计，不构成底层传输内存硬上限。
----@field read_timeout_ticks? integer 读取超时，单位 10 ms tick。
----@field idle_timeout_ticks? integer 客户端完整业务消息空闲超时，单位 10 ms tick；WebSocket ping/pong 和服务端 Push 不重置。
+---@field read_timeout_ms? integer TCP 定长读取或 WebSocket Upgrade 的读取上限，单位毫秒；默认 30000，范围 1..3600000。
+---@field idle_timeout_ms? integer 客户端完整业务消息空闲上限，单位毫秒；默认 300000，范围 1..3600000；WebSocket ping/pong 和服务端 Push 不重置。
 ---@field max_requests_per_second? integer 单连接每秒接纳的业务请求上限。
 ---@field max_total_requests_per_second? integer 当前实例每秒接纳的业务请求上限。
 ---@field max_pending_handshakes? integer 尚未完成握手的连接上限。
----@field handshake_timeout_ticks? integer 握手总期限，单位 10 ms tick。
+---@field handshake_timeout_ms? integer 从连接登记起算的握手总期限，单位毫秒；默认 10000，范围 1..3600000。
 ---@field max_clients? integer 当前实例最大在线连接数。
 ---@field write_warning_close_kb? integer Skynet warning 回调的 size 达到此 KB 时关闭；受底层告警粒度影响。
 
@@ -1334,7 +1351,7 @@ local function start(startup_config)
             crypto        = crypto, -- 执行本连接 ECDH/HMAC 的 Native 模块。
             now           = skynet.now, -- 握手期限使用的 10 ms 时钟。
             max_pending   = gateway_config.max_pending_handshakes, -- 同时持有 Native 上下文的连接上限。
-            timeout_ticks = gateway_config.handshake_timeout_ticks, -- 从 accept 起算的绝对期限。
+            timeout_ms = gateway_config.handshake_timeout_ms, -- 从 accept 起算的绝对期限，单位毫秒。
         }
     )
     if not handshake_result.ok then

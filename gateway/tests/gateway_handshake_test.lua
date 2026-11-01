@@ -35,7 +35,7 @@ local manager_result = factory.init(
     crypto        = crypto,
     now           = function() return now end,
     max_pending   = 2,
-    timeout_ticks = 100,
+    timeout_ms    = 1000, -- 测试期限为 1000ms，now 每前进一步代表 10ms。
 }
 )
 assert(manager_result.ok, manager_result.message)

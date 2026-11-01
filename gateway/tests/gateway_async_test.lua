@@ -415,12 +415,15 @@ local invalid_optional_configs =
     { max_clients = false },
     { write_warning_close_kb = false },
     { backlog = false },
-    { read_timeout_ticks = false },
-    { idle_timeout_ticks = false },
+    { read_timeout_ms = false },
+    { read_timeout_ticks = 3000 },
+    { idle_timeout_ms = false },
+    { idle_timeout_ticks = 30000 },
     { max_requests_per_second = false },
     { max_total_requests_per_second = false },
     { max_pending_handshakes = false },
-    { handshake_timeout_ticks = false },
+    { handshake_timeout_ms = false },
+    { handshake_timeout_ticks = 1000 },
 }
 for _, invalid_config in ipairs(invalid_optional_configs) do
     scenario(invalid_config, true)
@@ -598,7 +601,7 @@ assert(e.shutdown_count == 1 and e.ws_close_count == 1,
 assert(e.sends[#e.sends][2] == "gateway_disconnect", "WebSocket backpressure must detach the connection")
 
 -- 完整客户端业务帧刷新空闲期限；服务端 Push 和底层 ping/pong 不刷新该时钟。
-e = scenario({ transport = "websocket", idle_timeout_ticks = 2 })
+e = scenario({ transport = "websocket", idle_timeout_ms = 20 })
 e.accept(13, "idle-ws-peer")
 resume(e.forks[2])
 assert(e.ws.ping == nil and e.ws.pong == nil, "Gateway must not track transport ping/pong callbacks")

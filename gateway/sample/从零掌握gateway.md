@@ -735,7 +735,7 @@ local handshake_result = handshake_module.init(
     crypto        = crypto,
     now           = skynet.now,
     max_pending   = gateway_config.max_pending_handshakes,
-    timeout_ticks = gateway_config.handshake_timeout_ticks,
+    timeout_ms = gateway_config.handshake_timeout_ms,
 }
 )
 if not handshake_result.ok then
@@ -744,6 +744,8 @@ end
 
 local command_count = codec_result.value
 ```
+
+配置中的三类 timeout 都使用毫秒；旧的 `*_timeout_ticks` 字段会被拒绝，避免旧配置被忽略后静默使用默认值。内部保存的是毫秒期限，比较时由 `flywow_common` 处理 Skynet tick 回绕和 10ms 到毫秒的换算。
 
 这三步按顺序发生在 `socket.listen()` 之前。它们分别准备 Protobuf 编解码器、加载 Native 握手模块、初始化当前 Service 的握手模块。只有三步都成功，Gateway 才把结果放进自己的 `module_state`，然后创建 listener。
 
@@ -770,7 +772,7 @@ codec 先检查这两个字段的类型，再打开 `descriptor_path` 读取全�
 
 `pcall(require, "flywow_gateway_crypto")` 有两层行为：
 
-1. `require` 按 Lua 的 C 模块搜索路径加载 `flywow_gateway_crypto.so`。Skynet Lua 调用该模块的 `luaopen_flywow_gateway_crypto` 入口；入口注册 Native userdata 的 `verify`、`close` 方法，并返回带有 `new` 函数的模块表。
+1. `require` 按 Lua 的 C 模块搜索路径加载 `flywow_gateway_crypto.so`。Skynet Lua 调用该模块的 `luaopen_flywow_gateway_crypto` 入口；入口注册 Native userdata 的 `verify`、`close` 方法，并返回带有 `create_context` 函数的模块表。
 2. `pcall` 捕获加载过程中的 Lua 错误。成功时其返回值是 `true, crypto_module`；失败时是 `false, error`。因此局部变量 `crypto` 接到的是模块接口表，不是某个玩家的密码上下文。
 
 这里的“加载 Native 模块”不等于已经为连接生成密钥。模块加载失败（例如 Native 产物缺失、动态库依赖无法加载或 Lua C 模块初始化失败）会被转换为 `GATEWAY_CRYPTO_LOAD_FAILED` 并终止本次启动。Native 的 `create_context(hello)` 要等到 listener 已经接纳客户端、握手模块收到合法 HELLO 后才会调用；它创建的是该连接独占的 userdata。
@@ -782,11 +784,13 @@ codec 先检查这两个字段的类型，再打开 `descriptor_path` 读取全�
 | 字段 | 本次传入值 | 用途 |
 | --- | --- | --- |
 | `crypto` | 上一步 `require` 返回的模块表 | 握手模块验证 HELLO 时调用其 `create_context(hello)`，并通过返回的 userdata 执行 proof 验证和释放 |
-| `now` | `skynet.now` 函数本身 | 管理器需要判断期限时再读取当前时钟；这里没有写 `skynet.now()`，所以传入的不是一个固定 tick 数值 |
+| `now` | `skynet.now` 函数本身 | 握手模块需要判断期限时再读取当前时钟；这里没有写 `skynet.now()`，所以传入的不是一个固定 tick 数值 |
 | `max_pending` | `max_pending_handshakes` 配置值 | 限制本 Gateway 同时持有的待完成握手上下文数量 |
-| `timeout_ticks` | `handshake_timeout_ticks` 配置值 | 从某连接开始握手时起算的绝对期限，单位是 Skynet 的 10ms tick；例如配置值 `1000` 约为 10 秒，后续握手消息不会延长它 |
+| `timeout_ms` | `handshake_timeout_ms` 配置值 | 从连接登记起算的绝对期限，单位毫秒；例如 `10000` 表示 10 秒，握手消息不会延长它 |
 
-初始化函数检查 Native 的 new 接口、时钟与容量/期限。校验通过后保存当前 Service 的依赖和配置，返回空成功 Result；参数无效返回 HANDSHAKE_CONFIG_INVALID。pending 在模块加载时初始化为 0，init 不创建实例表，也不创建连接或 Native userdata。
+`now`返回10ms tick；`timeout_ms`保持毫秒单位。状态机调用 `flywow_common.elapsed_ticks(started_tick, current_tick)` 处理回绕，需要毫秒时直接调用 `flywow_common.elapsed_ms(started_tick, current_tick)`；该接口同样处理 tick 回绕。
+
+初始化函数检查 Native 的 `create_context` 接口、时钟与容量/期限。校验通过后保存当前 Service 的依赖和配置，返回空成功 Result；参数无效返回 HANDSHAKE_CONFIG_INVALID。pending 在模块加载时初始化为 0，init 不创建实例表，也不创建连接或 Native userdata。
 
 listener 开始工作后，连接回调才会调用 握手模块的 `accept()` 申请名额；合法 HELLO 到达后，握手模块才调用 `crypto.create_context(hello)` 创建该连接的 Native userdata。连接关闭或握手失败时，握手模块负责归还名额并关闭该 userdata。也就是说，握手模块是当前 Gateway Service 独占的握手状态机；它不写 Socket、不启动协程，也不预先分配所有客户端的密码状态。
 
@@ -799,7 +803,7 @@ WorldService 调用 Gateway start(config)
        读取 world.pb -> pb.load -> 核对 Registry 中的类型名
   -> pcall(require, "flywow_gateway_crypto")
        加载 Native Lua 模块 -> 得到 crypto 模块表
-  -> handshake_module.init({crypto=..., now=..., max_pending=..., timeout_ticks=...})
+  -> handshake_module.init({crypto=..., now=..., max_pending=..., timeout_ms=...})
        校验依赖和上限 -> 发布本 Service 的握手依赖与上限
   -> 所有步骤成功后发布启动状态
   -> socket.listen() / socket.start()
@@ -1289,7 +1293,7 @@ skynet.start(function()
         protocol_version              = 4, -- Envelope 的业务协议版本。
         max_clients                   = 4, -- 本例最多同时接入 4 个客户端。
         max_requests_per_second       = tonumber(os.getenv("GATEWAY_COURSE_RPS")) or 200, -- 故障实验可缩小接纳速率。
-        idle_timeout_ticks            = tonumber(os.getenv("GATEWAY_COURSE_IDLE_TICKS")) or 30000, -- 完整业务消息空闲期限，单位 10ms tick。
+        idle_timeout_ms            = tonumber(os.getenv("GATEWAY_COURSE_IDLE_MS")) or 300000, -- 完整业务消息空闲期限，单位毫秒。
     }
 
     -- 这是等待 Gateway 返回 Result 的控制面 call；它与请求处理阶段的 send 不同。
@@ -2651,10 +2655,10 @@ JS
 
 ### 7.5 实验 E：只有 Ping/Pong 或完全无业务的空闲连接
 
-重启，缩短业务消息空闲时间为 50 tick（约 0.5 秒）：
+重启，缩短业务消息空闲时间为 500ms（时钟每 10ms 前进一步）：
 
 ```bash
-GATEWAY_COURSE_IDLE_TICKS=50 bash gateway/sample/master_course/run.sh websocket server
+GATEWAY_COURSE_IDLE_MS=500 bash gateway/sample/master_course/run.sh websocket server
 ```
 
 终端 B：
@@ -2667,7 +2671,7 @@ console.log("握手已完成，但不发送任何业务 Envelope");
 JS
 ```
 
-**执行链**：应用握手 ready → `timeout_loop` 每 `skynet.sleep(10)` 扫描活跃连接 → `connection.last_message` 维持最近一次完整活动的时间 → 空闲期限达到配置值 → `detach_connection` / `close_transport`。`idle_timeout_ticks` 的合同限制完整客户端业务消息的空闲时间，服务端 Push、WebSocket Ping/Pong 不刷新这个期限。
+**执行链**：应用握手 ready → `timeout_loop` 每 `skynet.sleep(10)` 扫描活跃连接 → `connection.last_message` 维持最近一次完整活动的时间 → 空闲期限达到配置值 → `detach_connection` / `close_transport`。`idle_timeout_ms` 以毫秒配置，限制完整客户端业务消息的空闲时间；时钟按10ms tick计数，扫描协程每100ms检查一次，因此实际关闭可能晚于配置期限。服务端 Push、WebSocket Ping/Pong 不刷新这个期限。
 
 在生产中，心跳是否应算业务活动取决于宿主是否定义了真正的业务命令；TCP 可以在应用层定义心跳 command，但课程**不为了演示空闲机制额外添加新的业务协议**。
 
@@ -2751,11 +2755,11 @@ while module_state.phase == "running" do
     local expired = {}
     for _, connection in pairs(module_state.connections) do
         local since = connection.read_started or connection.last_message
-        local limit = connection.read_started
-            and module_state.gateway_config.read_timeout_ticks
-            or module_state.gateway_config.idle_timeout_ticks
-        if handshake_module.expired(connection.handshake) or
-            (now - since) % 0x100000000 >= limit then
+        local limit_ms = connection.read_started
+            and module_state.gateway_config.read_timeout_ms
+            or module_state.gateway_config.idle_timeout_ms
+        local elapsed_ms = flywow_common.elapsed_ms(since, now)
+        if handshake_module.expired(connection.handshake) or elapsed_ms >= limit_ms then
             expired[#expired + 1] = connection
         end
     end
@@ -2770,9 +2774,9 @@ end
 这是原函数完整控制流程的去注释版；逐字段说明应以真实源码为准。两个超时条件不同：
 
 1. `handshake_module.expired(context)`：从 `handshake.accept()` 记录的 `context.started` 起算，直到 confirm/close 归还名额之前都是**绝对握手期限**；中间收到 HELLO 并回复 CHALLENGE 也不重置。
-2. `read_started`/`last_message`：若正在一次 TCP 定长读取或 WS HTTP Upgrade，使用读取起点及 `read_timeout_ticks`；否则使用最近完整消息活动时刻及 `idle_timeout_ticks`。
+2. `read_started`/`last_message`：若正在一次 TCP 定长读取或 WS HTTP Upgrade，使用读取起点及 `read_timeout_ms`；否则使用最近完整消息活动时刻及 `idle_timeout_ms`。
 
-假设 WebSocket 已在 tick 0 完成应用握手，之后一直没有业务包，`idle_timeout_ticks=50`。在 tick 10、20、30、40 的扫描都还没超时；在 tick 50 才满足 `(50-0) >= 50`，执行 detach 和 transport close。**这是按源码推导的理想化时间线**：实际执行会受到 Skynet 消息调度、计时起点与网络收包时刻影响，不应声称毫秒级精确。
+假设 WebSocket 已在 tick 0 完成应用握手，之后一直没有业务包，`idle_timeout_ms=500`。在 tick 10、20、30、40 的扫描都还没超时；在 tick 50 经过 500ms，满足 `(50-0) * 10 >= 500`，执行 detach 和 transport close。**这是按源码推导的理想化时间线**：实际执行会受到 Skynet 消息调度、计时起点与网络收包时刻影响，不应声称毫秒级精确。
 
 若在 tick 30 收到一个已通过 Registry/Codec/速率检查的完整业务请求，`dispatch_payload` 更新 `connection.last_message=30`，那么 tick 50 时差值是 20，不会超时，直到新的期限达到。反过来，WebSocket ping/pong 由底层 `http.websocket` 处理，不进入 `dispatch_payload`，因此**不会刷新**本课 Gateway 的业务空闲起点。服务端 Push 走的是 `deliver_outbound_message`，也不会刷新该时间。
 
@@ -2934,7 +2938,7 @@ module_state.phase = "stopped"
 2. WebSocket HTTP Upgrade 已成功，但 A 的 `HandshakeContext.phase="proof"`。A 此时发 `EnterWorldRequest`，Gateway 会把它交给 WorldService 吗？依据哪个具体分支？
 3. 两名玩家的底层 fd 是 `18` 和 `21`，业务逻辑 ID 是 `1` 和 `2`。为什么 Gateway 既保存 `connections` 又保存 `connections_by_fd`？哪条入口分别读取？
 4. `crypto.create_context()` 创建的 C++ userdata 与 Lua `HandshakeContext` 是不是同一对象？派生密钥在 proof 验证完毕、Gateway confirm、连接断开这三个时刻分别发生什么？
-5. 同一条 WS 连接只发底层 ping/pong，从不发业务 Envelope，为什么 `idle_timeout_ticks` 仍会触发？`last_message` 实际在哪些代码分支更新？
+5. 同一条 WS 连接只发底层 ping/pong，从不发业务 Envelope，为什么 `idle_timeout_ms` 仍会触发？`last_message` 实际在哪些代码分支更新？
 6. Gateway 接受第一条 A 请求后执行 `skynet.send(WorldService,...)`。它随后等待的是 WorldService 回包，还是下一个 WS frame？如果 WorldService 迟迟不处理，Gateway 自己保留了哪些 pending 状态？
 7. B 刚 detach，但底层 WS close 正在 yield。WorldService 又发一次旧 B 的单播和 close，哪个路径拒绝？`closed` 和 `close_requested` 的职责分别是什么？
 8. B 的 Socket fd 被后来连接重用，但 WorldService 迟到的 A/B 响应仍带旧 `gateway_epoch/connection_id`。为什么不会发给新连接？
