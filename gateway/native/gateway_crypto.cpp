@@ -346,12 +346,13 @@ extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
         {"close", &LuaBinding::nativeCallback<close>},
         {nullptr, nullptr},
     };
+    // 注册 CryptoContext 元表及 verify/close；内部安装 __index、托管 __gc，并恢复入口栈高度。
+    LuaBinding::registerUserdata<CryptoContext>(state, kCryptoMetatable, methods);
+
     static const luaL_Reg functions[] = {
         {"create_context", &LuaBinding::nativeCallback<create_context>},
         {nullptr, nullptr},
     };
-    // 注册 CryptoContext 元表及 verify/close；内部安装 __index、托管 __gc，并恢复入口栈高度。
-    LuaBinding::registerUserdata<CryptoContext>(state, kCryptoMetatable, methods);
     // 将 create_context 注册到新建的模块表；该表压入栈顶，作为 require 的唯一返回值。
     luaL_newlib(state, functions);
     // Lua C API 按返回数量取栈顶结果；此处返回刚创建的模块表。
