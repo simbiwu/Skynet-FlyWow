@@ -89,7 +89,7 @@ void computeHmac(const unsigned char *key, const std::string &message, unsigned 
                          "CRYPTO_HMAC");
 }
 
-/// 在 new 回调中根据已校验的 CLIENT_HELLO 创建挑战并派生证明密钥。
+/// 在 create_context 回调中根据已校验的 CLIENT_HELLO 创建挑战并派生证明密钥。
 /// @param crypto_context 新构造 userdata，接收派生密钥及 transcript 摘要。
 /// @param hello 入口已确认长度为 67 字节且版本有效的完整 HELLO。
 /// @return 99 字节 SERVER_CHALLENGE；EVP 失败抛错，由入口清理 context。
@@ -333,11 +333,14 @@ int close(lua_State *state)
 /// require 加载当前 Lua State 的密码模块，注册 userdata 的 verify/close 方法。
 /// @param state Lua 加载器提供的栈；模块表追加到栈顶交给 require。
 /// @return 一个模块表；注册失败按 Lua 模块加载错误传播。
+/// @note require 加载 flywow_gateway_crypto 时，Lua 固定查找 luaopen_flywow_gateway_crypto。
+/// extern "C" 保留 Lua 加载器要求的未修饰 C ABI 导出符号名。
 // 入口只使用静态方法表和 Lua 值，Lua 加载失败时没有待析构的 C++ 局部资源。
 // __index 指向方法表，__gc 由 registerUserdata 安装，负责调用已构造对象的析构。
 extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
 {
     using namespace flywow_gateway;
+    // 这两张静态表只描述模块 API；每个 Lua State 注册自己的元表，不在此创建密码上下文。
     static const luaL_Reg methods[] = {
         {"verify", &LuaBinding::nativeCallback<verify>},
         {"close", &LuaBinding::nativeCallback<close>},
@@ -347,7 +350,10 @@ extern "C" int luaopen_flywow_gateway_crypto(lua_State *state)
         {"create_context", &LuaBinding::nativeCallback<create_context>},
         {nullptr, nullptr},
     };
+    // 注册 CryptoContext 元表及 verify/close；内部安装 __index、托管 __gc，并恢复入口栈高度。
     LuaBinding::registerUserdata<CryptoContext>(state, kCryptoMetatable, methods);
+    // 将 create_context 注册到新建的模块表；该表压入栈顶，作为 require 的唯一返回值。
     luaL_newlib(state, functions);
+    // Lua C API 按返回数量取栈顶结果；此处返回刚创建的模块表。
     return 1;
 }
