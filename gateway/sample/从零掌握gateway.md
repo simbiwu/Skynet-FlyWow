@@ -967,6 +967,11 @@ int callbackFailure(lua_State *state, const char *message)
 **【真实源码局部：同一文件 / `create_context()`】**
 
 ```cpp
+// CLIENT_HELLO 固定为 67 字节：2 字节头部，加上 65 字节客户端 P-256 公钥。
+// [0] 是消息类型 1，[1] 是握手版本 1；[2..66] 按 SEC1 非压缩格式编码：
+// 0x04 || X[32] || Y[32]，X/Y 各 32 字节且使用大端序。
+// 长度检查必须先于索引读取；|| 从左向右短路，长度不符时不会读取 [0..2]，
+// 精确长度也会拒绝协议未定义的尾随字节。
 if (hello.size() != 67 || hello[0] != 1 || hello[1] != 1 ||
     static_cast<unsigned char>(hello[2]) != 4)
 {
