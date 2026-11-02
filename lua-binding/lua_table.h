@@ -69,37 +69,42 @@ class LuaTable
     /// @return 写入成功 true；失败 false 并记录诊断（无 owner 的句柄除外）。
     template <typename Key, typename T> bool writeValue(const Key &key, const T &value)
     {
+        static_assert((std::is_integral_v<Key> && !std::is_same_v<Key, bool>) ||
+                      std::is_convertible_v<const Key &, std::string>);
         if (!valid())
             return false;
         detail::StackRestore stack(binding_->state_);
         struct Arguments
         {
-            FieldArguments<Key> field; ///< 本次字段操作的目标表、key 与输出诊断。
-            const T            &value; ///< 借用本次待写入的值，外层作用域覆盖保护调用。
-        } args{{this, key}, value};
-        // 参数 1 借用本次字段操作记录；记录及其中的 C++ 资源由外层作用域持有。
+            const LuaTable *table;             ///< 本次写入的目标表，借用当前句柄。
+            const Key      &key;               ///< 借用调用方字段 key，不执行隐式转换。
+            const T        &value;             ///< 借用调用方待写入值，保护调用结束前有效。
+            const char     *failure = nullptr; ///< 转换或托管 __gc 写保护失败时的静态诊断。
+        } args{this, key, value};
+
+        // 参数 1 借用 Arguments；回调的 Lua 错误由 pcall 转为栈顶错误对象。
         lua_pushcfunction(
             binding_->state_,
             [](lua_State *state) noexcept -> int
             {
                 auto *data = static_cast<Arguments *>(lua_touserdata(state, 1));
-                lua_rawgeti(state, LUA_REGISTRYINDEX, data->field.table->reference_);
-                auto *binding = data->field.table->binding_;
-                if (!pushKey(state, data->field))
+                lua_rawgeti(state, LUA_REGISTRYINDEX, data->table->reference_);
+                LuaBinding *binding = data->table->binding_;
+                if (!binding->pushRaw(state, data->key, &data->failure))
                     return 0;
                 if (!LuaBinding::canWriteField(state, -2, -1))
                 {
-                    data->field.failure = "__gc is managed by userdata registration";
+                    data->failure = "__gc is managed by userdata registration";
                     return 0;
                 }
-                if (!binding->pushRaw(state, data->value, &data->field.failure))
+                if (!binding->pushRaw(state, data->value, &data->failure))
                     return 0;
                 lua_rawset(state, -3);
                 return 0;
             });
         lua_pushlightuserdata(binding_->state_, &args);
         const bool ok = lua_pcall(binding_->state_, 1, 0, 0) == LUA_OK;
-        return binding_->completeCall(ok, args.field.failure);
+        return binding_->completeCall(ok, args.failure);
     }
 
     /// 验证正整数 key 为连续 1..N，忽略其他 key；空数组输出 0，失败保持输出。
@@ -132,25 +137,6 @@ class LuaTable
     /// 释放本句柄的 registry 引用并清空 owner；Lua 中其他引用仍可保活原表。
     /// @return 无返回值；空句柄可重复调用。
     void reset() noexcept;
-
-    // 只服务于写入保护回调；读取路径直接使用 Lua 栈和局部诊断。
-    template <typename Key> struct FieldArguments
-    {
-        const LuaTable *table;             ///< 要写入的目标表。
-        const Key      &key;               ///< 本次字段 key，调用期间借用。
-        const char     *failure = nullptr; ///< 值转换失败时的静态诊断。
-    };
-
-    /// 在写入回调中校验并压入 key，失败诊断写入 data。
-    /// @param state 写入回调收到的 Lua State。
-    /// @param data 本次写入的目标表、key 及诊断。
-    /// @return key 可表示为 Lua 整数或字符串时为 true。
-    template <typename Key> static bool pushKey(lua_State *state, FieldArguments<Key> &data)
-    {
-        static_assert((std::is_integral_v<Key> && !std::is_same_v<Key, bool>) ||
-                      std::is_convertible_v<const Key &, std::string>);
-        return data.table->binding_->pushRaw(state, data.key, &data.failure);
-    }
 
     /// 直接 raw 读取字段，不执行元方法；调用方用 StackRestore 恢复临时栈。
     /// @param key 要读取的整数或字符串字段名。

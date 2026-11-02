@@ -207,7 +207,7 @@ int LuaBinding::pushError(const std::string &code, const std::string &message)
     return pushError();
 }
 
-// 把输入 table 保存到 registry，供 LuaTable 句柄在当前 Binding 回调期间继续访问；StackRestore 恢复临时栈值。
+// 把输入 table 保存到 registry；luaL_ref 消耗复制值，原参数栈不变。
 bool LuaBinding::readTableAt(int index, LuaTable &output)
 {
     if (!lua_istable(state_, index))
@@ -216,7 +216,6 @@ bool LuaBinding::readTableAt(int index, LuaTable &output)
         return false;
     }
 
-    detail::StackRestore stack(state_);
     // 先复制原表；luaL_ref 消耗副本，原输入仍保留在原槽。
     lua_pushvalue(state_, index);
     const int reference = luaL_ref(state_, LUA_REGISTRYINDEX);
@@ -233,7 +232,6 @@ bool LuaBinding::readTable(int index, LuaTable &output)
 // 创建空 table 并保存到 registry，成功后由 output 接管引用。
 bool LuaBinding::newTable(LuaTable &output)
 {
-    detail::StackRestore stack(state_);
     lua_newtable(state_);
     output = LuaTable(this, luaL_ref(state_, LUA_REGISTRYINDEX));
     return true;
@@ -437,7 +435,6 @@ void *LuaBinding::inspectUserdata(lua_State *state, int index, const char *name,
 // 读取 userdata 并建立回调内强引用；类型或存活检查失败时保持调用方输出不变。
 void *LuaBinding::checkUserdata(int index, const std::string &name)
 {
-    detail::StackRestore stack(state_);
     int reference = LUA_NOREF; // 成功后交给 Binding 的保活记录。
     const char *failure = nullptr; // inspectUserdata 返回的静态类型或存活诊断。
     void *object = inspectUserdata(state_, index, name.c_str(), reference, &failure);
