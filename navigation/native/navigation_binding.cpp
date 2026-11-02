@@ -1150,6 +1150,7 @@ int advanceAirPath(lua_State *state)
     auto out = advanceResultTable(lua_binding, result.value);
     return out.valid() ? lua_binding.returnValues(out) : lua_binding.pushError();
 }
+// 导航分配失败保留容量错误合同；其他异常由注册处 nativeCallback 转换。
 template <int (*Callback)(lua_State *)> int airBoundary(lua_State *state)
 {
     try
@@ -1160,16 +1161,6 @@ template <int (*Callback)(lua_State *)> int airBoundary(lua_State *state)
     {
         LuaBinding binding(state);
         return binding.pushError("CAPACITY_EXCEEDED", "air allocation failed");
-    }
-    catch (const std::exception &)
-    {
-        LuaBinding binding(state);
-        return binding.pushError("INTERNAL_ERROR", "air native exception");
-    }
-    catch (...)
-    {
-        LuaBinding binding(state);
-        return binding.pushError("INTERNAL_ERROR", "unknown air native exception");
     }
 }
 int load_map(lua_State *state)

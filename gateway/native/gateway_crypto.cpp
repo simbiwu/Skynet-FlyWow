@@ -247,7 +247,7 @@ int create_context(lua_State *state)
     {
         response = buildChallenge(context, hello.data());
     }
-    catch (const std::exception &error)
+    catch (const std::runtime_error &error)
     {
         clearCryptoContext(context);
         lua_binding.setError(error.what(), error.what());
@@ -256,11 +256,20 @@ int create_context(lua_State *state)
     catch (...)
     {
         clearCryptoContext(context);
-        lua_binding.setError("CRYPTO_FAILURE", "unknown native handshake failure");
-        return lua_binding.pushError();
+        // 非密码业务异常（包括 bad_alloc）先擦除密码状态，再交注册入口转换。
+        throw;
     }
 
-    return lua_binding.returnValues(context, response);
+    // Lua 返回值构造不属于密码运算；异常时清理密钥后交注册入口报告。
+    try
+    {
+        return lua_binding.returnValues(context, response);
+    }
+    catch (...)
+    {
+        clearCryptoContext(context);
+        throw;
+    }
 }
 
 /// Lua 握手模块 在 proof 阶段验证客户端证明并生成服务端证明。
@@ -285,10 +294,13 @@ int verify(lua_State *state)
     }
 
     std::array<unsigned char, 32> expected = {}; // 预期客户端 HMAC；与输入证明做常量时间比较。
-    std::string                   message  = "client-proof"; // 证明用途前缀，后接握手摘要。
-    message.append(reinterpret_cast<const char *>(context->transcript_hash.data()), 32);
+    std::string response; // 密码运算成功后交给 Lua 的 SERVER_READY。
     try
     {
+        // 字符串分配也在清理范围内，失败时先擦除已有证明密钥再抛出。
+        std::string message = "client-proof"; // 证明用途前缀，后接握手摘要。
+        message.append(reinterpret_cast<const char *>(context->transcript_hash.data()), 32);
+
         // EVP 计算失败也须落入本回调的清理与错误返回路径。
         computeHmac(context->proof_key.data(), message, expected.data());
         requireCryptoSuccess(CRYPTO_memcmp(expected.data(), bytes.data() + 1, 32) == 0,
@@ -296,14 +308,13 @@ int verify(lua_State *state)
 
         message = "server-ready";
         message.append(reinterpret_cast<const char *>(context->transcript_hash.data()), 32);
-        std::string response(33, '\0'); // SERVER_READY：1 字节类型加 32 字节服务端证明。
+        response.assign(33, '\0'); // SERVER_READY：1 字节类型加 32 字节服务端证明。
         response[0] = 4;
         computeHmac(context->proof_key.data(), message,
                     reinterpret_cast<unsigned char *>(&response[1]));
         clearCryptoContext(context);
-        return lua_binding.returnValues(response);
     }
-    catch (const std::exception &error)
+    catch (const std::runtime_error &error)
     {
         clearCryptoContext(context);
         lua_binding.setError(error.what(), error.what());
@@ -312,9 +323,12 @@ int verify(lua_State *state)
     catch (...)
     {
         clearCryptoContext(context);
-        lua_binding.setError("CRYPTO_FAILURE", "unknown native handshake failure");
-        return lua_binding.pushError();
+        // 非密码业务异常（包括 bad_alloc）先擦除密码状态，再交注册入口转换。
+        throw;
     }
+
+    // 密码状态已清理；Native 返回值转换异常交注册入口处理。
+    return lua_binding.returnValues(response);
 }
 
 /// Gateway 关闭连接或完成握手时幂等释放密码资源。

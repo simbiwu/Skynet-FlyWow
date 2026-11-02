@@ -18,8 +18,8 @@ void ensureStack(lua_State *state, int extra)
 bool protectedCall(lua_State *state, lua_CFunction function, void *arguments, int inputs,
                    int outputs)
 {
-    // 预留包装函数、arguments 和 Lua C API 调用自身需要的槽位。
-    ensureStack(state, LUA_MINSTACK + 2);
+    // 只为下面压入的包装函数和 arguments 预留两个槽位。
+    ensureStack(state, 2);
 
     // 将回调与轻量参数记录插到原输入段之前，供回调以参数 1/2 读取。
     const int first = lua_gettop(state) - inputs + 1; // 原输入段在插入包装参数前的起点。
@@ -65,21 +65,15 @@ int callbackFailure(lua_State *state, const char *message)
     // 实际 Native 函数及异常对象均已析构，才允许使用 Lua 的最终错误出口。
     lua_settop(state, 0);
 
-    // 只借用静态诊断文本；保护调用负责处理 Lua 创建错误表时产生的 Lua 错误。
-    ErrorArguments args{"INTERNAL_ERROR", 14, message, std::strlen(message)}; // 静态错误码和借用诊断的字节长度。
-    try
-    {
-        if (protectedCall(state, &errorResult, &args, 0, 2))
-            return 2;
-    }
-    catch (...)
-    {
-        // 退出 catch 再跳转到 Lua，避免跳过异常对象析构。
-    }
-
-    // 结构化错误也无法创建时只能把固定错误交回 Lua。
-    lua_pushliteral(state, "Native operation failed while reporting an error");
-    return lua_error(state);
+    // 此处没有需要析构的 C++ 局部对象；Lua 分配失败直接走 Lua 错误出口。
+    // [] -> [nil, error_table]；诊断字段复制进 Lua，不借用 Native 对象。
+    lua_pushnil(state);
+    lua_createtable(state, 0, 2);
+    lua_pushliteral(state, "INTERNAL_ERROR");
+    lua_setfield(state, -2, "code");
+    lua_pushstring(state, message);
+    lua_setfield(state, -2, "message");
+    return 2;
 }
 
 bool ValueCodec<bool>::read(lua_State *state, int index, bool &output, const char **reason)
@@ -155,7 +149,6 @@ bool ValueCodec<void *>::read(lua_State *state, int index, void *&output, const 
 
 LuaBinding::LuaBinding(lua_State *state) : state_(state)
 {
-    detail::ensureStack(state_, LUA_MINSTACK);
 }
 
 // 回调结束时释放 readUserdata/checkUserdata 建立的强引用；对象内存和析构仍归 Lua GC。
@@ -258,17 +251,13 @@ int LuaBinding::pushError(const std::string &code, const std::string &message)
 
 namespace
 {
-struct ReferenceArguments
-{
-    int reference = LUA_NOREF; ///< 成功时建立的 registry 引用；外层接管或释放。
-};
-
 // 原值由外层复制到参数 2；ref 成功是最后一步，失败不会泄漏已发布的编号。
 int referenceTable(lua_State *state) noexcept
 {
-    auto *args = static_cast<ReferenceArguments *>(lua_touserdata(state, 1)); // 外层接收引用编号的记录。
+    // 借用外层接收 registry 引用编号的整数。
+    auto *reference = static_cast<int *>(lua_touserdata(state, 1));
     lua_pushvalue(state, 2);
-    args->reference = luaL_ref(state, LUA_REGISTRYINDEX);
+    *reference = luaL_ref(state, LUA_REGISTRYINDEX);
     return 0;
 }
 } // namespace
@@ -286,13 +275,13 @@ bool LuaBinding::readTableAt(int index, LuaTable &output)
     detail::StackRestore stack(state_);
     detail::ensureStack(state_, 1);
     lua_pushvalue(state_, index);
-    ReferenceArguments args; // 回调创建的 registry 引用编号，由 output 句柄接管。
+    int reference = LUA_NOREF; // 回调创建的 registry 引用编号，由 output 句柄接管。
 
-    if (!completeCall(detail::protectedCall(state_, &referenceTable, &args, 1, 0)))
+    if (!completeCall(detail::protectedCall(state_, &referenceTable, &reference, 1, 0)))
         return false;
 
     // 只在引用确实建立后替换 output，避免失败时丢失调用方原句柄。
-    output = LuaTable(this, args.reference);
+    output = LuaTable(this, reference);
     return true;
 }
 bool LuaBinding::readTable(int index, LuaTable &output)
@@ -304,24 +293,25 @@ bool LuaBinding::readTable(int index, LuaTable &output)
 bool LuaBinding::newTable(LuaTable &output)
 {
     detail::StackRestore stack(state_);
-    ReferenceArguments   args; // 新表 registry 引用编号，成功后交给 output。
+    int reference = LUA_NOREF; // 新表 registry 引用编号，成功后交给 output。
 
-    // 回调只使用 Lua C API；luaL_ref 消耗新表并把引用编号写入外层参数记录。
+    // 回调只使用 Lua C API；luaL_ref 消耗新表并把引用编号写入外层整数。
     const bool ok = detail::protectedCall(
         state_,
         [](lua_State *inner) noexcept -> int
         {
-            auto *data = static_cast<ReferenceArguments *>(lua_touserdata(inner, 1));
+            // 借用外层接收新表引用编号的整数。
+            auto *output_reference = static_cast<int *>(lua_touserdata(inner, 1));
             lua_newtable(inner); // 新建表随后由 luaL_ref 移入 registry。
-            data->reference = luaL_ref(inner, LUA_REGISTRYINDEX);
+            *output_reference = luaL_ref(inner, LUA_REGISTRYINDEX);
             return 0;
         },
-        &args, 0, 0);
+        &reference, 0, 0);
     if (!completeCall(ok))
         return false;
 
     // 保护调用成功后才接管新引用，不覆盖失败路径中的 output。
-    output = LuaTable(this, args.reference);
+    output = LuaTable(this, reference);
     return true;
 }
 
@@ -523,17 +513,14 @@ void *LuaBinding::inspectUserdata(lua_State *state, int index, const char *name,
 {
     // 固定输入索引，后续读取 uservalue 与创建引用都复用同一 full userdata。
     index = lua_absindex(state, index);
-    if (lua_type(state, index) != LUA_TUSERDATA)
-    {
-        *failure = "value must be full userdata with the registered metatable";
-        return nullptr;
-    }
-
     // luaL_testudata 同时确认具名元表身份并取得 userdata 内的 T 存储地址。
     void *object = luaL_testudata(state, index, name); // 通过精确元表检查后取得 Lua-owned 对象存储。
     if (!object)
     {
-        *failure = "value must be userdata with the registered metatable";
+        // 仅在元表检查失败后区分原有诊断，不在成功路径重复检查类型。
+        *failure = lua_type(state, index) != LUA_TUSERDATA
+                       ? "value must be full userdata with the registered metatable"
+                       : "value must be userdata with the registered metatable";
         return nullptr;
     }
 
@@ -556,12 +543,6 @@ void *LuaBinding::inspectUserdata(lua_State *state, int index, const char *name,
 void *LuaBinding::checkUserdata(int index, const std::string &name)
 {
     detail::StackRestore stack(state_);
-    if (lua_type(state_, index) != LUA_TUSERDATA)
-    {
-        setError("INVALID_ARGUMENT", "value must be full userdata with the registered metatable");
-        return nullptr;
-    }
-
     // protectedCall 内部的 Lua API 可能报错；复制参数后让 inspectUserdata 在隔离栈检查。
     detail::ensureStack(state_, 1);
     lua_pushvalue(state_, index);

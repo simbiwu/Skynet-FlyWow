@@ -247,7 +247,7 @@ template <> struct ValueCodec<void *>
 class LuaBinding
 {
   public:
-    /// 为一次同步 Native 回调创建 Binding，并预留后续 Lua 栈操作所需空间。
+    /// 为一次同步 Native 回调创建 Binding，借用 Lua State 并管理本次诊断与强引用。
     /// @param state 当前回调收到的 Lua State；Binding 借用它，不负责关闭。
     explicit LuaBinding(lua_State *state);
     /// 释放本次回调为 userdata 建立的 registry 强引用；必须早于所属 Lua State 关闭。
@@ -511,8 +511,8 @@ class LuaBinding
     template <typename... Values> static int pushResults(lua_State *state) noexcept
     {
         auto *arguments = static_cast<ValueArguments<Values...> *>(lua_touserdata(state, 1));
-        // 返回值数量已在编译期确定，先预留所有输出及转换临时槽。
-        luaL_checkstack(state, sizeof...(Values) + 4, "Native results exceed stack capacity");
+        // 返回值数量已在编译期确定，先按实际结果数量预留输出槽。
+        luaL_checkstack(state, sizeof...(Values), "Native results exceed stack capacity");
 
         // 按 Values 原顺序写入；首个转换失败时记录原因并停止后续写入。
         const bool ok = std::apply(

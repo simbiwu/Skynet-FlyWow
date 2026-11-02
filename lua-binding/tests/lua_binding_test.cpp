@@ -964,6 +964,8 @@ int main()
             for _, mode in ipairs({true, false}) do
                 local ok, value, err = pcall(binding.native_exception, mode)
                 assert(ok and value == nil and err.code == "INTERNAL_ERROR")
+                assert(err.message == (mode and "Native allocation failed"
+                    or "Unexpected Native exception"))
             end
             package.preload.flywow_binding_failing = binding.failing_module
             local loaded = pcall(require, "flywow_binding_failing")

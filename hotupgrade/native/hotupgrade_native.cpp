@@ -531,10 +531,6 @@ int resolve(lua_State *state)
         }
         return mapNativeFailure(binding, binding.returnValues(output));
     }
-    catch (const std::exception &)
-    {
-        return pushNativeException(state);
-    }
     catch (...)
     {
         return pushNativeException(state);
@@ -585,10 +581,6 @@ int list_lua(lua_State *state)
             }
         }
         return mapNativeFailure(binding, binding.returnValues(output));
-    }
-    catch (const std::exception &)
-    {
-        return pushNativeException(state);
     }
     catch (...)
     {
