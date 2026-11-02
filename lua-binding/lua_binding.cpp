@@ -8,13 +8,6 @@ namespace flywow_lua_binding
 {
 namespace detail
 {
-// 为即将执行的 Lua C API 预留栈槽；Lua 无法扩栈时抛 bad_alloc，由 Native 注册入口转换错误。
-void ensureStack(lua_State *state, int extra)
-{
-    if (!lua_checkstack(state, extra))
-        throw std::bad_alloc();
-}
-
 // 原生回调已退出并销毁局部对象后，才清空参数栈并尝试构造 Lua 错误结果。
 int callbackFailure(lua_State *state, const char *message)
 {
@@ -185,7 +178,6 @@ bool LuaBinding::completeCall(bool succeeded, const char *failure)
 // 直接构造 nil/error；Lua 复制诊断文本，返回值不借用 Binding 的字符串。
 int LuaBinding::pushError()
 {
-    detail::ensureStack(state_, 3);
     lua_pushnil(state_);
     lua_createtable(state_, 0, 2);
     if (error_code_.empty())
@@ -225,7 +217,6 @@ bool LuaBinding::readTableAt(int index, LuaTable &output)
     }
 
     detail::StackRestore stack(state_);
-    detail::ensureStack(state_, 3);
     // 先复制原表；luaL_ref 消耗副本，原输入仍保留在原槽。
     lua_pushvalue(state_, index);
     const int reference = luaL_ref(state_, LUA_REGISTRYINDEX);
@@ -243,7 +234,6 @@ bool LuaBinding::readTable(int index, LuaTable &output)
 bool LuaBinding::newTable(LuaTable &output)
 {
     detail::StackRestore stack(state_);
-    detail::ensureStack(state_, 3);
     lua_newtable(state_);
     output = LuaTable(this, luaL_ref(state_, LUA_REGISTRYINDEX));
     return true;
@@ -375,7 +365,6 @@ bool LuaBinding::allocateUserdata(const std::string &name, std::size_t bytes, vo
                                   int &reference)
 {
     detail::StackRestore stack(state_);
-    detail::ensureStack(state_, 4);
     luaL_getmetatable(state_, name.c_str());
     if (!lua_istable(state_, -1))
     {
@@ -449,7 +438,6 @@ void *LuaBinding::inspectUserdata(lua_State *state, int index, const char *name,
 void *LuaBinding::checkUserdata(int index, const std::string &name)
 {
     detail::StackRestore stack(state_);
-    detail::ensureStack(state_, 3);
     int reference = LUA_NOREF; // 成功后交给 Binding 的保活记录。
     const char *failure = nullptr; // inspectUserdata 返回的静态类型或存活诊断。
     void *object = inspectUserdata(state_, index, name.c_str(), reference, &failure);

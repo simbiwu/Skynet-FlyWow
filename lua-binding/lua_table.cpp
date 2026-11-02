@@ -58,7 +58,6 @@ void LuaTable::push() const
     // reference_ 是 registry 引用编号，不是业务数组 key。
     // rawgeti 压入同一 table：[S] -> [S, table]，不触发 __index。
     // 句柄继续持有 registry 引用；外层保护器只弹掉这份临时栈引用。
-    detail::ensureStack(binding_->state_, 1);
     lua_rawgeti(binding_->state_, LUA_REGISTRYINDEX, reference_);
 }
 
@@ -76,7 +75,6 @@ bool LuaTable::denseArrayLength(std::size_t &output) const
     std::size_t entries   = 0;        // 每个 table key 唯一，entries==max_index 才说明没有空洞。
     // nil 开始遍历。lua_next 每轮消耗旧 key 并压入新 key/value；结束时弹出最后的 key。
     // 循环每轮只移除 value，保留 key 供下一轮使用。遍历期间不调用用户代码也不改表，因此该 key 仍有效。
-    detail::ensureStack(binding_->state_, 1);
     lua_pushnil(binding_->state_);
     while (lua_next(binding_->state_, table_index) != 0)
     {

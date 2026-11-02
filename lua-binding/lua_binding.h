@@ -34,12 +34,6 @@ union UserdataAlignment
     LUAI_MAXALIGN;
 };
 
-// 为外层 C++ 操作预留栈；无法预留时由注册入口捕获 bad_alloc。
-/// @param state 当前操作借用的 Lua State。
-/// @param extra 在现有栈顶之外需要预留的槽数。
-/// @return 无；容量不足时抛出 std::bad_alloc。
-void ensureStack(lua_State *state, int extra);
-
 /// 将原生回调逸出的 C++ 异常转换为 Lua 可见的 INTERNAL_ERROR。
 /// @param state 已由原生回调处理过的 Lua 参数栈；失败路径会清空原参数和临时值。
 /// @param message 静态诊断文本；不依赖已析构的异常对象。
@@ -344,7 +338,8 @@ class LuaBinding
         }
 
         const int base = lua_gettop(state_); // 转换失败时丢弃已经压入的部分结果。
-        detail::ensureStack(state_, sizeof...(Values));
+        // C 函数默认栈空间之外的返回值由 Lua API 扩栈；超过 Lua 上限时按 Lua 栈错误处理。
+        luaL_checkstack(state_, static_cast<int>(sizeof...(Values)), "Native results exceed stack capacity");
         const char *failure = nullptr; // 严格转换失败时的静态诊断。
         if (!(pushRaw(state_, values, &failure) && ...))
         {

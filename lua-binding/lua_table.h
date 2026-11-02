@@ -77,7 +77,6 @@ class LuaTable
             FieldArguments<Key> field; ///< 本次字段操作的目标表、key 与输出诊断。
             const T            &value; ///< 借用本次待写入的值，外层作用域覆盖保护调用。
         } args{{this, key}, value};
-        detail::ensureStack(binding_->state_, 2);
         // 参数 1 借用本次字段操作记录；记录及其中的 C++ 资源由外层作用域持有。
         lua_pushcfunction(
             binding_->state_,
@@ -160,7 +159,6 @@ class LuaTable
     {
         static_assert((std::is_integral_v<Key> && !std::is_same_v<Key, bool>) ||
                       std::is_convertible_v<const Key &, std::string>);
-        detail::ensureStack(binding_->state_, 2);
         push();
         const char *failure = nullptr; // key 类型或范围转换失败的诊断。
         if (!binding_->pushRaw(binding_->state_, key, &failure))
