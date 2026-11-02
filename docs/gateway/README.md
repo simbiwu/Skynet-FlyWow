@@ -112,7 +112,7 @@ connection_id=0 的广播只作用于当前 Gateway 实例。多 Gateway 节点�
 
 业务通过 close 请求关闭指定连接。Gateway 校验当前 gateway_epoch 和 connection_id，先摘除连接，再关闭底层 TCP/WebSocket。关闭不取消 Battle 已经接纳的业务操作。
 
-宿主调用 Gateway 的 stop RPC 时，首个调用负责关闭监听与全部活动连接；Socket 关闭可能 yield，期间到达的并发 stop 会等待清理结束并取得相同的最终结果。停止完成后的重复调用返回成功且 `closed_connections=0`。
+宿主调用 Gateway 的 stop RPC 时，首个调用负责关闭监听与全部活动连接；Socket 关闭可能 yield，期间到达的重复 stop 立即成功返回 closed_connections=0，不等待或共享首次结果；此返回不表示首次停止已完成。停止完成后的重复调用返回成功且 `closed_connections=0`。
 
 `closed_connections` 统计 listener 关闭完成后连接快照中，由本次 stop 首次摘除并提交关闭的连接数。此前已经由 TCP 会话、超时或回调摘除的连接不计入；底层关闭失败仍计入，并通过 `GATEWAY_STOP_CLOSE_FAILED` 的 details 返回计数，因此它不代表 transport 关闭成功数量。
 
@@ -139,4 +139,4 @@ connection_id=0 的广播只作用于当前 Gateway 实例。多 Gateway 节点�
 
 待确认：第 9 项 Registry 重复查询暂不实施；has_command/has_response 与未知命令、缺少请求/响应类型的错误区分继续保留。Sample 宿主超时配置已迁移至毫秒合同并完成三种传输 Sample 验证。本机缺少 Unity/C# 编译工具，Unity SDK 的内部重命名和枚举仅完成静态核对，未完成 Unity 编译验证。
 
-公开 Service/SDK API、协议字段与握手字节合同保持原有约定；本轮指定的停止竞态修复及 H5 异步回调等待按整改清单落实。工作区原有直接 receive(context, bytes)、配置校验表和并发 stop 等未提交改动予以保留，不将其算成本轮新增设计。未修改第三方源码，未提交或推送。
+公开 Service/SDK API、协议字段与握手字节合同保持原有约定；本轮指定的停止竞态修复及 H5 异步回调等待按整改清单落实。后续最小化收尾已恢复显式逐字段配置校验，并删除并发 stop 的等待及结果共享；stopping 重复调用立即返回零，不代表首次清理完成。未修改第三方源码，未提交或推送。

@@ -35,8 +35,6 @@ local module_state =
     total_rate_count         = 0,         -- 当前窗口已接纳的请求数；只用于实例级限流。
     epoch              = nil,       -- 每次 Service 启动的新身份，隔离旧进程迟到响应。
     connection_count       = 0,         -- 当前登记的连接数，包含握手中连接；用于 O(1) 判断 max_clients。
-    stop_waiters       = {},        -- 正在等待当前停止流程完成的 stop RPC token。
-    stop_result        = nil,       -- stopping 阶段共享的最终结果；设置后才唤醒所有等待方。
 }
 local ws_handler = {} -- Skynet WebSocket 回调表；启动时注册，运行期间不替换。
 
@@ -124,50 +122,173 @@ local function normalize_config(startup_config)
         host = host, -- 已校验的监听地址；只影响当前 Gateway。
         transport = transport, -- 已校验且运行期不可切换的 TCP/WebSocket 传输。
     }
-    local integer_config_specs =
-    {
-        { name = "max_frame_bytes", default = 65535, minimum = 1, maximum = 0xffff }, -- 入站与出站 Envelope 的共同字节上限。
-        { name = "max_clients", default = 1024, minimum = 1, maximum = 1000000 }, -- 当前 Gateway 可登记的连接容量。
-        { name = "write_warning_close_kb", default = 1024, minimum = 1, maximum = 0x7fffffff }, -- Skynet 写缓冲告警关闭阈值，单位 KB。
-        { name = "port", minimum = 1, maximum = 65535 }, -- 宿主要求绑定的 TCP/WS 端口。
-        { name = "backlog", default = 128, minimum = 1, maximum = 65535 }, -- 操作系统尚未 accept 的连接队列容量。
-        { name = "protocol_version", minimum = 1, maximum = 0xffffffff }, -- Envelope uint32 兼容版本。
-        { name = "read_timeout_ms", default = 30000, minimum = 1, maximum = 3600000 }, -- 单次读取期限，单位毫秒。
-        { name = "idle_timeout_ms", default = 300000, minimum = 1, maximum = 3600000 }, -- 客户端完整业务消息空闲期限，单位毫秒。
-        { name = "max_requests_per_second", default = 200, minimum = 1, maximum = 100000 }, -- 单连接一秒窗口的业务请求数上限。
-        { name = "max_total_requests_per_second", default = 10000, minimum = 1, maximum = 1000000 }, -- 本 Gateway 一秒窗口的业务请求数上限。
-        { name = "max_pending_handshakes", minimum = 1 }, -- 上限和默认值依赖前面已校验的 max_clients。
-        { name = "handshake_timeout_ms", default = 10000, minimum = 1, maximum = 3600000 }, -- 从连接登记起算的握手期限，单位毫秒。
-    }
-
-    -- 缺省只在字段为 nil 时生效；显式 false 等非法类型仍由整数校验报告。
-    for _, config_spec in ipairs(integer_config_specs) do
-        local candidate = startup_config[config_spec.name]
-        local maximum = config_spec.maximum
-
-        -- 握手并发上限以已验证的连接容量为界，默认不超过 128 个。
-        if config_spec.name == "max_pending_handshakes" then
-            maximum = normalized.max_clients
-            if candidate == nil then
-                candidate = math.min(128, maximum)
-            end
-        elseif candidate == nil then
-            candidate = config_spec.default
-        end
-
-        local validation_result = validate_integer_config(
-            candidate,
-            config_spec.name,
-            config_spec.minimum,
-            maximum
-        )
-        if not validation_result.ok then
-            return validation_result
-        end
-
-        -- Gateway 持有独立配置副本，不在运行期读取宿主可变 table。
-        normalized[config_spec.name] = validation_result.value
+    local max_frame_bytes = startup_config.max_frame_bytes -- 宿主提供的max_frame_bytes；只在缺省时采用默认值。
+    if max_frame_bytes == nil then
+        max_frame_bytes = 65535
     end
+
+    -- 对 max_frame_bytes 执行整数和边界校验，失败保留原错误合同。
+    local max_frame_bytes_result = validate_integer_config(max_frame_bytes, "max_frame_bytes", 1, 0xffff)
+    if not max_frame_bytes_result.ok then
+        return max_frame_bytes_result
+    end
+
+    -- 将已验证的 max_frame_bytes 写入实例配置副本。
+    normalized.max_frame_bytes = max_frame_bytes_result.value
+
+    local max_clients = startup_config.max_clients -- 宿主提供的max_clients；只在缺省时采用默认值。
+    if max_clients == nil then
+        max_clients = 1024
+    end
+
+    -- 对 max_clients 执行整数和边界校验，失败保留原错误合同。
+    local max_clients_result = validate_integer_config(max_clients, "max_clients", 1, 1000000)
+    if not max_clients_result.ok then
+        return max_clients_result
+    end
+
+    -- 将已验证的 max_clients 写入实例配置副本。
+    normalized.max_clients = max_clients_result.value
+
+    local write_warning_close_kb = startup_config.write_warning_close_kb -- 宿主提供的write_warning_close_kb；只在缺省时采用默认值。
+    if write_warning_close_kb == nil then
+        write_warning_close_kb = 1024
+    end
+
+    -- 对 write_warning_close_kb 执行整数和边界校验，失败保留原错误合同。
+    local write_warning_close_kb_result = validate_integer_config(write_warning_close_kb, "write_warning_close_kb", 1, 0x7fffffff)
+    if not write_warning_close_kb_result.ok then
+        return write_warning_close_kb_result
+    end
+
+    -- 将已验证的 write_warning_close_kb 写入实例配置副本。
+    normalized.write_warning_close_kb = write_warning_close_kb_result.value
+
+    local port = startup_config.port -- 宿主提供的port；只在缺省时采用默认值。
+    if port == nil then
+        port = nil
+    end
+
+    -- 对 port 执行整数和边界校验，失败保留原错误合同。
+    local port_result = validate_integer_config(port, "port", 1, 65535)
+    if not port_result.ok then
+        return port_result
+    end
+
+    -- 将已验证的 port 写入实例配置副本。
+    normalized.port = port_result.value
+
+    local backlog = startup_config.backlog -- 宿主提供的backlog；只在缺省时采用默认值。
+    if backlog == nil then
+        backlog = 128
+    end
+
+    -- 对 backlog 执行整数和边界校验，失败保留原错误合同。
+    local backlog_result = validate_integer_config(backlog, "backlog", 1, 65535)
+    if not backlog_result.ok then
+        return backlog_result
+    end
+
+    -- 将已验证的 backlog 写入实例配置副本。
+    normalized.backlog = backlog_result.value
+
+    local protocol_version = startup_config.protocol_version -- 宿主提供的protocol_version；只在缺省时采用默认值。
+    if protocol_version == nil then
+        protocol_version = nil
+    end
+
+    -- 对 protocol_version 执行整数和边界校验，失败保留原错误合同。
+    local protocol_version_result = validate_integer_config(protocol_version, "protocol_version", 1, 0xffffffff)
+    if not protocol_version_result.ok then
+        return protocol_version_result
+    end
+
+    -- 将已验证的 protocol_version 写入实例配置副本。
+    normalized.protocol_version = protocol_version_result.value
+
+    local read_timeout_ms = startup_config.read_timeout_ms -- 宿主提供的read_timeout_ms；只在缺省时采用默认值。
+    if read_timeout_ms == nil then
+        read_timeout_ms = 30000
+    end
+
+    -- 对 read_timeout_ms 执行整数和边界校验，失败保留原错误合同。
+    local read_timeout_ms_result = validate_integer_config(read_timeout_ms, "read_timeout_ms", 1, 3600000)
+    if not read_timeout_ms_result.ok then
+        return read_timeout_ms_result
+    end
+
+    -- 将已验证的 read_timeout_ms 写入实例配置副本。
+    normalized.read_timeout_ms = read_timeout_ms_result.value
+
+    local idle_timeout_ms = startup_config.idle_timeout_ms -- 宿主提供的idle_timeout_ms；只在缺省时采用默认值。
+    if idle_timeout_ms == nil then
+        idle_timeout_ms = 300000
+    end
+
+    -- 对 idle_timeout_ms 执行整数和边界校验，失败保留原错误合同。
+    local idle_timeout_ms_result = validate_integer_config(idle_timeout_ms, "idle_timeout_ms", 1, 3600000)
+    if not idle_timeout_ms_result.ok then
+        return idle_timeout_ms_result
+    end
+
+    -- 将已验证的 idle_timeout_ms 写入实例配置副本。
+    normalized.idle_timeout_ms = idle_timeout_ms_result.value
+
+    local max_requests_per_second = startup_config.max_requests_per_second -- 宿主提供的max_requests_per_second；只在缺省时采用默认值。
+    if max_requests_per_second == nil then
+        max_requests_per_second = 200
+    end
+
+    -- 对 max_requests_per_second 执行整数和边界校验，失败保留原错误合同。
+    local max_requests_per_second_result = validate_integer_config(max_requests_per_second, "max_requests_per_second", 1, 100000)
+    if not max_requests_per_second_result.ok then
+        return max_requests_per_second_result
+    end
+
+    -- 将已验证的 max_requests_per_second 写入实例配置副本。
+    normalized.max_requests_per_second = max_requests_per_second_result.value
+
+    local max_total_requests_per_second = startup_config.max_total_requests_per_second -- 宿主提供的max_total_requests_per_second；只在缺省时采用默认值。
+    if max_total_requests_per_second == nil then
+        max_total_requests_per_second = 10000
+    end
+
+    -- 对 max_total_requests_per_second 执行整数和边界校验，失败保留原错误合同。
+    local max_total_requests_per_second_result = validate_integer_config(max_total_requests_per_second, "max_total_requests_per_second", 1, 1000000)
+    if not max_total_requests_per_second_result.ok then
+        return max_total_requests_per_second_result
+    end
+
+    -- 将已验证的 max_total_requests_per_second 写入实例配置副本。
+    normalized.max_total_requests_per_second = max_total_requests_per_second_result.value
+
+    local max_pending_handshakes = startup_config.max_pending_handshakes -- 宿主提供的max_pending_handshakes；只在缺省时采用默认值。
+    if max_pending_handshakes == nil then
+        max_pending_handshakes = math.min(128, normalized.max_clients)
+    end
+
+    -- 对 max_pending_handshakes 执行整数和边界校验，失败保留原错误合同。
+    local max_pending_handshakes_result = validate_integer_config(max_pending_handshakes, "max_pending_handshakes", 1, normalized.max_clients)
+    if not max_pending_handshakes_result.ok then
+        return max_pending_handshakes_result
+    end
+
+    -- 将已验证的 max_pending_handshakes 写入实例配置副本。
+    normalized.max_pending_handshakes = max_pending_handshakes_result.value
+
+    local handshake_timeout_ms = startup_config.handshake_timeout_ms -- 宿主提供的handshake_timeout_ms；只在缺省时采用默认值。
+    if handshake_timeout_ms == nil then
+        handshake_timeout_ms = 10000
+    end
+
+    -- 对 handshake_timeout_ms 执行整数和边界校验，失败保留原错误合同。
+    local handshake_timeout_ms_result = validate_integer_config(handshake_timeout_ms, "handshake_timeout_ms", 1, 3600000)
+    if not handshake_timeout_ms_result.ok then
+        return handshake_timeout_ms_result
+    end
+
+    -- 将已验证的 handshake_timeout_ms 写入实例配置副本。
+    normalized.handshake_timeout_ms = handshake_timeout_ms_result.value
 
     -- 协议文件与 handler 名称由宿主组合根提供，必须是非空字符串。
     normalized.handler_service = startup_config.handler_service
@@ -753,7 +874,7 @@ local function process_handshake(connection, bytes)
     local response_bytes = handshake_output.response_bytes
     local write_succeeded, write_result_or_error = write_frame(connection, response_bytes)
 
-    if not write_succeeded or write_result_or_error == false or connection.closed then
+    if not write_succeeded or write_result_or_error == false then
         return flywow_result.failure(
             "HANDSHAKE_WRITE_FAILED",
             tostring(write_succeeded and "transport rejected handshake response" or write_result_or_error)
@@ -786,11 +907,11 @@ end
 --- 先校验长度再读取 body；max_frame_bytes 限制业务 Envelope，不是底层传输接收内存硬上限。
 --- 读取 Socket 时 yield；投递不等待业务。退出后由 accept_client 外层协程统一摘除并关闭 TCP fd。
 ---@param connection GatewayConnection Gateway 独占的 TCP 连接。
----@return nil 直到 EOF、协议错误、超时或 Server 停止后退出，外层协程负责清理。
+---@return string 实际退出原因；外层协程负责摘除并关闭连接。
 local function run_tcp(connection)
     -- 已 detach 的连接不能再启动读取协程，避免关闭后重新使用 fd。
     if connection.closed then
-        return
+        return "tcp session ended"
     end
 
     -- 启动 TCP fd；业务帧长度在读取完整 body 前校验，写队列积压另由 warning 回调处理。
@@ -798,7 +919,7 @@ local function run_tcp(connection)
     local opened, open_error = socket.start(fd) -- Skynet 原生接口的返回值；成功为原 fd，失败为 nil 和诊断文本。
 
     if connection.closed then
-        return
+        return "tcp session ended"
     end
 
     -- pinned socket.start 成功返回原 fd；运行时失败按连接错误清理，不用 assert 表达。
@@ -811,7 +932,7 @@ local function run_tcp(connection)
             connection_id = connection.connection_id, -- 标识本次启动失败的逻辑连接。
         }
         )
-        return
+        return "socket start failed"
     end
 
     -- Socket 接管 fd 后仅注册写队列告警；帧大小由长度头和业务 Envelope 上限校验。
@@ -879,6 +1000,7 @@ local function run_tcp(connection)
             break
         end
     end
+    return "tcp session ended"
 end
 
 
@@ -941,7 +1063,7 @@ end
 ---@return nil 记录握手完成时间，不返回业务数据。
 function ws_handler.handshake(id, header, url)
     local connection = module_state.connections_by_fd[id] -- 当前 WebSocket 回调对应的连接；关闭或迟到回调时可能不存在。
-    if not connection or connection.closed then
+    if not connection then
         return
     end
 
@@ -1090,9 +1212,18 @@ local function accept_client(fd, peer)
         end
 
         -- 正常和异常退出共享关闭所有权；已被超时或 stop 摘除时不重复关闭。
-        local reason = ok and "tcp session ended" or "tcp session failed" -- 沿用正常与异常关闭原因。
+        local reason = ok and err or "tcp session failed" -- 沿用正常与异常关闭原因。
         if detach_connection(connection, reason) then
-            pcall(close_transport, connection, ok and 1001 or 1011, reason)
+            local close_ok, close_error = pcall(close_transport, connection, ok and 1001 or 1011, reason)
+            if not close_ok then
+                log_event(
+                {
+                    kind          = "error", -- TCP 清理过程中底层关闭抛错。
+                    code          = "TCP_CLOSE", -- 区分会话处理与关闭失败。
+                    message       = tostring(close_error), -- 保留底层关闭诊断。
+                    connection_id = connection.connection_id, -- 对应已摘除的连接。
+                })
+            end
         end
     end)
 end
@@ -1300,28 +1431,20 @@ end
 
 
 --- 幂等地停止监听并关闭所有 Gateway 拥有的连接。
---- 首个调用负责清理；并发调用等待该清理完成并返回相同结果，后续调用返回关闭数为零。
+--- 首个调用负责清理；stopping/stopped 时重复调用直接返回零，不表示首次清理已经完成。
 --- Socket 关闭可能 yield，不应在业务请求 handler 中同步调用；先快照索引再 detach，避免漏关或重复关闭。
----@return FlyWowResult<GatewayStopResult> 并发 stop 等待首次停止完成并取得同一结果；关闭异常返回稳定错误。
+---@return FlyWowResult<GatewayStopResult> 首次调用返回清理结果；重复调用立即成功且关闭数为零。
 local function stop()
-    -- 已 stopped 的实例直接返回，避免重复关闭已经释放的 fd。
-    if module_state.phase == "stopped" then
+    -- 已停止或正在停止的实例直接返回，避免重复清理；不等待首次调用。
+    if module_state.phase == "stopping" or module_state.phase == "stopped" then
         return flywow_result.success(
             {
-                closed_connections = 0, -- 已完成停止后再次调用，没有新关闭的连接。
+                closed_connections = 0, -- 本次重复调用不拥有清理责任，因此计数为零。
             }
         )
     end
 
-    -- 监听或连接关闭可能 yield；并发 stop 不能提前报告清理完成。
-    if module_state.phase == "stopping" then
-        local waiter = {} -- 当前 stop RPC 的唯一等待 token，由停止 owner 完成时唤醒。
-        module_state.stop_waiters[#module_state.stop_waiters + 1] = waiter
-        skynet.wait(waiter)
-        return module_state.stop_result
-    end
-
-    -- 首个 stop 成为清理 owner；其余 stop 在 stopping 阶段等待这一结果。
+    -- 首次调用独占清理；重复调用立即返回，不等待其完成。
     module_state.phase = "stopping"
 
     -- 关闭监听 fd，阻止 Skynet 再把新连接交给本实例。
@@ -1338,7 +1461,7 @@ local function stop()
     end
 
     -- 复制当前连接列表；后续 detach 会修改原索引，不能直接遍历它。
-    local closed = 0 -- 本次 stop 首次摘除的连接数，不累计此前已关闭连接。
+    local detached_count = 0 -- 本次 stop 首次摘除的连接数，不累计此前已关闭连接。
     local snapshot = {} -- stop 开始时仍登记的连接快照；detach 会修改原索引表。
 
     for _, connection in pairs(module_state.connections) do
@@ -1350,7 +1473,7 @@ local function stop()
     for index = 1, #snapshot do
         local connection = snapshot[index] -- 本轮停止要摘除并关闭的连接。
         if detach_connection(connection, "server shutdown") then
-            closed = closed + 1
+            detached_count = detached_count + 1
             local close_ok, close_error = pcall( -- 当前连接的 transport 关闭状态及原生异常诊断。
                 close_transport,
                 connection,
@@ -1369,29 +1492,19 @@ local function stop()
     -- 停止阶段会尽力关闭全部 fd；底层任一关闭失败都通过单一稳定错误返回。
     module_state.phase = "stopped"
     if close_error_count > 0 then
-        module_state.stop_result = flywow_result.failure(
+        return flywow_result.failure(
             "GATEWAY_STOP_CLOSE_FAILED",
             first_close_error,
-            { close_error_count = close_error_count, closed_connections = closed }
+            { close_error_count = close_error_count, closed_connections = detached_count }
         )
     else
-        module_state.stop_result = flywow_result.success(
+        return flywow_result.success(
             {
-                closed_connections = closed, -- 本次首次摘除并提交关闭的连接总数。
+                closed_connections = detached_count, -- 本次首次摘除并提交关闭的连接总数。
             }
         )
     end
 
-    -- 先发布最终结果再唤醒等待者；关闭过程中 yield 的并发 stop 因此得到同一结果。
-    for _, waiter in ipairs(module_state.stop_waiters) do
-        skynet.wakeup(waiter)
-    end
-
-    -- 等待者已收到唤醒，清空列表以释放本轮 stop 的 token 引用。
-    module_state.stop_waiters = {}
-
-    -- 返回停止结果给首个 RPC；被唤醒的并发 RPC 读取同一份已发布结果。
-    return module_state.stop_result
 end
 
 

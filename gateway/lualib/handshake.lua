@@ -232,15 +232,15 @@ function M.receive(context, bytes)
                 context.crypto_context.verify, context.crypto_context, bytes)
         if not call_succeeded or ready_or_error == nil or type(ready_or_error) ~= "string" then
             M.close(context)
-            local failure = call_succeeded and native_error or ready_or_error -- Native nil/error record 或 Binding 抛出的异常。
+            native_error = call_succeeded and native_error or ready_or_error -- Native nil/error record 或 Binding 抛出的异常。
             return flywow_result.failure(
                 "HANDSHAKE_PROOF",
                 "Native rejected the client proof",
                 {
-                    native_code = type(failure) == "table" and failure.code or nil, -- Lua Binding 提供的机器可读失败码。
+                    native_code = type(native_error) == "table" and native_error.code or nil, -- Lua Binding 提供的机器可读失败码。
                     -- 保留 Native 诊断文本，供日志定位证明错误。
-                    native_message = type(failure) == "table" and failure.message or
-                        tostring(failure), -- Binding 原始错误文本只用于定位证明失败。
+                    native_message = type(native_error) == "table" and native_error.message or
+                        tostring(native_error), -- Binding 原始错误文本只用于定位证明失败。
                 }
             )
         end

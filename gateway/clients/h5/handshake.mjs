@@ -2,7 +2,7 @@
 // 边界：Client SDK；固定P-256/HKDF/HMAC；需要支持Web Crypto的安全上下文。
 // 生命周期：每实例只服务一条连接；close释放CryptoKey引用，不保存登录或业务状态。
 // 不负责：不加密业务数据、不自动重连、不假定Web Crypto可擦除内部密钥副本。
-const ascii = new TextEncoder(); // 将握手域分离前缀编码为协议使用的 ASCII 字节。
+const utf8Encoder = new TextEncoder(); // 以 UTF-8 编码握手域分离前缀；协议前缀均为 ASCII 字符，编码字节保持一致。
 
 // 连接有限公开字节数组；返回新Uint8Array，不改变输入。
 function join(...parts)
@@ -72,9 +72,9 @@ export class HandshakeClient
             this.transcriptHash = new Uint8Array(await subtle.digest("SHA-256", join(this.hello, bytes))); // HELLO 与完整 CHALLENGE 的 transcript 摘要，complete 用于验证服务端证明。
             const hkdfKeyMaterial = await subtle.importKey("raw", sharedSecret, "HKDF", false, ["deriveKey"]); // 原始 ECDH Z 的 HKDF 输入句柄，不暴露为字符串。
             const proofKey = await subtle.deriveKey( // 用于双向握手证明的 HMAC 密钥句柄，不导出密钥字节。
-                { name: "HKDF", hash: "SHA-256", salt: bytes.slice(67), info: join(ascii.encode("flywow/handshake/v1"), this.transcriptHash) },
+                { name: "HKDF", hash: "SHA-256", salt: bytes.slice(67), info: join(utf8Encoder.encode("flywow/handshake/v1"), this.transcriptHash) },
                 hkdfKeyMaterial, { name: "HMAC", hash: "SHA-256", length: 256 }, false, ["sign", "verify"]);
-            const clientProof = new Uint8Array(await subtle.sign("HMAC", proofKey, join(ascii.encode("client-proof"), this.transcriptHash))); // 用握手 transcript 生成的客户端证明字节。
+            const clientProof = new Uint8Array(await subtle.sign("HMAC", proofKey, join(utf8Encoder.encode("client-proof"), this.transcriptHash))); // 用握手 transcript 生成的客户端证明字节。
             if (this.phase === "closed") throw new Error("HANDSHAKE_CLOSED");
             this.proofKey = proofKey; // 暂存到 READY 校验阶段；成功或 close 后清除引用。
             this.keyPair = null;
@@ -104,7 +104,7 @@ export class HandshakeClient
         try
         {
             if (bytes.length !== 33 || bytes[0] !== 4 ||
-                !await this.crypto.subtle.verify("HMAC", this.proofKey, bytes.slice(1), join(ascii.encode("server-ready"), this.transcriptHash)))
+                !await this.crypto.subtle.verify("HMAC", this.proofKey, bytes.slice(1), join(utf8Encoder.encode("server-ready"), this.transcriptHash)))
                 throw new Error("HANDSHAKE_READY");
             if (this.phase === "closed") throw new Error("HANDSHAKE_CLOSED");
             this.proofKey = null;
