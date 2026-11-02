@@ -2594,7 +2594,7 @@ ws.onerror = () => console.log("传输层观察到错误");
 JS
 ```
 
-**执行链**：`http.websocket` 完成 HTTP Upgrade → `ws_handler.message(id, bytes, "binary")` → `process_handshake` → `handshake.receive({context,bytes})`。此时固定 HELLO 必须是 67 字节、类型 1、版本 1；传入的 `[99]` 被握手状态机拒绝，Gateway 摘除连接，`close_transport` 关闭 WS。Handshake 握手模块 释放该连接的 Native/握手名额。
+**执行链**：`http.websocket` 完成 HTTP Upgrade → `ws_handler.message(id, bytes, "binary")` → `process_handshake` → `handshake.receive(context,bytes)`。此时固定 HELLO 必须是 67 字节、类型 1、版本 1；传入的 `[99]` 被握手状态机拒绝，Gateway 摘除连接，`close_transport` 关闭 WS。Handshake 握手模块 释放该连接的 Native/握手名额。
 
 **观察**：客户端连接被关闭；WorldService 的 `on_enter_world` 不应被调用；可能收到 `gateway_disconnect`，但因它没有进入过业务，`state.players` 不存在相应记录，因此在线人数保持 0。用真实日志判断具体失败错误码，不把这里的客户端提示文本冒充框架稳定错误码。
 

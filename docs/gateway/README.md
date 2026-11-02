@@ -135,8 +135,8 @@ connection_id=0 的广播只作用于当前 Gateway 实例。多 Gateway 节点�
 
 验证结果：Gateway Python 测试 15 项通过（包含新增 Lua/H5 场景及真实 Native 互通）；Gateway Native 重新构建成功；质量检查器单测 52 项通过；Skill 结构检查和 git diff --check 通过。仓库总门禁失败的 3 条均位于本轮未修改的既有脏文件 gateway/sample/master_course/service/world_service.lua：缺末尾换行及两处阶段说明缺失。
 
-WebSocket、TCP Protobuf、TCP Binary Sample 均实际运行并在启动阶段失败。临时诊断副本直接取得 GATEWAY_CONFIG_INVALID：read_timeout_ticks was replaced by read_timeout_ms。宿主 server/config/gateway_frame_sync.lua 仍包含 read_timeout_ticks、idle_timeout_ticks、handshake_timeout_ticks；样例读取该宿主配置，而 Gateway 已拒绝旧字段。本轮不修改宿主配置或协议，保留失败记录。历史 CI 基线 a67a6ee9 的 WebSocket 步骤失败、后续 TCP 步骤跳过；本地复现已定位上述配置不兼容，远端 CI 未重新运行。
+历史 CI 基线 a67a6ee9 的 WebSocket 步骤失败，后续 TCP 步骤被跳过。临时诊断确认根因为宿主配置仍使用旧 *_timeout_ticks 字段。随后 Server 各 Gateway 课程配置及 master_course Service 已迁移为毫秒字段；本地 WebSocket、TCP Protobuf、TCP Binary 三个 Sample 均实际运行并成功，输出对应 FLYWOW_GATEWAY_SAMPLE_OK 标记。
 
-待确认：第 9 项 Registry 重复查询暂不实施；has_command/has_response 与未知命令、缺少请求/响应类型的错误区分继续保留。Sample 的宿主配置迁移属于宿主集成变更，需独立处理。本机缺少 Unity/C# 编译工具，Unity SDK 的内部重命名和枚举仅完成静态核对，未完成 Unity 编译验证。
+待确认：第 9 项 Registry 重复查询暂不实施；has_command/has_response 与未知命令、缺少请求/响应类型的错误区分继续保留。Sample 宿主超时配置已迁移至毫秒合同并完成三种传输 Sample 验证。本机缺少 Unity/C# 编译工具，Unity SDK 的内部重命名和枚举仅完成静态核对，未完成 Unity 编译验证。
 
 公开 Service/SDK API、协议字段与握手字节合同保持原有约定；本轮指定的停止竞态修复及 H5 异步回调等待按整改清单落实。工作区原有直接 receive(context, bytes)、配置校验表和并发 stop 等未提交改动予以保留，不将其算成本轮新增设计。未修改第三方源码，未提交或推送。
