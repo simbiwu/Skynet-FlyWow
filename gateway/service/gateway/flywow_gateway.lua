@@ -25,16 +25,16 @@ local handshake_module = require "handshake"
 ---@field rate_count integer 本连接当前窗口已接纳的业务请求数；用于判断单连接速率上限。
 local module_state =
 {
-    phase              = "created", -- Service 生命周期；created/starting/running/stopping/stopped。
-    gateway_config     = nil,       -- 通过 start 校验后的只读配置；由 start 一次写入，后续运行阶段读取。
-    listen_fd          = nil,       -- 监听 Socket fd；关闭后清空。
-    connections        = {},        -- connection_id -> connection context；只由 Gateway 修改。
-    connections_by_fd  = {},        -- fd -> connection context；用于传输回调反查及 fd 复用身份检查。
-    next_connection_id = 0,         -- 单调递增连接标识；不复用为业务持久 ID。
-    total_rate_started       = 0,         -- 实例一秒接纳窗口起点，单位 10ms tick。
-    total_rate_count         = 0,         -- 当前窗口已接纳的请求数；只用于实例级限流。
-    epoch              = nil,       -- 每次 Service 启动的新身份，隔离旧进程迟到响应。
-    connection_count       = 0,         -- 当前登记的连接数，包含握手中连接；用于 O(1) 判断 max_clients。
+    phase              = "created",  -- Service 生命周期；created/starting/running/stopping/stopped。
+    gateway_config     = nil,        -- 通过 start 校验后的只读配置；由 start 一次写入，后续运行阶段读取。
+    listen_fd          = nil,        -- 监听 Socket fd；关闭后清空。
+    connections        = {},         -- connection_id -> connection context；只由 Gateway 修改。
+    connections_by_fd  = {},         -- fd -> connection context；用于传输回调反查及 fd 复用身份检查。
+    next_connection_id = 0,          -- 单调递增连接标识；不复用为业务持久 ID。
+    total_rate_started = 0,          -- 实例一秒接纳窗口起点，单位 10ms tick。
+    total_rate_count   = 0,          -- 当前窗口已接纳的请求数；只用于实例级限流。
+    epoch              = nil,        -- 每次 Service 启动的新身份，隔离旧进程迟到响应。
+    connection_count   = 0,          -- 当前登记的连接数，包含握手中连接；用于 O(1) 判断 max_clients。
 }
 local ws_handler = {} -- Skynet WebSocket 回调表；启动时注册，运行期间不替换。
 
@@ -122,173 +122,164 @@ local function normalize_config(startup_config)
         host = host, -- 已校验的监听地址；只影响当前 Gateway。
         transport = transport, -- 已校验且运行期不可切换的 TCP/WebSocket 传输。
     }
-    local max_frame_bytes = startup_config.max_frame_bytes -- 宿主提供的max_frame_bytes；只在缺省时采用默认值。
-    if max_frame_bytes == nil then
-        max_frame_bytes = 65535
+    local candidate = startup_config.max_frame_bytes
+    if candidate == nil then
+        candidate = 65535
     end
 
-    -- 对 max_frame_bytes 执行整数和边界校验，失败保留原错误合同。
-    local max_frame_bytes_result = validate_integer_config(max_frame_bytes, "max_frame_bytes", 1, 0xffff)
-    if not max_frame_bytes_result.ok then
-        return max_frame_bytes_result
+    -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
+    local validation_result = validate_integer_config(candidate, "max_frame_bytes", 1, 0xffff)
+    if not validation_result.ok then
+        return validation_result
     end
 
-    -- 将已验证的 max_frame_bytes 写入实例配置副本。
-    normalized.max_frame_bytes = max_frame_bytes_result.value
+    -- 将帧大小上限保存到运行配置，供入站与出站校验共用。
+    normalized.max_frame_bytes = validation_result.value
 
-    local max_clients = startup_config.max_clients -- 宿主提供的max_clients；只在缺省时采用默认值。
-    if max_clients == nil then
-        max_clients = 1024
+    candidate = startup_config.max_clients
+    if candidate == nil then
+        candidate = 1024
     end
 
-    -- 对 max_clients 执行整数和边界校验，失败保留原错误合同。
-    local max_clients_result = validate_integer_config(max_clients, "max_clients", 1, 1000000)
-    if not max_clients_result.ok then
-        return max_clients_result
+    -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
+    validation_result = validate_integer_config(candidate, "max_clients", 1, 1000000)
+    if not validation_result.ok then
+        return validation_result
     end
 
-    -- 将已验证的 max_clients 写入实例配置副本。
-    normalized.max_clients = max_clients_result.value
+    -- 保存连接容量，后续握手容量默认值依赖它。
+    normalized.max_clients = validation_result.value
 
-    local write_warning_close_kb = startup_config.write_warning_close_kb -- 宿主提供的write_warning_close_kb；只在缺省时采用默认值。
-    if write_warning_close_kb == nil then
-        write_warning_close_kb = 1024
+    candidate = startup_config.write_warning_close_kb
+    if candidate == nil then
+        candidate = 1024
     end
 
-    -- 对 write_warning_close_kb 执行整数和边界校验，失败保留原错误合同。
-    local write_warning_close_kb_result = validate_integer_config(write_warning_close_kb, "write_warning_close_kb", 1, 0x7fffffff)
-    if not write_warning_close_kb_result.ok then
-        return write_warning_close_kb_result
+    -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
+    validation_result = validate_integer_config(candidate, "write_warning_close_kb", 1, 0x7fffffff)
+    if not validation_result.ok then
+        return validation_result
     end
 
-    -- 将已验证的 write_warning_close_kb 写入实例配置副本。
-    normalized.write_warning_close_kb = write_warning_close_kb_result.value
+    -- 保存写缓冲告警阈值，传输告警回调按此值关闭慢连接。
+    normalized.write_warning_close_kb = validation_result.value
 
-    local port = startup_config.port -- 宿主提供的port；只在缺省时采用默认值。
-    if port == nil then
-        port = nil
+    -- port 和 protocol_version 必须由宿主显式提供。
+    validation_result = validate_integer_config(startup_config.port, "port", 1, 65535)
+    if not validation_result.ok then
+        return validation_result
     end
 
-    -- 对 port 执行整数和边界校验，失败保留原错误合同。
-    local port_result = validate_integer_config(port, "port", 1, 65535)
-    if not port_result.ok then
-        return port_result
+    -- 记录宿主要求的监听端口。
+    normalized.port = validation_result.value
+
+    candidate = startup_config.backlog
+    if candidate == nil then
+        candidate = 128
     end
 
-    -- 将已验证的 port 写入实例配置副本。
-    normalized.port = port_result.value
-
-    local backlog = startup_config.backlog -- 宿主提供的backlog；只在缺省时采用默认值。
-    if backlog == nil then
-        backlog = 128
+    -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
+    validation_result = validate_integer_config(candidate, "backlog", 1, 65535)
+    if not validation_result.ok then
+        return validation_result
     end
 
-    -- 对 backlog 执行整数和边界校验，失败保留原错误合同。
-    local backlog_result = validate_integer_config(backlog, "backlog", 1, 65535)
-    if not backlog_result.ok then
-        return backlog_result
+    -- 记录操作系统 accept 队列容量。
+    normalized.backlog = validation_result.value
+
+    -- protocol_version 必须显式提供，沿用相同的整数边界合同。
+    validation_result = validate_integer_config(startup_config.protocol_version, "protocol_version", 1, 0xffffffff)
+    if not validation_result.ok then
+        return validation_result
     end
 
-    -- 将已验证的 backlog 写入实例配置副本。
-    normalized.backlog = backlog_result.value
+    -- 记录 Envelope 版本，供消息入口和出站编码使用。
+    normalized.protocol_version = validation_result.value
 
-    local protocol_version = startup_config.protocol_version -- 宿主提供的protocol_version；只在缺省时采用默认值。
-    if protocol_version == nil then
-        protocol_version = nil
+    candidate = startup_config.read_timeout_ms
+    if candidate == nil then
+        candidate = 30000
     end
 
-    -- 对 protocol_version 执行整数和边界校验，失败保留原错误合同。
-    local protocol_version_result = validate_integer_config(protocol_version, "protocol_version", 1, 0xffffffff)
-    if not protocol_version_result.ok then
-        return protocol_version_result
+    -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
+    validation_result = validate_integer_config(candidate, "read_timeout_ms", 1, 3600000)
+    if not validation_result.ok then
+        return validation_result
     end
 
-    -- 将已验证的 protocol_version 写入实例配置副本。
-    normalized.protocol_version = protocol_version_result.value
+    -- 保存 TCP 读取与 WebSocket Upgrade 的毫秒期限。
+    normalized.read_timeout_ms = validation_result.value
 
-    local read_timeout_ms = startup_config.read_timeout_ms -- 宿主提供的read_timeout_ms；只在缺省时采用默认值。
-    if read_timeout_ms == nil then
-        read_timeout_ms = 30000
+    candidate = startup_config.idle_timeout_ms
+    if candidate == nil then
+        candidate = 300000
     end
 
-    -- 对 read_timeout_ms 执行整数和边界校验，失败保留原错误合同。
-    local read_timeout_ms_result = validate_integer_config(read_timeout_ms, "read_timeout_ms", 1, 3600000)
-    if not read_timeout_ms_result.ok then
-        return read_timeout_ms_result
+    -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
+    validation_result = validate_integer_config(candidate, "idle_timeout_ms", 1, 3600000)
+    if not validation_result.ok then
+        return validation_result
     end
 
-    -- 将已验证的 read_timeout_ms 写入实例配置副本。
-    normalized.read_timeout_ms = read_timeout_ms_result.value
+    -- 保存完整客户端消息之间的毫秒空闲期限。
+    normalized.idle_timeout_ms = validation_result.value
 
-    local idle_timeout_ms = startup_config.idle_timeout_ms -- 宿主提供的idle_timeout_ms；只在缺省时采用默认值。
-    if idle_timeout_ms == nil then
-        idle_timeout_ms = 300000
+    candidate = startup_config.max_requests_per_second
+    if candidate == nil then
+        candidate = 200
     end
 
-    -- 对 idle_timeout_ms 执行整数和边界校验，失败保留原错误合同。
-    local idle_timeout_ms_result = validate_integer_config(idle_timeout_ms, "idle_timeout_ms", 1, 3600000)
-    if not idle_timeout_ms_result.ok then
-        return idle_timeout_ms_result
+    -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
+    validation_result = validate_integer_config(candidate, "max_requests_per_second", 1, 100000)
+    if not validation_result.ok then
+        return validation_result
     end
 
-    -- 将已验证的 idle_timeout_ms 写入实例配置副本。
-    normalized.idle_timeout_ms = idle_timeout_ms_result.value
+    -- 保存单连接每秒接纳上限。
+    normalized.max_requests_per_second = validation_result.value
 
-    local max_requests_per_second = startup_config.max_requests_per_second -- 宿主提供的max_requests_per_second；只在缺省时采用默认值。
-    if max_requests_per_second == nil then
-        max_requests_per_second = 200
+    candidate = startup_config.max_total_requests_per_second
+    if candidate == nil then
+        candidate = 10000
     end
 
-    -- 对 max_requests_per_second 执行整数和边界校验，失败保留原错误合同。
-    local max_requests_per_second_result = validate_integer_config(max_requests_per_second, "max_requests_per_second", 1, 100000)
-    if not max_requests_per_second_result.ok then
-        return max_requests_per_second_result
+    -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
+    validation_result = validate_integer_config(candidate, "max_total_requests_per_second", 1, 1000000)
+    if not validation_result.ok then
+        return validation_result
     end
 
-    -- 将已验证的 max_requests_per_second 写入实例配置副本。
-    normalized.max_requests_per_second = max_requests_per_second_result.value
+    -- 保存 Gateway 实例每秒接纳上限。
+    normalized.max_total_requests_per_second = validation_result.value
 
-    local max_total_requests_per_second = startup_config.max_total_requests_per_second -- 宿主提供的max_total_requests_per_second；只在缺省时采用默认值。
-    if max_total_requests_per_second == nil then
-        max_total_requests_per_second = 10000
+    -- 握手容量受已验证的 max_clients 限制，默认不超过 128。
+    candidate = startup_config.max_pending_handshakes
+    if candidate == nil then
+        candidate = math.min(128, normalized.max_clients)
     end
 
-    -- 对 max_total_requests_per_second 执行整数和边界校验，失败保留原错误合同。
-    local max_total_requests_per_second_result = validate_integer_config(max_total_requests_per_second, "max_total_requests_per_second", 1, 1000000)
-    if not max_total_requests_per_second_result.ok then
-        return max_total_requests_per_second_result
+    -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
+    validation_result = validate_integer_config(candidate, "max_pending_handshakes", 1, normalized.max_clients)
+    if not validation_result.ok then
+        return validation_result
     end
 
-    -- 将已验证的 max_total_requests_per_second 写入实例配置副本。
-    normalized.max_total_requests_per_second = max_total_requests_per_second_result.value
+    -- 保存握手容量上限，值不超过 max_clients。
+    normalized.max_pending_handshakes = validation_result.value
 
-    local max_pending_handshakes = startup_config.max_pending_handshakes -- 宿主提供的max_pending_handshakes；只在缺省时采用默认值。
-    if max_pending_handshakes == nil then
-        max_pending_handshakes = math.min(128, normalized.max_clients)
+    candidate = startup_config.handshake_timeout_ms
+    if candidate == nil then
+        candidate = 10000
     end
 
-    -- 对 max_pending_handshakes 执行整数和边界校验，失败保留原错误合同。
-    local max_pending_handshakes_result = validate_integer_config(max_pending_handshakes, "max_pending_handshakes", 1, normalized.max_clients)
-    if not max_pending_handshakes_result.ok then
-        return max_pending_handshakes_result
+    -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
+    validation_result = validate_integer_config(candidate, "handshake_timeout_ms", 1, 3600000)
+    if not validation_result.ok then
+        return validation_result
     end
 
-    -- 将已验证的 max_pending_handshakes 写入实例配置副本。
-    normalized.max_pending_handshakes = max_pending_handshakes_result.value
-
-    local handshake_timeout_ms = startup_config.handshake_timeout_ms -- 宿主提供的handshake_timeout_ms；只在缺省时采用默认值。
-    if handshake_timeout_ms == nil then
-        handshake_timeout_ms = 10000
-    end
-
-    -- 对 handshake_timeout_ms 执行整数和边界校验，失败保留原错误合同。
-    local handshake_timeout_ms_result = validate_integer_config(handshake_timeout_ms, "handshake_timeout_ms", 1, 3600000)
-    if not handshake_timeout_ms_result.ok then
-        return handshake_timeout_ms_result
-    end
-
-    -- 将已验证的 handshake_timeout_ms 写入实例配置副本。
-    normalized.handshake_timeout_ms = handshake_timeout_ms_result.value
+    -- 保存从连接登记起算的握手毫秒期限。
+    normalized.handshake_timeout_ms = validation_result.value
 
     -- 协议文件与 handler 名称由宿主组合根提供，必须是非空字符串。
     normalized.handler_service = startup_config.handler_service
