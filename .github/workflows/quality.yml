@@ -105,12 +105,16 @@ jobs:
         working-directory: host
         run: bash server/protocol/build_protocol_lesson_03_frame_sync.sh
 
+      - name: 安装既有 Native 互通测试依赖
+        run: python -m pip install cryptography
+
       - name: 运行 Gateway Python 合同测试
         env:
           SKYNET_LUA: ${{ github.workspace }}/host/server/third_party/skynet/3rd/lua/lua
           SKYNET_LUACLIB: ${{ github.workspace }}/host/server/third_party/skynet-flywow/build/native
+          SKYNET_JEMALLOC: ${{ github.workspace }}/host/server/third_party/skynet/3rd/jemalloc/lib/libjemalloc.so.2
           LD_PRELOAD: ${{ github.workspace }}/host/server/third_party/skynet/3rd/jemalloc/lib/libjemalloc.so.2
-        run: python -m unittest gateway.tests.test_gateway_async gateway.tests.test_gateway_registry gateway.tests.test_gateway_handshake.HandshakeTests.test_state_machine -v
+        run: python -m unittest gateway.tests.test_gateway_async gateway.tests.test_gateway_registry gateway.tests.test_gateway_handshake -v
 
       - name: 运行独立 H5 Node SDK 测试
         run: node gateway/tests/gateway_handshake_sdk_test.mjs

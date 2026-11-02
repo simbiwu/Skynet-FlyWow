@@ -6,9 +6,14 @@ local flywow_result = require "flywow_result"
 local flywow_common = require "flywow_common"
 
 local M = {}
-local crypto_module, read_tick -- 当前 Service 注入的 Native 模块表与时钟。
-local max_pending, timeout_ms -- 当前 Service 的握手容量及毫秒期限。
-local pending = 0 -- 当前 Service 占用的握手名额；accept 增加，close 释放。
+local module_state =
+{
+    crypto_module = nil, -- 当前 Service 注入的 Native 密码模块。
+    read_tick = nil, -- 当前 Service 注入的 tick 时钟。
+    max_pending = nil, -- 同时占用的握手名额上限。
+    timeout_ms = nil, -- 从 accept 起算的绝对期限，单位毫秒。
+    pending = 0, -- accept 占用、release_context 释放；init 不重置活动名额。
+}
 
 ---@class HandshakeContext
 --- Gateway connection record 为单条连接保存的握手状态表。
@@ -59,33 +64,40 @@ function M.init(handshake_config)
     end
 
     -- 依赖全部通过校验后发布配置；Gateway 只在接受连接前初始化，不重置活动名额。
-    crypto_module, read_tick = candidate_crypto_module, candidate_read_tick
-    max_pending, timeout_ms = candidate_max_pending, candidate_timeout_ms
+    module_state.crypto_module, module_state.read_tick = candidate_crypto_module, candidate_read_tick
+    module_state.max_pending, module_state.timeout_ms = candidate_max_pending, candidate_timeout_ms
     return flywow_result.success()
 end
 
 --- 释放连接占用的握手名额和 Native 密码对象；重复调用不改变计数。
 ---@param context HandshakeContext|nil Gateway 为连接持有的独占握手上下文。
+---@param final_phase string 释放资源后提交的 ready 或 closed 终态。
 ---@return nil 不返回业务值；已释放或 nil context 都是幂等完成。
-function M.close(context)
+local function release_context(context, final_phase)
     if type(context) ~= "table" or context.phase == "ready" or context.phase == "closed" then
         return
     end
 
-    -- 只有活动阶段占用名额；先转 closed，重复 close 即由阶段拒绝二次释放。
-    context.phase = "closed"
-    pending = pending - 1
+    -- 只有活动阶段占用名额；先提交终态，重复 close 即由阶段拒绝二次释放。
+    context.phase = final_phase
+    module_state.pending = module_state.pending - 1
     if context.crypto_context then
         context.crypto_context:close()
         context.crypto_context = nil
     end
+end
 
+--- Gateway 关闭连接时释放尚未完成的握手；重复关闭不重复归还名额。
+---@param context HandshakeContext|nil 当前连接持有的握手上下文。
+---@return nil 资源释放完成，无业务返回值。
+function M.close(context)
+    release_context(context, "closed")
 end
 
 --- 为新连接申请一个握手名额；成功时创建 hello 阶段 context。
 ---@return FlyWowResult<HandshakeContext> 成功 value 为新 context；容量耗尽返回 HANDSHAKE_CAPACITY。
 function M.accept()
-    if pending >= max_pending then
+    if module_state.pending >= module_state.max_pending then
         return flywow_result.failure(
             "HANDSHAKE_CAPACITY",
             "pending handshake capacity reached"
@@ -93,26 +105,26 @@ function M.accept()
     end
 
     -- 有容量时创建新的 hello context 并把名额交给该连接。
-    pending = pending + 1
+    module_state.pending = module_state.pending + 1
     return flywow_result.success(
     {
         phase   = "hello", -- hello/proof/confirm 阶段占用 pending；终态不占名额。
-        started = read_tick(), -- 握手绝对起点；后续消息不能刷新期限。
+        started = module_state.read_tick(), -- 握手绝对起点；后续消息不能刷新期限。
         crypto_context = nil, -- 收到合法 HELLO 后创建的 Native userdata；跨调用保存证明密钥和 transcript 摘要，私钥由 challenge 构建函数局部持有。
     })
 end
 
 --- 检查握手总期限；通过 common 的 elapsed_ms 处理回绕并按毫秒判断。
 ---@param context HandshakeContext|nil 由 accept 返回、由 Gateway 连接记录持有的上下文。
----@return boolean context 仍占用名额且已超过绝对期限时为 true。
+---@return boolean 是否已超过握手绝对期限。
 function M.expired(context)
     if type(context) ~= "table" or context.phase == "ready" or context.phase == "closed" then
         return false
     end
 
     -- common.elapsed_ms 处理 tick 回绕并返回毫秒；握手期限始终以配置毫秒保存。
-    local elapsed_ms = flywow_common.elapsed_ms(context.started, read_tick()) -- 从 accept 起算的回绕安全时长，单位毫秒。
-    return elapsed_ms >= timeout_ms
+    local elapsed_ms = flywow_common.elapsed_ms(context.started, module_state.read_tick()) -- 从 accept 起算的回绕安全时长，单位毫秒。
+    return elapsed_ms >= module_state.timeout_ms
 end
 
 --- 返回当前握手阶段的精确帧体长度；TCP 在读取 body 前使用。
@@ -136,19 +148,11 @@ function M.expected_size(context)
 end
 
 --- 校验并推进一条完整握手帧；Native 的 nil/error record 在此映射为稳定结果码。
----@param handshake_input table 含 context 与 bytes；context 由 Gateway 持有，bytes 是本帧借用字节。
+---@param context HandshakeContext 当前连接独占持有的握手状态。
+---@param bytes string 当前完整握手帧；只在本次同步处理期间借用。
 ---@return FlyWowResult<HandshakeOutput> 成功 value 含 response_bytes/needs_confirmation；失败时释放连接握手资源。
-function M.receive(handshake_input)
-    if type(handshake_input) ~= "table" then
-        return flywow_result.failure(
-            "HANDSHAKE_INPUT_INVALID",
-            "handshake input must be a table"
-        )
-    end
-
-    -- 输入容器有效后读取连接独占状态和本次借用帧。
-    local context = handshake_input.context -- Gateway 为来源连接保存的独占状态，本次按 phase 推进。
-    local bytes = handshake_input.bytes -- 当前完整握手帧；仅在本次同步处理期间借用。
+function M.receive(context, bytes)
+    -- context 由 Gateway 为来源连接独占保存；bytes 是本次同步处理期间借用的完整帧。
     if type(context) ~= "table" or context.phase == "ready" or context.phase == "closed" then
         return flywow_result.failure(
             "HANDSHAKE_STATE",
@@ -186,7 +190,7 @@ function M.receive(handshake_input)
 
         -- Binding 可能抛 Lua 错误，也可能返回 nil/error record；两种形式在此统一处理。
         local call_succeeded, native_or_error, challenge_or_error =
-            pcall(crypto_module.create_context, bytes)
+            pcall(module_state.crypto_module.create_context, bytes)
         if not call_succeeded or native_or_error == nil or
             type(challenge_or_error) ~= "string" then
             M.close(context)
@@ -203,6 +207,12 @@ function M.receive(handshake_input)
             )
         end
 
+        -- Native 成功返回仍须满足 userdata 合同；在保存前拒绝错误类型并归还名额。
+        if type(native_or_error) ~= "userdata" then
+            M.close(context)
+            return flywow_result.failure("HANDSHAKE_STATE", "Native handshake context is missing")
+        end
+
         -- Native 成功后把 userdata 交给连接 context，再推进到 proof 阶段。
         context.crypto_context = native_or_error
         context.phase = "proof"
@@ -216,14 +226,6 @@ function M.receive(handshake_input)
     -- proof 阶段验证客户端 HMAC；只有 SERVER_READY 写出后才允许进入 ready。
     -- HELLO 响应返回后，下一条合法帧必须是 CLIENT_PROOF。
     if context.phase == "proof" then
-        if type(context.crypto_context) ~= "userdata" then
-            M.close(context)
-            return flywow_result.failure(
-                "HANDSHAKE_STATE",
-                "Native handshake context is missing"
-            )
-        end
-
         -- 验证失败会清理 Native key；保留 Native 错误码供诊断。
         local call_succeeded, ready_or_error, native_error =
             pcall(
@@ -271,7 +273,7 @@ function M.confirm(context)
         )
     end
 
-    -- 先拒绝已过期连接，再验证帧长，避免为无效消息调用 Native。
+    -- SERVER_READY 已写出后仍检查绝对期限，过期连接不能进入业务阶段。
     if M.expired(context) then
         M.close(context)
         return flywow_result.failure(
@@ -280,15 +282,14 @@ function M.confirm(context)
         )
     end
 
-    -- 确认仍有效后开放业务，并通过幂等 close 归还 pending 名额。
-    M.close(context)
-    context.phase = "ready"
+    -- 确认仍有效后释放 Native 对象和名额，直接提交 ready 终态。
+    release_context(context, "ready")
     return flywow_result.success()
 end
 
 --- 返回是否允许当前连接进入业务收发。
 ---@param context HandshakeContext|nil Gateway 为连接保存的握手上下文。
----@return boolean context 阶段为 ready 时为 true。
+---@return boolean 当前阶段是否为 ready。
 function M.ready(context)
     return type(context) == "table" and context.phase == "ready"
 end

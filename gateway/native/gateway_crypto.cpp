@@ -138,16 +138,16 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
                          "INVALID_PUBLIC_KEY");
 
     // CHALLENGE：类型/版本占前 2 字节，公钥占 [2,67)，随机 salt 占 [67,99)。
-    std::string response(99, '\0'); // 固定长度 SERVER_CHALLENGE，按协议字段偏移填充。
-    response[0] = 2;
-    response[1] = 1;
-    size_t size = 0; // 接收 OpenSSL 写入的服务端 P-256 公钥长度，协议要求恰为 65 字节。
+    std::string challenge_bytes(99, '\0'); // 固定长度 SERVER_CHALLENGE，按协议字段偏移填充。
+    challenge_bytes[0] = 2;
+    challenge_bytes[1] = 1;
+    size_t public_key_size = 0; // 接收 OpenSSL 写入的服务端 P-256 公钥长度，协议要求恰为 65 字节。
     requireCryptoSuccess(EVP_PKEY_get_octet_string_param(
                              server_key.get(), OSSL_PKEY_PARAM_PUB_KEY,
-                             reinterpret_cast<unsigned char *>(&response[2]), 65, &size) == 1 &&
-                             size == 65,
+                             reinterpret_cast<unsigned char *>(&challenge_bytes[2]), 65, &public_key_size) == 1 &&
+                             public_key_size == 65,
                          "CRYPTO_PUBLIC_KEY");
-    requireCryptoSuccess(RAND_bytes(reinterpret_cast<unsigned char *>(&response[67]), 32) == 1,
+    requireCryptoSuccess(RAND_bytes(reinterpret_cast<unsigned char *>(&challenge_bytes[67]), 32) == 1,
                          "CRYPTO_RANDOM");
 
     // derive_context 使用服务端私钥和客户端公钥计算原始 ECDH Z。
@@ -164,16 +164,16 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
         }
     } shared_secret;
 
-    size = sizeof(shared_secret.bytes); // EVP_PKEY_derive 的输出容量，成功后改写为实际长度。
+    size_t shared_secret_size = sizeof(shared_secret.bytes); // EVP_PKEY_derive 的输出容量，成功后改写为实际长度。
     requireCryptoSuccess(
         EVP_PKEY_derive_init(derive_context.get()) == 1 &&
             EVP_PKEY_derive_set_peer(derive_context.get(), peer.get()) == 1 &&
-            EVP_PKEY_derive(derive_context.get(), shared_secret.bytes, &size) == 1 && size == 32,
+            EVP_PKEY_derive(derive_context.get(), shared_secret.bytes, &shared_secret_size) == 1 && shared_secret_size == 32,
         "CRYPTO_DERIVE");
 
     // transcript 严格拼接完整 HELLO 与 CHALLENGE，不包含 TCP/WS 帧头。
     std::string transcript(hello, 67); // 完整 CLIENT_HELLO；追加 challenge 后计算 transcript 摘要。
-    transcript += response;
+    transcript += challenge_bytes;
     unsigned int hash_size = 0; // EVP 实际写入的摘要长度，必须等于 SHA-256 的 32 字节。
     requireCryptoSuccess(EVP_Digest(transcript.data(), transcript.size(),
                                     crypto_context->transcript_hash.data(), &hash_size,
@@ -199,7 +199,7 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
     OSSL_PARAM params[] = {
         OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, digest, 0),
         OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY, shared_secret.bytes, 32),
-        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT, &response[67], 32),
+        OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_SALT, &challenge_bytes[67], 32),
         OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, &info[0], info.size()),
         OSSL_PARAM_construct_end()};
     requireCryptoSuccess(EVP_KDF_derive(kdf.get(), crypto_context->proof_key.data(), 32, params) ==
@@ -207,7 +207,7 @@ std::string buildChallenge(CryptoContext *crypto_context, const char *hello)
                          "CRYPTO_HKDF");
 
     crypto_context->active     = true;
-    return response;
+    return challenge_bytes;
 }
 
 /// Lua 握手模块 在 hello 阶段调用 create_context，创建独占密码上下文及挑战。
@@ -242,10 +242,10 @@ int create_context(lua_State *state)
         return lua_binding.pushError();
     }
 
-    std::string response; // buildChallenge 产生的公开挑战消息，成功后交还 Lua。
+    std::string challenge_bytes; // buildChallenge 产生的公开挑战消息，成功后交还 Lua。
     try
     {
-        response = buildChallenge(context, hello.data());
+        challenge_bytes = buildChallenge(context, hello.data());
     }
     catch (const std::runtime_error &error)
     {
@@ -263,7 +263,7 @@ int create_context(lua_State *state)
     // Lua 返回值构造不属于密码运算；异常时清理密钥后交注册入口报告。
     try
     {
-        return lua_binding.returnValues(context, response);
+        return lua_binding.returnValues(context, challenge_bytes);
     }
     catch (...)
     {
@@ -294,7 +294,7 @@ int verify(lua_State *state)
     }
 
     std::array<unsigned char, 32> expected = {}; // 预期客户端 HMAC；与输入证明做常量时间比较。
-    std::string response; // 密码运算成功后交给 Lua 的 SERVER_READY。
+    std::string ready_bytes; // 密码运算成功后交给 Lua 的 SERVER_READY。
     try
     {
         // 字符串分配也在清理范围内，失败时先擦除已有证明密钥再抛出。
@@ -308,10 +308,10 @@ int verify(lua_State *state)
 
         message = "server-ready";
         message.append(reinterpret_cast<const char *>(context->transcript_hash.data()), 32);
-        response.assign(33, '\0'); // SERVER_READY：1 字节类型加 32 字节服务端证明。
-        response[0] = 4;
+        ready_bytes.assign(33, '\0'); // SERVER_READY：1 字节类型加 32 字节服务端证明。
+        ready_bytes[0] = 4;
         computeHmac(context->proof_key.data(), message,
-                    reinterpret_cast<unsigned char *>(&response[1]));
+                    reinterpret_cast<unsigned char *>(&ready_bytes[1]));
         clearCryptoContext(context);
     }
     catch (const std::runtime_error &error)
@@ -328,7 +328,7 @@ int verify(lua_State *state)
     }
 
     // 密码状态已清理；Native 返回值转换异常交注册入口处理。
-    return lua_binding.returnValues(response);
+    return lua_binding.returnValues(ready_bytes);
 }
 
 /// Gateway 关闭连接或完成握手时幂等释放密码资源。

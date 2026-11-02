@@ -48,12 +48,12 @@ assert(a_result.ok and b_result.ok)
 local a, b = a_result.value, b_result.value
 assert(not manager.accept().ok)
 assert(not manager.ready(a) and manager.expected_size(a) == 67)
-local challenge_result = manager.receive({ context = a, bytes = hello })
+local challenge_result = manager.receive(a, hello)
 assert(challenge_result.ok, challenge_result.message)
 assert(#challenge_result.value.response_bytes == 99)
 assert(not challenge_result.value.needs_confirmation)
 assert(manager.expected_size(a) == 33)
-local ready_result = manager.receive({ context = a, bytes = proof })
+local ready_result = manager.receive(a, proof)
 assert(ready_result.ok, ready_result.message)
 assert(#ready_result.value.response_bytes == 33 and ready_result.value.needs_confirmation)
 assert(not manager.ready(a), "must wait for successful transport write")
@@ -64,22 +64,22 @@ local c_result = manager.accept()
 assert(c_result.ok, "confirm must release exactly one pending slot")
 assert(not manager.accept().ok, "ready and active contexts must not exceed pending capacity")
 local c = c_result.value
-assert(not manager.receive({ context = c, bytes = hello:sub(1, 66) }).ok)
+assert(not manager.receive(c, hello:sub(1, 66)).ok)
 manager.close(c)
 manager.close(c)
 local replacement = manager.accept()
 assert(replacement.ok, "repeated close must release exactly one pending slot")
 manager.close(replacement.value)
-assert(not manager.receive({ context = b, bytes = string.char(1, 2) .. string.rep("a", 65) }).ok)
+assert(not manager.receive(b, string.char(1, 2) .. string.rep("a", 65)).ok)
 local d = manager.accept().value
-assert(manager.receive({ context = d, bytes = hello }).ok)
-assert(not manager.receive({ context = d, bytes = string.char(3) .. string.rep("x", 32) }).ok)
+assert(manager.receive(d, hello).ok)
+assert(not manager.receive(d, string.char(3) .. string.rep("x", 32)).ok)
 assert(closed == 2)
 local e = manager.accept().value
-assert(manager.receive({ context = e, bytes = hello }).ok)
+assert(manager.receive(e, hello).ok)
 now = 100
 assert(manager.expired(e))
-assert(not manager.receive({ context = e, bytes = proof }).ok)
+assert(not manager.receive(e, proof).ok)
 assert(closed == 3)
 -- tick回绕也按绝对期限，不随HELLO刷新。
 now = 0xfffffff0
@@ -89,4 +89,16 @@ assert(not manager.expired(f))
 now = 0x60
 assert(manager.expired(f))
 manager.close(f)
+-- 成功响应但返回错误 Native 类型时，必须在 HELLO 阶段拒绝并释放 pending。
+local original_create = crypto.create_context
+crypto.create_context = function() return {}, string.rep("c", 99) end
+local invalid_native = manager.accept().value
+local invalid_result = manager.receive(invalid_native, hello)
+assert(not invalid_result.ok and invalid_result.code == "HANDSHAKE_STATE")
+assert(invalid_native.phase == "closed" and invalid_native.crypto_context == nil)
+local slot_one, slot_two = manager.accept(), manager.accept()
+assert(slot_one.ok and slot_two.ok, "invalid Native type must release its pending slot")
+manager.close(slot_one.value)
+manager.close(slot_two.value)
+crypto.create_context = original_create
 print("GATEWAY_HANDSHAKE_UNIT_OK")

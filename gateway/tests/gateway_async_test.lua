@@ -25,6 +25,9 @@ local function scenario(overrides, expect_start_failure)
         started = {}, -- 已进入测试 Socket pool 的 fd。
         writes  = {}, -- 从 TCP/WS transport 发出的完整消息。
         closed  = {}, -- 已通过测试 transport 关闭接口释放的 fd。
+        waiters = {}, -- stop RPC 在测试替身中的等待 token。
+        woken   = {}, -- 已被停止 owner 唤醒的 stop RPC token。
+        results = {}, -- 所有管理 RPC 的返回结果；result 保留最近一次返回值。
         shutdown       = {}, -- 记录背压时强制释放的底层 fd。
         shutdown_count = 0,  -- 记录每个场景实际发出的强制关闭次数。
         ws_closed      = {}, -- 记录 WebSocket pool 对象是否已单独清理。
@@ -77,6 +80,25 @@ local function scenario(overrides, expect_start_failure)
         coroutine.yield("sleep")
     end
 
+    -- 模拟 Skynet wait/wakeup，让并发 stop 可确定地停在连接关闭期间。
+    ---@param token table stop RPC 独占的等待 token。
+    ---@return nil 当前 stop 协程挂起，直到停止 owner 唤醒 token。
+    function skynet.wait(token)
+        e.waiters[token] = true
+        coroutine.yield("wait", token)
+    end
+
+    -- 记录并发 stop 的恢复通知；只接受当前等待表中的 token。
+    ---@param token table stop RPC 的等待 token。
+    ---@return nil 记录唤醒；测试随后手动恢复对应协程。
+    function skynet.wakeup(token)
+        -- Skynet 只允许唤醒已 wait 的 token；否则意味着 Gateway 的并发停止合同出错。
+        assert(e.waiters[token], "wakeup requires a waiting stop RPC")
+
+        -- 测试驱动器恢复协程前先记录 token 已可继续运行。
+        e.woken[token] = true
+    end
+
     -- 返回测试时钟 tick。
     ---@return integer 当前测试控制的 10ms tick。
     function skynet.now()
@@ -113,6 +135,7 @@ local function scenario(overrides, expect_start_failure)
     ---@return nil 保存 RPC 返回值供测试读取。
     function skynet.retpack(result)
         e.result = result
+        e.results[#e.results + 1] = result
     end
 
     -- 保存真实 Service 的分发回调。
@@ -175,6 +198,9 @@ local function scenario(overrides, expect_start_failure)
         if #data < size then
             -- 让 Gateway 等待下一次读取；测试通过 resume 控制何时返回。
             coroutine.yield("read")
+            if e.read_resume_bytes then
+                return e.read_resume_bytes
+            end
             return false, ""
         end
 
@@ -202,6 +228,13 @@ local function scenario(overrides, expect_start_failure)
     ---@param fd integer 已登记的 TCP fd。
     ---@return nil 记录关闭并释放测试中的启动标记。
     function socket.close(fd)
+        -- 指定 fd 的关闭先挂起，让测试在关闭尚未完成时投递并发 stop。
+        if e.close_yield_fd == fd then
+            e.close_yield_fd = nil
+            coroutine.yield("socket_close", fd)
+        end
+
+        -- 只有关闭协程恢复后才记作底层 fd 已释放。
         e.closed[fd] = true
         e.started[fd] = nil
     end
@@ -623,5 +656,100 @@ e.now = 3
 resume(timeout_co)
 assert(e.closed[13] and e.ws_close_count == 1, "idle timeout must release the WebSocket transport object")
 assert(e.sends[#e.sends][2] == "gateway_disconnect", "idle timeout must detach the Gateway connection")
+
+-- 并发 stop 必须等首个调用完成可能 yield 的连接关闭，并共享其最终结果。
+e = scenario()
+e.accept(20, "stop-peer")
+resume(e.forks[2]) -- TCP reader 已启动并等待输入，连接仍由 Gateway 登记。
+e.close_yield_fd = 20
+local stop_owner = coroutine.create(function()
+    e.dispatch(1, 7, "stop")
+end)
+local owner_ok, owner_wait, owner_fd = coroutine.resume(stop_owner)
+assert(owner_ok and owner_wait == "socket_close" and owner_fd == 20,
+    "the first stop must remain in progress while transport close yields")
+assert(not e.closed[20], "the in-flight close has not completed")
+
+local stop_waiter = coroutine.create(function()
+    e.dispatch(2, 7, "stop")
+end)
+local waiter_ok, waiter_wait, waiter_token = coroutine.resume(stop_waiter)
+assert(waiter_ok and waiter_wait == "wait" and e.waiters[waiter_token],
+    "a concurrent stop must wait for the current stop owner")
+assert(not e.closed[20], "the waiting stop must not report success before cleanup completes")
+
+resume(stop_owner)
+assert(coroutine.status(stop_owner) == "dead" and e.closed[20],
+    "the stop owner must finish closing the connection")
+assert(e.woken[waiter_token], "the stop owner must wake every concurrent stop caller")
+resume(stop_waiter)
+assert(coroutine.status(stop_waiter) == "dead", "the waiting stop RPC must return after cleanup")
+assert(#e.results == 3, "start and both stop RPCs must return")
+assert(e.results[2].ok and e.results[3].ok, "both concurrent stop RPCs must succeed")
+assert(e.results[2] == e.results[3],
+    "concurrent stop callers must receive the same cleanup result object")
+assert(e.results[2].value.closed_connections == 1, "stop must count the connection it closed")
+
+-- 已完成停止后重复调用不再触碰 fd，也不重复累计此前关闭的连接。
+e.dispatch(3, 7, "stop")
+assert(e.results[4].ok and e.results[4].value.closed_connections == 0,
+    "a repeated stop after completion must succeed with zero newly closed connections")
+
+-- listener 关闭 yield 时，停止中的 TCP 恢复数据和 WS 消息都不得投递。
+e = scenario()
+e.accept(30, "stop-tcp")
+resume(e.forks[2])
+e.close_yield_fd = 1
+local stopping = coroutine.create(function() e.dispatch(1, 7, "stop") end)
+resume(stopping)
+local before_stop_messages = #e.sends
+e.read_resume_bytes = string.pack(">I2", 1)
+resume(e.forks[2])
+assert(#e.sends == before_stop_messages + 1, "TCP resume during stop only emits disconnect")
+resume(stopping)
+assert(e.result.ok, "active TCP stop must complete")
+assert(e.result.value.closed_connections == 0, "TCP cleanup already detached before stop snapshot")
+
+e = scenario({ transport = "websocket" })
+e.accept(31, "stop-ws")
+resume(e.forks[2])
+resume(e.forks[1])
+e.close_yield_fd = 1
+stopping = coroutine.create(function() e.dispatch(1, 7, "stop") end)
+resume(stopping)
+before_stop_messages = #e.sends
+e.ws.message(31, "2", "binary")
+e.now = 100000
+resume(e.forks[1])
+assert(#e.sends == before_stop_messages, "WS and timeout callbacks must stop after phase change")
+resume(stopping)
+assert(e.result.ok and e.result.value.closed_connections == 1, "stop owns the active WS")
+e.ws.message(31, "2", "binary")
+e.ws.close(31)
+assert(e.ws_close_count == 1, "late callbacks must not close transport twice")
+
+-- 单连接和实例预算分别生效；100 tick 边界重新开放完整一秒预算。
+e = scenario({ transport = "websocket", max_requests_per_second = 2 })
+e.accept(32, "rate")
+resume(e.forks[2])
+e.ws.message(32, "2", "binary")
+e.now = 100
+e.ws.message(32, "3", "binary")
+assert(not e.closed[32], "connection window must reset at 100 ticks")
+e.ws.message(32, "4", "binary")
+e.ws.message(32, "5", "binary")
+assert(e.closed[32], "connection limit must reject the first excess request")
+
+e = scenario({ transport = "websocket", max_total_requests_per_second = 2 })
+e.accept(33, "total-a")
+resume(e.forks[2])
+e.accept(34, "total-b")
+resume(e.forks[3])
+e.now = 100
+e.ws.message(33, "2", "binary")
+e.ws.message(34, "2", "binary")
+assert(not e.closed[33] and not e.closed[34], "instance window must reset")
+e.ws.message(34, "3", "binary")
+assert(e.closed[34] and not e.closed[33], "instance excess closes only its source")
 
 print("GATEWAY_ASYNC_UNIT_OK")

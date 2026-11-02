@@ -13,31 +13,29 @@ local registry -- 当前 Service 已验证的协议表；init 成功后发布，
 ---@param descriptor_path string Server 工作目录下 descriptor 文件的路径。
 ---@return FlyWowResult<string> 完整 descriptor bytes；I/O 失败返回 GATEWAY_DESCRIPTOR_READ_FAILED。
 local function read_descriptor(descriptor_path)
-    local open_succeeded, descriptor_file, open_error = pcall(io.open, descriptor_path, "rb")
-    if not open_succeeded or descriptor_file == nil then
+    local descriptor_file, open_error = io.open(descriptor_path, "rb")
+    if descriptor_file == nil then
         return flywow_result.failure(
             "GATEWAY_DESCRIPTOR_READ_FAILED",
-            tostring(open_succeeded and open_error or descriptor_file),
+            tostring(open_error),
             { descriptor_path = descriptor_path }
         )
     end
 
     -- 文件已成功打开，读取完整 bytes 后不论结果如何都关闭本函数独占的句柄。
-    local read_succeeded, descriptor_bytes, read_error =
-        pcall(descriptor_file.read, descriptor_file, "*a")
-    local close_succeeded, close_result, close_error =
-        pcall(descriptor_file.close, descriptor_file)
-    if not read_succeeded or descriptor_bytes == nil then
+    local descriptor_bytes, read_error = descriptor_file:read("*a")
+    local close_result, close_error = descriptor_file:close()
+    if descriptor_bytes == nil then
         return flywow_result.failure(
             "GATEWAY_DESCRIPTOR_READ_FAILED",
-            tostring(read_succeeded and read_error or descriptor_bytes),
+            tostring(read_error),
             { descriptor_path = descriptor_path }
         )
     end
-    if not close_succeeded or close_result == nil then
+    if close_result == nil then
         return flywow_result.failure(
             "GATEWAY_DESCRIPTOR_READ_FAILED",
-            tostring(close_succeeded and close_error or close_result),
+            tostring(close_error),
             { descriptor_path = descriptor_path }
         )
     end
@@ -102,29 +100,34 @@ function M.init(codec_config)
     if not load_succeeded or loaded_or_error ~= true then
         return flywow_result.failure(
             "GATEWAY_DESCRIPTOR_INVALID",
-            tostring(load_succeeded and loaded_or_error or loaded_or_error),
+            tostring(loaded_or_error),
             { descriptor_path = codec_config.descriptor_path }
         )
     end
 
     -- 在监听前核对 Registry 所引用的消息类型，拒绝不匹配的 descriptor。
-    local required_types = { candidate_registry.envelope_type }
-    for _, definition in pairs(candidate_registry.commands) do
-        if definition.request_type then
-            required_types[#required_types + 1] = definition.request_type
-        end
-        if definition.response_type then
-            required_types[#required_types + 1] = definition.response_type
-        end
+    if pb.type(candidate_registry.envelope_type) == nil then
+        return flywow_result.failure(
+            "GATEWAY_DESCRIPTOR_INVALID",
+            "descriptor is missing a registry message type",
+            { descriptor_path = codec_config.descriptor_path, message_type = candidate_registry.envelope_type }
+        )
     end
 
-    -- 类型清单已由 Registry 收集，逐项确认已加载的 descriptor 能解析对应消息。
-    for _, type_name in ipairs(required_types) do
-        if pb.type(type_name) == nil then
+    -- 直接遍历定义，按请求、响应顺序检查 descriptor；不再收集临时类型清单。
+    for _, definition in pairs(candidate_registry.commands) do
+        local missing_type -- 当前定义首个缺失类型，用于保持原错误详情。
+        if definition.request_type and pb.type(definition.request_type) == nil then
+            missing_type = definition.request_type
+        elseif definition.response_type and pb.type(definition.response_type) == nil then
+            missing_type = definition.response_type
+        end
+
+        if missing_type then
             return flywow_result.failure(
                 "GATEWAY_DESCRIPTOR_INVALID",
                 "descriptor is missing a registry message type",
-                { descriptor_path = codec_config.descriptor_path, message_type = type_name }
+                { descriptor_path = codec_config.descriptor_path, message_type = missing_type }
             )
         end
     end
