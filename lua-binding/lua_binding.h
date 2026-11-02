@@ -20,6 +20,7 @@ extern "C"
 namespace flywow_lua_binding
 {
 class LuaBinding;
+class LuaNativeData;
 class LuaTable;
 using Callback = lua_CFunction;
 
@@ -420,6 +421,12 @@ class LuaBinding
     {
         return validIndex(index) && readUserdataAt(index, name, output);
     }
+
+    /// 借用 NativeData 根或子节点；只在当前同步回调且节点未被删除期间有效。
+    /// @param index Lua 参数中的 NativeData 代理位置。
+    /// @param output 成功接收节点地址；失败保持原值，不可长期保存或跨 yield。
+    /// @return 类型和节点有效时 true；否则记录 INVALID_ARGUMENT，返回 false。
+    bool readNativeData(int index, LuaNativeData *&output);
 
     /// 从闭包 upvalue 取得托管 userdata；指针与 readUserdata 一样只在本回调借用。
     /// @param index 从 1 开始的真实业务 upvalue 编号。

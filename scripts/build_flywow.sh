@@ -94,9 +94,9 @@ fi
 # 所有最终动态库共用此目录；CMake 中间文件仍按模块隔离。
 mkdir -p "$NATIVE_DIR"
 
-# Lua Binding 是 Navigation 的构建依赖，也可单独选择；它只产出静态库。
+# Lua Binding 是 Navigation 的构建依赖，也可单独选择；它产出静态库和 NativeData Lua 模块。
 if [[ "$MODULE" == lua_binding || "$MODULE" == navigation || "$MODULE" == all ]]; then
-    # 使用已经构建的宿主 Lua 静态库运行真实 ABI 测试；静态封装不生成独立 .so。
+    # 使用已经构建的宿主 Lua 静态库运行真实 ABI 测试；同时验证直接 require 的 NativeData .so。
     [[ -f "$SKYNET_ROOT/3rd/lua/liblua.a" ]] || {
         printf '%s\n' 'Lua Binding 测试需要先构建宿主 Skynet 的 liblua.a' >&2
         exit 1
@@ -104,9 +104,12 @@ if [[ "$MODULE" == lua_binding || "$MODULE" == navigation || "$MODULE" == all ]]
     cmake -S "$FRAMEWORK_DIR/lua-binding" -B "$BUILD_ROOT/cmake/lua-binding" \
         -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DFLYWOW_LUA_BINDING_TESTS=ON \
         -DSKYNET_LUA_DIR="$SKYNET_ROOT/3rd/lua" \
-        -DSKYNET_LUA_LIBRARY="$SKYNET_ROOT/3rd/lua/liblua.a"
+        -DSKYNET_LUA_LIBRARY="$SKYNET_ROOT/3rd/lua/liblua.a" \
+        -DFLYWOW_NATIVE_OUTPUT_DIR="$NATIVE_DIR"
     cmake --build "$BUILD_ROOT/cmake/lua-binding" -j"$(nproc)"
     ctest --test-dir "$BUILD_ROOT/cmake/lua-binding" --output-on-failure
+    # test -s 在产物存在且非空时返回成功；缺失或空文件会让 set -e 停止构建。
+    test -s "$NATIVE_DIR/flywow_native_data.so"
 fi
 
 # Gateway 分支只构建握手 Native .so；Lua Service、客户端 SDK 和协议工具不属于这个目标。
