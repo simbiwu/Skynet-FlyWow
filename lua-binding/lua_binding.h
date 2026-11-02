@@ -13,7 +13,6 @@ extern "C"
 #include <limits>
 #include <new>
 #include <string>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -40,17 +39,7 @@ union UserdataAlignment
 /// @param extra 在现有栈顶之外需要预留的槽数。
 /// @return 无；容量不足时抛出 std::bad_alloc。
 void ensureStack(lua_State *state, int extra);
-// 输入为栈顶 inputs 项；回调参数 1 为明确的数据记录，输入从 2 开始。
-// 成功留下 outputs 项，Lua 执行失败留下错误对象。建立调用前的栈预留仍可能抛 bad_alloc。
-// 回调只执行 Lua C API，不持有 C++ 资源。
-/// @param state 当前操作借用的 Lua State。
-/// @param function 只调用 Lua C API 的保护回调。
-/// @param arguments 回调参数 1 读取的借用记录指针。
-/// @param inputs 原栈顶属于本次调用的输入值数量。
-/// @param outputs 成功时要求留下的结果数；LUA_MULTRET 保留全部结果。
-/// @return Lua 回调成功为 true；Lua 错误为 false，错误对象留在栈顶。
-bool protectedCall(lua_State *state, lua_CFunction function, void *arguments, int inputs,
-                   int outputs);
+
 /// 将原生回调逸出的 C++ 异常转换为 Lua 可见的 INTERNAL_ERROR。
 /// @param state 已由原生回调处理过的 Lua 参数栈；失败路径会清空原参数和临时值。
 /// @param message 静态诊断文本；不依赖已析构的异常对象。
@@ -66,6 +55,7 @@ class StackRestore
     explicit StackRestore(lua_State *state) : state_(state), top_(lua_gettop(state))
     {
     }
+
     /// 恢复到构造时记录的栈顶；正常用法只丢弃本作用域新增的临时值。
     ~StackRestore()
     {
@@ -208,6 +198,7 @@ template <> struct ValueCodec<bool>
     /// @param reason 非空诊断输出；类型错误时供 Binding 记录。
     /// @return 输入类型正确为 true，否则为 false。
     static bool read(lua_State *state, int index, bool &output, const char **reason);
+
     /// 将 C++ bool 压入一个 Lua boolean。
     /// @param state 当前 Binding 借用的 Lua State。
     /// @param value 要返回给 Lua 的布尔值。
@@ -215,6 +206,7 @@ template <> struct ValueCodec<bool>
     /// @return 总是 true，栈顶新增一个 boolean。
     static bool push(lua_State *state, bool value, const char **reason);
 };
+
 template <> struct ValueCodec<std::string>
 {
     /// 复制 Lua 字符串的全部字节到 C++ string，保留内嵌零字节。
@@ -224,6 +216,7 @@ template <> struct ValueCodec<std::string>
     /// @param reason 非空诊断输出；类型错误时供 Binding 记录。
     /// @return 输入类型正确并完成复制为 true；类型错误为 false。
     static bool read(lua_State *state, int index, std::string &output, const char **reason);
+
     /// 将 C++ string 的全部字节复制到 Lua，并由 Lua 持有返回字符串。
     /// @param state 当前 Binding 借用的 Lua State。
     /// @param value 要复制给 Lua 的完整字节串。
@@ -231,6 +224,7 @@ template <> struct ValueCodec<std::string>
     /// @return 成功压入一个 Lua 字符串为 true。
     static bool push(lua_State *state, const std::string &value, const char **reason);
 };
+
 template <> struct ValueCodec<void *>
 {
     /// 只读取 lightuserdata 中的借用地址，不创建 Lua-owned userdata。
@@ -250,26 +244,23 @@ class LuaBinding
     /// 为一次同步 Native 回调创建 Binding，借用 Lua State 并管理本次诊断与强引用。
     /// @param state 当前回调收到的 Lua State；Binding 借用它，不负责关闭。
     explicit LuaBinding(lua_State *state);
+
     /// 释放本次回调为 userdata 建立的 registry 强引用；必须早于所属 Lua State 关闭。
     ~LuaBinding();
     LuaBinding(const LuaBinding &)            = delete;
     LuaBinding &operator=(const LuaBinding &) = delete;
 
     // 注册为 Lua C 函数的唯一异常入口；不占用 upvalue，不改变业务参数或正常多返回值。
-    // 实际函数返回/展开后才构造错误；持续 OOM 最终交给 Lua 错误出口。
+    // 实际函数完成 C++ 异常展开后才构造错误；不承诺 OOM 后恢复。
     /// @tparam Function 注册的实际 Native 函数；正常签名为 int(lua_State*)。
     /// @param state Lua 提供的原参数栈，业务 upvalue 没有内部偏移。
-    /// @return 原函数的 Lua 结果数量；意外异常返回 nil/INTERNAL_ERROR，持续 OOM 抛 Lua 错误。
+    /// @return 原函数的 Lua 结果数量；意外异常返回 nil/INTERNAL_ERROR，OOM 行为交由运行时和宿主处理。
     template <Callback Function> static int nativeCallback(lua_State *state)
     {
         const char *failure = "Unexpected Native exception";
         try
         {
             return Function(state);
-        }
-        catch (const std::bad_alloc &)
-        {
-            failure = "Native allocation failed";
         }
         catch (...)
         {
@@ -303,6 +294,7 @@ class LuaBinding
     {
         return validIndex(index) && readAt(index, output);
     }
+
     // nil/省略保留调用方的默认值；显式 false 仍按 T 校验。
     /// @param index 可省略的位置参数编号。
     /// @param output 调用方先设置默认值；nil/省略保留默认值。
@@ -315,19 +307,21 @@ class LuaBinding
         // 实参存在时仍验证槽位，再允许 nil 沿用调用方默认值。
         return validIndex(index) && (lua_isnil(state_, index) || readAt(index, output));
     }
+
     /// 判断指定参数是否省略或为 nil；显式 false、0 和空串都返回 false。
     /// @param index 被检查的位置参数；仅超出实参数量的正编号视为省略。
     /// @return 参数省略或 nil 为 true，不改变栈或诊断。
     bool isNoneOrNil(int index) const noexcept;
+
     /// 将参数中的 Lua table 固定为当前回调内可读写的独立句柄。
     /// @param index 原始参数或真实栈位置；读取保持原参数栈。
     /// @param output 成功时获得同一表的独立引用，必须早于 Binding 析构。
     /// @return 成功 true；类型或 Lua 操作失败 false，输出保持不变。
     bool readTable(int index, LuaTable &output);
-    // 创建表并建立独立引用；已进入保护调用的 Lua 失败返回 false，不覆盖 output。
-    // 建立保护边界、C++ 字符串复制和保存诊断仍可能抛异常，由注册入口处理。
+
+    // 创建空表并建立独立引用；OOM 不转换为普通失败结果。
     /// @param output 成功才接管新表引用；不允许超过本 Binding 生命周期。
-    /// @return 创建成功 true；失败 false 并记录诊断。
+    /// @return 正常完成返回 true；OOM 行为交由运行时和宿主处理。
     bool newTable(LuaTable &output);
 
     /// 严格读取闭包中的业务 upvalue；读取类型与范围规则和 readValue 相同。
@@ -338,7 +332,8 @@ class LuaBinding
     {
         return validUpvalue(index) && readAt(lua_upvalueindex(index), output);
     }
-    // 一次受保护调用压入全部结果；失败改为 nil/error。调用后立即 return。
+
+    // 按顺序直接压入全部结果；转换失败改为 nil/error。调用后立即 return。
     /// @param values 顺序交给 Lua 的零个或多个结果。
     /// @return 成功为结果数；转换失败为 nil/error 的两个结果。
     template <typename... Values> int returnValues(const Values &...values)
@@ -348,39 +343,38 @@ class LuaBinding
             return 0;
         }
 
-        // 非空结果通过保护回调转换；base 用于丢弃转换失败时已压入的部分值。
-        const int                 base = lua_gettop(state_); // 转换失败时恢复到调用前的栈顶。
-        ValueArguments<Values...> arguments{this, std::tie(values...), nullptr}; // 借用结果和诊断槽。
-        const bool                ok =
-            detail::protectedCall(state_, &pushResults<Values...>, &arguments, 0, LUA_MULTRET);
-
-        // 失败时丢弃可能已压入的部分结果，再统一返回 nil/error。
-        if (!completeCall(ok, arguments.failure))
+        const int base = lua_gettop(state_); // 转换失败时丢弃已经压入的部分结果。
+        detail::ensureStack(state_, sizeof...(Values));
+        const char *failure = nullptr; // 严格转换失败时的静态诊断。
+        if (!(pushRaw(state_, values, &failure) && ...))
         {
             lua_settop(state_, base);
+            setError("INVALID_ARGUMENT", failure);
             return pushError();
         }
-
-        // pcall 已把全部结果留在栈顶；返回其数量交由 Lua C API 读取。
         return sizeof...(Values);
     }
-    // 返回 nil,{code,message}；构造错误结果也失败时抛 bad_alloc，让注册入口完成资源展开。
+
+    // 直接构造 nil,{code,message}；OOM 不增加恢复或二次错误构造。
     /// 将最近记录的诊断压成 Lua 的 nil、错误表两个返回值。
-    /// @return 成功构造时为 2；结果分配失败时抛出 bad_alloc。
+    /// @return 正常完成返回 2；OOM 行为交由运行时和宿主处理。
     int pushError();
+
     /// 先复制并记录本次错误，再返回 nil、错误表；支持 message/code 引用当前诊断成员。
     /// @param code 稳定错误码，交给 Lua 调用方作程序化判断。
     /// @param message 面向日志或调试的诊断文本，不作为机器协议。
-    /// @return 成功构造时为 2；字符串复制或结果分配失败时抛出异常。
+    /// @return 正常完成返回 2；C++ 意外异常由注册入口处理，OOM 交由运行时和宿主处理。
     int pushError(const std::string &code, const std::string &message);
+
     /// 只更新本回调诊断，不压栈；业务 parser 失败时供上层 pushError 使用。
     /// @param code 本次失败的稳定错误码；成功调用不会自动清除旧诊断。
     /// @param message 与错误码配对的诊断文本。
     void setError(const std::string &code, const std::string &message);
+
     /// @return 最近记录的错误码；尚未记录错误时为空字符串，成功操作不清除此值。
     const std::string &errorCode() const;
 
-    // Lua 分配和类型挂接一次完成；C++ 构造在 pcall 外执行，构造后才启用 __gc。
+    // 先分配 Lua 存储并挂接元表，再构造 C++ 对象；构造成功后才启用 __gc。
     /// @param name 此 State 已注册且精确对应 T 的类型名。
     /// @param output 成功接收借用指针，不能 delete 或跨回调保存。
     /// @param args 直接转发给 T 构造函数的参数。
@@ -396,7 +390,7 @@ class LuaBinding
         if (!allocateUserdata(name, sizeof(T), storage, reference))
             return false;
 
-        // 在 Lua pcall 外构造 T，避免 Lua longjmp 越过尚未析构的 C++ 对象。
+        // 直接构造 T；普通构造异常须撤销临时引用，保持未构造状态。
         T *object = nullptr;
         try
         {
@@ -411,17 +405,17 @@ class LuaBinding
         }
 
         // 构造成功后才置 alive；从此刻起对象析构责任交给 userdata 的 __gc。
-        // 这些写入不分配；即使后续保活记录失败，Lua GC 仍能析构对象。
+        // alive=true 后，对象最终由 userdata 的 __gc 析构。
         lua_rawgeti(state_, LUA_REGISTRYINDEX, reference);
         lua_pushboolean(state_, 1);
         lua_setiuservalue(state_, -2, 1);
-        if (!retainUserdata(object, reference))
-            return false;
+        retainUserdata(object, reference);
 
         // 只在 userdata 已构造、启用析构并由本回调保活后发布借用指针。
         output = object;
         return true;
     }
+
     /// 从 Lua 参数取得指定类型且尚未析构的 userdata，并在本回调期间保持其存活。
     /// @param index 含 userdata 的位置参数。
     /// @param name 已注册的精确类型名。
@@ -431,6 +425,7 @@ class LuaBinding
     {
         return validIndex(index) && readUserdataAt(index, name, output);
     }
+
     /// 从闭包 upvalue 取得托管 userdata；指针与 readUserdata 一样只在本回调借用。
     /// @param index 从 1 开始的真实业务 upvalue 编号。
     /// @param name 已注册且对应 T 的精确类型名。
@@ -449,18 +444,16 @@ class LuaBinding
         int   reference; ///< Lua registry 强引用；Binding 析构时释放。
     };
 
-    // Lua GC 调用此闭包；确认 userdata 身份和 alive 标记后先置为失效，再析构 placement-new 对象。
+    // Lua 回收 userdata 时调用此闭包。它验证对象身份和构造完成标记，确保 T 只析构一次；内存仍由 Lua 释放。
     /// @param state GC 回调收到的栈；参数 1 应为由本类型元表管理的 userdata。
     /// @return 不产生 Lua 返回值；伪造对象、类型不符或已清理时安全地不做处理。
     template <typename T> static int collectUserdata(lua_State *state) noexcept
     {
         /*
-            __gc 的参数栈为 [S, userdata]。Lua 5.4 的 getiuservalue 总会压入一项；
-            uservalue 序号无效时压入 nil 并返回 LUA_TNONE。本类型创建时固定分配了第 1 项：
-            [S, userdata] -> [S, userdata, alive_state]。
+            Lua 把待回收对象放在参数 1；创建 userdata 时，第一个 uservalue 用作构造完成标记。
+            lua_getiuservalue 总会压入一项：标记缺失时压入 nil，因此读取后也要弹掉这一项。
         */
-        // __gc 也可能由挂了此元表的普通 table 触发；先确认 full userdata、存储尺寸和元表身份。
-        // [userdata] -> [userdata, actual_meta] -> [userdata]，闭包 upvalue 1 保留注册元表。
+        // 只有带本类型注册元表的 full userdata 才能析构；普通 table 也可能挂上相同元表，必须排除。
         if (lua_type(state, 1) != LUA_TUSERDATA || lua_rawlen(state, 1) != sizeof(T) ||
             lua_getmetatable(state, 1) == 0)
         {
@@ -478,51 +471,23 @@ class LuaBinding
         const int state_type = lua_getiuservalue(state, 1, 1);
         if (state_type != LUA_TBOOLEAN || lua_toboolean(state, -1) == 0)
         {
-            // 状态缺失、类型不符或已清理：弹掉刚读出的 uservalue，恢复 [S, userdata]；
-            // 返回 0 表示不产生 Lua 返回值，也不重复析构对象。
+            // 标记缺失、类型不符或已经为 false 时不调用析构函数；先移除刚读取的标记，再无返回值退出。
             lua_pop(state, 1);
             return 0;
         }
 
-        // 先弹出 alive_state，再压入 false 并写回：[S, userdata, true]
-        // -> [S, userdata] -> [S, userdata, false] -> [S, userdata]。
-        // 先翻转状态，后续重复进入 __gc 会走上面的无操作分支。
+        // 先把构造完成标记改为 false，再调用析构函数，避免重复进入 __gc 时二次析构。
         lua_pop(state, 1);
         lua_pushboolean(state, 0);
         lua_setiuservalue(state, 1, 1);
 
-        // lua_touserdata 读取参数 1 的 full userdata 存储地址，不改变栈。
-        // Lua 负责释放这块内存；这里仅结束 placement-new 的 T 生命周期，不能用 delete。
+        // Lua 随后负责释放 userdata 内存；这里仅结束其中 T 对象的生命周期，不调用 delete。
         static_cast<T *>(lua_touserdata(state, 1))->~T();
         return 0;
     }
 
-    // 数据记录只有借用值和失败原因；执行代码是静态 Lua C 回调，不传递 operation 对象。
-    template <typename... Values> struct ValueArguments
-    {
-        LuaBinding *binding; ///< 借用所属回调，负责严格转换与结果诊断。
-        std::tuple<const Values &...>
-                    values;  ///< 借用待写入的实参，顺序就是 Lua 返回值或 upvalue 顺序。
-        const char *failure; ///< 失败时由原生操作写入的常量原因；外层随后记录诊断。
-    };
-    // 在保护调用内按原顺序转换 ValueArguments；任一值无法表示时不报告部分结果。
-    /// @param state protectedCall 提供的栈，索引 1 为 ValueArguments。
-    /// @return 所有值成功时返回其数量；转换失败返回 0，由外层读取 failure。
-    template <typename... Values> static int pushResults(lua_State *state) noexcept
-    {
-        auto *arguments = static_cast<ValueArguments<Values...> *>(lua_touserdata(state, 1));
-        // 返回值数量已在编译期确定，先按实际结果数量预留输出槽。
-        luaL_checkstack(state, sizeof...(Values), "Native results exceed stack capacity");
-
-        // 按 Values 原顺序写入；首个转换失败时记录原因并停止后续写入。
-        const bool ok = std::apply(
-            [&](const auto &...values)
-            { return (arguments->binding->pushRaw(state, values, &arguments->failure) && ...); },
-            arguments->values);
-        return ok ? sizeof...(Values) : 0;
-    }
-    // 在 protectedCall 内将普通值交给对应 ValueCodec；Lua 分配错误由保护调用捕获。
-    /// @param state 当前受保护的 Lua State。
+    // 将普通值交给对应 ValueCodec，类型或范围失败通过 reason 返回。
+    /// @param state 当前操作借用的 Lua State。
     /// @param value 要压入 Lua 栈的普通值。
     /// @param reason 失败时接收 ValueCodec 的常量诊断。
     /// @return 转换并压入成功为 true；无法表示为 false。
@@ -530,8 +495,9 @@ class LuaBinding
     {
         return detail::ValueCodec<T>::push(state, value, reason);
     }
+
     // 把本回调持有的 userdata 指针映射回 Lua 强引用；不允许把裸指针当作 lightuserdata 返回。
-    /// @param state 当前受保护的 Lua State。
+    /// @param state 当前操作借用的 Lua State。
     /// @param value 当前 Binding 保活的 userdata 对象地址。
     /// @param reason 未由当前 Binding 保活时接收诊断。
     /// @return 找到并压入原 userdata 为 true；否则为 false。
@@ -539,8 +505,9 @@ class LuaBinding
     {
         return pushObject(state, value, reason);
     }
+
     // 字符数组按 C 字符串首个零字节结束的规则转发到字符串重载。
-    /// @param state 当前受保护的 Lua State。
+    /// @param state 当前操作借用的 Lua State。
     /// @param value 待转换的零结尾字符数组。
     /// @param reason 字符串重载失败时接收诊断。
     /// @return 转换并压入成功为 true；失败为 false。
@@ -549,26 +516,30 @@ class LuaBinding
     {
         return pushRaw(state, static_cast<const char *>(value), reason);
     }
+
     // table 只能返回给创建它的 Binding 回调；实现通过 registry 引用压入原表。
-    /// @param state 当前受保护的 Lua State。
+    /// @param state 当前操作借用的 Lua State。
     /// @param value 属于当前 Binding 的 LuaTable 句柄。
     /// @param reason 句柄无效或归属其他 Binding 时接收诊断。
     /// @return 原 table 成功压栈为 true；句柄无效为 false。
     bool pushRaw(lua_State *state, const LuaTable &value, const char **reason);
+
     // 非空指针按 C 字符串复制；nullptr 由单独重载映射为 Lua nil。
-    /// @param state 当前受保护的 Lua State。
+    /// @param state 当前操作借用的 Lua State。
     /// @param value 非空零结尾字符串；空值应走 nullptr_t 重载。
     /// @param reason value 为空时接收诊断。
     /// @return 字符串成功压栈为 true；空指针为 false。
     bool pushRaw(lua_State *state, const char *value, const char **reason);
+
     // 显式空指针表示 Lua nil，与无效的 const char* 字符串区分。
-    /// @param state 当前受保护的 Lua State。
+    /// @param state 当前操作借用的 Lua State。
     /// @param value 表示 Lua nil 的 nullptr。
     /// @param reason 为统一重载签名保留；此转换不会失败。
     /// @return 总是 true，栈顶新增 nil。
     bool pushRaw(lua_State *state, std::nullptr_t, const char **reason);
+
     // 用本回调持有的 registry 引用找回 userdata；未持有的地址返回失败原因。
-    /// @param state 当前受保护的 Lua State。
+    /// @param state 当前操作借用的 Lua State。
     /// @param object 要返回给 Lua 的 Native 对象地址。
     /// @param reason 未找到本回调持有的 userdata 时接收诊断。
     /// @return 找到并压入其 userdata 为 true；否则为 false。
@@ -588,6 +559,7 @@ class LuaBinding
         }
         return true;
     }
+
     // 将存活检查返回的 void* 转为调用方请求的 T*；对象仍由 Lua userdata 所有。
     /// @param index 已由入口验证的参数槽或 upvalue 伪索引。
     /// @param name 当前 Lua State 中注册的精确元表名。
@@ -601,41 +573,49 @@ class LuaBinding
         output = static_cast<T *>(object);
         return true;
     }
-    // 处理 protectedCall 的结果：成功返回 true；Lua 错误或 failure 文本转成本次 Binding 诊断。
-    /// @param succeeded protectedCall 是否得到 LUA_OK。
+
+    // 处理 lua_pcall 的结果：成功返回 true；Lua 错误或 failure 文本转成本次 Binding 诊断。
+    /// @param succeeded lua_pcall 是否得到 LUA_OK。
     /// @param failure 回调报告的常量输入错误；为 nullptr 时只处理 Lua 错误对象。
     /// @return 无错误为 true；否则记录诊断并返回 false。
     bool completeCall(bool succeeded, const char *failure = nullptr);
+
     // 确认 index 是当前参数栈中的正槽或真实负槽；伪索引和栈外位置记录 INVALID_ARGUMENT。
     /// @param index 要读取的 Lua 栈编号。
     /// @return 编号指向当前实际栈值为 true；否则记录 INVALID_ARGUMENT。
     bool validIndex(int index);
+
     // 确认 index 指向现有业务 upvalue，并限制在 Lua 5.4 允许的 upvalue 数范围内。
     /// @param index 从 1 开始的业务 upvalue 编号。
     /// @return 闭包持有该 upvalue 为 true；否则记录 INVALID_ARGUMENT。
     bool validUpvalue(int index);
+
     // 将已确认的 table 槽复制到 registry，成功后输出借用本 Binding 的独立 LuaTable 句柄。
     /// @param index 已确认的 table 栈槽。
     /// @param output 成功接管新 registry 引用；失败保持原句柄。
     /// @return 引用建立成功为 true；类型或 Lua 操作失败为 false。
     bool readTableAt(int index, LuaTable &output);
+
     // 按 Lua 真值读取已确认的槽位；结果写入 output，不改变栈。
     /// @param index 已确认的 Lua 值栈槽。
     /// @param output 接收 Lua truthiness；nil/false 为 false，其余值为 true。
     /// @return 总是 true；此读取不产生类型错误。
     bool readTruthAt(int index, bool &output);
-    // 将 object 与 registry 引用加入当前回调的保活记录；重复对象释放多余引用，保存失败也释放引用。
+
+    // 将 object 与 registry 引用加入当前回调的保活记录；重复对象释放多余引用。
     /// @param object 本次由 Lua userdata 持有的 Native 对象地址。
     /// @param reference 为该 userdata 新建的 registry 强引用编号。
-    /// @return 记录成功或重复对象已由旧引用保活为 true；保存失败为 false。
-    bool retainUserdata(void *object, int reference);
+    /// @return 无返回值；新引用由 Binding 接管，重复引用立即释放。
+    void retainUserdata(void *object, int reference);
+
     // 托管析构闭包的元表字段保护；以精确元表身份拒绝替换 __gc，临时栈值在返回前清除。
-    /// @param state 当前受保护的 Lua State。
+    /// @param state 当前操作借用的 Lua State。
     /// @param table_index 要写入字段的目标 table 栈槽。
     /// @param key_index 本次写入的 key 栈槽。
     /// @return 目标不是托管元表的 __gc 字段为 true；需要保护的写入为 false。
     static bool canWriteField(lua_State *state, int table_index, int key_index) noexcept;
-    // 在 protectedCall 内按已注册元表名分配 Lua userdata，并返回其存储地址和 registry 强引用。
+
+    // 按已注册元表名分配 Lua userdata，并返回其存储地址和 registry 强引用。
     /// @param name 当前 Lua State 中注册的精确元表名。
     /// @param bytes 要分配的 userdata 存储字节数。
     /// @param storage 成功接收 Lua-owned 存储地址；失败保持原值。
@@ -643,13 +623,15 @@ class LuaBinding
     /// @return 分配、挂接元表和引用建立成功为 true；失败记录诊断并返回 false。
     bool allocateUserdata(const std::string &name, std::size_t bytes, void *&storage,
                           int &reference);
+
     // 检查指定参数的 userdata 类型与 alive 标记，并由当前 Binding 持有它直到回调结束。
     /// @param index 已确认的参数槽或 upvalue 伪索引。
     /// @param name 当前 Lua State 中注册的精确元表名。
     /// @return 成功返回本回调借用的对象地址；失败返回 nullptr 并记录诊断。
     void *checkUserdata(int index, const std::string &name);
-    // protectedCall 内验证 userdata 类型、元表和 alive 标记；成功输出指针并创建 registry 引用。
-    /// @param state protectedCall 提供的 Lua State。
+
+    // 验证 userdata 类型、元表和 alive 标记；成功输出指针并创建 registry 引用。
+    /// @param state 当前操作借用的 Lua State。
     /// @param index 待验证的 full userdata 栈索引。
     /// @param name 当前 Lua State 中注册的精确元表名。
     /// @param reference 成功时接收新建的 registry 强引用编号。
@@ -657,6 +639,7 @@ class LuaBinding
     /// @return userdata 对象地址；类型、元表或存活标记不符时返回 nullptr。
     static void *inspectUserdata(lua_State *state, int index, const char *name, int &reference,
                                  const char **failure);
+
     // 为当前 Lua State 注册具名元表、受控 __gc 闭包和 methods 索引表；返回时恢复入口栈高度。
     /// @param state 正在加载模块的 Lua State。
     /// @param name 本 State 唯一的元表注册名。

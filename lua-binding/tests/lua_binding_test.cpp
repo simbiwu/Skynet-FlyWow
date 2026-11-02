@@ -5,6 +5,7 @@
 extern "C"
 {
 #include <lualib.h>
+int luaopen_skynet_sharetable_core(lua_State *state);
 }
 #include <array>
 #include <chrono>
@@ -33,8 +34,6 @@ struct TestEnvironment
     lua_State *state              = nullptr; // 只借用本测试 State，用于直接观测封装操作的栈高度。
     int        constructed        = 0;       // 本 State 成功构造的 Tracked 数量。
     int        destroyed          = 0;       // 本 State 已析构的 Tracked 数量。
-    int        boundary_entered   = 0;       // OOM 回调进入次数。
-    int        boundary_destroyed = 0;       // OOM 回调栈资源析构次数。
 };
 
 struct Tracked
@@ -499,15 +498,30 @@ int upvalue_boundaries(lua_State *state)
 }
 
 /// 让 C++ 异常经过真实 Lua 回调，验证不会越过 C ABI。
-/// @param state 参数 1 选择 bad_alloc 或普通意外异常。
+/// @param state 无业务参数。
 /// @return 正常路径不返回；注册入口将异常转换为 nil 和 INTERNAL_ERROR。
-int native_exception(lua_State *state)
+int native_exception(lua_State *)
 {
-    if (lua_toboolean(state, 1))
-    {
-        throw std::bad_alloc();
-    }
     throw std::runtime_error("injected native exception");
+}
+
+/// 验证共享表拒绝写入时返回诊断，恢复栈且保留已有字段。
+/// @param state 参数 1 是宿主 sharetable 创建的只读共享表。
+/// @return 成功验证返回 true；断言失败由测试入口报告。
+int shared_table_write(lua_State *state)
+{
+    LuaBinding binding(state);
+    LuaTable table;
+    require(binding.readTable(1, table), "shared table read failed");
+    const int top = lua_gettop(state); // 各次失败都必须恢复到这一栈高。
+    require(!table.writeValue(1, 99), "shared existing key write accepted");
+    require(lua_gettop(state) == top && binding.errorCode() == "INTERNAL_ERROR",
+            "shared write changed stack or error code");
+    require(!table.writeValue(2, 99), "shared new key write accepted");
+    require(lua_gettop(state) == top, "shared insertion changed stack");
+    int value = 0;
+    require(table.readValue(1, value) && value == 17, "shared write changed original value");
+    return binding.returnValues(true);
 }
 
 /// require 加载失败模块，不得把 nil/error 当成成功模块并缓存 true。
@@ -523,45 +537,6 @@ int failing_module(lua_State *state)
     LuaBinding::registerUserdata<Tracked>(state, "binding.Invalid", methods);
     lua_newtable(state);
     return 1;
-}
-
-// OOM 故障期间仍必须通过 C++ 展开析构的栈资源；计数由单个测试 State 独占。
-struct BoundaryResource
-{
-    TestEnvironment *owner; ///< 本轮测试计数 owner，生命周期覆盖资源和对应 Lua State。
-    explicit BoundaryResource(TestEnvironment *test_environment) : owner(test_environment)
-    {
-        ++owner->boundary_entered;
-    }
-    ~BoundaryResource() noexcept
-    {
-        ++owner->boundary_destroyed;
-    }
-};
-
-/// 在栈资源、userdata 和表均存在时触发 Lua 分配，检查错误不会跳过 C++ 析构或遗失 userdata。
-/// @param state upvalue 1 是本轮 TestEnvironment 的借用指针，故障期间不解析 Lua 参数。
-/// @return 成功返回表；Lua OOM 经注册入口返回错误结果或在持续 OOM 时抛 Lua 错误。
-int allocation_failure(lua_State *state)
-{
-    auto *env = static_cast<TestEnvironment *>(
-        lua_touserdata(state, lua_upvalueindex(1))); // 故障前注册的测试 owner。
-    BoundaryResource resource(env);                  // 必须先于任何可能失败的封装分配建立析构观测。
-    LuaBinding       lua_binding(state);             // 本回调的错误与短期引用 owner，不跨调用保存。
-    Tracked         *object = nullptr; // 构造成功后由 Lua GC 管理，不能因后续表分配失败而泄漏。
-    if (!lua_binding.newUserdata(kTracked, object, env))
-    {
-        return lua_binding.pushError();
-    }
-    LuaTable table; // 字符串、字段扩容、registry 引用分别经过受保护操作。
-    if (!lua_binding.newTable(table))
-    {
-        return lua_binding.pushError();
-    }
-    const std::string payload(4096, 'x'); // 本地 C++ 字节串，Lua OOM 后也必须析构。
-    require(table.writeValue("payload", payload), "allocation probe field write failed");
-    require(table.writeValue("object", object), "allocation probe userdata write failed");
-    return lua_binding.returnValues(table);
 }
 
 /// 注册本 State 独占的测试类型和回调，把借用测试环境传入需要计数的闭包。
@@ -685,6 +660,11 @@ std::unique_ptr<lua_State, StateDeleter> createState(TestEnvironment *environmen
     require(state != nullptr, "State creation failed");
     environment->state = state.get();
     luaL_openlibs(state.get());
+    // 复用宿主 sharetable 实现创建真实共享表，不在测试中修改 Lua 私有标记。
+    luaL_requiref(state.get(), "skynet.sharetable.core", luaopen_skynet_sharetable_core, 0);
+    lua_pop(state.get(), 1);
+    lua_pushcfunction(state.get(), &LuaBinding::nativeCallback<shared_table_write>);
+    lua_setglobal(state.get(), "shared_table_write");
 
     // 建立测试模块：push 函数和借用环境指针使栈从 [] 变为 [registerTestModule, env]；
     // lua_call 消耗两项并压回模块 table，setglobal 消耗 table，栈恢复为空。
@@ -740,6 +720,15 @@ collectgarbage("collect")
 )lua";
 
 const char *kTableTests = R"lua(
+local core = require "skynet.sharetable.core"
+local matrix = core.matrix("return {[1]=17}")
+local shared = core.clone(matrix:getptr())
+assert(core.is_sharedtable(shared))
+assert(shared_table_write(shared))
+shared = nil
+collectgarbage("collect")
+matrix:close()
+
 local hostile = { child={map_id=17}, kept=9 }
 setmetatable(hostile, {
     __index = function() error("raw read invoked __index") end,
@@ -812,62 +801,6 @@ collectgarbage("collect")
 created, destroyed = binding.counters()
 assert(created == 3 and destroyed == 3, "manual and automatic GC destroyed userdata more than once")
 )lua";
-
-// 替换当前 State 的 allocator 仅用于故障注入；释放与缩容始终交原 allocator，不影响清理路径。
-struct FaultAllocator
-{
-    lua_Alloc original;         ///< 创建该 State 的真实 allocator，故障关闭后恢复原函数。
-    void     *original_context; ///< 与 original 配套的借用上下文，不由测试释放。
-    int       allocations_left; ///< 允许的增长分配次数；到零后持续拒绝，覆盖 Lua 紧急 GC 后的重试。
-    int       rejected;         ///< 实际拒绝次数，证明故障确实进入 Lua 分配路径。
-};
-
-// Lua 内存故障替身只拒绝增长，不持有资源，不抛 C++ 异常穿过 Lua allocator ABI。
-void *faultAllocator(void *context, void *memory, std::size_t old_size, std::size_t new_size)
-{
-    auto *fault = static_cast<FaultAllocator *>(context); // 单次用例独占的分配计数。
-    if (new_size != 0 && (memory == nullptr || new_size > old_size))
-    {
-        if (fault->allocations_left == 0)
-        {
-            ++fault->rejected;
-            return nullptr;
-        }
-        --fault->allocations_left;
-    }
-    return fault->original(fault->original_context, memory, old_size, new_size);
-}
-
-// 每个故障点使用全新 State；恢复 allocator 后回收所有 Lua 对象，核对栈资源和 userdata 的真实析构。
-void testAllocationFailures()
-{
-    int rejected_cases = 0; // 至少一个用例必须真实触发 OOM，不能仅验证无故障成功路径。
-    for (int allowed = 0; allowed < 32; ++allowed)
-    {
-        TestEnvironment env;            // 覆盖本轮 State、栈资源及 userdata 的完整生命周期。
-        auto state = createState(&env); // 本用例独占的 State，关闭前计数环境必须保持存活。
-        lua_pushlightuserdata(state.get(), &env);
-        lua_pushcclosure(state.get(), &LuaBinding::nativeCallback<allocation_failure>, 1);
-        FaultAllocator fault{}; // allocator 上下文在恢复原 allocator 前一直存活。
-        fault.original         = lua_getallocf(state.get(), &fault.original_context);
-        fault.allocations_left = allowed;
-        lua_setallocf(state.get(), &faultAllocator, &fault);
-        const int status =
-            lua_pcall(state.get(), 0, LUA_MULTRET, 0); // 捕获持续 OOM 的最终 Lua 错误。
-        lua_setallocf(state.get(), fault.original, fault.original_context);
-
-        require(status == LUA_OK || status == LUA_ERRMEM || status == LUA_ERRRUN,
-                "unexpected allocator failure status");
-        rejected_cases += fault.rejected != 0;
-        lua_settop(state.get(), 0);
-        lua_gc(state.get(), LUA_GCCOLLECT);
-        state.reset();
-        require(env.boundary_entered == 1 && env.boundary_destroyed == 1,
-                "Lua OOM skipped C++ resource destruction");
-        require(env.constructed == env.destroyed, "Lua OOM leaked a constructed userdata");
-    }
-    require(rejected_cases > 0, "allocation failure injection never rejected an allocation");
-}
 
 // 固定 100000 次请求字段读取的同进程对照，仅报告此调用形态耗时，不推导服务器容量。
 void measureTableReads(lua_State *state)
@@ -961,17 +894,13 @@ int main()
             assert(values.n == 64 and values[1] == 0 and values[64] == 63)
             assert(binding.many_upvalues() == 63)
             assert(binding.upvalue_boundaries())
-            for _, mode in ipairs({true, false}) do
-                local ok, value, err = pcall(binding.native_exception, mode)
-                assert(ok and value == nil and err.code == "INTERNAL_ERROR")
-                assert(err.message == (mode and "Native allocation failed"
-                    or "Unexpected Native exception"))
-            end
+            local ok, value, err = pcall(binding.native_exception)
+            assert(ok and value == nil and err.code == "INTERNAL_ERROR")
+            assert(err.message == "Unexpected Native exception")
             package.preload.flywow_binding_failing = binding.failing_module
             local loaded = pcall(require, "flywow_binding_failing")
             assert(not loaded and package.loaded.flywow_binding_failing == nil)
         )lua");
-        testAllocationFailures();
         testConcurrentStates();
         measureTableReads(first.get());
         std::cout << "FLYWOW_LUA_BINDING_TEST_OK\n";

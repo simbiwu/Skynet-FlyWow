@@ -28,7 +28,10 @@ if(FLYWOW_LUA_BINDING_TESTS)
         message(FATAL_ERROR "Tests require explicit bundled SKYNET_LUA_LIBRARY")
     endif()
     # 测试链接调用者指定的 Skynet Lua 静态库，避免验证到另一套系统 Lua ABI。
-    add_executable(flywow_lua_binding_test tests/lua_binding_test.cpp)
+    # 只在 ABI 测试中编译宿主现有 sharetable 实现，验证非 OOM 的共享表写入错误；源码保持只读。
+    enable_language(C)
+    add_executable(flywow_lua_binding_test tests/lua_binding_test.cpp
+        "${SKYNET_LUA_DIR}/../../lualib-src/lua-sharetable.c")
     find_package(Threads REQUIRED)
     target_link_libraries(flywow_lua_binding_test PRIVATE flywow_lua_binding
         "${SKYNET_LUA_LIBRARY}" dl m Threads::Threads)

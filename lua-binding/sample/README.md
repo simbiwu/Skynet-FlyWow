@@ -10,7 +10,7 @@
 bash lua-binding/sample/run_lua_binding_sample.sh ../skynet
 ```
 
-脚本根据自身位置解析源码和产物目录，先通过统一入口构建静态库并执行 `flywow_lua_binding_test` ABI 回归，再编译、运行 `lua_binding_sample.cpp`。ABI 回归链接指定 Skynet 自带的 `liblua.a`，覆盖数值与 table 转换、闭包 upvalue、异常边界、分配失败、动态/静态 userdata 注册和析构、State 隔离及关闭清理。Sample 本身只演示最小请求/响应调用。产物位于 `build/lua-binding-sample/`，任何构建或断言失败均返回非零状态。成功输出：
+脚本根据自身位置解析源码和产物目录，先通过统一入口构建静态库并执行 `flywow_lua_binding_test` ABI 回归，再编译、运行 `lua_binding_sample.cpp`。ABI 回归链接指定 Skynet 自带的 `liblua.a`，覆盖数值与 table 转换、闭包 upvalue、异常边界、共享表写入失败、动态/静态 userdata 注册和析构、State 隔离及关闭清理。Sample 本身只演示最小请求/响应调用。产物位于 `build/lua-binding-sample/`，任何构建或断言失败均返回非零状态。成功输出：
 
 ```text
 FLYWOW_LUA_BINDING_SAMPLE_OK

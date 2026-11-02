@@ -33,8 +33,9 @@ SKYNET_LUA="$SKYNET_ROOT/3rd/lua"
 bash "$FRAMEWORK_DIR/scripts/build_flywow.sh" "$SKYNET_ROOT" lua_binding
 mkdir -p "$RUNTIME_ROOT"
 
-"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror \
 # -I 给 C++ 编译器追加头文件搜索目录；后续每个 -I 分别对应模块和宿主 Lua 头文件。
+# 行尾反斜杠将下一行接到当前编译命令；续行之间不能插入注释，否则命令会被截断。
+"${CXX:-c++}" -std=c++17 -Wall -Wextra -Werror \
     -I"$FRAMEWORK_DIR/lua-binding" -I"$SKYNET_LUA" \
     "$SCRIPT_DIR/lua_binding_sample.cpp" "$LIBRARY" "$SKYNET_LUA/liblua.a" \
     -ldl -lm -pthread -o "$RUNTIME_ROOT/lua_binding_sample"

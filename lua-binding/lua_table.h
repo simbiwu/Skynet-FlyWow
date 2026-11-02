@@ -17,7 +17,7 @@ class LuaTable
     LuaTable &operator=(const LuaTable &) = delete;
     bool valid() const;
 
-    // raw 读取字段；类型校验在保护调用外执行，C++ 字符串异常交给注册入口。
+    // raw 读取字段并严格转换，不触发 __index。
     /// @param key 真实整数或完整字符串 key。
     /// @param output 严格类型转换的输出，失败不覆盖。
     /// @return 读取成功 true；无效句柄、类型或 Lua 操作错误 false。
@@ -28,6 +28,7 @@ class LuaTable
         detail::StackRestore stack(binding_->state_);
         return readField(key) && binding_->readAt(-1, output);
     }
+
     // 子表直接在同一次字段读取中建立引用；失败不覆盖 output。
     /// @param key 存放子表的字段。
     /// @param output 成功获得独立子表引用，仍借用本 Binding。
@@ -37,28 +38,9 @@ class LuaTable
         if (!valid())
             return false;
         detail::StackRestore stack(binding_->state_);
-        FieldArguments<Key>  args{this, key};
-        const bool           ok = detail::protectedCall(
-            binding_->state_,
-            [](lua_State *state) noexcept -> int
-            {
-                auto *data = static_cast<FieldArguments<Key> *>(lua_touserdata(state, 1));
-                if (!getField(state, *data))
-                    return 0;
-                if (!lua_istable(state, -1))
-                {
-                    data->failure = "value must be a table";
-                    return 0;
-                }
-                data->reference = luaL_ref(state, LUA_REGISTRYINDEX);
-                return 0;
-            },
-            &args, 0, 0);
-        if (!binding_->completeCall(ok, args.failure))
-            return false;
-        output = LuaTable(binding_, args.reference);
-        return true;
+        return readField(key) && binding_->readTableAt(-1, output);
     }
+
     /// 只判断字段是否 nil；非 nil 或无效句柄均返回 false，不代替读取结果检查。
     template <typename Key> bool isNil(const Key &key) const
     {
@@ -67,6 +49,7 @@ class LuaTable
         detail::StackRestore stack(binding_->state_);
         return readField(key) && lua_isnil(binding_->state_, -1);
     }
+
     // Lua 真值：nil/false 为假；0 和空串为真。
     /// @param key 待读取字段。
     /// @param output 成功时接收 Lua 真值；失败保持不变。
@@ -78,7 +61,8 @@ class LuaTable
         detail::StackRestore stack(binding_->state_);
         return readField(key) && binding_->readTruthAt(-1, output);
     }
-    // 完整字段写入只进入一次 pcall；key/value 无效时不更新原字段。
+
+    // 写入共享表可能抛出非 OOM Lua 错误，因此保留一次 pcall；转换失败不更新字段。
     // 普通 table 可写任何合法 key；托管元表的 __gc 在注册与后续字段写入时均受保护。
     /// @param key 真实整数或完整字符串 key。
     /// @param value 要保存的值；nullptr 删除字段，table/userdata 不复制对象。
@@ -93,7 +77,9 @@ class LuaTable
             FieldArguments<Key> field; ///< 本次字段操作的目标表、key 与输出诊断。
             const T            &value; ///< 借用本次待写入的值，外层作用域覆盖保护调用。
         } args{{this, key}, value};
-        const bool ok = detail::protectedCall(
+        detail::ensureStack(binding_->state_, 2);
+        // 参数 1 借用本次字段操作记录；记录及其中的 C++ 资源由外层作用域持有。
+        lua_pushcfunction(
             binding_->state_,
             [](lua_State *state) noexcept -> int
             {
@@ -111,8 +97,9 @@ class LuaTable
                     return 0;
                 lua_rawset(state, -3);
                 return 0;
-            },
-            &args, 0, 0);
+            });
+        lua_pushlightuserdata(binding_->state_, &args);
+        const bool ok = lua_pcall(binding_->state_, 1, 0, 0) == LUA_OK;
         return binding_->completeCall(ok, args.field.failure);
     }
 
@@ -129,71 +116,61 @@ class LuaTable
         if (!valid())
             return false;
         detail::StackRestore stack(binding_->state_);
-        struct Arguments
-        {
-            FieldArguments<Key> field; ///< 本次字段操作的目标表、key 与输出诊断。
-            const std::string  &name;  ///< 借用本次字段/类型名称，不在保护回调中构造字符串。
-            void               *object = nullptr; ///< 原生操作返回的借用地址；外层决定构造或保活。
-        } args{{this, key}, name};
-        const bool ok = detail::protectedCall(
-            binding_->state_,
-            [](lua_State *state) noexcept -> int
-            {
-                auto *data = static_cast<Arguments *>(lua_touserdata(state, 1));
-                if (!getField(state, data->field))
-                    return 0;
-                data->object = LuaBinding::inspectUserdata(
-                    state, -1, data->name.c_str(), data->field.reference, &data->field.failure);
-                return 0;
-            },
-            &args, 0, 0);
-        if (!binding_->completeCall(ok, args.field.failure) ||
-            !binding_->retainUserdata(args.object, args.field.reference))
-            return false;
-        output = static_cast<T *>(args.object);
-        return true;
+        return readField(key) && binding_->readUserdataAt(-1, name, output);
     }
 
   private:
     friend class LuaBinding;
+    /// 接管已经建立的 registry 引用；只由 Binding 和字段读取路径创建。
+    /// @param binding 借用的同步回调 owner，必须晚于句柄销毁。
+    /// @param reference 要接管的独立 registry 引用编号。
     LuaTable(LuaBinding *binding, int reference);
+
+    /// 将句柄引用的原表压入栈顶，不触发元方法；调用方保证句柄有效。
+    /// @return 无返回值；栈顶新增一份临时表引用。
     void push() const;
+
+    /// 释放本句柄的 registry 引用并清空 owner；Lua 中其他引用仍可保活原表。
+    /// @return 无返回值；空句柄可重复调用。
     void reset() noexcept;
 
+    // 只服务于写入保护回调；读取路径直接使用 Lua 栈和局部诊断。
     template <typename Key> struct FieldArguments
     {
-        const LuaTable *table;               ///< 本次操作的目标表句柄；registry 编号不代表栈位置。
-        const Key      &key;                 ///< 借用原始字段 key，不执行隐式转换。
-        const char     *failure   = nullptr; ///< 失败时由原生操作写入的常量原因；外层随后记录诊断。
-        int             reference = LUA_NOREF; ///< 成功时建立的 registry 引用；外层接管或释放。
+        const LuaTable *table;             ///< 要写入的目标表。
+        const Key      &key;               ///< 本次字段 key，调用期间借用。
+        const char     *failure = nullptr; ///< 值转换失败时的静态诊断。
     };
+
+    /// 在写入回调中校验并压入 key，失败诊断写入 data。
+    /// @param state 写入回调收到的 Lua State。
+    /// @param data 本次写入的目标表、key 及诊断。
+    /// @return key 可表示为 Lua 整数或字符串时为 true。
     template <typename Key> static bool pushKey(lua_State *state, FieldArguments<Key> &data)
     {
         static_assert((std::is_integral_v<Key> && !std::is_same_v<Key, bool>) ||
                       std::is_convertible_v<const Key &, std::string>);
         return data.table->binding_->pushRaw(state, data.key, &data.failure);
     }
-    // 仅供 C 回调使用；成功留下 table/value，原始 key 不发生隐式转换。
-    template <typename Key> static bool getField(lua_State *state, FieldArguments<Key> &data)
-    {
-        lua_rawgeti(state, LUA_REGISTRYINDEX, data.table->reference_);
-        if (!pushKey(state, data))
-            return false;
-        lua_rawget(state, -2);
-        return true;
-    }
+
+    /// 直接 raw 读取字段，不执行元方法；调用方用 StackRestore 恢复临时栈。
+    /// @param key 要读取的整数或字符串字段名。
+    /// @return 成功时栈顶留下字段值；key 转换失败时记录诊断并返回 false。
     template <typename Key> bool readField(const Key &key) const
     {
-        FieldArguments<Key> args{this, key};
-        const bool          ok = detail::protectedCall(
-            binding_->state_,
-            [](lua_State *state) noexcept -> int
-            {
-                auto *data = static_cast<FieldArguments<Key> *>(lua_touserdata(state, 1));
-                return getField(state, *data) ? 1 : 0;
-            },
-            &args, 0, 1);
-        return binding_->completeCall(ok, args.failure);
+        static_assert((std::is_integral_v<Key> && !std::is_same_v<Key, bool>) ||
+                      std::is_convertible_v<const Key &, std::string>);
+        detail::ensureStack(binding_->state_, 2);
+        push();
+        const char *failure = nullptr; // key 类型或范围转换失败的诊断。
+        if (!binding_->pushRaw(binding_->state_, key, &failure))
+        {
+            binding_->setError("INVALID_ARGUMENT", failure);
+            return false;
+        }
+        // [原栈, table, key] -> [原栈, table, value]，不触发 __index。
+        lua_rawget(binding_->state_, -2);
+        return true;
     }
 
     LuaBinding *binding_   = nullptr;   // 借用所属回调，不能晚于 Binding 销毁。
