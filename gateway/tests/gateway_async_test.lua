@@ -7,12 +7,17 @@ local root = assert(arg[1]) -- 被测 FlyWow 根路径；由测试入口显式�
 package.path = root .. "/common/lualib/?.lua;" ..
     root .. "/gateway/lualib/?.lua;" .. package.path
 local flywow_result = require "flywow_result"
+local HELLO = string.char(1, 1, 4) .. string.rep("h", 64) -- 合法长度与头部的客户端握手消息，公钥由密码替身接受。
+local PROOF = string.char(3) .. string.rep("p", 32) -- 密码替身接受的客户端证明。
+local CHALLENGE = string.char(2, 1) .. string.rep("c", 97) -- 密码替身输出的固定服务端挑战。
+local READY = string.char(4) .. string.rep("r", 32) -- 密码替身输出的固定服务端证明。
 
 -- 创建独立的可控场景；overrides 为配置覆盖，无 I/O；返回由测试拥有的控制对象。
 ---@param overrides table|nil 可覆盖 TCP/WebSocket 模式等本场景启动配置；不会修改调用方的 table。
 ---@param expect_start_failure boolean|nil true 时要求启动以配置错误失败，用于验证显式非法值。
+---@param use_real_handshake boolean|nil true 时加载真实 Lua 状态机，只替换密码运算。
 ---@return table 包含替身状态、注入入口和已注册 Service 命令回调的测试场景。
-local function scenario(overrides, expect_start_failure)
+local function scenario(overrides, expect_start_failure, use_real_handshake)
     local e = -- 当前场景的可控观测状态，由替身写入并由断言读取。
     {
         now     = 0,
@@ -198,7 +203,10 @@ local function scenario(overrides, expect_start_failure)
     ---@param bytes string 要记录的完整 frame。
     ---@return boolean 是否接受写入；fail_write 用于注入失败。
     function socket.write(fd, bytes)
-        if e.fail_write then
+        if e.on_write then
+            e.on_write()
+        end
+        if e.fail_write or e.fail_write_number == #e.writes + 1 then
             -- 按 Skynet Socket 合同报告底层写入拒绝。
             return false
         end
@@ -268,7 +276,7 @@ local function scenario(overrides, expect_start_failure)
         e.started[fd] = true
         e.ws = handler
         handler.handshake(fd, {}, "/")
-        handler.message(fd, "1", "binary")
+        handler.message(fd, e.first_ws_message or "1", "binary")
         coroutine.yield("ws")
         return true
     end
@@ -278,6 +286,16 @@ local function scenario(overrides, expect_start_failure)
     ---@param bytes string 完整 binary message。
     ---@return nil 记录测试写入。
     function websocket.write(fd, bytes)
+        if e.on_write then
+            e.on_write()
+        end
+
+        -- 按指定写入序号模拟 Socket helper 抛错，保留 WS 原生失败方式。
+        if e.fail_write_number == #e.writes + 1 then
+            error("injected websocket write failure")
+        end
+
+        -- transport 接受写入后才保存消息，供测试判断响应是否真正提交。
         e.writes[#e.writes + 1] = { fd, bytes }
     end
 
@@ -397,6 +415,52 @@ local function scenario(overrides, expect_start_failure)
                     return flywow_result.success()
                 end,
     }
+    -- 组合边界场景使用真实 receive/confirm/close；文件 userdata 只替代 Native 的密码运算与释放动作。
+    if use_real_handshake then
+        package.loaded["handshake"] = nil
+        e.handshake = require "handshake" -- 本场景真实模块；通过公开 accept/close 检查名额是否归还。
+        e.crypto_closed = 0 -- 记录此场景实际释放的密码对象数量。
+        local crypto = {} -- 固定 Native 合同的可控密码替身，不替换 Lua 状态机。
+        --- Gateway 状态机收到 HELLO 时创建独占 userdata，普通密码错误返回 nil/error。
+        ---@param hello string 真实状态机已校验头部与长度的 CLIENT_HELLO。
+        ---@return userdata|nil 密码对象，或测试注入的普通密码失败。
+        ---@return string|table 完整挑战，或 Native 形状的 code/message 错误记录。
+        function crypto.create_context(hello)
+            assert(hello == HELLO)
+            if e.fail_crypto then
+                return nil, { code = "INVALID_PUBLIC_KEY", message = "test invalid public key" }
+            end
+
+            -- 每连接独占一个文件 userdata；关闭时恢复原元表，避免替身污染其他连接。
+            local native = assert(io.tmpfile()) -- 用于验证真实状态机持有和释放 userdata。
+            local original_metatable = debug.getmetatable(native) -- 本对象原文件方法，释放前恢复。
+            local close_file = native.close -- 保留原始文件关闭操作，不递归调用替身 close。
+            debug.setmetatable(native,
+            {
+                __index = -- 仅模拟固定 Native verify/close 合同，不验证密码算法。
+                {
+                    verify = function(_, proof_bytes) -- 校验证明后可推进时钟，模拟同步密码运算跨越期限。
+                        if proof_bytes ~= PROOF then
+                            return nil, { code = "HANDSHAKE_PROOF", message = "test proof mismatch" }
+                        end
+                        if e.advance_on_verify then
+                            e.now = e.now + e.advance_on_verify
+                        end
+                        return READY
+                    end,
+                    close = function(self) -- 释放该连接独占的密码替身并累计实际关闭次数。
+                        e.crypto_closed = e.crypto_closed + 1
+                        debug.setmetatable(self, original_metatable)
+                        close_file(self)
+                    end,
+                },
+            })
+            return native, CHALLENGE
+        end
+        package.loaded["flywow_gateway_crypto"] = crypto
+    end
+
+    -- 依赖安装完成后加载真实 Service；随后用公开 start 命令建立场景。
     dofile(root .. "/gateway/service/flywow_gateway.lua")
     -- Gateway 不再隐式加载宿主 config.gateway；测试显式传入运行所需配置。
     -- descriptor/registry 在本测试中由上方 package.loaded 替身提供，不读取磁盘协议产物。
@@ -733,4 +797,67 @@ resume(e.forks[2])
 assert(table.concat(e.logs, "\n"):find("TCP_CLOSE", 1, true))
 assert(e.sends[#e.sends][2] == "gateway_disconnect")
 
+-- 用真实 Lua 状态机验证 Socket 写入与最终确认之间的业务门禁；不依赖内部 phase 字段断言。
+for _, transport in ipairs({ "tcp", "websocket" }) do
+    e = scenario({ transport = transport, max_pending_handshakes = 1, handshake_timeout_ms = 1000 }, false, true)
+    e.first_ws_message = HELLO
+    e.streams[50] = string.pack(">s2", HELLO) .. string.pack(">s2", PROOF)
+    e.on_write = function()
+        local before = #e.writes -- 写调用尚未返回，此时业务发送仍须被拒绝。
+        local on_write = e.on_write -- 暂时关闭观察回调，避免错误的提前开放引起递归。
+        e.on_write = nil
+        e.dispatch(0, 7, "send_data", { gateway_epoch = "99:12345", connection_id = 1, command_id = 1001, data = { result = 7 } })
+        assert(#e.writes == before, "business must stay blocked until transport write and confirm finish")
+        e.on_write = on_write
+    end
+    e.accept(50, "handshake-success")
+    resume(e.forks[2])
+    if transport == "websocket" then
+        e.ws.message(50, PROOF, "binary")
+    end
+    e.on_write = nil
+    assert(#e.writes == 2 and not e.closed[50] and e.crypto_closed == 1)
+    local expected_challenge = transport == "tcp" and string.pack(">s2", CHALLENGE) or CHALLENGE -- transport framing 必须与实际模式一致。
+    local expected_ready = transport == "tcp" and string.pack(">s2", READY) or READY -- 只有写出此证明后业务才可发送。
+    assert(e.writes[1][2] == expected_challenge and e.writes[2][2] == expected_ready)
+    e.dispatch(0, 7, "send_data", { gateway_epoch = "99:12345", connection_id = 1, command_id = 1001, data = { result = 7 } })
+    assert(#e.writes == 3, "ready connection must allow business after the final write")
+    local available = e.handshake.accept() -- 成功确认应释放唯一名额。
+    assert(available.ok and not e.handshake.accept().ok)
+    e.handshake.close(available.value)
+
+    -- 挑战写失败、READY 写失败、写后确认过期与 Native 两种普通失败都必须清理并留下准确诊断。
+    for _, failure_case in ipairs({ "challenge_write", "ready_write", "expired_confirm", "crypto", "proof" }) do
+        e = scenario({ transport = transport, max_pending_handshakes = 1, handshake_timeout_ms = 1000 }, false, true)
+        e.first_ws_message = HELLO
+        e.fail_write_number = failure_case == "challenge_write" and 1 or failure_case == "ready_write" and 2 or nil
+        e.advance_on_verify = failure_case == "expired_confirm" and 100 or nil
+        e.fail_crypto = failure_case == "crypto"
+        local proof_bytes = failure_case == "proof" and string.char(3) .. string.rep("x", 32) or PROOF -- 只改变证明，保留正常帧长。
+        e.streams[51] = string.pack(">s2", HELLO) .. string.pack(">s2", proof_bytes)
+        e.accept(51, failure_case)
+        resume(e.forks[2])
+        if transport == "websocket" and not e.closed[51] then
+            e.ws.message(51, proof_bytes, "binary")
+        end
+        assert(e.closed[51], transport .. " must close on " .. failure_case)
+        local logs = table.concat(e.logs, "\n") -- 汇总本场景现有日志，用于验证失败类别及只记录一次。
+        local _, error_count = logs:gsub("FLYWOW_GATEWAY_ERROR", "") -- 一条握手失败不能在多个层重复记录。
+        assert(error_count == 1 and not logs:find("handshake complete", 1, true))
+        if failure_case == "crypto" then
+            assert(logs:find("native_code=INVALID_PUBLIC_KEY", 1, true))
+            assert(logs:find("native_message=test invalid public key", 1, true))
+        elseif failure_case == "proof" then
+            assert(logs:find("native_message=test proof mismatch", 1, true))
+        elseif failure_case == "expired_confirm" then
+            assert(logs:find("HANDSHAKE_TIMEOUT", 1, true))
+        else
+            assert(logs:find("HANDSHAKE_WRITE_FAILED", 1, true))
+        end
+        assert(e.crypto_closed == (failure_case == "crypto" and 0 or 1))
+        local released = e.handshake.accept() -- 失败必须归还一个名额，不能多扣或多归还。
+        assert(released.ok and not e.handshake.accept().ok)
+        e.handshake.close(released.value)
+    end
+end
 print("GATEWAY_ASYNC_UNIT_OK")

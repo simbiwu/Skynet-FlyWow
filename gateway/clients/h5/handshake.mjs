@@ -2,13 +2,24 @@
 // 边界：Client SDK；固定P-256/HKDF/HMAC；需要支持Web Crypto的安全上下文。
 // 生命周期：每实例只服务一条连接；close释放CryptoKey引用，不保存登录或业务状态。
 // 不负责：不加密业务数据、不自动重连、不假定Web Crypto可擦除内部密钥副本。
+const CLIENT_HELLO_TYPE = 1; // 客户端首条握手消息类型。
+const SERVER_CHALLENGE_TYPE = 2; // 服务端挑战消息类型。
+const CLIENT_PROOF_TYPE = 3; // 客户端证明消息类型。
+const SERVER_READY_TYPE = 4; // 服务端证明消息类型。
+const HANDSHAKE_VERSION = 1; // 框架握手版本，独立于业务协议。
+const SERVER_CHALLENGE_SIZE = 99; // 类型、版本、65 字节公钥和 32 字节 salt。
+const SERVER_READY_SIZE = 33; // 类型和完整 HMAC-SHA256。
+const PUBLIC_KEY_OFFSET = 2; // 类型和版本之后为公钥。
+const SALT_OFFSET = 67; // 公钥占 [2,67)，之后为 HKDF salt。
+const DEFAULT_MAX_PENDING_MESSAGES = 256; // 当前处理消息与待处理消息的合计条数上限。
+const DEFAULT_MAX_PENDING_BYTES = 4 * 1024 * 1024; // 当前处理消息与待处理消息合计最多占用 4 MiB。
 const utf8Encoder = new TextEncoder(); // 以 UTF-8 编码握手域分离前缀；协议前缀均为 ASCII 字符，编码字节保持一致。
 
 // 连接有限公开字节数组；返回新Uint8Array，不改变输入。
 function join(...parts)
 {
     const joinedBytes = new Uint8Array(parts.reduce((n, part) => n + part.length, 0)); // 按输入总长度一次分配的输出字节串。
-    let offset = 0;
+    let offset = 0; // 下一个输入片段在目标数组中的写入位置。
     for (const part of parts)
     {
         joinedBytes.set(part, offset);
@@ -41,7 +52,7 @@ export class HandshakeClient
             this.keyPair = keyPair; // 私钥留在当前实例，仅供本次 ECDH 派生使用。
             const publicKeyBytes = new Uint8Array(await this.crypto.subtle.exportKey("raw", keyPair.publicKey)); // CLIENT_HELLO 中的 65 字节非压缩 P-256 公钥。
             if (this.phase === "closed") throw new Error("HANDSHAKE_CLOSED");
-            this.hello = join(new Uint8Array([1, 1]), publicKeyBytes); // 本实例后续计算 transcript 使用的完整 CLIENT_HELLO。
+            this.hello = join(new Uint8Array([CLIENT_HELLO_TYPE, HANDSHAKE_VERSION]), publicKeyBytes); // 本实例后续计算 transcript 使用的完整 CLIENT_HELLO。
             this.phase = "challenge";
             return this.hello.slice();
         }
@@ -54,7 +65,7 @@ export class HandshakeClient
 
     // 校验99字节challenge并返回PROOF；异步计算期间禁止重入，失败关闭状态。
     /**
-     * @param {Uint8Array} bytes transport 收到的完整 SERVER_CHALLENGE，只读借用。
+     * @param {Uint8Array} bytes transport 收到的完整 SERVER_CHALLENGE；Promise 完成前调用方不得修改数组。
      * @returns {Promise<Uint8Array>} CLIENT_PROOF；消息或密码运算失败时拒绝 Promise。
      */
     async respond(bytes)
@@ -64,22 +75,22 @@ export class HandshakeClient
         let sharedSecret; // 原始 32 字节 ECDH 结果；finally 擦除可见数组。
         try
         {
-            if (bytes.length !== 99 || bytes[0] !== 2 || bytes[1] !== 1 || bytes[2] !== 4)
+            if (bytes.length !== SERVER_CHALLENGE_SIZE || bytes[0] !== SERVER_CHALLENGE_TYPE || bytes[1] !== HANDSHAKE_VERSION || bytes[PUBLIC_KEY_OFFSET] !== 4)
                 throw new Error("HANDSHAKE_CHALLENGE");
             const subtle = this.crypto.subtle; // 本轮异步运算共用的平台密码入口。
-            const peer = await subtle.importKey("raw", bytes.slice(2, 67), { name: "ECDH", namedCurve: "P-256" }, false, []); // 从 SERVER_CHALLENGE 导入的服务端公钥。
+            const peer = await subtle.importKey("raw", bytes.slice(PUBLIC_KEY_OFFSET, SALT_OFFSET), { name: "ECDH", namedCurve: "P-256" }, false, []); // 从 SERVER_CHALLENGE 导入的服务端公钥。
             sharedSecret = new Uint8Array(await subtle.deriveBits({ name: "ECDH", public: peer }, this.keyPair.privateKey, 256));
             this.transcriptHash = new Uint8Array(await subtle.digest("SHA-256", join(this.hello, bytes))); // HELLO 与完整 CHALLENGE 的 transcript 摘要，complete 用于验证服务端证明。
             const hkdfKeyMaterial = await subtle.importKey("raw", sharedSecret, "HKDF", false, ["deriveKey"]); // 原始 ECDH Z 的 HKDF 输入句柄，不暴露为字符串。
             const proofKey = await subtle.deriveKey( // 用于双向握手证明的 HMAC 密钥句柄，不导出密钥字节。
-                { name: "HKDF", hash: "SHA-256", salt: bytes.slice(67), info: join(utf8Encoder.encode("flywow/handshake/v1"), this.transcriptHash) },
+                { name: "HKDF", hash: "SHA-256", salt: bytes.slice(SALT_OFFSET), info: join(utf8Encoder.encode("flywow/handshake/v1"), this.transcriptHash) },
                 hkdfKeyMaterial, { name: "HMAC", hash: "SHA-256", length: 256 }, false, ["sign", "verify"]);
             const clientProof = new Uint8Array(await subtle.sign("HMAC", proofKey, join(utf8Encoder.encode("client-proof"), this.transcriptHash))); // 用握手 transcript 生成的客户端证明字节。
             if (this.phase === "closed") throw new Error("HANDSHAKE_CLOSED");
             this.proofKey = proofKey; // 暂存到 READY 校验阶段；成功或 close 后清除引用。
             this.keyPair = null;
             this.phase = "ready-proof";
-            return join(new Uint8Array([3]), clientProof);
+            return join(new Uint8Array([CLIENT_PROOF_TYPE]), clientProof);
         }
         catch (error)
         {
@@ -94,7 +105,7 @@ export class HandshakeClient
 
     // 验证服务端READY；使用Web Crypto验证接口，成功后释放密钥，仅保留ready状态。
     /**
-     * @param {Uint8Array} bytes transport 收到的完整 SERVER_READY，只读借用。
+     * @param {Uint8Array} bytes transport 收到的完整 SERVER_READY；Promise 完成前调用方不得修改数组。
      * @returns {Promise<void>} 成功进入 ready；证明失败时关闭握手并拒绝 Promise。
      */
     async complete(bytes)
@@ -103,7 +114,7 @@ export class HandshakeClient
         this.phase = "verifying";
         try
         {
-            if (bytes.length !== 33 || bytes[0] !== 4 ||
+            if (bytes.length !== SERVER_READY_SIZE || bytes[0] !== SERVER_READY_TYPE ||
                 !await this.crypto.subtle.verify("HMAC", this.proofKey, bytes.slice(1), join(utf8Encoder.encode("server-ready"), this.transcriptHash)))
                 throw new Error("HANDSHAKE_READY");
             if (this.phase === "closed") throw new Error("HANDSHAKE_CLOSED");

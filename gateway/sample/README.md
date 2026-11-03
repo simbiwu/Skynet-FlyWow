@@ -32,3 +32,16 @@ bash gateway/sample/master_course/run.sh tcp client
 ```
 
 `prepare` 会调用课程目录中的 `bootstrap.sh`，复用 Server 固定版本准备脚本，按需构建 Skynet、lua-protobuf 和 Gateway Crypto。运行脚本会在启动前生成本课程的 Descriptor 和 Registry。需要单独以前台启动服务时运行 `bash gateway/sample/master_course/run.sh websocket server`。
+
+## 握手失败清理验证
+
+TCP 客户端的握手阶段失败时，`connectTcp` 会立即释放握手对象并销毁 Socket；调用方只需处理拒绝的 Promise，不依赖十秒空闲超时回收连接。H5 的 `connectGateway` 等待业务回调 Promise 后再处理下一条，以保持消息顺序；回调拒绝会关闭连接。
+
+可从任意目录运行以下测试；`/absolute/path/to/flywow` 替换为当前 FlyWow 根目录：
+
+```bash
+node /absolute/path/to/flywow/gateway/tests/gateway_tcp_sample_test.mjs
+node /absolute/path/to/flywow/gateway/tests/gateway_handshake_sdk_test.mjs
+```
+
+第一条使用本机随机端口与真实 Web Crypto，验证坏挑战、坏 READY、EOF、空长度帧和密码调用失败后的立即关闭；成功标记为 `GATEWAY_TCP_SAMPLE_FAILURE_CLEANUP_OK`。第二条验证 H5 异步消息顺序与回调失败关闭，成功标记为 `H5_ASYNC_MESSAGE_ORDER_OK`。两者不启动 Skynet；完整握手、请求、回包与 Push 仍通过上面的三个真实 Sample 验证。

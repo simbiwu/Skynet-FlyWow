@@ -23,6 +23,17 @@ class HandshakeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("H5_HANDSHAKE_SDK_FAILURES_OK", result.stdout)
 
+    # 真实本机 TCP 验证坏挑战、坏 READY、EOF、空长度帧与密码调用失败的立即清理。
+    def test_tcp_sample_failure_cleanup(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("需要Node 22/Web Crypto")
+        root = Path(__file__).resolve().parents[2]
+        result = subprocess.run([node, str(root / "gateway/tests/gateway_tcp_sample_test.mjs")],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("GATEWAY_TCP_SAMPLE_FAILURE_CLEANUP_OK", result.stdout)
+
     # 固定Lua驱动真实状态机；没有解释器时明确跳过。
     def test_state_machine(self):
         lua = os.environ.get("SKYNET_LUA")
@@ -35,6 +46,14 @@ class HandshakeTests(unittest.TestCase):
 
     # 使用独立Python库计算Z/HKDF/HMAC，与真实Native交互，不使用替身密码运算。
     def test_native_interop(self):
+        self._native_interop(False)
+
+    # 使用同一挑战下原本有效的证明，验证 close-before-verify 真正使密码对象失效。
+    def test_native_close_before_verify(self):
+        self._native_interop(True)
+
+    # 两种生命周期场景共用独立密码参考实现，避免复制 ECDH/HKDF/HMAC 计算。
+    def _native_interop(self, close_before_verify):
         lua = os.environ.get("SKYNET_LUA")
         lib = os.environ.get("SKYNET_LUACLIB")
         jemalloc = os.environ.get("SKYNET_JEMALLOC")
@@ -50,7 +69,8 @@ class HandshakeTests(unittest.TestCase):
         preload = env.get("LD_PRELOAD")
         env["LD_PRELOAD"] = jemalloc + (":" + preload if preload else "")
         child = subprocess.Popen(
-            [lua, str(root / "gateway/tests/gateway_crypto_driver.lua"), lib],
+            [lua, str(root / "gateway/tests/gateway_crypto_driver.lua"), lib,
+             "close_before_verify" if close_before_verify else "verify"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -70,9 +90,12 @@ class HandshakeTests(unittest.TestCase):
             proof = b"\x03" + hmac.digest(key, b"client-proof" + transcript, "sha256")
             output, error = child.communicate(proof.hex() + "\n", timeout=10)
             self.assertEqual(child.returncode, 0, error)
-            expected = b"\x04" + hmac.digest(key, b"server-ready" + transcript, "sha256")
-            self.assertEqual(bytes.fromhex(output.splitlines()[0]), expected)
-            self.assertIn("NATIVE_LIFECYCLE_OK", output)
+            if close_before_verify:
+                self.assertIn("NATIVE_CLOSE_BEFORE_VERIFY_OK", output)
+            else:
+                expected = b"\x04" + hmac.digest(key, b"server-ready" + transcript, "sha256")
+                self.assertEqual(bytes.fromhex(output.splitlines()[0]), expected)
+                self.assertIn("NATIVE_LIFECYCLE_OK", output)
         finally:
             if child.poll() is None:
                 child.kill()

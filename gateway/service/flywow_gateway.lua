@@ -833,10 +833,6 @@ local function read_exact(connection, size)
         return nil
     end
 
-    if #received_bytes ~= size then
-        return nil
-    end
-
     return received_bytes
 end
 
@@ -847,50 +843,53 @@ end
 ---@param bytes string 一条完整握手消息；不跨调用保存。
 ---@return FlyWowResult<nil> 成功表示响应已写出且所需 ready 状态已提交；失败返回握手或传输错误。
 local function process_handshake(connection, bytes)
-    local handshake_result = handshake_module.receive(connection.handshake, bytes)
-    if not handshake_result.ok then
-        log_event(
-        {
-            kind          = "error",
-            code          = handshake_result.code, -- 状态机为当前握手阶段返回的稳定错误码。
-            message       = handshake_result.message, -- 握手失败诊断只进入事件日志。
-            connection_id = connection.connection_id, -- 标识被拒绝的逻辑连接。
-        }
-        )
-        return handshake_result
-    end
-
-    -- 握手状态机通过后发送其响应；只有发送成功才提交需要的 ready。
-    local handshake_output = handshake_result.value -- 握手响应字节和写成功后确认标记。
-    local response_bytes = handshake_output.response_bytes
-    local write_succeeded, write_result_or_error = write_frame(connection, response_bytes)
-
-    if not write_succeeded or write_result_or_error == false then
-        return flywow_result.failure(
-            "HANDSHAKE_WRITE_FAILED",
-            tostring(write_succeeded and "transport rejected handshake response" or write_result_or_error)
-        )
-    end
-
-    -- 响应写入完成后刷新活动时间；最后阶段还需提交握手 ready。
-    connection.last_message = skynet.now()
-
-    if handshake_output.needs_confirmation then
-        local confirm_result = handshake_module.confirm(connection.handshake)
-        if not confirm_result.ok then
-            return confirm_result
+    local handshake_result = handshake_module.receive(connection.handshake, bytes) -- 响应生成结果；写入与确认成功之前不能视为本次处理完成。
+    local completion_result = handshake_result -- 先保留状态机失败；成功后由实际的写入或确认结果替换。
+    if handshake_result.ok then
+        -- 状态机只生成响应，先提交本地写入；固定 Socket/WS 写接口不 yield。
+        local handshake_output = handshake_result.value -- 完整响应及是否需要在写成功后确认 ready。
+        local write_succeeded, write_result_or_error = write_frame(connection, handshake_output.response_bytes) -- 原生写是否返回及其拒绝值或异常。
+        if not write_succeeded or write_result_or_error == false then
+            completion_result = flywow_result.failure(
+                "HANDSHAKE_WRITE_FAILED",
+                tostring(write_succeeded and "transport rejected handshake response" or write_result_or_error)
+            )
+        else
+            -- 写入成功后刷新活动时间；最终响应还须检查绝对期限并归还握手名额。
+            connection.last_message = skynet.now()
+            if handshake_output.needs_confirmation then
+                completion_result = handshake_module.confirm(connection.handshake)
+                if completion_result.ok then
+                    log_event(
+                    {
+                        kind = "ready", -- READY 已被本地传输接受且绝对期限检查通过。
+                        connection_id = connection.connection_id, -- 现已允许业务收发的逻辑连接。
+                        message = "handshake complete", -- 不表示客户端已经收到或验证服务端证明。
+                    })
+                end
+            else
+                completion_result = flywow_result.success()
+            end
         end
-
-        log_event(
-        {
-            kind          = "ready", -- 连接开放业务消息的生命周期事件。
-            connection_id = connection.connection_id, -- 当前连接的逻辑编号，用于关联诊断。
-            message       = "handshake complete", -- SERVER_READY 写成功且握手已提交。
-        }
-        )
     end
 
-    return flywow_result.success()
+    -- 握手生成、传输或确认的失败都在这里记录一次；Native 的细分原因不能在通用错误码中丢失。
+    if not completion_result.ok then
+        local native_details = completion_result.details -- Native 失败的安全诊断；帧、期限与写失败可能没有此字段。
+        local failure_message = completion_result.message -- 顶层失败文本；只为日志附加 Native 操作码与原因。
+        if native_details then
+            failure_message = failure_message .. " native_code=" .. tostring(native_details.native_code) ..
+                " native_message=" .. tostring(native_details.native_message)
+        end
+        log_event(
+        {
+            kind = "error", -- 当前握手步骤失败，由 TCP/WS 调用方摘除并关闭连接。
+            code = completion_result.code, -- 保留可程序化判断的握手错误类别。
+            message = failure_message, -- 不包含帧、证明或密钥的诊断。
+            connection_id = connection.connection_id, -- 产生本次失败的逻辑连接。
+        })
+    end
+    return completion_result
 end
 
 --- 运行一个已登记 TCP 连接；本协程串行读取和投递，直到 EOF、错误或 Service 停止。
@@ -1045,20 +1044,20 @@ function ws_handler.message(id, payload, opcode)
     end
 end
 
---- WebSocket 握手完成后清除握手计时；连接在 accept 时已登记，HTTP Upgrade 由 Skynet 完成。
---- id 是 Skynet connection id；header/url 由底层拥有且本函数不保存；peer 使用 accept 的实际对端地址。
+--- Skynet 完成 HTTP Upgrade 后结束读取计时；应用握手的绝对期限仍从 accept 登记连接起算。
+--- id 对应 accept 登记的连接；header/url 由底层拥有且本函数不保存。
 --- 无返回值，不执行跨 Service 调用或 yield；超过 max_clients 的连接在握手前拒绝。
 ---@param id integer Skynet 分配的 WebSocket 连接编号。
 ---@param header table HTTP Upgrade 请求头；只读且不保存。
 ---@param url string 客户端请求路径；只读且不保存。
----@return nil 记录握手完成时间，不返回业务数据。
+---@return nil 清除 Upgrade 读取等待并刷新活动时间，不修改应用握手的起点。
 function ws_handler.handshake(id, header, url)
     local connection = module_state.connections_by_fd[id] -- 当前 WebSocket 回调对应的连接；关闭或迟到回调时可能不存在。
     if not connection then
         return
     end
 
-    -- HTTP Upgrade 成功后应用握手期限开始；从此按完整消息活动时间检查空闲连接。
+    -- Upgrade 读取已经完成；不重置 handshake.started，因此 Upgrade 耗时仍计入握手总期限。
     connection.read_started = nil
     connection.last_message = skynet.now()
 end

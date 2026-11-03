@@ -8,11 +8,19 @@ export async function connectTcp(port)
     const socket = net.createConnection({host: "127.0.0.1", port}); // 本 sample 独占的 TCP 连接。
     socket.setTimeout(10000);
     socket.once("timeout", () => socket.destroy(new Error("TCP_TIMEOUT")));
-    await new Promise((resolve, reject) =>
+    try
     {
-        socket.once("connect", resolve);
-        socket.once("error", reject);
-    });
+        await new Promise((resolve, reject) =>
+        {
+            socket.once("connect", resolve);
+            socket.once("error", reject);
+        });
+    }
+    catch (error)
+    {
+        socket.destroy();
+        throw error;
+    }
 
     let buffer = Buffer.alloc(0); // 尚未拼成完整 TCP 帧的输入尾部，data 回调消费后保留余量。
     let failure; // 首次观察到的传输错误；后续读操作据此拒绝 Promise。
@@ -27,6 +35,7 @@ export async function connectTcp(port)
             if (size === 0)
             {
                 failure = new Error("EMPTY_TCP_FRAME");
+                socket.destroy(failure);
                 break;
             }
             if (buffer.length < size + 2) break;
@@ -66,10 +75,20 @@ export async function connectTcp(port)
         writeRaw(Buffer.concat([header, bytes]));
     };
 
-    const handshake = new HandshakeClient(globalThis.crypto); // 仅服务当前 TCP socket 的握手状态。
-    writeFrame(await handshake.begin());
-    writeFrame(await handshake.respond(await readFrame()));
-    await handshake.complete(await readFrame());
+    let handshake; // 握手创建成功后才持有密码状态；失败时必须和本函数拥有的 Socket 一起释放。
+    try
+    {
+        handshake = new HandshakeClient(globalThis.crypto);
+        writeFrame(await handshake.begin());
+        writeFrame(await handshake.respond(await readFrame()));
+        await handshake.complete(await readFrame());
+    }
+    catch (error)
+    {
+        handshake?.close();
+        socket.destroy();
+        throw error;
+    }
 
     return {
         readFrame,
