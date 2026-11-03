@@ -75,7 +75,7 @@ skynet.start(function()
         end
     end)
 
-    module_state.gateway_service_handle = skynet.newservice("gateway/flywow_gateway")
+    module_state.gateway_service_handle = skynet.newservice("flywow_gateway")
     local gateway_config = {} -- 从宿主预设复制的启动配置副本，仅追加本 sample 的 handler/端口/传输设置。
     for key, value in pairs(require "gateway_frame_sync") do
         gateway_config[key] = value

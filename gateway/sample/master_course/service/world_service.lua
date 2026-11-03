@@ -118,7 +118,7 @@ skynet.start(function()
         end
     end)
 
-    state.gateway = skynet.newservice("gateway/flywow_gateway")
+    state.gateway = skynet.newservice("flywow_gateway")
     local transport = os.getenv("GATEWAY_COURSE_TRANSPORT") or "websocket" -- Shell 选择本次使用 WS 或 TCP。
     local port = tonumber(os.getenv("GATEWAY_COURSE_PORT")) or 19221 -- 宿主选取的本地端口。
     local config =

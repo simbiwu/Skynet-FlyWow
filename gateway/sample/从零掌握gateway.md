@@ -265,7 +265,7 @@ Gateway 启动时只读校验每个数字 key 与消息类型，并计算命令�
 
 ## 2. 服务启动涉及哪几个执行环境
 
-本课程只创建一个小型 `WorldService` 来兼任启动者和业务 handler，再由它通过 `skynet.newservice("gateway/flywow_gateway")` 启动独立的 Gateway Service。它们是两个不同 Skynet Service、两个 Lua State；**WorldService 不拥有 fd，不持有 Gateway 的连接 table**。
+本课程只创建一个小型 `WorldService` 来兼任启动者和业务 handler，再由它通过 `skynet.newservice("flywow_gateway")` 启动独立的 Gateway Service。它们是两个不同 Skynet Service、两个 Lua State；**WorldService 不拥有 fd，不持有 Gateway 的连接 table**。
 
 第一步准备运行时配置。然后写 WorldService：它起初只需要把 Gateway 正确启动；第三阶段再加入业务处理。阶段 2 先观察 listener，阶段 3 才连接真实客户端。
 
@@ -314,7 +314,7 @@ skynet.start(function()
         end
     end)
 
-    local gateway = skynet.newservice("gateway/flywow_gateway")
+    local gateway = skynet.newservice("flywow_gateway")
     local transport = os.getenv("GATEWAY_COURSE_TRANSPORT") or "websocket"
     local port = tonumber(os.getenv("GATEWAY_COURSE_PORT")) or 19221
     local config =
@@ -619,7 +619,7 @@ bash gateway/sample/master_course/run.sh websocket server
 
 ```text
 WorldService 的 skynet.start 协程
-  -> skynet.newservice("gateway/flywow_gateway")
+  -> skynet.newservice("flywow_gateway")
   -> skynet.call(gateway, "lua", "start", config)   [调用方挂起]
 Gateway Service 自己的 Lua State
   -> skynet.start -> skynet.dispatch("lua", ...)
@@ -1284,7 +1284,7 @@ skynet.start(function()
         end
     end)
 
-    state.gateway = skynet.newservice("gateway/flywow_gateway")
+    state.gateway = skynet.newservice("flywow_gateway")
     local transport = os.getenv("GATEWAY_COURSE_TRANSPORT") or "websocket" -- Shell 选择本次使用 WS 或 TCP。
     local port = tonumber(os.getenv("GATEWAY_COURSE_PORT")) or 19221 -- 宿主选取的本地端口。
     local config =
