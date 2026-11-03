@@ -5,7 +5,7 @@
 | 旧入口 | 新入口 |
 | --- | --- |
 | FlyWow `lualib/...` | `gateway/lualib/...` |
-| FlyWow `service/flywow_gateway.lua` 或 `service/gateway/flywow_gateway.lua` | `gateway/service/gateway/flywow_gateway.lua` |
+| FlyWow `service/flywow_gateway.lua` 或 `gateway/service/flywow_gateway.lua` | `gateway/service/flywow_gateway.lua` |
 | `native/gateway_crypto` | `gateway/native/gateway_crypto.cpp` |
 | `clients/unity` / `clients/h5` | `gateway/clients/unity` / `gateway/clients/h5` |
 | Gateway registry 生成工具 | `gateway/tools/generate_gateway_registry.py` |

@@ -397,7 +397,7 @@ local function scenario(overrides, expect_start_failure)
                     return flywow_result.success()
                 end,
     }
-    dofile(root .. "/gateway/service/gateway/flywow_gateway.lua")
+    dofile(root .. "/gateway/service/flywow_gateway.lua")
     -- Gateway 不再隐式加载宿主 config.gateway；测试显式传入运行所需配置。
     -- descriptor/registry 在本测试中由上方 package.loaded 替身提供，不读取磁盘协议产物。
     -- 传入当前场景配置建立真实 Service 运行状态；覆盖项因此能驱动 TCP/WS 分支。

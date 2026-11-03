@@ -615,7 +615,7 @@ bash gateway/sample/master_course/run.sh websocket server
 
 ### 2.4 真实源码跟踪：start 如何从一个 RPC 变成监听
 
-**【真实源码】** `gateway/service/gateway/flywow_gateway.lua`：
+**【真实源码】** `gateway/service/flywow_gateway.lua`：
 
 ```text
 WorldService 的 skynet.start 协程
@@ -650,7 +650,7 @@ WorldService 的原调用协程被唤醒，继续检查 result.ok/value
 
 ### 2.5 源码精读：`module_state` 究竟属于谁
 
-上一节的调用栈已经到达 Gateway 的 `start(config)`。现在暂停在 `start()` 入口，看它操作的模块级表。**【真实源码局部：`gateway/service/gateway/flywow_gateway.lua`，文件顶层】**：
+上一节的调用栈已经到达 Gateway 的 `start(config)`。现在暂停在 `start()` 入口，看它操作的模块级表。**【真实源码局部：`gateway/service/flywow_gateway.lua`，文件顶层】**：
 
 ```lua
 local module_state =
@@ -690,7 +690,7 @@ local module_state =
 
 执行现场：WorldService 的启动协程已向 Gateway 发出 `skynet.call(gateway,"lua","start",config)`，处于等待；Gateway 通过文件末尾的 `skynet.dispatch("lua", ...)` 收到 `start`，调用它自己的 `start(startup_config)`。此时还没有监听 fd，也没有连接上下文。
 
-**【真实源码局部：`gateway/service/gateway/flywow_gateway.lua` / `start()`，初始化依赖阶段】**：
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `start()`，初始化依赖阶段】**：
 
 ```lua
 local config_result = normalize_config(startup_config)
@@ -1550,7 +1550,7 @@ Server 日志（位于 `build/gateway-master-course/websocket/server.log`）**�
 
 **【真实源码】**：
 
-- `gateway/service/gateway/flywow_gateway.lua`：`accept_client(fd,peer)` → `websocket.accept(fd,ws_handler,"ws",peer)` → `ws_handler.handshake`/`ws_handler.message`。
+- `gateway/service/flywow_gateway.lua`：`accept_client(fd,peer)` → `websocket.accept(fd,ws_handler,"ws",peer)` → `ws_handler.handshake`/`ws_handler.message`。
 - `gateway/lualib/handshake.lua`：`init`、`accept`、`receive`、`confirm`、`ready`、`close`。
 - `gateway/native/gateway_crypto.cpp`：真实 P-256 ECDH、HKDF-SHA256、HMAC-SHA256。
 - `gateway/clients/h5/handshake.mjs`：`HandshakeClient.begin/respond/complete` 和 `connectGateway`。
@@ -1574,7 +1574,7 @@ Server 日志（位于 `build/gateway-master-course/websocket/server.log`）**�
 
 先观察客户端 A 的 WebSocket 已建立但尚未 `connectGateway()` resolve。此时进入 Gateway Service 的 `accept_client(fd,peer)`，调用者是 **Skynet listener 的 accept 回调**，而不是 WorldService 的 `skynet.dispatch`。`fd` 是底层 Socket Driver 分配的整数，`peer` 是诊断用对端地址。
 
-**【真实源码局部：`gateway/service/gateway/flywow_gateway.lua` / `accept_client()`】**：
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `accept_client()`】**：
 
 ```lua
 if module_state.gateway_config.transport == "websocket" then
@@ -1604,7 +1604,7 @@ end
 
 #### 4.5.2 两张连接索引为什么都存在
 
-进入 `create_connection`（真实路径仍为 `gateway/service/gateway/flywow_gateway.lua`），按顺序做三件事：检查 `client_count` 和 `next_connection_id` 上限、通过 `handshake_module.accept()` 占一个握手名额、构造 `connection` 并同时登记两张索引。
+进入 `create_connection`（真实路径仍为 `gateway/service/flywow_gateway.lua`），按顺序做三件事：检查 `client_count` 和 `next_connection_id` 上限、通过 `handshake_module.accept()` 占一个握手名额、构造 `connection` 并同时登记两张索引。
 
 **【真实源码局部：`create_connection()`，省略容量拒绝与日志分支】**：
 
@@ -1739,7 +1739,7 @@ return flywow_result.success(
 
 执行现场重新回到 Gateway Service 的 `process_handshake(connection,bytes)`。它把 `connection.handshake` 和当前完整帧借给状态机；`handshake.receive` 不知道 Socket fd，也不负责写网络。
 
-**【真实源码局部：`gateway/service/gateway/flywow_gateway.lua` / `process_handshake()`】**：
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `process_handshake()`】**：
 
 ```lua
 local handshake_result = handshake_module.receive(
@@ -1831,7 +1831,7 @@ bash scripts/build_flywow.sh /path/to/skynet lua_binding
 
 执行现场：A 已 ready，Gateway 收到上述 10 字节 Envelope。仍在 Gateway Service 的 WS 消息回调，**未进入 WorldService**。
 
-**【真实源码】** `gateway/service/gateway/flywow_gateway.lua`：`ws_handler.message` → `dispatch_payload(connection,payload)`：
+**【真实源码】** `gateway/service/flywow_gateway.lua`：`ws_handler.message` → `dispatch_payload(connection,payload)`：
 
 1. `#payload` 检查 `max_frame_bytes`；不是 Skynet 接收内存的硬上限。
 2. `codec_module.decode_envelope(payload)` → `gateway/lualib/codec.lua` 中 `pb.decode(Envelope,bytes)`；得到版本 4、command 1001、三字节 body。
@@ -1882,7 +1882,7 @@ Gateway 接收新的消息 <-------------------------+
 
 `10` 是十六进制字节 `0x10`，不是业务 command；Protobuf key 使用 `field_number << 3 | wire_type`。实际把它发进 WebSocket 时，`http.websocket` 已经拼出单条完整 binary message，Gateway 不再执行 TCP `read_exact(2)`。
 
-当前执行上下文仍为 **Gateway Service** 的 WebSocket 会话协程，文件 `gateway/service/gateway/flywow_gateway.lua`，函数 `ws_handler.message(id,payload,"binary")`。它取 `module_state.connections_by_fd[id]`，再判断：
+当前执行上下文仍为 **Gateway Service** 的 WebSocket 会话协程，文件 `gateway/service/flywow_gateway.lua`，函数 `ws_handler.message(id,payload,"binary")`。它取 `module_state.connections_by_fd[id]`，再判断：
 
 ```lua
 if handshake_module.ready(connection.handshake) then
@@ -1896,7 +1896,7 @@ end
 
 #### 4.7.1 `dispatch_payload()` 第一段：帧和 Envelope
 
-**【真实源码局部：`gateway/service/gateway/flywow_gateway.lua` / `dispatch_payload()`】**：
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `dispatch_payload()`】**：
 
 ```lua
 if connection.closed or #payload == 0 or
@@ -2004,7 +2004,7 @@ Gateway Service，Lua State G            WorldService，Lua State W
 
 现在从 WorldService 的 `send_to_gateway(epoch,connection_id,1001,data)` 返回到 Gateway Service 的 `skynet.dispatch`。该入口匹配 `command="send_data"`，调用 `deliver_outbound_message(outbound_message)`；和前面的入站同名 `send_data` **只代表宿主与网关互发的消息命令**，消息方向由发起者决定。
 
-**【真实源码局部：`gateway/service/gateway/flywow_gateway.lua` / `deliver_outbound_message()`】**：
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `deliver_outbound_message()`】**：
 
 ```lua
 if not module_state.gateway_config or type(outbound_message) ~= "table" or
@@ -2099,7 +2099,7 @@ WorldService 清理 players，并调用 Gateway.stop()
 
 ### 5.2 源码深入：单播与广播
 
-**执行位置**：`gateway/service/gateway/flywow_gateway.lua` 的 `skynet.dispatch` 收到 `send_data`，调用 `deliver_outbound_message(outbound_message)`；其参数正是上一步 WorldService 的 `send_to_gateway()` 构造的 table。
+**执行位置**：`gateway/service/flywow_gateway.lua` 的 `skynet.dispatch` 收到 `send_data`，调用 `deliver_outbound_message(outbound_message)`；其参数正是上一步 WorldService 的 `send_to_gateway()` 构造的 table。
 
 1. 检查 `gateway_epoch` 和当前 Gateway 阶段；旧实例消息立即丢弃。
 2. 直接查询 `registry.commands[1002]` 并检查 `1002` 的 `response_type`（本例仅下行，所以客户端不能用 `1002` 发请求）。
@@ -2122,7 +2122,7 @@ skynet.send(state.gateway, "lua", "close",
 })
 ```
 
-**【真实源码】** `gateway/service/gateway/flywow_gateway.lua`：
+**【真实源码】** `gateway/service/flywow_gateway.lua`：
 
 ```text
 Gateway 的 skynet.dispatch("lua", ...) 收到 command="close"
@@ -2181,7 +2181,7 @@ send_data(epoch, connection_id=0, command_id=1002, "新手村已开放")
 
 现在看 B 被主动断开的过程。`WorldService` 30 tick 后 `skynet.send(gateway,"lua","close",{gateway_epoch,connection_id})`。Gateway **文件末尾的 Service 分发入口**先调用 `request_close(close_request)`；该函数不执行同步 RPC 给业务 Service。
 
-**【真实源码局部：`gateway/service/gateway/flywow_gateway.lua` / `request_close()`，省略初始参数类型校验】**：
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `request_close()`，省略初始参数类型校验】**：
 
 ```lua
 local connection = module_state.connections[close_request.connection_id]
@@ -2227,7 +2227,7 @@ skynet.send(module_state.gateway_config.handler_service, "lua", "gateway_disconn
 
 ### 5.6 `close_requested` 与 `closed` 不是重复字段
 
-**【真实源码局部：`gateway/service/gateway/flywow_gateway.lua` / `close_transport()`】**：
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `close_transport()`】**：
 
 ```lua
 if connection.close_requested then
@@ -2384,7 +2384,7 @@ bash gateway/sample/master_course/run.sh tcp
 
 ### 6.3 源码深入：run_tcp 和 read_exact
 
-**【真实源码】** `gateway/service/gateway/flywow_gateway.lua`：`accept_client` → `skynet.fork(run_tcp)` → `socket.start(fd)` → `socket.warning` → `read_exact(connection,2)` → `string.unpack(">I2",header)` → 检查阶段所允许的长度 → `read_exact(connection,size)` → `process_handshake` 或 `dispatch_payload`。
+**【真实源码】** `gateway/service/flywow_gateway.lua`：`accept_client` → `skynet.fork(run_tcp)` → `socket.start(fd)` → `socket.warning` → `read_exact(connection,2)` → `string.unpack(">I2",header)` → 检查阶段所允许的长度 → `read_exact(connection,size)` → `process_handshake` 或 `dispatch_payload`。
 
 `read_exact()` 调用固定 Skynet 的 `socket.read(fd,size)`；如果底层数据未读满，当前 **Gateway 的 TCP 读协程挂起**，Socket Driver 持续接收并在满足条件时唤醒它；其他客户端各自的读取协程和其他 Service 不因此全局阻塞。读取前 `connection.read_started=skynet.now()`，读取返回后清除，以供 timeout_loop 判断**当前这一次定长读取**是否超时。
 
@@ -2396,7 +2396,7 @@ bash gateway/sample/master_course/run.sh tcp
 
 ### 6.3.1 把 TCP 读拆成真正的两个等待点
 
-回到 `gateway/service/gateway/flywow_gateway.lua` 的 `run_tcp(connection)`。调用者是 `accept_client` 为每一条 TCP 连接 fork 的读协程，传入的 `connection` 已经存入双索引，但 `socket.start(fd)` 可能尚未完成 Socket pool 接管。
+回到 `gateway/service/flywow_gateway.lua` 的 `run_tcp(connection)`。调用者是 `accept_client` 为每一条 TCP 连接 fork 的读协程，传入的 `connection` 已经存入双索引，但 `socket.start(fd)` 可能尚未完成 Socket pool 接管。
 
 **【真实源码局部：`run_tcp()`，已省略 warning 注册与错误日志】**：
 
@@ -2447,7 +2447,7 @@ Socket 收到第3批: E9 07 1A 03 08 E9 07 -> body 满10B，read_exact 返回完
 
 ### 6.3.2 `read_exact()` 为什么要在 yield 后再次检查 `closed`
 
-**【真实源码：`gateway/service/gateway/flywow_gateway.lua` / `read_exact()` 关键实现】**：
+**【真实源码：`gateway/service/flywow_gateway.lua` / `read_exact()` 关键实现】**：
 
 ```lua
 local function read_exact(connection, size)
@@ -2709,13 +2709,13 @@ JS
 
 ### 8.1 已有背压处理的真实边界
 
-**【真实源码】** `gateway/service/gateway/flywow_gateway.lua` 的 TCP `socket.warning` 回调、`ws_handler.warning`、`close_transport(force_shutdown)`。固定 Skynet 首次写队列警告约从 1 MiB 发生，后续按底层 warning 粒度触发；`write_warning_close_kb` 只在**收到 warning 时**判断，**不是精确的 1 KiB/64 KiB 内存硬阈值**。`size==0` 是缓冲恢复通知，不属于背压超限。超过配置时 TCP 和 WS 都通过显式 `force_shutdown=true` 使用 `socket.shutdown`，随后仍走对应 transport 清理。
+**【真实源码】** `gateway/service/flywow_gateway.lua` 的 TCP `socket.warning` 回调、`ws_handler.warning`、`close_transport(force_shutdown)`。固定 Skynet 首次写队列警告约从 1 MiB 发生，后续按底层 warning 粒度触发；`write_warning_close_kb` 只在**收到 warning 时**判断，**不是精确的 1 KiB/64 KiB 内存硬阈值**。`size==0` 是缓冲恢复通知，不属于背压超限。超过配置时 TCP 和 WS 都通过显式 `force_shutdown=true` 使用 `socket.shutdown`，随后仍走对应 transport 清理。
 
 本课程不靠给两名玩家狂发公告模拟一个不受控的真实网络压力测试。使用仓库已有 `gateway/tests/gateway_async_test.lua` 查看模拟 warning 的断言，再结合 Skynet `lualib/skynet/socket.lua` 的 `socket.warning`、`socket.shutdown` 以及 `skynet-src/socket_server.c` 的 warning 机制，理解真实可达的回调时机。**模拟测试通过只证明回调逻辑，不等于真实 TCP/WS 高负载已测。**
 
 ### 8.2 stop 的状态和资源 owner
 
-**【真实源码】** `gateway/service/gateway/flywow_gateway.lua`：`stop()`：
+**【真实源码】** `gateway/service/flywow_gateway.lua`：`stop()`：
 
 ```text
 WorldService 的监视协程
@@ -2751,7 +2751,7 @@ WorldService 恢复，检查 ok 与 closed_connections；本课程结束进程
 
 前面的实验 E 看到了约半秒后连接断开。现在进入执行原因。**调用者**：Gateway `start()` 完成监听后执行 `skynet.fork(timeout_loop)`；它是 Gateway Lua State 中的一条独立扫描协程，不属于某个客户端。该协程每 `skynet.sleep(10)`（按本工程 10ms tick 约 100ms）醒来一次，检查当时登记在 `module_state.connections` 的全部连接。
 
-**【真实源码局部：`gateway/service/gateway/flywow_gateway.lua` / `timeout_loop()`】**：
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `timeout_loop()`】**：
 
 ```lua
 while module_state.phase == "running" do
@@ -2819,7 +2819,7 @@ WS 的对应行为：`websocket.accept` 所在的会话协程正读下一个 WS 
 
 已有 Gateway 的 TCP `socket.warning(fd,callback)` 和 WS `ws_handler.warning(ws_obj,size)`，最终都依据 `size >= write_warning_close_kb` 判断是否 `detach_connection` 并 `close_transport(...,true)`。但触发入口的 `size` 来自**Skynet 底层写缓冲告警，单位 KB**；它不是 Gateway 每次 `socket.write` 之后主动同步检查的队列大小。
 
-**【真实源码局部：`gateway/service/gateway/flywow_gateway.lua` / `ws_handler.warning()`】**：
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `ws_handler.warning()`】**：
 
 ```lua
 function ws_handler.warning(ws_object, size)
@@ -2859,7 +2859,7 @@ Skynet 源码明确提示 `shutdown` 以后仍需要后续 close；因此当前 
 
 进入终局时，WorldService 的监视协程调用 `skynet.call(state.gateway,"lua","stop")`，这是**控制面 RPC**。Gateway 在自己的消息分发入口进入 `stop()`，等待由它管理的 Socket 资源回收后返回 `FlyWowResult`；并非进程收到一个特殊的全局退出信号。
 
-**【真实源码局部：`gateway/service/gateway/flywow_gateway.lua` / `stop()`，按阶段整理关键语句】**：
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `stop()`，按阶段整理关键语句】**：
 
 ```lua
 if module_state.phase == "stopped" then
@@ -2925,7 +2925,7 @@ module_state.phase = "stopped"
 
 | 真正的生产文件                               | 本课程何时进入              | 阅读后必须掌握的东西                                                                                                                                                                                |
 | -------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gateway/service/gateway/flywow_gateway.lua` | 启动、接收请求、回包、关闭  | `start/normalize_config/accept_client/run_tcp/read_exact/ws_handler.message/dispatch_payload/deliver_outbound_message/request_close/detach_connection/close_transport/timeout_loop/stop` 的调用顺序 |
+| `gateway/service/flywow_gateway.lua` | 启动、接收请求、回包、关闭  | `start/normalize_config/accept_client/run_tcp/read_exact/ws_handler.message/dispatch_payload/deliver_outbound_message/request_close/detach_connection/close_transport/timeout_loop/stop` 的调用顺序 |
 | `gateway/tools/generate_gateway_registry.py` | 第一阶段生成协议表 | 直接输出按数字 command ID 查询的消息类型映射 |
 | `gateway/lualib/codec.lua`                   | 第一条业务请求              | `init/decode_envelope/decode_request/encode_response`：Descriptor 与 pb 编解码                                                                                                                       |
 | `gateway/lualib/handshake.lua`               | 连接握手                    | `accept/receive/confirm/ready/expired/close` 和握手上下文所有权                                                                                                                                     |
