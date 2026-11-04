@@ -51,11 +51,10 @@ function M.init(handshake_config)
             "crypto.create_context and now function are required"
         )
     end
-    if math.type(candidate_timeout_ms) ~= "integer" or candidate_timeout_ms < 1 or
-        candidate_timeout_ms > flywow_common.MAX_TIMEOUT_MS then
+    if math.type(candidate_timeout_ms) ~= "integer" or candidate_timeout_ms < 1 then
         return flywow_result.failure(
             "HANDSHAKE_CONFIG_INVALID",
-            "timeout_ms must be a positive integer shorter than half a Skynet clock cycle"
+            "timeout_ms must be a positive integer"
         )
     end
 
@@ -100,7 +99,7 @@ function M.accept()
     }
 end
 
---- 检查握手总期限；通过 common 的 elapsed_ms 处理回绕并按毫秒判断。
+--- 检查从连接建立到现在经过的毫秒数，判断是否达到握手总期限。
 ---@param context HandshakeContext|nil accept 建立的记录；读取 phase 与 started，终态不再检查期限。
 ---@return boolean 是否已超过握手绝对期限。
 function M.expired(context)
@@ -108,8 +107,8 @@ function M.expired(context)
         return false
     end
 
-    -- common.elapsed_ms 处理 tick 回绕并返回毫秒；握手期限始终以配置毫秒保存。
-    local elapsed_ms = flywow_common.elapsed_ms(context.started, module_state.read_tick()) -- 从 accept 起算的回绕安全时长，单位毫秒。
+    -- common.elapsed_ms 把起始与当前的 tick 差换成毫秒，再与配置期限比较。
+    local elapsed_ms = flywow_common.elapsed_ms(context.started, module_state.read_tick()) -- 从 accept 起算的时长，单位毫秒。
     return elapsed_ms >= module_state.timeout_ms
 end
 

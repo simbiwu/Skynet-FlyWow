@@ -506,9 +506,6 @@ local invalid_configs =
     { max_clients = false },
     { max_clients = 0 },
     { max_clients = 1.5 },
-    { read_timeout_ms = 0x80000000 * 10 },
-    { idle_timeout_ms = 0x80000000 * 10 },
-    { handshake_timeout_ms = 0x80000000 * 10 },
     { read_timeout_ms = false },
     { idle_timeout_ms = false },
     { handshake_timeout_ms = false },
@@ -516,6 +513,13 @@ local invalid_configs =
 for _, invalid_config in ipairs(invalid_configs) do
     scenario(invalid_config, true)
 end
+
+-- 三项期限超过旧半周期上限，仍是合法的正整数毫秒配置。
+scenario({
+    read_timeout_ms      = 0x80000000 * 10, -- 验证读取期限可超过旧半周期上限。
+    idle_timeout_ms      = 0x80000000 * 10, -- 验证空闲期限可超过旧半周期上限。
+    handshake_timeout_ms = 0x80000000 * 10, -- 验证握手期限可超过旧半周期上限。
+}, false, true)
 
 scenario(nil, true, false, true)
 

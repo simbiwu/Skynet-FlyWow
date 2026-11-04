@@ -94,7 +94,7 @@ Gateway 不按请求条数维护每秒接纳窗口，也不根据全实例请求
 
 宿主必须显式提供正整数 max_clients，作为当前 Gateway 实例的连接配额；已接纳但尚未完成握手的连接同样占用它。达到配额时拒绝新连接，不影响已有连接；关闭后归还配额。握手模块只管理逐连接状态、Native 生命周期和绝对期限。
 
-监听使用 socket.listen(host, port)，backlog 由固定 Skynet 默认处理（当前为 32）。TCP/WS 共用 65535 字节业务 Envelope 上限，不提供帧长配置。三项超时继续以毫秒配置，共用 flywow_common.MAX_TIMEOUT_MS 边界，正整数且短于半个 32 位 tick 周期，不施加部署无关的一小时上界。
+监听使用 socket.listen(host, port)，backlog 由固定 Skynet 默认处理（当前为 32）。TCP/WS 共用 65535 字节业务 Envelope 上限，不提供帧长配置。三项超时继续以毫秒配置，均校验为正整数，不施加额外的时钟周期上限。
 
 ## Transport
 

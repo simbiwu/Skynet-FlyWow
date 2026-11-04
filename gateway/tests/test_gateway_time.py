@@ -10,8 +10,8 @@ import unittest
 
 
 class SkynetTimeTests(unittest.TestCase):
-    # 同时验证普通 tick 差和 32 位回绕后的毫秒差。
-    def test_tick_wrap_and_millisecond_elapsed_time(self):
+    # 同时验证普通 tick 差和超过 32 位后的毫秒差。
+    def test_large_tick_and_millisecond_elapsed_time(self):
         lua = os.environ.get("SKYNET_LUA")
         if not lua:
             self.skipTest("需要显式设置 SKYNET_LUA 为 pinned Skynet 的 Lua")

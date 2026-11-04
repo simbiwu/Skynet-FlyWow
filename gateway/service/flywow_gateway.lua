@@ -137,7 +137,7 @@ local function normalize_config(startup_config)
     end
 
     -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
-    validation_result = validate_integer_config(candidate, "read_timeout_ms", 1, flywow_common.MAX_TIMEOUT_MS)
+    validation_result = validate_integer_config(candidate, "read_timeout_ms", 1, math.maxinteger)
     if not validation_result.ok then
         return validation_result
     end
@@ -151,7 +151,7 @@ local function normalize_config(startup_config)
     end
 
     -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
-    validation_result = validate_integer_config(candidate, "idle_timeout_ms", 1, flywow_common.MAX_TIMEOUT_MS)
+    validation_result = validate_integer_config(candidate, "idle_timeout_ms", 1, math.maxinteger)
     if not validation_result.ok then
         return validation_result
     end
@@ -165,7 +165,7 @@ local function normalize_config(startup_config)
     end
 
     -- 仅缺省时补默认值；显式输入原样交给下方整数边界校验。
-    validation_result = validate_integer_config(candidate, "handshake_timeout_ms", 1, flywow_common.MAX_TIMEOUT_MS)
+    validation_result = validate_integer_config(candidate, "handshake_timeout_ms", 1, math.maxinteger)
     if not validation_result.ok then
         return validation_result
     end
@@ -1058,7 +1058,7 @@ end
 
 
 --- 一个扫描协程限制 TCP 半包/空闲读与 WS 握手/空闲占用；不按请求创建 timer。
---- 无参数；最多扫描 max_clients 个连接，tick 回绕用模运算；detach 后关闭会 yield。
+--- 无参数；最多扫描 max_clients 个连接，detach 后关闭会 yield。
 ---@return nil Service 停止后退出；运行期间每 100 ms 扫描并关闭超时连接。
 local function timeout_loop()
     -- 定时检查握手期限、TCP 读超时和客户端完整业务消息空闲期限。
@@ -1076,8 +1076,8 @@ local function timeout_loop()
             local limit_ms = connection.read_started -- 正在等待定长数据时使用读取期限，否则使用连接空闲期限；配置单位始终是毫秒。
                 and module_state.gateway_config.read_timeout_ms
                 or module_state.gateway_config.idle_timeout_ms
-            -- common.elapsed_ms 统一处理 tick 回绕并返回毫秒；超时配置和阈值保持毫秒。
-            local elapsed_ms = flywow_common.elapsed_ms(since, now) -- 当前读取或业务空闲阶段已经过的毫秒数，内部处理 tick 回绕。
+            -- common.elapsed_ms 将两个 Skynet tick 读数的差换成毫秒，与超时配置单位一致。
+            local elapsed_ms = flywow_common.elapsed_ms(since, now) -- 当前读取或业务空闲阶段已经过的毫秒数。
             if handshake_module.expired(connection.handshake) or elapsed_ms >= limit_ms then
                 expired_connections[#expired_connections + 1] = connection
             end
@@ -1101,9 +1101,9 @@ end
 ---@field descriptor_path string 宿主构建生成的 Protobuf descriptor 文件路径。
 ---@field registry_module string 已生成的协议 registry 模块名。
 ---@field protocol_version integer Envelope 使用的协议版本。
----@field read_timeout_ms? integer TCP 定长读取或 WebSocket Upgrade 的读取上限，单位毫秒；默认 30000，小于半个 32 位 tick 周期。
----@field idle_timeout_ms? integer 客户端完整业务消息空闲上限，单位毫秒；默认 300000，小于半个 32 位 tick 周期；WebSocket ping/pong 和服务端 Push 不重置。
----@field handshake_timeout_ms? integer 从连接登记起算的握手总期限，单位毫秒；默认 10000，小于半个 32 位 tick 周期。
+---@field read_timeout_ms? integer TCP 定长读取或 WebSocket Upgrade 的读取上限，单位毫秒；默认 30000。
+---@field idle_timeout_ms? integer 客户端完整业务消息空闲上限，单位毫秒；默认 300000；WebSocket ping/pong 和服务端 Push 不重置。
+---@field handshake_timeout_ms? integer 从连接登记起算的握手总期限，单位毫秒；默认 10000。
 ---@field max_clients integer 宿主显式提供的实例接纳配额，正整数；包含尚未完成握手的连接。
 
 ---@class GatewayStartResult

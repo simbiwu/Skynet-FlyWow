@@ -753,7 +753,7 @@ end
 local command_count = codec_result.value
 ```
 
-配置中的三类 timeout 都使用毫秒。内部保存的是毫秒期限，比较时由 `flywow_common` 处理 Skynet tick 回绕和 10ms 到毫秒的换算。
+配置中的三类 timeout 都使用毫秒。内部保存的是毫秒期限，比较时由 `flywow_common` 把 10ms tick 差换算为毫秒。
 
 这三步按顺序发生在 `socket.listen()` 之前。它们分别准备 Protobuf 编解码器、加载 Native 握手模块、初始化当前 Service 的握手模块。只有三步都成功，Gateway 才把结果放进自己的 `module_state`，然后创建 listener。
 
@@ -795,7 +795,7 @@ codec 先检查这两个字段的类型，再打开 `descriptor_path` 读取全�
 | `now` | `skynet.now` 函数本身 | 握手模块需要判断期限时再读取当前时钟；这里没有写 `skynet.now()`，所以传入的不是一个固定 tick 数值 |
 | `timeout_ms` | `handshake_timeout_ms` 配置值 | 从连接登记起算的绝对期限，单位毫秒；例如 `10000` 表示 10 秒，握手消息不会延长它 |
 
-`now`返回10ms tick；`timeout_ms`保持毫秒单位。状态机调用 `flywow_common.elapsed_ticks(started_tick, current_tick)` 处理回绕，需要毫秒时直接调用 `flywow_common.elapsed_ms(started_tick, current_tick)`；该接口同样处理 tick 回绕。
+`now`返回10ms tick；`timeout_ms`保持毫秒单位。状态机调用 `flywow_common.elapsed_ticks(started_tick, current_tick)` 计算两个读数的 tick 差，需要毫秒时直接调用 `flywow_common.elapsed_ms(started_tick, current_tick)`；该接口把 tick 差乘以 10。
 
 初始化函数检查 Native 的 `create_context` 接口、时钟与期限。校验通过后保存当前 Service 的依赖和配置，返回空成功 Result；参数无效返回 HANDSHAKE_CONFIG_INVALID。init 不创建实例表，也不创建连接或 Native userdata。
 

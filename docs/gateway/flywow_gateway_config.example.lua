@@ -68,7 +68,7 @@ return
 
     -- 当前 Gateway 实例的在线连接上限，包含尚未完成握手的连接；必须显式提供正整数。
     max_clients                   = 1024,
-    -- 握手总期限，单位毫秒；10000 表示 10 秒，正整数且小于半个 32 位 tick 周期。
+    -- 握手总期限，单位毫秒；10000 表示 10 秒，须为正整数。
     handshake_timeout_ms          = 10000,
     -- TCP 定长读取或 WebSocket Upgrade 的单次读取期限，单位毫秒；默认 30000（30 秒）。
     read_timeout_ms               = 30000,

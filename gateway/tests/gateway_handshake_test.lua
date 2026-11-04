@@ -39,6 +39,10 @@ local init_result = handshake_module.init(
 }
 )
 assert(init_result.ok, init_result.message)
+-- 握手模块单独初始化时也接受超过旧半周期上限的正整数期限。
+local long_timeout_result = handshake_module.init({crypto = crypto, now = function() return now end, timeout_ms = 0x80000000 * 10})
+assert(long_timeout_result.ok, long_timeout_result.message)
+assert(handshake_module.init({crypto = crypto, now = function() return now end, timeout_ms = 1000}).ok)
 local hello = string.char(1, 1, 4) .. string.rep("a", 64)
 local proof = string.char(3) .. string.rep("p", 32)
 local a = handshake_module.accept() -- 本次连接初始状态。
@@ -71,12 +75,12 @@ now = 100
 assert(handshake_module.expired(e))
 assert(not handshake_module.receive(e, proof).ok)
 assert(closed == 3)
--- tick回绕也按绝对期限，不随HELLO刷新。
+-- tick 超过 32 位后仍按起始时间计算期限，不随 HELLO 刷新。
 now = 0xfffffff0
 local f = handshake_module.accept()
-now = 0x20
+now = 0x100000020
 assert(not handshake_module.expired(f))
-now = 0x60
+now = 0x100000060
 assert(handshake_module.expired(f))
 handshake_module.close(f)
 -- READY 已生成但尚未写出时到达绝对期限，confirm 仍须拒绝并释放 Native 对象。
