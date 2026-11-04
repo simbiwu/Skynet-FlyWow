@@ -54,11 +54,9 @@ return
     host                          = "127.0.0.1",
     -- 监听端口；Lua integer，合法范围 1..65535；多个实例不能占用同一地址端口。
     port                          = 19001,
-    -- 监听队列上限；Lua integer，合法范围 1..65535；不等于 max_clients。
-    backlog                       = 128,
     -- 传输类型；只能是 tcp 或 websocket；一个 Gateway Service 生命周期内固定一种类型。
     transport                     = "tcp",
-    -- WebSocket 子协议；当前只支持 ws。TLS/WSS 必须由宿主前置终止。
+    -- WebSocket 使用 ws，TLS/WSS 由宿主前置终止。
 
     -- protoc 生成的 FileDescriptorSet；Gateway 用它加载 Envelope/request/response 类型。
     -- 它不是 .proto 源文件，也不是 registry；文件必须在 start 时可读。
@@ -68,22 +66,12 @@ return
     -- Envelope 协议兼容版本；Client、descriptor 和 registry 必须来自同一协议发布版本。
     protocol_version              = 4,
 
-    -- 当前 Gateway 实例的在线连接上限，包含尚未完成握手的连接；合法范围 1..1000000。
+    -- 当前 Gateway 实例的在线连接上限，包含尚未完成握手的连接；必须显式提供正整数。
     max_clients                   = 1024,
-    -- 待握手连接上限；合法范围 1..max_clients，超过后拒绝新握手，避免握手资源无界增长。
-    max_pending_handshakes        = 128,
-    -- 握手总期限，单位毫秒；10000 表示 10 秒，合法范围 1..3600000。
+    -- 握手总期限，单位毫秒；10000 表示 10 秒，正整数且小于半个 32 位 tick 周期。
     handshake_timeout_ms          = 10000,
     -- TCP 定长读取或 WebSocket Upgrade 的单次读取期限，单位毫秒；默认 30000（30 秒）。
     read_timeout_ms               = 30000,
     -- 客户端完整业务消息空闲期限，单位毫秒；默认 300000（5 分钟），WebSocket ping/pong 和服务端 Push 不重置。
     idle_timeout_ms               = 300000,
-    -- 单个业务 Envelope 最大字节数；TCP uint16 framing 上限为 65535；不限制底层传输接收内存。
-    max_frame_bytes               = 65535,
-    -- 每连接一秒最多接纳 200 个业务请求；超限关闭该来源连接。
-    max_requests_per_second       = 200,
-    -- 整个 Gateway 一秒最多接纳 10000 个请求；超限关闭触发上限的连接。
-    max_total_requests_per_second = 10000,
-    -- 收到 Skynet 写缓冲 warning 后，回调 size 达到此 KB 值时关闭；底层从 1 MiB 起按告警粒度通知，不是精确内存上限。
-    write_warning_close_kb        = 1024,
 }

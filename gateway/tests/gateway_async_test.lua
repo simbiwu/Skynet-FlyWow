@@ -16,8 +16,9 @@ local READY = string.char(4) .. string.rep("r", 32) -- 密码替身输出的固�
 ---@param overrides table|nil 可覆盖 TCP/WebSocket 模式等本场景启动配置；不会修改调用方的 table。
 ---@param expect_start_failure boolean|nil true 时要求启动以配置错误失败，用于验证显式非法值。
 ---@param use_real_handshake boolean|nil true 时加载真实 Lua 状态机，只替换密码运算。
+---@param omit_capacity boolean|nil true 时故意缺失宿主连接配额，验证必填合同。
 ---@return table 包含替身状态、注入入口和已注册 Service 命令回调的测试场景。
-local function scenario(overrides, expect_start_failure, use_real_handshake)
+local function scenario(overrides, expect_start_failure, use_real_handshake, omit_capacity)
     local e = -- 当前场景的可控观测状态，由替身写入并由断言读取。
     {
         now     = 0,
@@ -40,12 +41,18 @@ local function scenario(overrides, expect_start_failure, use_real_handshake)
     {
         host             = "127.0.0.1",
         port             = 19021,
-        protocol_version = 4,
-        descriptor_path  = "stub",
-        registry_module  = "test.registry",
+        protocol_version = 4, -- 与测试 Envelope 的业务版本一致。
+        max_clients      = 1024, -- 测试宿主显式分配的连接配额，不依赖框架默认值。
+        descriptor_path  = "stub", -- 本场景 Codec 替身不读取磁盘，保留必需的配置形状。
+        registry_module  = "test.registry", -- 指向本场景安装的命令 Registry 替身。
     }
     for k, v in pairs(overrides or {}) do
         config[k] = v
+    end
+
+    -- 缺省场景显式分配容量；此开关专门让启动入口观察缺失必填字段。
+    if omit_capacity then
+        config.max_clients = nil
     end
 
     -- 注册 Skynet 替身，记录消息和协程，不启动真实 Service 调度。
@@ -167,7 +174,7 @@ local function scenario(overrides, expect_start_failure, use_real_handshake)
     -- Gateway 的业务帧上限不依赖 socket.limit 的传输缓冲行为。
     ---@return nil 若 Gateway 调用该接口则说明重新引入了无效限制。
     function socket.limit()
-        error("Gateway must not use socket.limit for max_frame_bytes")
+        error("Gateway must not use socket.limit as an Envelope memory cap")
     end
 
     -- 警告回调无需触发，真实集成另测写队列。
@@ -391,9 +398,9 @@ local function scenario(overrides, expect_start_failure, use_real_handshake)
         -- 每个连接使用独立替身上下文；真实密码学握手由 Native 测试覆盖。
         init = function() return flywow_result.success() end,
 
-                ---@return FlyWowResult<table> 测试握手上下文；调用方负责在连接结束时关闭。
+                ---@return table 测试握手上下文；调用方负责在连接结束时关闭。
                 accept = function()
-                    return flywow_result.success({})
+                    return {}
                 end,
                 ---@return nil 释放测试握手上下文。
                 close = function()
@@ -418,7 +425,7 @@ local function scenario(overrides, expect_start_failure, use_real_handshake)
     -- 组合边界场景使用真实 receive/confirm/close；文件 userdata 只替代 Native 的密码运算与释放动作。
     if use_real_handshake then
         package.loaded["handshake"] = nil
-        e.handshake = require "handshake" -- 本场景真实模块；通过公开 accept/close 检查名额是否归还。
+        e.handshake = require "handshake" -- 本场景真实模块；验证握手状态和 Native 对象释放。
         e.crypto_closed = 0 -- 记录此场景实际释放的密码对象数量。
         local crypto = {} -- 固定 Native 合同的可控密码替身，不替换 Lua 状态机。
         --- Gateway 状态机收到 HELLO 时创建独占 userdata，普通密码错误返回 nil/error。
@@ -492,27 +499,25 @@ local function frame(id)
     return string.pack(">I2", #payload) .. payload
 end
 
-local invalid_optional_configs =
+local invalid_configs =
 {
     { host = false },
     { transport = false },
-    { max_frame_bytes = false },
     { max_clients = false },
-    { write_warning_close_kb = false },
-    { backlog = false },
+    { max_clients = 0 },
+    { max_clients = 1.5 },
+    { read_timeout_ms = 0x80000000 * 10 },
+    { idle_timeout_ms = 0x80000000 * 10 },
+    { handshake_timeout_ms = 0x80000000 * 10 },
     { read_timeout_ms = false },
-    { read_timeout_ticks = 3000 },
     { idle_timeout_ms = false },
-    { idle_timeout_ticks = 30000 },
-    { max_requests_per_second = false },
-    { max_total_requests_per_second = false },
-    { max_pending_handshakes = false },
     { handshake_timeout_ms = false },
-    { handshake_timeout_ticks = 1000 },
 }
-for _, invalid_config in ipairs(invalid_optional_configs) do
+for _, invalid_config in ipairs(invalid_configs) do
     scenario(invalid_config, true)
 end
+
+scenario(nil, true, false, true)
 
 local e = scenario()
 e.streams[10] = frame(1) .. frame(2)
@@ -636,19 +641,16 @@ e.accept(12, "peer")
 resume(e.forks[2])
 assert(e.closed[12], "WebSocket accept exceptions must release the accepted fd")
 assert(e.sends[1][2] == "gateway_disconnect", "failed WebSocket accept must detach its connection")
--- 慢客户端达到写缓冲阈值时，关闭必须使用底层强制释放路径。
-e = scenario({ write_warning_close_kb = 2 })
+-- 慢客户端收到非零写缓冲告警时，关闭必须使用底层强制释放路径。
+e = scenario()
 e.accept(10, "slow-peer")
 resume(e.forks[2])
 local tcp_log_count = #e.logs
 e.warning(10, 0)
 assert(#e.logs == tcp_log_count and not e.closed[10], "TCP recovery notification must be ignored")
 e.warning(10, 1)
-assert(#e.logs == tcp_log_count + 1 and not e.closed[10],
-    "TCP nonzero warning below the configured threshold must be logged without closing")
-e.warning(10, 2)
-e.warning(10, 2)
-assert(e.shutdown[10] and e.closed[10], "TCP warning at the configured threshold must force-close the socket")
+e.warning(10, 1)
+assert(e.shutdown[10] and e.closed[10], "TCP nonzero warning must force-close the socket")
 assert(e.shutdown_count == 1, "repeated TCP warnings must shut down only once")
 assert(e.sends[#e.sends][2] == "gateway_disconnect", "TCP backpressure must release the connection")
 
@@ -669,18 +671,15 @@ for _, failure_result in ipairs({ false, "nil" }) do
 end
 
 -- WebSocket warning uses a different reason string; the explicit force flag must still shut down.
-e = scenario({ transport = "websocket", write_warning_close_kb = 2 })
+e = scenario({ transport = "websocket" })
 e.accept(11, "slow-ws-peer")
 resume(e.forks[2])
 local ws_log_count = #e.logs
 e.ws.warning({ id = 11 }, 0)
 assert(#e.logs == ws_log_count and not e.closed[11], "WebSocket recovery notification must be ignored")
 e.ws.warning({ id = 11 }, 1)
-assert(#e.logs == ws_log_count + 1 and not e.closed[11],
-    "WebSocket nonzero warning below the configured threshold must be logged without closing")
-e.ws.warning({ id = 11 }, 2)
-e.ws.warning({ id = 11 }, 2)
-assert(e.shutdown[11] and e.closed[11], "WebSocket warning at the configured threshold must force-close the socket")
+e.ws.warning({ id = 11 }, 1)
+assert(e.shutdown[11] and e.closed[11], "WebSocket nonzero warning must force-close the socket")
 assert(e.shutdown_count == 1 and e.ws_close_count == 1,
     "repeated WebSocket warnings must release transport objects only once")
 assert(e.sends[#e.sends][2] == "gateway_disconnect", "WebSocket backpressure must detach the connection")
@@ -756,29 +755,62 @@ e.ws.message(31, "2", "binary")
 e.ws.close(31)
 assert(e.ws_close_count == 1, "late callbacks must not close transport twice")
 
--- 单连接和实例预算分别生效；100 tick 边界重新开放完整一秒预算。
-e = scenario({ transport = "websocket", max_requests_per_second = 2 })
-e.accept(32, "rate")
+-- 宿主连接总配额包括未完成握手的连接；拒绝的新 fd 不进入读取协程。
+e = scenario({ transport = "websocket", max_clients = 1 }, false, true)
+e.first_ws_message = HELLO
+e.accept(32, "handshake-holds-capacity")
 resume(e.forks[2])
-e.ws.message(32, "2", "binary")
-e.now = 100
-e.ws.message(32, "3", "binary")
-assert(not e.closed[32], "connection window must reset at 100 ticks")
-e.ws.message(32, "4", "binary")
-e.ws.message(32, "5", "binary")
-assert(e.closed[32], "connection limit must reject the first excess request")
+assert(e.crypto_closed == 0 and #e.writes == 1)
+local fork_count = #e.forks -- 未完成握手已占用唯一连接配额，下一条连接不能创建协程。
+e.accept(33, "over-capacity")
+assert(e.closed[33] and #e.forks == fork_count and not e.closed[32])
+e.ws.close(32)
+assert(e.crypto_closed == 1)
+e.accept(34, "capacity-reused-after-close")
+assert(not e.closed[34] and #e.forks == fork_count + 1)
 
-e = scenario({ transport = "websocket", max_total_requests_per_second = 2 })
-e.accept(33, "total-a")
+-- 容量和期限只受真实数值合同约束，不再使用部署无关的百万/一小时上界。
+scenario(
+{
+    max_clients          = math.maxinteger, -- 只验证 Lua integer 表示边界，不宣称可承载此数量连接。
+    read_timeout_ms      = 3600001, -- 超过一小时仍为合法读取期限。
+    idle_timeout_ms      = 3600001, -- 超过一小时仍为合法业务空闲期限。
+    handshake_timeout_ms = 3600001, -- 与独立握手模块的时钟边界保持一致。
+}, false, true)
+
+-- TCP 长度头决定的固定 65535 字节边界同样用于 WS 入站；越界不能进入 handler。
+e = scenario({ transport = "websocket" })
+e.accept(35, "frame-boundary")
 resume(e.forks[2])
-e.accept(34, "total-b")
-resume(e.forks[3])
-e.now = 100
-e.ws.message(33, "2", "binary")
-e.ws.message(34, "2", "binary")
-assert(not e.closed[33] and not e.closed[34], "instance window must reset")
-e.ws.message(34, "3", "binary")
-assert(e.closed[34] and not e.closed[33], "instance excess closes only its source")
+local before_boundary = #e.sends -- 完整合法边界帧应恰好多投递一次业务请求。
+e.ws.message(35, string.rep("x", 65535), "binary")
+assert(#e.sends == before_boundary + 1 and not e.closed[35])
+e.ws.message(35, string.rep("x", 65536), "binary")
+assert(e.closed[35] and e.sends[#e.sends][2] == "gateway_disconnect")
+
+-- 出站同样允许完整边界，超长编码结果只拒绝本次发送，不向 Socket 提交无效帧。
+for _, transport in ipairs({ "tcp", "websocket" }) do
+    e = scenario({ transport = transport })
+    e.accept(36, "outbound-boundary")
+    resume(e.forks[2])
+    local before_writes = #e.writes -- 边界响应只应增加一次 transport 写入。
+    e.dispatch(0, 7, "send_data",
+    {
+        gateway_epoch = "99:12345", -- 与替身时钟固定的 Gateway 实例身份一致。
+        connection_id = 1, -- 本场景唯一已 ready 的逻辑连接。
+        command_id    = 1001, -- 测试 Registry 中支持响应编码的命令。
+        data          = { result = string.rep("x", 65535) }, -- Codec 替身直接输出指定长度。
+    })
+    assert(#e.writes == before_writes + 1 and not e.closed[36])
+    e.dispatch(0, 7, "send_data",
+    {
+        gateway_epoch = "99:12345", -- 保持同一实例与连接，只改变本条响应大小。
+        connection_id = 1, -- 本场景仍活跃的唯一连接。
+        command_id    = 1001, -- 复用同一响应编码入口。
+        data          = { result = string.rep("x", 65536) }, -- 超出协议长度头所能表达的范围。
+    })
+    assert(#e.writes == before_writes + 1 and not e.closed[36])
+end
 
 -- TCP 启动失败保留具体退出诊断，外层仍负责释放未接管 fd。
 e = scenario()
@@ -799,7 +831,7 @@ assert(e.sends[#e.sends][2] == "gateway_disconnect")
 
 -- 用真实 Lua 状态机验证 Socket 写入与最终确认之间的业务门禁；不依赖内部 phase 字段断言。
 for _, transport in ipairs({ "tcp", "websocket" }) do
-    e = scenario({ transport = transport, max_pending_handshakes = 1, handshake_timeout_ms = 1000 }, false, true)
+    e = scenario({ transport = transport, handshake_timeout_ms = 1000 }, false, true)
     e.first_ws_message = HELLO
     e.streams[50] = string.pack(">s2", HELLO) .. string.pack(">s2", PROOF)
     e.on_write = function()
@@ -822,13 +854,10 @@ for _, transport in ipairs({ "tcp", "websocket" }) do
     assert(e.writes[1][2] == expected_challenge and e.writes[2][2] == expected_ready)
     e.dispatch(0, 7, "send_data", { gateway_epoch = "99:12345", connection_id = 1, command_id = 1001, data = { result = 7 } })
     assert(#e.writes == 3, "ready connection must allow business after the final write")
-    local available = e.handshake.accept() -- 成功确认应释放唯一名额。
-    assert(available.ok and not e.handshake.accept().ok)
-    e.handshake.close(available.value)
 
     -- 挑战写失败、READY 写失败、写后确认过期与 Native 两种普通失败都必须清理并留下准确诊断。
     for _, failure_case in ipairs({ "challenge_write", "ready_write", "expired_confirm", "crypto", "proof" }) do
-        e = scenario({ transport = transport, max_pending_handshakes = 1, handshake_timeout_ms = 1000 }, false, true)
+        e = scenario({ transport = transport, handshake_timeout_ms = 1000 }, false, true)
         e.first_ws_message = HELLO
         e.fail_write_number = failure_case == "challenge_write" and 1 or failure_case == "ready_write" and 2 or nil
         e.advance_on_verify = failure_case == "expired_confirm" and 100 or nil
@@ -855,9 +884,6 @@ for _, transport in ipairs({ "tcp", "websocket" }) do
             assert(logs:find("HANDSHAKE_WRITE_FAILED", 1, true))
         end
         assert(e.crypto_closed == (failure_case == "crypto" and 0 or 1))
-        local released = e.handshake.accept() -- 失败必须归还一个名额，不能多扣或多归还。
-        assert(released.ok and not e.handshake.accept().ok)
-        e.handshake.close(released.value)
     end
 end
 print("GATEWAY_ASYNC_UNIT_OK")

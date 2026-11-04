@@ -84,7 +84,6 @@ skynet.start(function()
     gateway_config.port = SAMPLE_PORT
     gateway_config.transport = SAMPLE_TRANSPORT
     gateway_config.max_clients = 4
-    gateway_config.max_pending_handshakes = 4
 
     local gateway_start_result = skynet.call(module_state.gateway_service_handle, "lua", "start", gateway_config) -- Gateway start 返回的 FlyWowResult。
     if not gateway_start_result.ok then

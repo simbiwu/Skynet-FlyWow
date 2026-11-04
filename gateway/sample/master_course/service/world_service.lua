@@ -131,7 +131,6 @@ skynet.start(function()
         registry_module               = "world_registry", -- 当前课程生成的 Lua Registry。
         protocol_version              = 4, -- Envelope 的业务协议版本。
         max_clients                   = 4, -- 本例最多同时接入 4 个客户端。
-        max_requests_per_second       = tonumber(os.getenv("GATEWAY_COURSE_RPS")) or 200, -- 故障实验可缩小接纳速率。
         idle_timeout_ms              = tonumber(os.getenv("GATEWAY_COURSE_IDLE_MS")) or 300000, -- 完整业务消息空闲期限，单位毫秒。
     }
 

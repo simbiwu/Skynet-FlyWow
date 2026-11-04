@@ -4,7 +4,7 @@
 >
 > 源码基线：`simbiwu/Skynet-FlyWow` `7509b289fdd05a63b24c9c11b2a1eafc1e836a4a`（2026-10-29）。Skynet 固定 `v1.8.0`，Lua 使用该 Skynet 自带版本，协议版本 `4`；宿主协议工具固定版本以 `shared/protocol/VERSIONS.env` 为准。
 >
-> **代码身份**：标为「亲手新建」的是本课程的完整教学文件，不是仓库现存源码；标为「真实源码」的路径、函数、合同已在上述提交中核对；日志均为**预期现象，不是本课程实测结果**。课程中的运行日志为预期现象。LuaBinding 相关片段已同步本次工作区接口简化；本轮未编译或运行验证。
+> **代码身份**：标为「亲手新建」的是本课程的完整教学文件，不是仓库现存源码；标为「真实源码」的路径、函数、合同已在上述提交中核对；日志均为**预期现象，不是本课程实测结果**。课程中的运行日志为预期现象。LuaBinding 相关片段已同步本次工作区接口简化；历史源码深读不等于全量验证；C++ 主线的本轮验证记录见文末。
 
 ---
 
@@ -17,7 +17,7 @@
 我们真正研究的是 Gateway，世界场景仅在一个小型 Lua Service 的 table 中保存两条连接记录。学完应该能沿真实源码解释：
 
 ```text
-Node 客户端
+C++17 TCP 客户端
   -> TCP/WS 建连
   -> CLIENT_HELLO -> SERVER_CHALLENGE -> CLIENT_PROOF -> SERVER_READY
   -> Envelope{version=4, command=1001, body=EnterWorldRequest{player_id=1001}}
@@ -30,13 +30,13 @@ Node 客户端
   -> gateway_disconnect / 清理连接 / stop
 ```
 
-**课程分六阶段**：协议与构建；启动及握手；一条请求与响应；两个客户端与 Push；TCP 对照；故障与生命周期。第一阶段开始就把工程文件逐一写出来；后续阶段通过真实现象进入函数内部，不分散成互不关联的 API 讲义。
+**课程分六阶段**：协议与构建；启动及握手；一条请求与响应；两个客户端与 Push；TCP 读循环深入与 WS 对照；故障与生命周期。第一阶段开始就把工程文件逐一写出来；后续阶段通过真实现象进入函数内部，不分散成互不关联的 API 讲义。
 
 **源码阅读约定**：教程中「亲手新建/完整替换」代码块才是应复制实施的完整文件；「真实源码局部」为从固定提交中选择的关键语句，可能删去源文件中的注释、日志或错误分支，并用“省略”提示衔接，**不是可以直接替换生产文件的完整函数**。读到这类片段时先确认入口及调用者，再阅读仓库中同名函数的完整上下文。时间线与示例 fd、tick 是为了推导而设的数值，不代表实际日志。每个源码专题的最后都要回到真实业务主线。
 
 ### 工程约束和真正的「从零」
 
-从空目录 `gateway/sample/master_course/` 开始。只使用 FlyWow 当前公开接口；不修改 Gateway、Skynet 或任何第三方源码。不使用现成 `gateway/sample/` 中的协议、客户端或运行入口，也不使用以前的 Battle/Lesson 3 协议。**仅复用已经安装并固定版本的基础工具链**：Skynet 及其自带 Lua、lua-protobuf、protoc、OpenSSL 3，以及 FlyWow 自身的 Registry 生成器、Native 构建脚本和 H5 握手 SDK。
+从空目录 `gateway/sample/master_course/` 开始。只使用 FlyWow 当前公开接口；不修改 Gateway、Skynet 或任何第三方源码。不使用现成 `gateway/sample/` 中的协议、客户端或运行入口，也不使用以前的 Battle/Lesson 3 协议。**仅复用已经安装并固定版本的基础工具链**：Skynet 及其自带 Lua、lua-protobuf、protoc、OpenSSL 3，以及 FlyWow 自身的 Registry 生成器、Native 构建脚本。
 
 以下命令约定真实仓库布局：
 
@@ -52,14 +52,23 @@ skynet-battle-navigation-commercial-learning/
 └── shared/protocol/VERSIONS.env
 ```
 
-使用 WSL2/Linux，从**宿主仓库根目录**准备环境；以下脚本来自真实宿主工程，不是旧课程步骤：
+使用 WSL2/Linux。缺少 C++/OpenSSL 开发工具时先安装 Ubuntu 工具包：
+
+~~~bash
+sudo apt-get install build-essential libssl-dev
+~~~
+
+sudo 以管理员权限调用 apt-get；install 安装具名软件包，build-essential 提供编译工具，libssl-dev 提供 OpenSSL 头文件和 libcrypto。已有依赖时跳过。
+
+随后从**宿主仓库根目录**准备环境；以下脚本来自真实宿主工程，不是旧课程步骤：
 
 ```bash
 bash server/scripts/linux/build_skynet.sh
 bash server/scripts/linux/bootstrap_protocol_tools.sh
 bash server/scripts/linux/build_lua_protobuf.sh
 bash server/third_party/skynet-flywow/scripts/build_flywow.sh server/third_party/skynet gateway
-node --version     # 要求 Node.js 22+ 且支持 Web Crypto、WebSocket
+g++ --version      # 要求 C++17 编译器
+openssl version    # 要求 OpenSSL 3 开发工具，安装方法见 4.3
 ```
 
 `bootstrap_protocol_tools.sh` 按 `VERSIONS.env` 拉取固定版本的构建依赖；不可自行替换或更改第三方源码。若本地工具链已经具备，可跳过重复构建。以下命令默认在 **`server/third_party/skynet-flywow`（FlyWow 根目录）**执行；`run.sh` 会自己切换到宿主 `server/` 作为 Skynet 的工作目录。
@@ -77,10 +86,8 @@ gateway/sample/master_course/
 ├── service/
 │   └── world_service.lua
 ├── client/
-│   ├── protobuf.mjs
-│   ├── world_scenario.mjs
-│   ├── websocket_client.mjs
-│   └── tcp_client.mjs
+│   ├── world_client.cpp        # 第 4 节主线客户端
+│   └── world_faults.cpp        # 第 7 节故障实验入口
 ├── skynet_config.lua
 ├── bootstrap.sh
 ├── build_protocol.sh
@@ -315,7 +322,7 @@ skynet.start(function()
     end)
 
     local gateway = skynet.newservice("flywow_gateway")
-    local transport = os.getenv("GATEWAY_COURSE_TRANSPORT") or "websocket"
+    local transport = os.getenv("GATEWAY_COURSE_TRANSPORT") or "tcp"
     local port = tonumber(os.getenv("GATEWAY_COURSE_PORT")) or 19221
     local config =
     {
@@ -376,7 +383,7 @@ SKYNET_ROOT="$SERVER_ROOT/third_party/skynet"
 # for 会把列表中的工具名逐个放进 tool；例如第一轮 tool=curl、下一轮 tool=python3。
 # command -v 在 PATH 中查找该命令；重定向丢弃探测输出，只保留成功或失败状态。
 # 检查本课程后续会直接使用的构建和运行命令。
-for tool in bash curl python3 tar cmake make cc c++ node timeout; do
+for tool in bash curl python3 tar cmake make cc c++ g++ openssl timeout; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         printf '缺少必需工具：%s\n' "$tool" >&2
         exit 1
@@ -421,17 +428,17 @@ printf 'GATEWAY_MASTER_COURSE_PREPARE_OK\n'
 
 ### 2.4 亲手新建 `run.sh`
 
-路径：`gateway/sample/master_course/run.sh`。这个脚本只编排**本课程**：`prepare` 调用 `bootstrap.sh` 准备依赖；普通运行检查固定产物、生成本课协议并启动真实 Skynet。命令 `bash .../run.sh websocket server` 仅在前台启动服务器，供分阶段实验；省略 `server` 时运行客户端并等待服务正常退出。`tcp` 模式使用同一 WorldService、协议和进程入口。
+路径：`gateway/sample/master_course/run.sh`。正文默认使用 tcp/client 编译运行第 4 节 C++；websocket/client 分支仅供 Node 附录使用。这个脚本只编排**本课程**：`prepare` 调用 `bootstrap.sh` 准备依赖；普通运行检查固定产物、生成本课协议并启动真实 Skynet。命令 `bash .../run.sh tcp server` 仅在前台启动服务器，供分阶段实验；省略 `server` 时运行客户端并等待服务正常退出。`tcp` 模式使用同一 WorldService、协议和进程入口。
 
 ```bash
 #!/usr/bin/env bash
 # 用途：构建 Gateway 课程协议并启动服务端，或启动客户端完成一次 WebSocket/TCP 示例。
 # 工作目录：可从任意目录运行；脚本根据自身位置查找 FlyWow、Server 和 Skynet，不依赖调用者当前目录。
-# 参数：prepare 独立准备依赖；运行模式下第一个参数是 websocket/tcp（默认 websocket），第二个是 client/server（默认 client）。
+# 参数：prepare 独立准备依赖；运行模式下第一个参数是 websocket/tcp（默认 tcp），第二个是 client/server（默认 client）。
 # 示例：bash /path/to/skynet-flywow/gateway/sample/master_course/run.sh prepare
-# 示例：bash /path/to/skynet-flywow/gateway/sample/master_course/run.sh websocket client
+# 示例：bash /path/to/skynet-flywow/gateway/sample/master_course/run.sh tcp client
 # 示例：bash gateway/sample/master_course/run.sh tcp server
-# 前置条件：固定 Skynet、宿主 lua-protobuf、FlyWow Gateway Native 和 Node.js 均已构建/安装。
+# 前置条件：固定 Skynet、宿主 lua-protobuf、FlyWow Gateway Native 和 C++17/OpenSSL 3 开发工具均已构建/安装。
 # 行为：client 模式会启动临时服务、运行客户端并在退出时清理服务；server 模式以前台方式运行服务。
 # Bash 语法：变量用 "$NAME" 引用；双引号保护空格；# 开头是注释；本脚本用缩进展示 if/for 函数块。
 # Bash 语法：[[ ... ]] 是条件判断；&& 表示前项成功后继续；|| 表示前项失败时执行后项。
@@ -448,7 +455,7 @@ SERVER_ROOT="$(cd "$FLYWOW_ROOT/../.." && pwd)"
 SKYNET_ROOT="$SERVER_ROOT/third_party/skynet"
 
 # ${1:-} 在没有第一个参数时展开为空；只有第一个参数恰好是 prepare 才进入准备分支。
-# 例如 run.sh prepare 调用 bootstrap；不带参数会继续使用默认 websocket/client 运行模式。
+# 例如 run.sh prepare 调用 bootstrap；不带参数会继续使用默认 tcp/client 运行模式。
 # $# 表示位置参数个数；此分支只接受一个参数。exec 用 bootstrap 替换当前 Shell，并沿用其退出状态。
 if [[ "${1:-}" == "prepare" ]]; then
     if [[ "$#" -ne 1 ]]; then
@@ -459,12 +466,12 @@ if [[ "${1:-}" == "prepare" ]]; then
 fi
 
 # Bash 把脚本名后面的参数按顺序编号：$1 是第一个参数（传输方式），$2 是第二个参数（启动方式）。
-# ${1:-websocket} 的意思是：如果没有给第一个参数，或第一个参数是空字符串，就把 MODE 设为 websocket；否则使用第一个参数原值。
-# 例如：run.sh tcp client 会令 MODE=tcp；只运行 run.sh 会令 MODE=websocket。
-MODE="${1:-websocket}"
+# ${1:-tcp} 的意思是：如果没有给第一个参数，或第一个参数是空字符串，就把 MODE 设为 tcp；否则使用第一个参数原值。
+# 例如：run.sh tcp client 会令 MODE=tcp；只运行 run.sh 会令 MODE=tcp。
+MODE="${1:-tcp}"
 
 # ${2:-client} 同理：没有给第二个参数或它为空时，ACTION 取 client；否则取第二个参数原值。
-# 例如：run.sh tcp server 会令 ACTION=server；run.sh websocket 或只运行 run.sh 都会令 ACTION=client。
+# 例如：run.sh tcp server 会令 ACTION=server；run.sh tcp 或只运行 run.sh 都会令 ACTION=client。
 ACTION="${2:-client}"
 
 # 只接受本课程支持的两种传输和两种启动方式；错误时打印用法并以状态码 2 结束。
@@ -518,7 +525,7 @@ LOG_DIR="$FLYWOW_ROOT/build/gateway-master-course/$MODE"
 mkdir -p "$LOG_DIR"
 SERVER_LOG="$LOG_DIR/server.log"
 
-# client 模式需要同时运行服务端和客户端：Skynet 放在后台，Node 客户端稍后在前台运行。
+# client 模式需要同时运行服务端和客户端：Skynet 放在后台，对应客户端稍后在前台运行。
 # > 将服务端标准输出写入日志，2>&1 再把标准错误接到同一个日志；末尾的 & 让 Bash 不等待 Skynet 结束。
 # $! 是刚刚启动的后台 Skynet 进程号，之后用它判断服务是否仍在运行并负责清理。
 "$SKYNET_ROOT/skynet" "$COURSE_DIR/skynet_config.lua" >"$SERVER_LOG" 2>&1 &
@@ -537,7 +544,7 @@ cleanup() {
 }
 
 # trap 把 cleanup 注册为当前 Bash 的 EXIT 钩子；Bash 正常结束或因 set -e 遇到未处理错误退出时都会调用它。
-# 这不是 Skynet 或 Node 调用 cleanup；它们结束后只是让 Bash 继续或退出，最终由 Bash 执行钩子。
+# 这不是 Skynet 或客户端 调用 cleanup；它们结束后只是让 Bash 继续或退出，最终由 Bash 执行钩子。
 trap cleanup EXIT
 
 # 等待服务在日志中报告就绪，最多 200 次，每次间隔 0.1 秒，合计约 20 秒。
@@ -565,13 +572,19 @@ if [[ "$ready" != 1 ]]; then
     exit 1
 fi
 
-# 启动与传输模式对应的 Node 客户端。该命令没有 &，所以客户端在前台运行，Bash 会等它结束后才执行下面的代码。
+# 启动对应客户端：TCP 使用正文 C++，WebSocket 使用文末可选 Node 附录。该命令没有 &，所以客户端在前台运行，Bash 会等它结束后才执行下面的代码。
 # timeout 最多允许运行 20 秒；超时或客户端失败会产生非零退出状态，set -e 会结束脚本并触发上面的 EXIT 清理钩子。
 # 端口作为客户端的第一个位置参数；客户端正常完成后进程退出，控制权回到当前 Bash。
 if [[ "$MODE" == websocket ]]; then
     timeout 20s node "$COURSE_DIR/client/websocket_client.mjs" "$GATEWAY_COURSE_PORT"
 else
-    timeout 20s node "$COURSE_DIR/client/tcp_client.mjs" "$GATEWAY_COURSE_PORT"
+    # TCP 使用正文 C++ 文件；mkdir -p 创建产物目录，已有目录可以复用。
+    CPP_BUILD_DIR="$FLYWOW_ROOT/build/gateway-master-course/cpp"
+    mkdir -p "$CPP_BUILD_DIR"
+    # g++ 编译 C++17 文件，-lcrypto 链接 OpenSSL，-o 指定可执行产物。
+    g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror \
+        "$COURSE_DIR/client/world_client.cpp" -lcrypto -o "$CPP_BUILD_DIR/world_client"
+    timeout 20s "$CPP_BUILD_DIR/world_client" "$GATEWAY_COURSE_PORT"
 fi
 
 # 客户端完成后，WorldService 会在 disconnect 事件处理完后停止服务。
@@ -608,12 +621,12 @@ bash gateway/sample/master_course/run.sh prepare
 随后启动服务：
 
 ```bash
-bash gateway/sample/master_course/run.sh websocket server
+bash gateway/sample/master_course/run.sh tcp server
 ```
 
-预期日志含 `COURSE_GATEWAY_READY transport=websocket port=19221 commands=2`。按 `Ctrl+C` 结束；**这个阶段不带客户端参数运行自动场景**，因为客户端及完整业务处理尚未编写。
+预期日志含 `COURSE_GATEWAY_READY transport=tcp port=19221 commands=2`。按 `Ctrl+C` 结束；**这个阶段不带客户端参数运行自动场景**，因为客户端及完整业务处理尚未编写。
 
-### 2.4 真实源码跟踪：start 如何从一个 RPC 变成监听
+### 2.5 真实源码跟踪：start 如何从一个 RPC 变成监听
 
 **【真实源码】** `gateway/service/flywow_gateway.lua`：
 
@@ -640,7 +653,7 @@ WorldService 的原调用协程被唤醒，继续检查 result.ok/value
 
 这里必须注意两个不同的 `start`：`skynet.start` 是 **Service 入口初始化回调**；Gateway 的 `start(config)` 是**宿主发送的业务命令处理函数**。`skynet.call` 等待应答，不能把它与后面的请求投递 `skynet.send` 混淆。
 
-`normalize_config` 先处理所有必需字段和默认值；例如 `transport="websocket"` 合法，`host=false` 不会被当成缺省地址。`codec_module.init` 只读校验生成表、统计命令并在当前 Gateway Lua State 里加载 Descriptor；Handshake 握手模块 在本 Service 里持有握手名额，**此时还没有一个客户端连接**。
+`normalize_config` 先处理所有必需字段和默认值；例如 `transport="websocket"` 合法，`host=false` 不会被当成缺省地址。`codec_module.init` 只读校验生成表、统计命令并在当前 Gateway Lua State 里加载 Descriptor；Handshake 握手模块 在本 Service 里保存握手依赖与期限，**此时还没有一个客户端连接**。
 
 **回到主线**：只有 listener 创建且 `socket.start` 成功后才进入 `running`。`WorldService` 收到 Result 后才打印课程 READY；下一阶段才会发生 accept 和握手。
 
@@ -648,25 +661,21 @@ WorldService 的原调用协程被唤醒，继续检查 result.ok/value
 
 ---
 
-### 2.5 源码精读：`module_state` 究竟属于谁
+### 2.6 源码精读：`module_state` 究竟属于谁
 
 上一节的调用栈已经到达 Gateway 的 `start(config)`。现在暂停在 `start()` 入口，看它操作的模块级表。**【真实源码局部：`gateway/service/flywow_gateway.lua`，文件顶层】**：
 
 ```lua
 local module_state =
 {
-    phase              = "created",
-    gateway_config     = nil,
-    handshake          = nil,
-    codec              = nil,
-    listen_fd          = nil,
-    connections        = {},
-    connections_by_fd  = {},
-    next_connection_id = 0,
-    rate_started       = 0,
-    rate_count         = 0,
-    epoch              = nil,
-    client_count       = 0,
+    phase              = "created",  -- Service 生命周期；created/starting/running/stopping/stopped。
+    gateway_config     = nil,        -- 通过 start 校验后的只读配置；由 start 一次写入，后续运行阶段读取。
+    listen_fd          = nil,        -- 监听 Socket fd；关闭后清空。
+    connections        = {},         -- connection_id -> connection context；只由 Gateway 修改。
+    connections_by_fd  = {},         -- fd -> connection context；用于传输回调反查及 fd 复用身份检查。
+    next_connection_id = 0,          -- 单调递增连接标识；不复用为业务持久 ID。
+    epoch              = nil,        -- 每次 Service 启动的新身份，隔离旧进程迟到响应。
+    connection_count   = 0,          -- 当前登记的连接数，包含握手中连接；用于 O(1) 判断 max_clients。
 }
 ```
 
@@ -675,18 +684,18 @@ local module_state =
 | 状态                 | 写入者/时机          | 真正消费者                      | 生命周期               |
 | -------------------- | -------------------- | ------------------------------- | ---------------------- |
 | `phase`              | `start`/`stop`       | `accept_client`、超时与出站入口 | 当前 Gateway Service   |
-| `gateway_config`     | `start` 校验后设置   | 网络、握手、限流入口            | 启动后到停止           |
+| `gateway_config`     | `start` 校验后设置   | 网络与握手入口            | 启动后到停止           |
 
 
 | `listen_fd`          | 监听成功后持有       | `stop`                          | 监听期                 |
 | `connections`        | 创建/摘除连接        | 出站单播、广播、超时、stop      | 每条连接登记期         |
 | `connections_by_fd`  | 创建/摘除连接        | WS 回调、关闭安全检查           | 每条连接登记期         |
 | `epoch`              | `start` 生成         | 识别旧实例的消息                | 当前 Service 实例      |
-| `client_count`       | 连接登记 / detach    | `max_clients` 检查              | 当前 Service 实例      |
+| `connection_count`       | 连接登记 / detach    | `max_clients` 检查              | 当前 Service 实例      |
 
 **不要为了教学实现另一张表。** 这份表就是课程后面全部状态实验的唯一源码入口。
 
-### 2.6 逐段追 `start()`：何时才能宣布 READY
+### 2.7 逐段追 `start()`：何时才能宣布 READY
 
 执行现场：WorldService 的启动协程已向 Gateway 发出 `skynet.call(gateway,"lua","start",config)`，处于等待；Gateway 通过文件末尾的 `skynet.dispatch("lua", ...)` 收到 `start`，调用它自己的 `start(startup_config)`。此时还没有监听 fd，也没有连接上下文。
 
@@ -734,7 +743,6 @@ local handshake_result = handshake_module.init(
 {
     crypto        = crypto,
     now           = skynet.now,
-    max_pending   = gateway_config.max_pending_handshakes,
     timeout_ms = gateway_config.handshake_timeout_ms,
 }
 )
@@ -745,7 +753,7 @@ end
 local command_count = codec_result.value
 ```
 
-配置中的三类 timeout 都使用毫秒；旧的 `*_timeout_ticks` 字段会被拒绝，避免旧配置被忽略后静默使用默认值。内部保存的是毫秒期限，比较时由 `flywow_common` 处理 Skynet tick 回绕和 10ms 到毫秒的换算。
+配置中的三类 timeout 都使用毫秒。内部保存的是毫秒期限，比较时由 `flywow_common` 处理 Skynet tick 回绕和 10ms 到毫秒的换算。
 
 这三步按顺序发生在 `socket.listen()` 之前。它们分别准备 Protobuf 编解码器、加载 Native 握手模块、初始化当前 Service 的握手模块。只有三步都成功，Gateway 才把结果放进自己的 `module_state`，然后创建 listener。
 
@@ -779,20 +787,19 @@ codec 先检查这两个字段的类型，再打开 `descriptor_path` 读取全�
 
 #### 第三步：初始化握手模块
 
-`handshake_module.init()` 收到的四个具名字段是：
+`handshake_module.init()` 收到的三个具名字段是：
 
 | 字段 | 本次传入值 | 用途 |
 | --- | --- | --- |
 | `crypto` | 上一步 `require` 返回的模块表 | 握手模块验证 HELLO 时调用其 `create_context(hello)`，并通过返回的 userdata 执行 proof 验证和释放 |
 | `now` | `skynet.now` 函数本身 | 握手模块需要判断期限时再读取当前时钟；这里没有写 `skynet.now()`，所以传入的不是一个固定 tick 数值 |
-| `max_pending` | `max_pending_handshakes` 配置值 | 限制本 Gateway 同时持有的待完成握手上下文数量 |
 | `timeout_ms` | `handshake_timeout_ms` 配置值 | 从连接登记起算的绝对期限，单位毫秒；例如 `10000` 表示 10 秒，握手消息不会延长它 |
 
 `now`返回10ms tick；`timeout_ms`保持毫秒单位。状态机调用 `flywow_common.elapsed_ticks(started_tick, current_tick)` 处理回绕，需要毫秒时直接调用 `flywow_common.elapsed_ms(started_tick, current_tick)`；该接口同样处理 tick 回绕。
 
-初始化函数检查 Native 的 `create_context` 接口、时钟与容量/期限。校验通过后保存当前 Service 的依赖和配置，返回空成功 Result；参数无效返回 HANDSHAKE_CONFIG_INVALID。pending 在模块加载时初始化为 0，init 不创建实例表，也不创建连接或 Native userdata。
+初始化函数检查 Native 的 `create_context` 接口、时钟与期限。校验通过后保存当前 Service 的依赖和配置，返回空成功 Result；参数无效返回 HANDSHAKE_CONFIG_INVALID。init 不创建实例表，也不创建连接或 Native userdata。
 
-listener 开始工作后，连接回调才会调用 握手模块的 `accept()` 申请名额；合法 HELLO 到达后，握手模块才调用 `crypto.create_context(hello)` 创建该连接的 Native userdata。连接关闭或握手失败时，握手模块负责归还名额并关闭该 userdata。也就是说，握手模块是当前 Gateway Service 独占的握手状态机；它不写 Socket、不启动协程，也不预先分配所有客户端的密码状态。
+listener 开始工作后，连接回调才会调用 握手模块的 `accept()` 创建本连接状态；合法 HELLO 到达后，握手模块才调用 `crypto.create_context(hello)` 创建该连接的 Native userdata。连接关闭或握手失败时，握手模块负责关闭该 userdata。也就是说，握手模块是当前 Gateway Service 独占的握手状态机；它不写 Socket、不启动协程，也不预先分配所有客户端的密码状态。
 
 #### 把三个步骤连成启动时间线
 
@@ -803,8 +810,8 @@ WorldService 调用 Gateway start(config)
        读取 world.pb -> pb.load -> 核对 Registry 中的类型名
   -> pcall(require, "flywow_gateway_crypto")
        加载 Native Lua 模块 -> 得到 crypto 模块表
-  -> handshake_module.init({crypto=..., now=..., max_pending=..., timeout_ms=...})
-       校验依赖和上限 -> 发布本 Service 的握手依赖与上限
+  -> handshake_module.init({crypto=..., now=..., timeout_ms=...})
+       校验依赖和期限 -> 发布本 Service 的握手依赖与期限
   -> 所有步骤成功后发布启动状态
   -> socket.listen() / socket.start()
   -> 才能接纳客户端并创建逐连接的握手 context
@@ -1000,7 +1007,7 @@ catch (const std::exception &error)
 return lua_binding.returnValues(context, response);
 ```
 
-这段不是在 Gateway 启动时执行，而是握手进行到 HELLO 阶段后，由 Lua 侧调用 `crypto.create_context(bytes)` 才执行。Native 再次校验 HELLO 的固定长度和头部，成功后创建一个由 Lua userdata 持有的 `CryptoContext`，生成 challenge，并一次返回 userdata 与 challenge。异常路径清理刚创建的密码材料，再向 Lua 返回 Binding 错误；Lua 握手模块接到错误后会关闭该握手上下文并归还 pending 名额。由此可以区分：
+这段不是在 Gateway 启动时执行，而是握手进行到 HELLO 阶段后，由 Lua 侧调用 `crypto.create_context(bytes)` 才执行。Native 再次校验 HELLO 的固定长度和头部，成功后创建一个由 Lua userdata 持有的 `CryptoContext`，生成 challenge，并一次返回 userdata 与 challenge。异常路径清理刚创建的密码材料，再向 Lua 返回 Binding 错误；Lua 握手模块接到错误后会关闭该握手上下文并释放该连接状态。由此可以区分：
 
 | 对象 | 创建时机 | owner | 生命周期结束 |
 | --- | --- | --- | --- |
@@ -1012,28 +1019,17 @@ return lua_binding.returnValues(context, response);
 **【真实源码局部：`gateway/lualib/handshake.lua` / `M.init()`】**
 
 ```lua
--- pending 位于模块作用域；init 在接受连接前发布已验证配置。
-local pending = 0
-
 function M.accept()
-    if pending >= max_pending then
-        return flywow_result.failure(
-            "HANDSHAKE_CAPACITY",
-            "pending handshake capacity reached"
-        )
-    end
-
-    pending = pending + 1
-    return flywow_result.success(
+    return
     {
-        phase   = "hello",
-        started = read_tick(),
+        phase          = "hello",
+        started        = module_state.read_tick(),
         crypto_context = nil,
-    })
+    }
 end
 ```
 
-pending 是 handshake 模块在当前 Service Lua State 中持有的私有计数。模块加载时为 0；init 只在接受连接前配置依赖，不重置名额。accept 增加名额并创建连接 context；close 在活动阶段释放一次。
+Gateway 先检查连接总配额，再调用 accept 创建独占的 HandshakeContext。模块不预先创建连接或 Native userdata；合法 HELLO 到达后才创建 Native 对象，成功确认或关闭时释放。
 
 握手模块 后续处理 HELLO 时，`M.receive()` 才调用 Native 模块：
 
@@ -1064,20 +1060,19 @@ return flywow_result.success(
 })
 ```
 
-`pcall` 同时接住 Binding 可能抛出的 Lua 错误和 Native Binding 返回的失败值。创建成功后，第一返回值 userdata 被保存进连接 context，第二返回值 challenge 作为本阶段输出；状态从 `hello` 推进到 `proof`。失败时先走 `M.close(context)`，释放名额和已有 Native 资源，再返回稳定的 `HANDSHAKE_CRYPTO`。
+`pcall` 同时接住 Binding 可能抛出的 Lua 错误和 Native Binding 返回的失败值。创建成功后，第一返回值 userdata 被保存进连接 context，第二返回值 challenge 作为本阶段输出；状态从 `hello` 推进到 `proof`。失败时先走 `M.close(context)`，释放已有 Native 资源，再返回稳定的 `HANDSHAKE_CRYPTO`。
 
 连接关闭时的释放由同一个 握手模块 完成：
 
 ```lua
 context.phase = "closed"
-pending = pending - 1
 if context.crypto_context then
     context.crypto_context:close()
     context.crypto_context = nil
 end
 ```
 
-仅 `hello/proof/confirm` 阶段占有 pending；关闭时转入 `closed`，重复关闭按终态直接返回。Native userdata 存在时调用它的 `close()` 并清空引用。这样，名额由握手模块持有和归还，密钥由 Native userdata 持有和擦除，Gateway 则继续拥有 Socket fd 与连接记录。三个 owner 不应混为一个。
+握手失败或连接关闭时转入 closed；成功确认时转入 ready，两种终态均释放 Native 对象。Gateway 持有 Socket 和连接记录，HandshakeContext 持有本连接 Native 引用，不能混淆 owner。
 
 **【真实源码局部：同一 `start()` / 监听和发布运行状态】**：
 
@@ -1108,7 +1103,7 @@ skynet.fork(timeout_loop)
 
 这里真正有三层独立的“就绪”：Skynet Service 已加载 Lua 入口、Gateway 已监听并进入 `running`、某一个客户端已完成应用握手进入 `ready`。它们不是同一个布尔值。
 
-### 2.7 从 Skynet 源码解释为什么 `call` 会等待
+### 2.8 从 Skynet 源码解释为什么 `call` 会等待
 
 打开固定版本 `cloudwu/skynet` `v1.8.0` 的 `lualib/skynet.lua`，找到 `skynet.call()`、`yield_call()` 和 `skynet.send()`。这里跨越了两个 Service、两份 Lua State 和 Skynet 消息队列。
 
@@ -1285,7 +1280,7 @@ skynet.start(function()
     end)
 
     state.gateway = skynet.newservice("flywow_gateway")
-    local transport = os.getenv("GATEWAY_COURSE_TRANSPORT") or "websocket" -- Shell 选择本次使用 WS 或 TCP。
+    local transport = os.getenv("GATEWAY_COURSE_TRANSPORT") or "tcp" -- Shell 选择本次使用 WS 或 TCP。
     local port = tonumber(os.getenv("GATEWAY_COURSE_PORT")) or 19221 -- 宿主选取的本地端口。
     local config =
     {
@@ -1297,7 +1292,7 @@ skynet.start(function()
         registry_module               = "world_registry", -- 当前课程生成的 Lua Registry。
         protocol_version              = 4, -- Envelope 的业务协议版本。
         max_clients                   = 4, -- 本例最多同时接入 4 个客户端。
-        max_requests_per_second       = tonumber(os.getenv("GATEWAY_COURSE_RPS")) or 200, -- 故障实验可缩小接纳速率。
+        read_timeout_ms = tonumber(os.getenv("GATEWAY_COURSE_READ_MS")) or 30000, -- TCP 正在读取长度头或载荷时的期限，单位毫秒；实验 E 可缩短。
         idle_timeout_ms            = tonumber(os.getenv("GATEWAY_COURSE_IDLE_MS")) or 300000, -- 完整业务消息空闲期限，单位毫秒。
     }
 
@@ -1320,7 +1315,9 @@ skynet.start(function()
                     skynet.error("COURSE_STOP_FAILED ", stop_result.code)
                     os.exit(1)
                 end
-                skynet.error("COURSE_GATEWAY_OK closed=", stop_result.value.closed_connections)
+                -- 最终标记直接写 stdout 并 flush；随后立即退出时不能依赖异步日志已落盘。
+                io.stdout:write("COURSE_GATEWAY_OK closed=",
+                    tostring(stop_result.value.closed_connections), "\n")
                 io.stdout:flush()
                 io.stderr:flush()
                 os.exit(0)
@@ -1335,11 +1332,1917 @@ end)
 
 **上下文检查**：此文件没有创建额外 PlayerService/Manager，也没有账号表、存储层或业务重试。`state.players` 只关联当前两个连接；`gateway_disconnect` 对尚未进入的连接是正常可达路径，因此忽略它。`state.disconnected` 只用于本示例在两人实际退出后结束进程，**不是 Gateway 内部状态**。
 
-## 4. 写一个没有第三方 Node Protobuf 依赖的最小客户端编解码器
+## 4. 用 C++17 Client 完成握手、编解码与双人流程
+
+服务端已具备完整业务处理。本节创建 Linux/WSL2 C++17 TCP Client，先观察真实响应，再进入源码。不需要 Node。代码使用 POSIX Socket，不能直接作为 Windows Winsock 工程编译。
+
+### 4.1 当前问题：A/B 怎样用 C++ 进入新手村？
+
+仍然验证 A=1001、B=1002、scene_id=7。真实顺序是：
+
+~~~text
+main
+  -> Connection(port) 建立 TCP
+  -> handshake：HELLO -> CHALLENGE -> PROOF -> 校验 READY
+  -> sendEnter：EnterWorldRequest -> Envelope -> 两字节长度头
+  -> Gateway run_tcp -> dispatch_payload -> WorldService
+  -> WorldService send_data -> Gateway -> TCP response / notice
+  -> expectMessage 验证进入、单播、广播
+  -> A closeNow；B expectServerClose
+  -> WorldService 收到两条 gateway_disconnect
+~~~
+
+handshake 返回后才能发送 Envelope。应用握手使用 P-256 ECDH、HKDF-SHA256 和 HMAC-SHA256，由 OpenSSL 完成密码运算。它不加密后续业务数据，也不提供账号认证或基于证书的服务器身份认证。
+
+这里用单线程同步阻塞读写，同时持有 A/B 两个 fd。先确认 A 进入再连接 B；读取 A 的广播时，B 的广播保存在 B 的 TCP 接收缓冲中。这是按确定顺序验收的课程客户端，不承担游戏客户端持续收包、UI 线程调度与并发请求管理职责。
+
+### 4.2 亲手新建完整 C++ 文件
+
+**新建文件**：以 FlyWow 根目录为基准，路径为 gateway/sample/master_course/client/world_client.cpp。父目录不存在时先创建：
+
+~~~bash
+mkdir -p gateway/sample/master_course/client
+~~~
+
+mkdir 的 -p 创建缺失目录，目录已存在时也可继续，不覆盖已有文件。
+
+学习导航：
+
+- 精读 Connection::sendFrame/readExact/receiveFrame：TCP 是字节流，短读短写都需推进 offset，不能假设一次 recv 收到完整消息。
+- 精读 handshake：每条连接独占临时密钥，完整校验服务端 READY 后才返回。
+- 精读 sendEnter/parseFields/expectMessage：Envelope 和内层业务消息分开编码、解码。
+- 最后看 main：A/B 的响应、公告和关闭怎样串成业务时间线。
+- OpenSSL 句柄创建可先略读，但必须知道 unique_ptr 释放句柄，Secret 擦除可见秘密数组。
+- 输入是服务端端口；输出是验收日志和退出码。连接失败、超时、协议不符或证明错误都报告失败并关闭连接。
+
+为看清网络字节，代码只实现本课程使用的 uint32/string/bytes，拒绝未支持的 wire type。它不是通用 Protobuf SDK；协议扩展后应使用与项目工具链一致的生成式 SDK，不应把教学解析器扩成框架。
+
+下面是完整文件，不依赖 Node 或前文 JavaScript 文件：
+
+~~~cpp
+// 课程 TCP Client：顺序执行握手与双玩家场景；仅依赖 Linux Socket 和 OpenSSL 3。
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cstring>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <openssl/core_names.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/kdf.h>
+#include <openssl/params.h>
+#include <stdexcept>
+#include <string>
+#include <unistd.h>
+#include <vector>
+
+using Bytes                            = std::vector<unsigned char>;
+constexpr unsigned    kEnterWorld      = 1001;  // Registry 中入场请求及响应的命令号。
+constexpr unsigned    kNotice          = 1002;  // Registry 中服务器公告的命令号。
+constexpr unsigned    kProtocolVersion = 4;     // Envelope 业务版本，与握手版本 1 分开。
+constexpr std::size_t kMaxFrame        = 65535; // TCP 两字节无符号长度头能够表达的最大载荷。
+
+// 普通协议、系统调用和密码运算失败退出本轮实验；不尝试重连或恢复。
+void require(bool success, const char *explanation)
+{
+    if (!success)
+    {
+        throw std::runtime_error(explanation);
+    }
+}
+
+// 擦除当前握手的共享秘密与证明密钥，包括异常退出路径。
+struct Secret
+{
+    unsigned char bytes[32]{}; ///< 本次握手独占的 256 位秘密，不写日志或转成字符串。
+    ~Secret()
+    {
+        OPENSSL_cleanse(bytes, sizeof(bytes));
+    }
+};
+
+// 一条连接独占一个 fd；构造后即由本对象回收，握手失败也由栈展开关闭。
+class Connection
+{
+  public:
+    explicit Connection(unsigned port)
+    {
+        require(port > 0 && port <= 65535, "PORT_RANGE");
+        fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        require(fd_ >= 0, "SOCKET");
+        // 构造器失败时析构器不会执行，因此这里显式关闭已创建的 fd。
+        timeval     timeout{5, 0}; // 每次阻塞 I/O 最多等待 5 秒；整轮期限由外层 timeout 控制。
+        sockaddr_in address{};     // 本教程只连接同一台机器的 IPv4 回环地址。
+        address.sin_family = AF_INET;
+        address.sin_port   = htons(static_cast<uint16_t>(port));
+        inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+        if (setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+            setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0 ||
+            connect(fd_, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0)
+        {
+            closeNow();
+            throw std::runtime_error("CONNECT_OR_TIMEOUT_OPTION");
+        }
+    }
+    Connection(const Connection &)            = delete;
+    Connection &operator=(const Connection &) = delete;
+    ~Connection()
+    {
+        closeNow();
+    }
+
+    void closeNow()
+    {
+        if (fd_ >= 0)
+        {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    /// 握手与业务共用 framing；payload 不包含长度头，空帧不属于课程合同。
+    void sendFrame(const Bytes &payload)
+    {
+        require(!payload.empty() && payload.size() <= kMaxFrame, "FRAME_SIZE");
+        Bytes frame{static_cast<unsigned char>(payload.size() >> 8),
+                    static_cast<unsigned char>(payload.size() & 255)};
+        frame.insert(frame.end(), payload.begin(), payload.end());
+        std::size_t offset = 0; // 已被内核接收的字节数，短写后从此处继续。
+        while (offset < frame.size())
+        {
+            const auto count =
+                send(fd_, frame.data() + offset, frame.size() - offset, MSG_NOSIGNAL);
+            if (count < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            require(count > 0, "SEND");
+            offset += static_cast<std::size_t>(count);
+        }
+    }
+
+    /// 读取恰好 size 字节；EOF、超时和错误均失败，保留下一帧字节在内核缓冲中。
+    Bytes readExact(std::size_t size)
+    {
+        Bytes       result(size); // 当前头部或载荷的独占缓冲，返回后由调用者持有。
+        std::size_t offset = 0;
+        while (offset < size)
+        {
+            const auto count = recv(fd_, result.data() + offset, size - offset, 0);
+            if (count < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            require(count > 0, count == 0 ? "EARLY_EOF" : "RECV_OR_TIMEOUT");
+            offset += static_cast<std::size_t>(count);
+        }
+        return result;
+    }
+
+    Bytes receiveFrame()
+    {
+        const auto        header = readExact(2); // 网络序头部只描述后续载荷，不包括自身两个字节。
+        const std::size_t size   = (static_cast<unsigned>(header[0]) << 8) | header[1];
+        require(size > 0, "EMPTY_FRAME");
+        return readExact(size);
+    }
+
+    /// B 的消息消费完后必须真正收到服务器 EOF，不能把超时当作主动关闭成功。
+    void expectServerClose()
+    {
+        unsigned char extra = 0;
+        ssize_t       count;
+        do
+        {
+            count = recv(fd_, &extra, 1, 0);
+        } while (count < 0 && errno == EINTR);
+        require(count == 0, "EXPECTED_SERVER_EOF");
+        closeNow();
+    }
+
+  private:
+    int fd_ = -1; // 当前连接独占的 Linux fd；closeNow 后为 -1，不承担业务玩家身份。
+};
+
+// 握手完成前由 main 调用；本函数只执行一次，返回即意味着 READY 的 HMAC 已验证。
+// @param connection 已建立的 TCP 连接；握手消息均经过相同的两字节 framing。
+void handshake(Connection &connection)
+{
+    using Key     = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+    using Context = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
+
+    // 每条连接生成全新的 P-256 密钥，禁止跨玩家复用私钥。
+    Context generator(EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr), EVP_PKEY_CTX_free);
+    require(generator && EVP_PKEY_keygen_init(generator.get()) > 0, "KEYGEN_INIT");
+    require(EVP_PKEY_CTX_set_group_name(generator.get(), "prime256v1") > 0, "CURVE");
+    EVP_PKEY *generated = nullptr; // OpenSSL 输出转交给下方 RAII owner。
+    require(EVP_PKEY_generate(generator.get(), &generated) > 0, "KEYGEN");
+    Key   local(generated, EVP_PKEY_free);
+    Bytes hello(67); // 类型 1、握手版本 1、65 字节未压缩公钥。
+    hello[0]                = 1;
+    hello[1]                = 1;
+    std::size_t public_size = 65;
+    require(EVP_PKEY_get_octet_string_param(local.get(), OSSL_PKEY_PARAM_PUB_KEY, hello.data() + 2,
+                                            65, &public_size) > 0 &&
+                public_size == 65,
+            "PUBLIC_KEY");
+    connection.sendFrame(hello);
+    const auto challenge = connection.receiveFrame(); // 类型、版本、公钥、32 字节 salt。
+    require(challenge.size() == 99 && challenge[0] == 2 && challenge[1] == 1 && challenge[2] == 4,
+            "CHALLENGE");
+
+    // 导入服务端公钥；derive 同时验证它能用于当前曲线的 ECDH。
+    Context importer(EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr), EVP_PKEY_CTX_free);
+    require(importer && EVP_PKEY_fromdata_init(importer.get()) > 0, "IMPORT_INIT");
+    char       group[] = "prime256v1";
+    Bytes      peer_public(challenge.begin() + 2, challenge.begin() + 67);
+    OSSL_PARAM params[] = {OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME, group, 0),
+                           OSSL_PARAM_construct_octet_string(
+                               OSSL_PKEY_PARAM_PUB_KEY, peer_public.data(), peer_public.size()),
+                           OSSL_PARAM_construct_end()};
+    EVP_PKEY  *imported = nullptr;
+    require(EVP_PKEY_fromdata(importer.get(), &imported, EVP_PKEY_PUBLIC_KEY, params) > 0,
+            "IMPORT_PEER");
+    Key         peer(imported, EVP_PKEY_free);
+    Context     derive(EVP_PKEY_CTX_new(local.get(), nullptr), EVP_PKEY_CTX_free);
+    Secret      shared; // ECDH Z，HKDF 完成后不再用于业务。
+    std::size_t shared_size = sizeof(shared.bytes);
+    require(derive && EVP_PKEY_derive_init(derive.get()) > 0 &&
+                EVP_PKEY_derive_set_peer(derive.get(), peer.get()) > 0 &&
+                EVP_PKEY_derive(derive.get(), shared.bytes, &shared_size) > 0 &&
+                shared_size == sizeof(shared.bytes),
+            "ECDH");
+
+    // transcript 对完整 HELLO 与 CHALLENGE 求 SHA-256，不包含 TCP 长度头。
+    Bytes transcript = hello;
+    transcript.insert(transcript.end(), challenge.begin(), challenge.end());
+    unsigned char hash[32]{};
+    unsigned      hash_size = 0;
+    require(EVP_Digest(transcript.data(), transcript.size(), hash, &hash_size, EVP_sha256(),
+                       nullptr) > 0 &&
+                hash_size == 32,
+            "SHA256");
+    const std::string prefix = "flywow/handshake/v1";
+    Bytes             info(prefix.begin(), prefix.end());
+    info.insert(info.end(), hash, hash + 32);
+    Context     hkdf(EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr), EVP_PKEY_CTX_free);
+    Secret      proof_key; // 双向证明共用的 HKDF 结果，仅在本函数生命周期存在。
+    std::size_t key_size = sizeof(proof_key.bytes);
+    require(hkdf && EVP_PKEY_derive_init(hkdf.get()) > 0 &&
+                EVP_PKEY_CTX_set_hkdf_md(hkdf.get(), EVP_sha256()) > 0 &&
+                EVP_PKEY_CTX_set1_hkdf_salt(hkdf.get(), challenge.data() + 67, 32) > 0 &&
+                EVP_PKEY_CTX_set1_hkdf_key(hkdf.get(), shared.bytes, 32) > 0 &&
+                EVP_PKEY_CTX_add1_hkdf_info(hkdf.get(), info.data(), info.size()) > 0 &&
+                EVP_PKEY_derive(hkdf.get(), proof_key.bytes, &key_size) > 0 && key_size == 32,
+            "HKDF");
+
+    // 两种前缀防止客户端证明被当成服务端证明；HMAC 输入均为前缀加 transcript hash。
+    const auto mac = [&](const std::string &label)
+    {
+        Bytes input(label.begin(), label.end());
+        input.insert(input.end(), hash, hash + 32);
+        Bytes    result(32);
+        unsigned size = 0;
+        require(HMAC(EVP_sha256(), proof_key.bytes, 32, input.data(), input.size(), result.data(),
+                     &size) != nullptr &&
+                    size == 32,
+                "HMAC");
+        return result;
+    };
+    Bytes      proof{3};
+    const auto client_mac = mac("client-proof");
+    proof.insert(proof.end(), client_mac.begin(), client_mac.end());
+    connection.sendFrame(proof);
+    const auto ready    = connection.receiveFrame();
+    const auto expected = mac("server-ready");
+    require(ready.size() == 33 && ready[0] == 4 &&
+                CRYPTO_memcmp(ready.data() + 1, expected.data(), expected.size()) == 0,
+            "READY");
+    std::cout << "HANDSHAKE_READY\n";
+}
+
+// 仅实现本课程 uint32/string/bytes；不是通用 Protobuf SDK。
+void appendVarint(Bytes &output, unsigned value)
+{
+    while (value >= 128)
+    {
+        output.push_back(static_cast<unsigned char>((value & 127) | 128));
+        value >>= 7;
+    }
+    output.push_back(static_cast<unsigned char>(value));
+}
+
+void sendEnter(Connection &connection, unsigned player_id)
+{
+    Bytes body{8}; // 字段 1 的 tag：1 * 8 + wire_type(0)。
+    appendVarint(body, player_id);
+    Bytes envelope{8};
+    appendVarint(envelope, kProtocolVersion);
+    envelope.push_back(16); // 字段 2，wire_type=0：command。
+    appendVarint(envelope, kEnterWorld);
+    envelope.push_back(26); // 字段 3，wire_type=2：bytes body。
+    appendVarint(envelope, body.size());
+    envelope.insert(envelope.end(), body.begin(), body.end());
+    connection.sendFrame(envelope);
+}
+
+// 仅服务当前课程的小型字段解码器；拒绝截断、uint32 溢出及未支持的 wire type。
+struct Field
+{
+    unsigned wire    = 0; ///< 当前字段采用 varint(0) 或 length-delimited(2)。
+    unsigned integer = 0; ///< wire=0 时保存解码后的 uint32。
+    Bytes    bytes;       ///< wire=2 时保存本字段独占的 body 或 UTF-8 字符串字节。
+};
+
+std::map<unsigned, Field> parseFields(const Bytes &input)
+{
+    std::size_t offset      = 0; // 下一次读取在完整 Protobuf 消息中的位置。
+    const auto  read_varint = [&]()
+    {
+        unsigned value = 0;
+        for (unsigned i = 0; i < 5; ++i)
+        {
+            require(offset < input.size(), "TRUNCATED_VARINT");
+            const unsigned byte = input[offset++];
+            require(i != 4 || byte < 16, "UINT32_OVERFLOW");
+            value |= (byte & 127) << (7 * i);
+            if ((byte & 128) == 0)
+            {
+                return value;
+            }
+        }
+        throw std::runtime_error("INVALID_VARINT");
+    };
+    std::map<unsigned, Field> fields; // 当前消息字段号到字段值；不跨消息保存。
+    while (offset < input.size())
+    {
+        const unsigned tag = read_varint();
+        require((tag >> 3) != 0, "INVALID_FIELD");
+        Field field;
+        field.wire = tag & 7;
+        if (field.wire == 0)
+        {
+            field.integer = read_varint();
+        }
+        else
+        {
+            require(field.wire == 2, "UNSUPPORTED_WIRE");
+            const unsigned size = read_varint();
+            require(size <= input.size() - offset, "TRUNCATED_BYTES");
+            field.bytes.assign(input.begin() + offset, input.begin() + offset + size);
+            offset += size;
+        }
+        fields[tag >> 3] = std::move(field);
+    }
+    return fields;
+}
+
+// 不依赖 assert，Release 构建也会验证必需字段、wire type 与真实业务响应。
+void expectMessage(Connection &connection, unsigned player_id, unsigned online_count,
+                   const std::string &notice = "")
+{
+    const auto envelope = parseFields(connection.receiveFrame());
+    require(envelope.at(1).wire == 0 && envelope.at(1).integer == kProtocolVersion &&
+                envelope.at(2).wire == 0 && envelope.at(3).wire == 2,
+            "ENVELOPE");
+    const auto fields = parseFields(envelope.at(3).bytes);
+    if (notice.empty())
+    {
+        require(envelope.at(2).integer == kEnterWorld && fields.at(1).wire == 0 &&
+                    fields.at(1).integer == player_id && fields.at(2).wire == 0 &&
+                    fields.at(2).integer == 7 && fields.at(3).wire == 0 &&
+                    fields.at(3).integer == online_count,
+                "ENTER_RESULT");
+        std::cout << "ENTER_OK player=" << player_id << " scene=7 online=" << online_count << '\n';
+    }
+    else
+    {
+        require(envelope.at(2).integer == kNotice && fields.at(1).wire == 2 &&
+                    std::string(fields.at(1).bytes.begin(), fields.at(1).bytes.end()) == notice,
+                "NOTICE_RESULT");
+        std::cout << "NOTICE_OK player=" << player_id << " " << notice << '\n';
+    }
+}
+
+// 进程入口组织两条连接的真实时序；异常后栈展开关闭 A/B，以非零状态报告实验失败。
+int main(int argc, char **argv)
+{
+    try
+    {
+        require(argc <= 2, "USAGE: world_client [port]");
+        unsigned port = 19221; // 与课程服务端的 GATEWAY_COURSE_PORT 相同。
+        if (argc == 2)
+        {
+            const std::string argument = argv[1];
+            require(!argument.empty() &&
+                        argument.find_first_not_of("0123456789") == std::string::npos,
+                    "PORT");
+            const auto parsed_port =
+                std::stoul(argument); // 先按宽类型校验，避免缩窄后绕过端口范围。
+            require(parsed_port > 0 && parsed_port <= 65535, "PORT_RANGE");
+            port = static_cast<unsigned>(parsed_port);
+            require(port > 0 && port <= 65535, "PORT_RANGE");
+        }
+
+        // A 确认进入后才创建 B，在线人数断言才具有确定顺序。
+        Connection a(port);
+        handshake(a);
+        sendEnter(a, 1001);
+        expectMessage(a, 1001, 1);
+        Connection b(port);
+        handshake(b);
+        sendEnter(b, 1002);
+        expectMessage(b, 1002, 2);
+
+        // B 的单播和广播使用同一 TCP 流，保持服务器发送顺序。
+        expectMessage(b, 1002, 0, "欢迎玩家1002");
+        expectMessage(a, 1001, 0, "新手村已开放");
+        expectMessage(b, 1002, 0, "新手村已开放");
+        a.closeNow();
+        b.expectServerClose();
+        std::cout << "COURSE_CPP_CLIENT_OK A主动退出，B收到服务端EOF\n";
+        return 0;
+    }
+    catch (const std::exception &error)
+    {
+        std::cerr << "COURSE_CPP_CLIENT_FAILED " << error.what() << '\n';
+        return 1;
+    }
+}
+~~~
+
+### 4.3 编译并手动运行两端
+
+使用原文准备好的 WSL/Linux 环境、C++17 编译器和 OpenSSL 3 开发头文件及 libcrypto。Ubuntu 缺少开发工具时可安装发行版工具包：
+
+~~~bash
+sudo apt-get install build-essential libssl-dev
+g++ --version
+openssl version
+~~~
+
+sudo 以管理员权限运行安装器；apt-get install 安装指定软件包，build-essential 提供编译工具，libssl-dev 提供 OpenSSL 头文件和链接库。已有这些依赖时无需重复安装；不会修改仓库中的第三方源码。
+
+以下命令在 **FlyWow 根目录**执行：
+
+~~~bash
+mkdir -p build/gateway-master-course/cpp
+g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror \
+    gateway/sample/master_course/client/world_client.cpp \
+    -lcrypto -o build/gateway-master-course/cpp/world_client
+~~~
+
+g++ 编译并链接源文件；-std=c++17 选择项目语言基线；-Wall、-Wextra、-Wpedantic 开启常见及标准兼容警告；-Werror 将警告作为错误；-lcrypto 链接 OpenSSL 密码库；-o 后指定可执行文件路径。行尾反斜杠将命令延续到下一行。
+
+打开两个 WSL 终端，都进入 FlyWow 根目录。终端一只启动现有课程服务端：
+
+~~~bash
+bash gateway/sample/master_course/run.sh tcp server
+~~~
+
+该脚本可从任意目录通过绝对路径调用。tcp 选择两字节 framing，server 选择前台服务端模式；该分支仅启动服务端。等待 COURSE_GATEWAY_READY transport=tcp 日志，Skynet 可能在等号后插入空格。
+
+终端二运行 C++：
+
+~~~bash
+timeout 20s build/gateway-master-course/cpp/world_client 19221
+~~~
+
+timeout 为整轮实验设置 20 秒总期限，超时返回非零状态；Socket I/O 另有每次 5 秒等待期限。19221 必须与服务端端口一致；省略参数也使用 19221。
+
+自定义端口时，终端一和终端二分别运行：
+
+~~~bash
+GATEWAY_COURSE_PORT=19300 bash gateway/sample/master_course/run.sh tcp server
+timeout 20s build/gateway-master-course/cpp/world_client 19300
+~~~
+
+第一行的临时环境变量赋值仅传给该 bash 进程及子进程，不改变另一终端的环境。
+
+成功日志应包含：
+
+~~~text
+HANDSHAKE_READY
+ENTER_OK player=1001 scene=7 online=1
+HANDSHAKE_READY
+ENTER_OK player=1002 scene=7 online=2
+NOTICE_OK player=1002 欢迎玩家1002
+NOTICE_OK player=1001 新手村已开放
+NOTICE_OK player=1002 新手村已开放
+COURSE_CPP_CLIENT_OK A主动退出，B收到服务端EOF
+~~~
+
+同时检查终端一的两条 COURSE_ENTER 和两条 COURSE_DISCONNECT，在线人数最终为 0。每轮实验重新启动课程服务端；失败后若进程仍在终端一运行，按 Ctrl+C 停止，再重新启动。
+
+也可运行一键命令：
+
+~~~bash
+bash gateway/sample/master_course/run.sh tcp
+~~~
+
+第 2.4 节脚本在 tcp/client 分支编译并运行本节 C++ 文件，自动管理服务端与日志。双终端用于调试，一键模式用于重复验收。
+
+### 4.4 沿 C++ 调用栈理解字节与生命周期
+
+#### 请求怎样进入 Gateway？
+
+main 调用 sendEnter(a,1001)，先编码 player_id，再包 Envelope，最后添加 TCP 头：
+
+~~~text
+body:       08 E9 07
+Envelope:   08 04 10 E9 07 1A 03 08 E9 07
+TCP frame:  00 0A 08 04 10 E9 07 1A 03 08 E9 07
+~~~
+
+tag 的原始关系是「字段号 × 8 + wire type」。Envelope 的字段 3 是 bytes，wire type=2，因此 tag=3×8+2=26，即 1A；body 长度为 3，所以后面是 03。TCP 长度是完整 Envelope 的 10 字节，不含自身头部，按网络序写成 00 0A。
+
+服务端 gateway/service/flywow_gateway.lua 的 run_tcp 读取相同 framing。握手完成后，dispatch_payload 才把业务载荷交给 Codec/Registry，再异步投递 WorldService。详细源码分析继续读原文 4.5 及后续章节。C++ 阻塞 recv 与 Skynet 协程 socket.read 属于不同执行上下文。
+
+#### 为什么不能只检查 READY 类型？
+
+handshake 中的数据对应同一公开握手合同：
+
+| C++ 局部数据 | 来源与用途 |
+|---|---|
+| hello | 类型 1、握手版本 1、65 字节本次临时公钥 |
+| challenge | 99 字节挑战，公钥区间 [2,67)，salt 区间 [67,99) |
+| shared | P-256 ECDH 共享秘密 Z，不在网络上传输 |
+| hash | SHA256(hello 拼接 challenge)，不含 TCP 长度头 |
+| proof_key | HKDF-SHA256(Z, salt, info)，info 是 ASCII flywow/handshake/v1 拼接 hash |
+| client_mac | HMAC-SHA256(proof_key, ASCII client-proof 拼接 hash) |
+| expected | HMAC-SHA256(proof_key, ASCII server-ready 拼接 hash) |
+
+PROOF 为类型字节 03 加 32 字节 client_mac；READY 为类型字节 04 加 32 字节服务端 MAC。只检查类型或长度无法验证对端掌握本次派生密钥。CRYPTO_memcmp 比较完整证明，成功才返回 main。
+
+返回时 RAII owner 释放 OpenSSL 句柄，shared/proof_key 析构擦除可见秘密数组，没有秘密用于后续业务加密。可对照真实源码 gateway/clients/h5/handshake.mjs 的 begin/respond/complete 和 gateway/native 中的密码实现；两端使用同一 transcript 和前缀，因此能够互操作。
+
+#### 两条连接怎样顺序接收消息？
+
+receiveFrame 顺序读包。A 确认进入后才连接 B；B 的响应和公告按它自己连接上的顺序读取，不需要额外消息邮箱。
+
+expectMessage 先解 Envelope，再按 command 解 body。A/B 各有独立 fd 和内核接收缓冲，在一个连接上等待不会消费另一个连接的字节。这适用于本例有限且顺序已知的验收。
+
+#### 谁关闭网络连接？
+
+Connection 创建并独占 fd，禁止复制。构造中连接失败时显式关闭；构造成功后由析构器或 closeNow 关闭。MSG_NOSIGNAL 避免向已断开的连接写入时 SIGPIPE 杀死进程；短写按 offset 继续，错误由 main 报告。
+
+A 主动 closeNow 后，Gateway 清理连接并发出 gateway_disconnect，WorldService 删除映射。B 等服务端延时 close 产生 TCP EOF；超时、额外数据和网络错误都不算关闭成功。C++ 退出不代表业务清理已经完成，还要核对服务端日志。
+
+readExact 恰好读取当前帧所需字节，因此可处理拆包与粘包。部分头部或载荷到达时继续读取，后续帧留在内核缓冲中；帧尚未读完整就收到 EOF 则报告 EARLY_EOF。
+
+
+### 4.5 源码深挖（一）：从 Socket 到 READY
+
+已经观察到两次 HANDSHAKE_READY，现在沿 TCP 真实路径回到服务端：
+
+1. listener 把 fd/peer 交给 gateway/service/flywow_gateway.lua 的 accept_client；create_connection 分配 connection_id，建立双索引。
+2. Gateway fork 每连接一条 run_tcp 协程，socket.start 接管 fd，读取两字节头和完整 HELLO。
+3. process_handshake 调用 gateway/lualib/handshake.lua 的 receive 与 gateway/native/gateway_crypto.cpp，回送 99 字节 CHALLENGE。
+4. C++ handshake 校验挑战，发送 33 字节 PROOF；服务端验证、写出 33 字节 READY，再 confirm。
+5. C++ 验证服务端 HMAC，返回 main，sendEnter 才发送 Envelope。
+
+四段载荷长度为 67 → 99 → 33 → 33，每条外面有两字节长度头。客户端和服务端密码运算都同步执行；服务端读取 Socket 时可能 yield，客户端阻塞 recv 不会阻塞 Skynet 其他 Service。
+
+4.5.3 保留 WebSocket HTTP Upgrade 的传输对照，不要求运行 Node。主线仍是 run_tcp → process_handshake → run_tcp 下一轮读取。
+
+#### 4.5.1 拿到 fd 的第一行代码在哪里
+
+先观察客户端 A 的 TCP 已建立而 C++ handshake 尚未返回。此时进入 Gateway Service 的 `accept_client(fd,peer)`，调用者是 **Skynet listener 的 accept 回调**，而不是 WorldService 的 `skynet.dispatch`。`fd` 是底层 Socket Driver 分配的整数，`peer` 是诊断用对端地址。
+
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `accept_client()`】**：
+
+```lua
+local connection = create_connection(fd, "tcp")
+if not connection then
+    socket.close_fd(fd)
+    return
+end
+
+skynet.fork(function()
+    local ok, err = pcall(run_tcp, connection)
+    -- 省略失败日志、会话退出后的摘除与 transport 清理；此处不是完整分支。
+end)
+```
+
+这是当前工作区 TCP 分支的局部源码：accept 回调完成连接登记并 fork 后返回，后续定长读取在新协程中执行。create_connection 失败时 fd 尚未进入 Lua socket_pool，使用 close_fd；成功后的接管与读取由 run_tcp 负责。WebSocket 的同类路径在下一节传输对照中讨论。
+
+#### 4.5.2 两张连接索引为什么都存在
+
+进入 `create_connection`（真实路径仍为 `gateway/service/flywow_gateway.lua`），按顺序做三件事：检查 `connection_count` 和 `next_connection_id` 上限、通过 `handshake_module.accept()` 创建独占握手状态、构造 `connection` 并同时登记两张索引。
+
+**【真实源码局部：`create_connection()`，省略容量拒绝与日志分支】**：
+
+```lua
+local handshake = handshake_module.accept()
+module_state.next_connection_id = module_state.next_connection_id + 1
+local connection =
+{
+    handshake       = handshake,
+    connection_id   = module_state.next_connection_id,
+    fd              = fd,
+    transport       = transport,
+    closed          = false,
+    read_started    = nil,
+    last_message    = skynet.now(),
+}
+module_state.connections[connection.connection_id] = connection
+module_state.connections_by_fd[fd] = connection
+module_state.connection_count = module_state.connection_count + 1
+```
+
+所有字段均是一个 **GatewayConnection** 的属性，`handshake` 指向该连接自己的 HandshakeContext。上述摘录删除了源码中的逐字段注释以便聚焦，但记录字段和赋值顺序与仓库一致。
+
+举例：A 的 fd 假设为 `18`，Gateway 给它逻辑连接号 `1`。此时两张表实际指向的是**同一个连接对象**：
+
+```text
+module_state.connections[1] -----------+
+                                       +--> connectionA {id=1, fd=18, ...}
+module_state.connections_by_fd[18] ----+
+connectionA.handshake ----------------------> handshakeContextA {phase="hello"}
+```
+
+这里没有复制两个对象；两张索引用于不同入口：WorldService 的出站命令拿的是 `connection_id`，所以查 `connections[1]`；WebSocket 回调给的是 `fd`，所以查 `connections_by_fd[18]`。将 `player_id=1001` 塞进这两张表会跨越网关与业务的职责边界。
+
+**生命周期验证**：连接未 ready 就关闭时，也应从两张表删除并释放握手 Native 对象。你可以在第六阶段发送错误 HELLO，再看 `gateway_disconnect` 及后续新连接是否仍能被接受；不能因为失败发生在业务之前就假定它不会占资源。
+
+#### 4.5.3 传输对照：HTTP WebSocket Upgrade 与 FlyWow 应用握手的层次
+
+进入固定 Skynet `v1.8.0` 的 `lualib/http/websocket.lua`，`M.accept()` 会调用 `socket.start(socket_id)`，创建 `ws_obj`，注册 warning，然后进入 `resolve_accept()`。这段逻辑在 **Gateway Service fork 的 WS 会话协程**中执行，读取网络时可能挂起。HTTP Upgrade 成功，`resolve_accept()` 调用 `try_handle(self,"handshake",header,url)`，触发 `ws_handler.handshake(id,...)`。
+
+**【真实源码局部：固定 Skynet `lualib/http/websocket.lua` / `resolve_accept()`】**：
+
+```lua
+local header = err
+try_handle(self, "handshake", header, url)
+local recv_count = 0
+local recv_buf = {}
+local first_op
+while true do
+    if _isws_closed(self.id) then
+        try_handle(self, "close")
+        return
+    end
+    local fin, op, payload_data = read_frame(self)
+    -- 接下来分流 close / ping / pong / message；这里仅展示进入读循环。
+end
+```
+
+此处的 `"handshake"` 是**HTTP WebSocket 升级回调名称**，并不等于应用层的 P-256 握手完成。真实 `ws_handler.handshake()` 此时只清空 `connection.read_started` 并设置 `last_message`；它不会调用 `handshake.confirm()`。
+
+之后客户端发来的 67 字节 HELLO 才被 `read_frame` 解成一条 `binary message`，经 `try_handle(self,"message",payload_data,op)` 进入 `ws_handler.message()`。
+
+**回到调用者**：`ws_handler.handshake` 返回后，Skynet 的 `resolve_accept` 继续 while 读帧；`ws_handler.message` 返回后也是继续 while 读下一帧。Gateway 并没有另起一个线程执行 WS 回调。
+
+#### 4.5.4 Handshake 的状态不是一个 ready 布尔值
+
+**【真实源码：`gateway/lualib/handshake.lua` / `M.init()` 模块函数】**。`M.accept()` 由 `create_connection` 调用；`M.receive()` 由 `process_handshake` 调用；`M.confirm()` 由 Gateway 在 SERVER_READY 写成功之后调用；`M.close()` 在确认 ready 或连接 detach 时释放资源。
+
+| `context.phase` | 客户端下一条消息     | 状态变更                                     | Native 生命周期                   |
+| --------------- | -------------------- | -------------------------------------------- | --------------------------------- |
+| `hello`         | `CLIENT_HELLO` 67B   | `receive()` 成功后变 `proof`                 | 创建本连接 Native userdata   |
+| `proof`         | `CLIENT_PROOF` 33B   | 验证成功后变 `confirm`                       | Native 擦除验证密钥，等待 transport 写出证明 |
+| `confirm`       | **不应再接收下一条** | SERVER_READY 写成功后 `confirm()` 变 `ready` | 释放该连接状态                 |
+| `ready`         | 业务 Envelope        | `ready()` 返回 true                          | 不再持有 Native 密钥              |
+| `closed`        | 无                   | 失败释放/关闭                                | Native 释放，拒绝继续推进            |
+
+连接容量只有 Gateway 的 connection_count/max_clients 一套。握手 context.phase 决定当前允许的消息和 Native 生命周期，ready 或 closed 终态不再持有 Native 对象。
+
+**【真实源码局部：`gateway/lualib/handshake.lua` / `M.receive()`，HELLO 分支】**：
+
+```lua
+if context.phase == "hello" then
+    if bytes:byte(1) ~= 1 or bytes:byte(2) ~= 1 then
+        M.close(context)
+        return flywow_result.failure(
+            "HANDSHAKE_VERSION",
+            "unsupported handshake message type or version"
+        )
+    end
+    local call_succeeded, native_or_error, challenge_or_error =
+        pcall(crypto_module.create_context, bytes)
+    -- 失败后 M.close(context)，返回 HANDSHAKE_CRYPTO。
+    -- 成功分支如下：
+    context.crypto_context = native_or_error
+    context.phase = "proof"
+    return flywow_result.success(
+    {
+        response_bytes = challenge_or_error,
+        needs_confirmation = false,
+    })
+end
+```
+
+这里的 `crypto.create_context` 对应 Native 的公开 `create_context(hello)`，**不是 Lua 的 `handshake.init()`**。它返回 userdata 加 99 字节 challenge。失败时 Lua 状态机转换为 `FlyWowResult`，不会把 OpenSSL 异常作为业务响应抛给客户端。
+
+**【真实源码局部：`gateway/lualib/handshake.lua` / `M.receive()`，PROOF 分支与 `confirm()`】**：
+
+```lua
+context.phase = "confirm"
+return flywow_result.success(
+{
+    response_bytes = ready_or_error,
+    needs_confirmation = true,
+})
+```
+
+上面发生在 `context.crypto_context.verify(...)` 验证成功之后。`M.confirm()` 必须在确认仍为 `confirm`、未过期后调用 release_context(context, "ready") 释放资源并直接提交 ready，释放 Native 对象。这个顺序对应真实网络行为：**客户端看到的 SERVER_READY 证明已经被本地发送接口接受，Gateway 才允许业务包进入**。
+
+#### 4.5.5 Gateway 是怎样决定何时调用 `confirm()` 的
+
+执行现场重新回到 Gateway Service 的 `process_handshake(connection,bytes)`。它把 `connection.handshake` 和当前完整帧借给状态机；`handshake.receive` 不知道 Socket fd，也不负责写网络。
+
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `process_handshake()`】**：
+
+```lua
+local handshake_result = handshake_module.receive(
+{
+    context = connection.handshake,
+    bytes   = bytes,
+})
+if not handshake_result.ok then
+    -- 记录原有错误码并返回失败 Result；调用者负责关闭连接。
+end
+local handshake_output = handshake_result.value
+local response_bytes = handshake_output.response_bytes
+-- TCP 用 socket.write 写长度头+response；WS 用 websocket.write 写 binary。
+-- 若写入失败或连接已摘除，返回 HANDSHAKE_WRITE_FAILED。
+connection.last_message = skynet.now()
+if handshake_output.needs_confirmation then
+    local confirm_result = handshake_module.confirm(connection.handshake)
+    if not confirm_result.ok then
+        return confirm_result
+    end
+end
+return flywow_result.success()
+```
+
+这是**按实际源码顺序摘录的连续关键语句，中间写入分支做了注释省略**，不是一个可直接替换源码的函数。`connection.last_message` 是成功完成握手消息写入后的活动时间，和 `context.started`（绝对握手期限起点）不同。发送 CHALLENGE 不重置握手的绝对期限。
+
+实际到达 `confirm` 时，`SERVER_READY` 已经生成并交给 `socket.write`/`websocket.write`，因此 `confirm()` 才把状态切到 `ready`。如果写失败，`process_handshake` 返回错误，`ws_handler.message` 或 `run_tcp` 沿失败路径关闭连接；没有“客户端提前发送业务包就自动缓存”的行为。
+
+#### 4.5.6 Native 层究竟保存了什么，又什么时候释放
+
+打开 `gateway/native/gateway_crypto.cpp`。入口是 `luaopen_flywow_gateway_crypto()`，它向 Lua 注册模块 `create_context` 以及 userdata 的 `verify/close`；不是直接向 Skynet 注册 Service。Lua 调用 `crypto.create_context(bytes)` 进入 C++ `create_context(lua_State*)`，成功时创建独占的 `CryptoContext`，调用 `buildChallenge()`。
+
+**【真实源码局部：`gateway/native/gateway_crypto.cpp`】**：
+
+```cpp
+struct CryptoContext
+{
+    std::array<unsigned char, 32> proof_key = {};
+    std::array<unsigned char, 32> transcript_hash = {};
+    bool active = false;
+    ~CryptoContext() noexcept;
+};
+```
+
+这个 C++ record 由一个 Lua userdata 拥有。`buildChallenge()` 调用 OpenSSL EVP 生成 P-256 临时密钥对，验证客户端公钥点，计算原始 ECDH `Z`，再按合同生成：
+
+```text
+HELLO    = 01 01 + 客户端公钥65B
+CHALLENGE= 02 01 + 服务端公钥65B + 32B随机挑战
+T        = SHA256(HELLO || CHALLENGE)
+Z        = ECDH(server_private, client_public) 原始32B
+K        = HKDF-SHA256(Z, salt=随机挑战32B,
+           info="flywow/handshake/v1" || T, length=32)
+PROOF    = 03 + HMAC-SHA256(K,"client-proof" || T)
+READY    = 04 + HMAC-SHA256(K,"server-ready" || T)
+```
+
+这段是**协议推导式，不是 C++ 源码**。`Z` 的作用域使用 RAII `SharedSecret` 析构时擦除；`server_key` 由 `buildChallenge` 的局部 RAII owner 持有，正常返回和异常退出都会释放，不保存在 userdata 中。此后 userdata 保存 `proof_key`、`transcript_hash` 和 `active=true`，等待客户端 proof。
+
+客户端发回 PROOF 后，C++ `verify()` 用 `CRYPTO_memcmp` 比较客户端 HMAC，构造 READY，调用 `clearCryptoContext()` 擦除 `proof_key`/`transcript_hash` 并设置 `active=false`。`M.confirm()` 再调用 release_context(context, "ready")，将 userdata 引用清空、释放握手 Native 对象。
+
+**正常与失败路径的清理必须区分**：正常情况下密钥在 `verify()` 成功时已经擦除，`confirm()` 负责转 ready 和释放 Lua 持有关系；非法公钥、错误 proof 或超时时，`M.close()`/Native close 走失败清理。C++ userdata 的内存最终由 Lua GC 回收，`__gc` 的重复清理是幂等的；不能把“清理内部密钥”误说成“立即释放 Lua userdata 内存”。
+
+最后返回客户端：`gateway/clients/h5/handshake.mjs` 的 `HandshakeClient.complete()` 用 Web Crypto 验证服务器证明，成功后把自身阶段切 `ready` 并清掉密钥引用；`connectGateway()` Promise 随后 resolve。**服务端 ready 与客户端 SDK ready 是两次不同的确认动作**。
+
+#### 4.5.7 本阶段动手验证什么
+
+本课程的端到端流程检查 Gateway、Native 加载、握手和客户端协议。LuaBinding 另有一组固定 Skynet Lua ABI 的 Native 回归测试，覆盖参数/table 操作、真实 upvalue 编号、异常边界、Lua 分配失败时的资源展开，以及动态和静态 userdata 注册与析构。新增的静态注册用例通过 Lua `package.preload` 调用模块入口，核对静态 `luaL_Reg` 方法表、userdata 方法和 GC；它不等同于加载真实 `.so` 或运行 Gateway 集成。
+
+从 FlyWow 根目录可运行该 Binding 回归（参数需指向已构建的 Skynet 根目录）：
+
+~~~bash
+bash scripts/build_flywow.sh /path/to/skynet lua_binding
+~~~
+
+该目标链接指定 Skynet 自带的 Lua 5.4.7，而不是系统 Lua。它用于验证 Binding 的 ABI 与生命周期合同，不能替代下方 WS/TCP 课程实验。
+
+先执行第 4.3 节正常 TCP 流程，再按第 7.2 节对照错误类型和错误长度的 HELLO：
+
+1. 正常流程中，观察 `FLYWOW_GATEWAY_OPEN`、`FLYWOW_GATEWAY_READY` 及第一条 `COURSE_ENTER` 的先后关系。前者的 `READY` 在真实日志里有 Gateway 监听 ready 与连接 ready 两类上下文，必须读出具体字段与时间，不应只按字符串混为一类。
+2. 错误 HELLO `Bytes{99}`：它只有 1 字节，TCP 会在 run_tcp 的阶段长度检查得到 FRAME_LIMIT，不会进入 M.receive；WebSocket 的同类输入则交给 M.receive 后得到 HANDSHAKE_FRAME。若要验证 HANDSHAKE_VERSION，发送第 7.2 节的 67 字节错误类型消息。两种输入触发位置不同。
+3. 根据错误路径画出 `accept → handshake.accept → receive失败 → detach → handshake.close → transport close`，检查从未进入 WorldService 的请求也会触发 `gateway_disconnect`。
+
+**返回主线**：A 握手后 process_handshake 返回 run_tcp 读循环，下一条完整 TCP 业务载荷才进入 `dispatch_payload`。下面继续从这条入站业务包追踪到 WorldService。
+
+---
+
+### 4.6 源码深挖（二）：A 的业务请求如何穿过两个 Service
+
+执行现场：A 已 ready，Gateway 收到上述 10 字节 Envelope。仍在 Gateway Service 的 TCP 读协程，**未进入 WorldService**。
+
+**【真实源码】** `gateway/service/flywow_gateway.lua`：`ws_handler.message` → `dispatch_payload(connection,payload)`：
+
+1. `#payload` 检查 `MAX_FRAME_BYTES`；不是 Skynet 接收内存的硬上限。
+2. `codec_module.decode_envelope(payload)` → `gateway/lualib/codec.lua` 中 `pb.decode(Envelope,bytes)`；得到版本 4、command 1001、三字节 body。
+3. Codec 内部的 `registry.commands[1001]` → 直接查询生成表；得到 `.flywow.gateway.course.EnterWorldRequest`。
+4. `codec_module.decode_request(command_id,body)` → `pb.decode`，获得 `{player_id=1001}`。
+5. 刷新本连接完整业务消息的活动时间。
+6. 构造 `inbound_request = {gateway_epoch,connection_id,command_id,data}`，以 `skynet.send(handler_service,"lua","send_data",inbound_request)` 异步投递。
+
+**重要区分**：
+
+```text
+Gateway Lua State                         WorldService Lua State
+-----------------                         ----------------------
+dispatch_payload(connection,payload)
+  codec/registry
+  skynet.send(".gateway_course_world", "lua", "send_data", request)
+  return FlyWowResult.success()  ----->     skynet.dispatch("lua", ...)
+                                           on_enter_world(request)
+                                           state.players[connection_id] = 1001
+                                           skynet.send(gateway,"lua","send_data", response)
+                                             |
+Gateway 接收新的消息 <-------------------------+
+  deliver_outbound_message(response)
+  -> codec.encode_response
+  -> write_connection -> socket.write(长度头 + Envelope)
+```
+
+这里 **没有 Gateway 等待 WorldService 回包的 `skynet.call`，也没有保存 pending request 或 `request_id`**。WorldService 处理请求的时间不会延迟 Gateway 对这一请求的异步投递完成。两个 Service 的 Lua table 不共享内存，消息需要经过 Skynet 的序列化与投递。
+
+**【真实源码】** `deliver_outbound_message` 校验 `gateway_epoch`、逻辑 `connection_id`、command 和 ready，调用 `codec.encode_response` 生成 Envelope，再通过 `write_connection` 发送。`WorldService` 的 `{player_id=1001,scene_id=7,online_count=1}` 经过其 Registry `response_type` 编码，客户端按 command 1001 重新解码。这才算完整的一次请求响应。
+
+**阶段验收**：沿程序实际位置画出 Gateway 与 WorldService 的两条协程/消息执行链，明确哪里产生网络读等待、哪里 RPC 等待、哪里只有异步 send。能解释 `0` 代表 Skynet 普通 `send` 已接受投递，而不是业务已处理成功。
+
+---
+
+### 4.7 源码精读：10 字节请求从哪里变成业务 table
+
+先把上节的 `sendEnter(a,1001)` 写成可见字节，避免把 `Envelope` 与 TCP framing 混淆。客户端从 `client/world_client.cpp` 得到的完整 **Protobuf Envelope** 是：
+
+```text
+08 04                       Envelope.protocol_version = 4
+10 E9 07                    Envelope.command = 1001
+1A 03                       Envelope.body 长度 = 3
+   08 E9 07                 EnterWorldRequest.player_id = 1001
+-------------------------
+总计 10B（无 TCP 长度头 / WS 帧头）
+```
+
+`10` 是十六进制字节 `0x10`，不是业务 command；Protobuf key 使用 `field_number << 3 | wire_type`。实际把它发进 WebSocket 时，`http.websocket` 已经拼出单条完整 binary message，Gateway 不再执行 TCP `read_exact(2)`。
+
+当前执行上下文仍为 **Gateway Service** 的 WebSocket 会话协程，文件 `gateway/service/flywow_gateway.lua`，函数 `ws_handler.message(id,payload,"binary")`。它取 `module_state.connections_by_fd[id]`，再判断：
+
+```lua
+if handshake_module.ready(connection.handshake) then
+    frame_result = dispatch_payload(connection, payload)
+else
+    frame_result = process_handshake(connection, payload)
+end
+```
+
+这是两个互斥分支。A 已 ready，因此这条 10 字节消息不可能再被当作 `CLIENT_HELLO`；如果 SDK 在未 ready 时误发 Protobuf，Handshake 会依据当前固定长度/阶段拒绝。
+
+#### 4.7.1 `dispatch_payload()` 第一段：帧和 Envelope
+
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `dispatch_payload()`】**：
+
+```lua
+if connection.closed or #payload == 0 or
+    #payload > MAX_FRAME_BYTES then
+    -- 记录 FRAME_LIMIT 并返回失败结果，原文件包含完整 log_event 构造。
+end
+
+local envelope_result = codec_module.decode_envelope(payload)
+if not envelope_result.ok then
+    -- 返回 ENVELOPE_DECODE，details.cause_code 保留 Codec 错误类别。
+end
+local envelope = envelope_result.value
+if envelope.protocol_version ~= module_state.gateway_config.protocol_version then
+    -- 返回 PROTOCOL_VERSION。
+end
+```
+
+这一段分开三类错误：大小或空帧属于 `FRAME_LIMIT`；bytes 无法按 `Envelope` 解码属于 `ENVELOPE_DECODE`；成功解码但业务版本不兼容属于 `PROTOCOL_VERSION`。不能只说“解包失败”。本课的 10 字节成功得到 `envelope={protocol_version=4, command=1001, body=<3字节>}`；Lua 的 `body` 是 bytes string，还不是 `EnterWorldRequest` table。
+
+`codec.decode_envelope` 来自 `gateway/lualib/codec.lua`，内部调用 `pb.decode(codec_config.registry.envelope_type,payload)`。`pb` 加载的类型描述来自第一阶段生成的 `.pb`，不会每帧再加载文件；失败被 `pcall(pb.decode,...)` 转成 `FlyWowResult`。
+
+#### 4.7.2 第二段：Registry 决定如何解释 body
+
+**【真实源码局部：同一 `dispatch_payload()`】**：
+
+```lua
+if not codec_module.has_command(envelope.command) then
+    -- 记录 UNKNOWN_COMMAND 并返回失败 Result。
+end
+
+local request_result = codec_module.decode_request(
+    envelope.command, envelope.body
+)
+if not request_result.ok then
+    -- 记录 REQUEST_DECODE 并返回失败 Result。
+end
+local request = request_result.value
+```
+
+`definition` 来自 `world_registry.lua` 的生成命令表。本例的 `request_type=".flywow.gateway.course.EnterWorldRequest"`，Codec 内部再调用 `pb.decode(definition.request_type,body)`，最终得到 `{player_id=1001}`。
+
+如果客户端发送 `SYSTEM_NOTICE=1002`，Registry 能找到定义，但 `request_type=nil`。这时**不是 `UNKNOWN_COMMAND`**，而是 Codec 的 `decode_request` 按不支持入站类型返回错误，Gateway 对外记 `REQUEST_DECODE`。要能准确描述“命令号不存在”与“命令仅允许服务端下发”这两种失败。
+
+#### 4.7.3 第三段：刷新活动时间并异步投递
+
+两层解码通过后，Gateway 更新本连接的完整业务消息活动时间，再构造四字段 inbound_request。这里不等待 WorldService，也不建立请求关联状态。
+
+```lua
+local request = request_result.value
+connection.last_message = skynet.now()
+local inbound_request =
+{
+    gateway_epoch = module_state.epoch,
+    connection_id = connection.connection_id,
+    command_id    = envelope.command,
+    data          = request,
+}
+local call_succeeded, send_result_or_error = pcall(
+    skynet.send,
+    module_state.gateway_config.handler_service,
+    "lua", "send_data", inbound_request
+)
+```
+
+inbound_request 是跨 Service 的已解码记录，不是网络 Protobuf 字节。skynet.send 返回 0 表示本地异步投递被接纳，不表示业务处理成功；nil/false 或异常沿现有错误路径关闭来源连接。随后 run_tcp 继续读下一条长度头，WorldService 在自己的消息协程处理请求。
+
+### 4.8 在两份 Lua State 之间追踪一次请求与响应
+
+注意这里不是普通 Lua 函数调用：`WorldService` 和 `Gateway` 通过 Skynet 消息队列传递值，业务消息的接收由各自 `skynet.dispatch("lua",...)` 执行。
+
+```text
+Gateway Service，Lua State G            WorldService，Lua State W
+  TCP 读取协程 G-read                       业务消息协程 W-msg
+  │                                       │
+  ├─ dispatch_payload                     │
+  ├─ skynet.send(".gateway_course_world", ───> Skynet 投递消息
+  │    "lua","send_data",record)         ├─ skynet.dispatch("lua",...)
+  ├─ return success                       ├─ on_enter_world(record)
+  └─ 回到 read_exact 等待下一条长度头          ├─ state.players[id]=1001
+                                          ├─ send_to_gateway(epoch,id,1001,response)
+                                          └─ skynet.send(gateway,"lua","send_data",...)
+           Gateway 后续收到独立的出站消息 <───┘
+  Gateway 另一条消息分发协程 G-send
+  ├─ deliver_outbound_message(outbound)
+  ├─ codec.encode_response(...)
+  ├─ write_connection(...)
+  └─ return（无业务 RPC 返回）
+```
+
+两个接收回调在各自的 Service 内调度，不能假设它们共用一次 C++ 调用栈。WorldService 的 `state.players` 也**不会因为 Gateway 把 `connection.closed=true` 而被自动修改**；只有 `gateway_disconnect` 消息在 WorldService 被处理之后才删除该玩家记录。
+
+### 4.9 出站源码精读：为什么回包能找到原来的连接
+
+现在从 WorldService 的 `send_to_gateway(epoch,connection_id,1001,data)` 返回到 Gateway Service 的 `skynet.dispatch`。该入口匹配 `command="send_data"`，调用 `deliver_outbound_message(outbound_message)`；和前面的入站同名 `send_data` **只代表宿主与网关互发的消息命令**，消息方向由发起者决定。
+
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `deliver_outbound_message()`】**：
+
+```lua
+if not module_state.gateway_config or type(outbound_message) ~= "table" or
+    outbound_message.gateway_epoch ~= module_state.epoch or
+    module_state.phase ~= "running" then
+    return
+end
+
+if not codec_module.has_response(outbound_message.command_id) then
+    return
+end
+local encode_result = codec_module.encode_response(
+    outbound_message.command_id,
+    module_state.gateway_config.protocol_version,
+    outbound_message.data
+)
+```
+
+此前还存在对 `connection_id/command_id/data` 的类型检查，此处为聚焦主线略去。出站先校验 `epoch`，防止上一 Gateway 实例迟到响应；再通过 `response_type` 选择 protobuf 类型并编码。`codec.encode_response` 在 `gateway/lualib/codec.lua` 中先 `pb.encode(EnterWorldResponse,data)`，再包 `{protocol_version=4,command=1001,body=...}` 并 `pb.encode(Envelope,...)`。
+
+**【真实源码局部：同一函数的目标连接选择】**：
+
+```lua
+if outbound_message.connection_id == 0 then
+    for _, connection in pairs(module_state.connections) do
+        if not connection.closed and
+            handshake_module.ready(connection.handshake) then
+            write_connection(connection, encoded)
+        end
+    end
+    return
+end
+
+local connection = module_state.connections[outbound_message.connection_id]
+if not connection or connection.closed or
+    not handshake_module.ready(connection.handshake) then
+    return
+end
+write_connection(connection, encoded)
+```
+
+这个索引就是 `create_connection()` 里创建的 `connections[id]`。若 A 的旧 fd 被后来新客户端复用，旧 A 的逻辑 `connection_id` 也不会被复用；当 A 已 detach 时，`connections[旧id]` 不存在，所以出站消息会被丢弃，不可能“顺手发给使用同一个 fd 的新人”。
+
+`write_connection()` 在 WS 分支调用 `websocket.write(fd,encoded,"binary")`，TCP 分支调用 `socket.write(fd,string.pack(">I2",#encoded)..encoded)`。写失败会记录 `WRITE_FAILED`、摘除连接，并 fork transport 关闭；成功也**只表示本地写操作成功**，不等于客户端应用已经消费响应。
+
+### 4.10 这一条主线结束后，必须能独立推导的问题
+
+**实验**：在第六阶段使用未知 command `9999`，再把它换成合法的服务端专用 command `1002`，对比 Gateway 产生的错误类别。再思考 A 收到 `EnterWorldResponse` 时是否可以证明 WorldService 一定按某个 `request_id` 取回缓存的请求——答案不能这样推导，因为 Gateway 没有这样的关联状态；本例是 WorldService 主动带连接身份发送另一条独立消息。
+
+此节返回第四阶段主线：A 的请求与回包已经完成，B 接入后将触发相同的入站与出站流程；区别是单播和广播由 `connection_id` 的值决定。
+
+---
+
+# 第四阶段：双连接、单播、广播、主动关闭
+
+## 5. 为什么不能把 player_id 当成 Socket id
+
+第 3 阶段运行时已经能看到完整两人场景。现在不增添模块，只观察**同一次运行中的第二条连接**，并沿源码解释它为什么不会误发到玩家 A。
+
+| 业务事实           | Gateway 实际管理的东西                                       | WorldService 保存的东西                      |
+| ------------------ | ------------------------------------------------------------ | -------------------------------------------- |
+| 玩家 A（1001）接入 | fd、当前实例的 `connection_id=1`（示意值）和 `gateway_epoch` | `players[1]=1001`                            |
+| 玩家 B（1002）接入 | 另一条 fd、另一 `connection_id=2`（示意值）                  | `players[2]=1002`                            |
+| 发送 B 私信        | `send_data` 按 `connection_id=2` 选目标                      | 业务决定公告内容                             |
+| 广播               | `connection_id=0`，当前 Gateway 的 ready 连接                | 不需要业务循环逐个写 Socket                  |
+| B 主动断开         | `close` 指向 B 的逻辑连接                                    | `gateway_disconnect` 到达后删除 `players[2]` |
+
+`fd` 是 Skynet Socket Driver 的底层编号，Gateway 不把它交给业务 Service；`connection_id` 是本 Gateway 实例内递增分配的逻辑编号，两个不同实例可能都有 `connection_id=1`。所以出站 `send_data`、`close` 必须带入本次请求携带的 `gateway_epoch`，而且广播 `0` **只到当前 Gateway 实例**，不是全服跨节点广播。
+
+## 5.1 整体运行与逐步观察
+
+从 FlyWow 根目录运行：
+
+```bash
+bash gateway/sample/master_course/run.sh tcp
+```
+
+观察 `WorldService` 源码 `on_enter_world` 中 B 分支的确切发送顺序：
+
+```text
+收到 B 的 EnterWorldRequest
+    -> 回 B 的 EnterWorldResponse（1001）
+    -> 单播 B 的 SystemNoticeResponse（1002，"欢迎玩家1002"）
+    -> 广播 SystemNoticeResponse（1002，"新手村已开放"）
+    -> 30 tick 后投递 close(B)
+客户端 A 收到广播 -> A 调用 closeNow()
+网关分别收到 A/B 的 close -> 回报两个 gateway_disconnect
+WorldService 清理 players，并调用 Gateway.stop()
+```
+
+本例 `skynet.timeout(30, ...)` 只是用于让教学过程的“先收到消息、再被主动断开”清晰可见，**不是 Gateway 的可靠送达 ACK**。正式业务若必须确认某条消息已被客户端处理，应在业务协议中另行定义确认合同；Gateway 当前不提供这种机制。
+
+### 5.2 源码深入：单播与广播
+
+**执行位置**：`gateway/service/flywow_gateway.lua` 的 `skynet.dispatch` 收到 `send_data`，调用 `deliver_outbound_message(outbound_message)`；其参数正是上一步 WorldService 的 `send_to_gateway()` 构造的 table。
+
+1. 检查 `gateway_epoch` 和当前 Gateway 阶段；旧实例消息立即丢弃。
+2. 直接查询 `registry.commands[1002]` 并检查 `1002` 的 `response_type`（本例仅下行，所以客户端不能用 `1002` 发请求）。
+3. `codec.encode_response` 将 `{content="新手村已开放"}` 编为 `SystemNoticeResponse` 再包入 Envelope。
+4. `connection_id>0`：只查 `module_state.connections[connection_id]`，连接存在且 ready 才写。
+5. `connection_id==0`：遍历**当前 Gateway Service** 的 `module_state.connections`，只向尚未关闭且 ready 的连接写同一份已编码 bytes。
+6. `write_connection`：WebSocket 调用 `websocket.write`；TCP 则在同一 Envelope 前添加两字节网络序长度。
+
+本次广播的两个接收者在 Gateway 内只共享一次编码得到的不可变 bytes；业务 Service 没有直接遍历/拥有 Gateway 的 Socket。发送结果只表示本地写入尝试，**不是对端应用已处理**。
+
+### 5.3 源码深入：close 与 gateway_disconnect
+
+**调用方**：`WorldService.on_enter_world` 注册的延迟回调向 Gateway 发出：
+
+```lua
+skynet.send(state.gateway, "lua", "close",
+{
+    gateway_epoch = epoch, -- B 的请求对应的当前 Gateway 实例身份。
+    connection_id = target_id, -- B 的逻辑连接编号，而不是 fd。
+})
+```
+
+**【真实源码】** `gateway/service/flywow_gateway.lua`：
+
+```text
+Gateway 的 skynet.dispatch("lua", ...) 收到 command="close"
+  -> request_close(close_request)
+       -> 校验 gateway_epoch、connection_id
+       -> module_state.connections[id]
+       -> detach_connection(connection, "closed by handler")
+            closed=true；释放 Handshake 上下文；移除 id/fd 双索引
+            发送 skynet.send(handler, "lua", "gateway_disconnect", ...)
+       -> skynet.fork(function() close_transport(connection,1008,"closed by server") end)
+  -> 返回 Gateway 消息分发
+关闭协程：
+  -> close_transport()
+       -> close_requested 标记；选择 websocket.close 或 socket.close
+       -> 底层关闭可能 yield
+WorldService 收到 gateway_disconnect
+  -> on_disconnect(message)
+       -> 从 state.players 删除 B；在线人数减 1
+```
+
+为什么 `detach_connection` 在底层关闭之前？因为 Socket close 可能 yield，不能让旧连接在等待过程中仍接受出站消息；而 `close_requested` 又避免两个关闭协程重复操作同一个 Socket。这里区分**逻辑摘除**和**物理传输关闭**，是理解 Gateway 生命周期的关键。
+
+**回到主线**：B 被清理之后，A 的客户端 `close()` 也会触发自己的断开通知。`state.disconnected==2`，WorldService 的监视协程 `skynet.call(gateway,"lua","stop")`，Gateway 进入停止阶段，关闭监听；本例已无在线连接，所以 `closed_connections` 预期是 `0`。
+
+**阶段验收**：能说明 `connection_id=0` 不会变成客户端 0；能区分 fd、connection_id、player_id、gateway_epoch；能追踪 B 的“请求关闭 → 摘除 → 发送通知 → transport 关闭”全过程，以及 A/B 各自独立的退出路径。
+
+---
+
+### 5.4 源码精读：为什么同一份出站消息可以广播
+
+上一节 B 入场后，`WorldService.on_enter_world()` 连续发出三条 `skynet.send`：B 的响应、B 的私信、面向当前 Gateway 的公告。Gateway 收到的是**三条独立的 Service 消息**，每条单独进入 `deliver_outbound_message()`；并不是在一次 RPC 中返回三个值。
+
+广播时 `connection_id=0` 并非特殊的 fd。Gateway 先根据 `command=1002` 将 `{content="新手村已开放"}` 编成**一份** Envelope bytes，再遍历当时存活的连接。它在读循环里不会向 WorldService 查询“谁属于新手村”，只判断连接尚未 `closed` 且握手 `ready`。因此两条 ready 连接都能收到，未 ready 的连接即使已占据 `max_clients` 名额也不能收到业务公告。
+
+源码路径：`skynet.dispatch("lua", ...)` → `deliver_outbound_message()` → `codec.encode_response()` → `write_connection()`。这里没有 `skynet.call(handler)`，也没有广播批次的 ACK 状态；多 Gateway 节点的全局广播需要宿主分别向每个 Gateway 实例发送，当前 `connection_id=0` 的范围只限本实例。
+
+**针对本案例的可观察推演**：
+
+```text
+A 已 ready: connection_id=1
+B 已 ready: connection_id=2
+A/B 对应不同 Socket fd（示意）
+
+send_data(epoch, connection_id=2, command_id=1002, "欢迎玩家1002")
+    -> connections[2] -> write(B)                 只一条
+
+send_data(epoch, connection_id=0, command_id=1002, "新手村已开放")
+    -> 遍历 connections
+         A: closed=false, ready=true -> write(A)
+         B: closed=false, ready=true -> write(B)   共两条
+```
+
+**实验**：在正常流程中核对客户端 A 并未收到 B 的私信，而两人都收到了广播。观察结果之后再按上面的源代码分支解释：不是业务客户端自己过滤了私信，而是 Gateway 只向 B 的 fd 执行了本地写入。
+
+### 5.5 源码精读：逻辑摘除与物理关闭是两个阶段
+
+现在看 B 被主动断开的过程。`WorldService` 30 tick 后 `skynet.send(gateway,"lua","close",{gateway_epoch,connection_id})`。Gateway **文件末尾的 Service 分发入口**先调用 `request_close(close_request)`；该函数不执行同步 RPC 给业务 Service。
+
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `request_close()`，省略初始参数类型校验】**：
+
+```lua
+local connection = module_state.connections[close_request.connection_id]
+if not connection or not detach_connection(connection, "closed by handler") then
+    return
+end
+skynet.fork(function()
+    close_transport(connection, 1008, "closed by server")
+end)
+```
+
+`detach_connection` 是**当前 Gateway Service 内部的同步状态更改**，它先标记 `connection.closed=true`，释放握手 握手模块 对这条连接的引用，把 `connections[id]` 和 `connections_by_fd[fd]` 都删除，减少 `connection_count`，最后异步投递 `gateway_disconnect` 给 WorldService。它本身不做 `socket.close`；出站路径从此立即查不到 B 了。
+
+**【真实源码局部：同一文件 / `detach_connection()`】**：
+
+```lua
+if connection == nil or connection.closed then
+    return false
+end
+connection.closed = true
+handshake_module.close(connection.handshake)
+module_state.connections[connection.connection_id] = nil
+module_state.connections_by_fd[connection.fd] = nil
+module_state.connection_count = module_state.connection_count - 1
+skynet.send(module_state.gateway_config.handler_service, "lua", "gateway_disconnect",
+{
+    gateway_epoch = module_state.epoch,
+    connection_id = connection.connection_id,
+})
+-- 原函数接着记录 close 日志，最后 return true。
+```
+
+这段仅省略最终 `log_event`。它给出一个非常重要的阶段区分：
+
+| 时刻                        | Gateway 内部状态                      | Socket 层                              | WorldService                     |
+| --------------------------- | ------------------------------------- | -------------------------------------- | -------------------------------- |
+| B 还在线                    | 双索引能找到 B，`closed=false`        | TCP 读协程仍在运行                      | `players[B_id]=1002`             |
+| `detach_connection` 已完成  | 查不到 B；`closed=true`；握手资源释放 | fd 可能尚未关完                        | 断开通知可能尚在消息队列         |
+| `close_transport` 执行中    | B 已不可出站/广播                     | 调用 WS close 或 TCP close，可能 yield | 正在处理或等待 disconnect        |
+| `gateway_disconnect` 已处理 | B 仍不在连接表                        | 具体 Socket 释放按 transport 完成      | 删除 `players[B_id]`，在线数减 1 |
+
+这正是传统 C++ MMO 网关里“先从玩家/连接管理结构摘除，再异步释放网络资源”常见做法的对应关系；Skynet 的不同点是后面的 Socket close 可能让出协程，而不是通过共享内存直接在另一个线程执行删除。
+
+### 5.6 `close_requested` 与 `closed` 不是重复字段
+
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `close_transport()`】**：
+
+```lua
+if connection.close_requested then
+    return
+end
+local current = module_state.connections_by_fd[connection.fd]
+if current and current ~= connection then
+    return
+end
+connection.close_requested = true
+if force_shutdown and not socket.invalid(connection.fd) then
+    socket.shutdown(connection.fd)
+end
+if connection.transport == "websocket" and not websocket.is_close(connection.fd) then
+    websocket.close(connection.fd, code or 1001, reason or "closed")
+elseif socket.invalid(connection.fd) then
+    socket.close_fd(connection.fd)
+else
+    socket.close(connection.fd)
+end
+```
+
+`closed` 表示**逻辑身份已经摘除**；`close_requested` 表示**底层关闭已提交**。同一条连接可能先被超时扫描发现，随后又收到业务 `close` 或传输 error；`detach` 必须保证只减一次 `connection_count`、只通知一次业务，而 `close_transport` 必须保证不在多个协程中反复关闭同一个 fd。
+
+`current` 是从 `connections_by_fd[fd]` 反查当前 owner；如果 fd 已分配给新连接，旧 context 不能把它关掉。与 `next_connection_id` 单调递增一起，形成两层不同的保护：**业务消息按逻辑 ID 查找，物理清理按当下 fd 所有权检查**。这并非新加的设计，正是已有源码行为。
+
+`force_shutdown` 仅背压超限时为 true。正常关连接调用 `websocket.close` 或 `socket.close`；WS close 内部会尝试发送关闭帧并清理 WebSocket 对象。需要精确理解“本地提交了关闭”与“客户端必定收到一个有序 close frame”的差别：后者不是 Gateway 当前可证明的 ACK 合同。
+
+### 5.7 传输对照：追到 Skynet 的 `websocket.close()`：谁释放 WS pool
+
+固定 Skynet `v1.8.0` `lualib/http/websocket.lua` 自身管理 `ws_pool[id]`。`M.close(id,code,reason)` 找到 `ws_obj` 后尝试写 close frame，最后调用 `_close_websocket(ws_obj)`，后者移除 WS pool 对象并调用其 `close()`（普通 WS 进一步调用 `socket.close(id)`）。这是**Skynet 第三方已实现的逻辑**，教程只读取，不修改。
+
+这一层不归 Gateway `module_state.connections` 管理。Gateway 维护的是本模块的业务连接记录；WebSocket 库维护的是 WS 协议对象；Skynet Socket 库维护的是 fd 对应的 socket pool 记录。正常断开时三层要分别结束各自持有的状态，但不需要 Gateway 为 Skynet 再建一张 WS pool。
+
+```text
+Gateway connections       http.websocket ws_pool         skynet.socket socket_pool
+       │                         │                                │
+       ├─ detach: 删除 A/B       │                                │
+       └─ close_transport ------> M.close(fd) --------------------> socket.close(fd)
+                                  删除 ws_obj                       底层释放，可能等待
+```
+
+**实验与回主线**：按第六阶段的握手失败实验检查关闭一次即可释放握手 Native 对象；再正常接入新客户端，确认 `connections` 不会返回旧编号。回到课程 WorldService：收到 `gateway_disconnect` 后删除的是 `players[connection_id]`，从不调用 `socket.close(fd)`。
+
+---
+
+# 第五阶段：深入 TCP 读循环，并对照 WebSocket
+
+## 6. TCP 只有字节流，没有 WebSocket 的消息边界
+
+前四阶段已用 C++ TCP 跑通完整场景。现在保持客户端与业务文件不变，深入长度读取、协程挂起与恢复，再对照 WS 消息边界。
+
+WebSocket 交给 Gateway 的是完整 `binary message`；TCP 则需要先读 **2 字节 uint16 big-endian 长度**，再按长度读 body。由于示例 Envelope 是 10 字节，所以 TCP 线上发送 `00 0A` + 上面的 10 字节。握手每条消息也有相同的两字节 TCP 长度头。
+
+C++ handshake 已实现相同公开密码合同；本阶段不再创建另一套客户端。
+
+## 6.1 对照客户端和服务端的 TCP framing
+
+第 4.2 节 Connection::sendFrame 为握手和业务添加两字节长度头，readExact/receiveFrame 按相同合同读取。保持 C++ 文件不变，沿下面服务端源码核对两端行为。
+
+## 6.2 重跑 C++ 全流程
+
+~~~bash
+bash gateway/sample/master_course/run.sh tcp
+~~~
+
+预期仍为两次 HANDSHAKE_READY、两次 ENTER_OK、三条 NOTICE_OK 及 COURSE_CPP_CLIENT_OK。服务端监听 tcp，记录两个 disconnect 和 COURSE_GATEWAY_OK。此时关注长度读取与协程切换，不更换协议或客户端。
+
+### 6.3 源码深入：run_tcp 和 read_exact
+
+**【真实源码】** `gateway/service/flywow_gateway.lua`：`accept_client` → `skynet.fork(run_tcp)` → `socket.start(fd)` → `socket.warning` → `read_exact(connection,2)` → `string.unpack(">I2",header)` → 检查阶段所允许的长度 → `read_exact(connection,size)` → `process_handshake` 或 `dispatch_payload`。
+
+`read_exact()` 调用固定 Skynet 的 `socket.read(fd,size)`；如果底层数据未读满，当前 **Gateway 的 TCP 读协程挂起**，Socket Driver 持续接收并在满足条件时唤醒它；其他客户端各自的读取协程和其他 Service 不因此全局阻塞。读取前 `connection.read_started=skynet.now()`，读取返回后清除，以供 timeout_loop 判断**当前这一次定长读取**是否超时。
+
+第一次客户端发送 `00 43` 加 67 字节 HELLO，Gateway 在 `handshake.ready=false` 时要求当前握手阶段的**精确长度**，不能提前把任意字节当成业务 Envelope。四段握手结束后，同一个循环改为读取正常业务帧，验证 `size <= MAX_FRAME_BYTES` 再解码。
+
+这里有一个容易误解的边界：`MAX_FRAME_BYTES` 限制**业务 Envelope 长度**，不是 TCP 或 WebSocket 的底层接收内存硬上限。源码已经移除了无效的 `socket.limit(fd,MAX_FRAME_BYTES+2)`；不能在教程里把它说成“完整内存防护”。
+
+**返回主线**：TCP `dispatch_payload` 完毕返回到 `run_tcp` 读取循环，继续等待下一条长度头。WorldService 接收到的 record 与 WS 完全一致，业务不知道 TCP 何时收满每个字节。
+
+### 6.3.1 把 TCP 读拆成真正的两个等待点
+
+回到 `gateway/service/flywow_gateway.lua` 的 `run_tcp(connection)`。调用者是 `accept_client` 为每一条 TCP 连接 fork 的读协程，传入的 `connection` 已经存入双索引，但 `socket.start(fd)` 可能尚未完成 Socket pool 接管。
+
+**【真实源码局部：`run_tcp()`，已省略 warning 注册与错误日志】**：
+
+```lua
+local fd = connection.fd
+local opened, open_error = socket.start(fd)
+-- 检查 socket.start 的结果以及连接是否已被关闭。
+
+while not connection.closed and module_state.phase == "running" do
+    local header = read_exact(connection, 2)
+    if not header then
+        break
+    end
+    local size = string.unpack(">I2", header)
+    local ready = handshake_module.ready(connection.handshake)
+    if (not ready and size ~= handshake_module.expected_size(connection.handshake)) or
+        (ready and (size < 1 or size > MAX_FRAME_BYTES)) then
+        -- 记录 FRAME_LIMIT 并 break。
+    end
+    local payload = read_exact(connection, size)
+    if not payload then
+        break
+    end
+    local frame_result
+    if ready then
+        frame_result = dispatch_payload(connection, payload)
+    else
+        frame_result = process_handshake(connection, payload)
+    end
+    if not frame_result.ok then
+        break
+    end
+end
+-- 最终 detach_connection + close_transport。
+```
+
+这段并非完整函数，注释明确了所省略的注册/清理分支。**第一次 read_exact(2)** 是读网络序长度头；**第二次 read_exact(size)** 是读当前阶段的完整应用消息。对于应用握手 HELLO：必须先读到 `00 43`（十六进制 67），长度才能通过 `expected_size(context)=67`。对于业务 `EnterWorld`：先读到 `00 0A`（十六进制 10），才按 10 字节解析 Envelope。
+
+**真实客户端可能把这些字节分三次送达**：
+
+```text
+Socket 收到第1批: 00                   -> header 还差 1 字节，读协程挂起
+Socket 收到第2批: 0A 08 04 10          -> header 满2B，返回；body 只有3B，第二次读挂起
+Socket 收到第3批: E9 07 1A 03 08 E9 07 -> body 满10B，read_exact 返回完整 Envelope
+```
+
+这里表中的 1、3、7 字节只是**教学设定的分批到达情况**；网络的实际分包由 OS、TCP 和发送时机决定，不能把三次 `data` 当成协议固定行为。
+
+### 6.3.2 `read_exact()` 为什么要在 yield 后再次检查 `closed`
+
+**【真实源码：`gateway/service/flywow_gateway.lua` / `read_exact()` 关键实现】**：
+
+```lua
+local function read_exact(connection, size)
+    connection.read_started = skynet.now()
+    local received_bytes = socket.read(connection.fd, size)
+    connection.read_started = nil
+    if connection.closed then
+        return nil
+    end
+    if not received_bytes then
+        return nil
+    end
+    if #received_bytes ~= size then
+        return nil
+    end
+    return received_bytes
+end
+```
+
+`connection.read_started` 表示**这一轮定长读取开始的 tick**；timeout_loop 判断读超时时使用它。`socket.read` 可能 yield，恢复回来时连接可能已经被另一条超时/关闭路径逻辑摘除，因此首先判断 `connection.closed`，不允许把迟到 bytes 再当成有效业务请求。
+
+### 6.3.3 深挖固定 Skynet：协程究竟在哪一行挂起
+
+文件：固定 Skynet `v1.8.0` `lualib/skynet/socket.lua`。调用链不是简单的“Lua 读一个系统调用”：
+
+```text
+Gateway.run_tcp 的读协程 G-read
+  -> read_exact(connection, size)
+  -> skynet.socket.read(fd,size)
+       -> driver.pop(socket.buffer, socket.pool, size)
+          ├─ 已足够：直接返回 bytes
+          └─ 不足：s.read_required=size
+                   -> suspend(s)
+                      -> s.co=coroutine.running()
+                      -> skynet.wait(s.co)               [G-read yield]
+Socket Driver 有更多数据到达
+  -> Skynet 的 socket 消息分发协程
+       -> socket_message[1](fd,size,data)
+       -> driver.push(s.buffer,s.pool,data,size)
+       -> 检查 s.read_required 是 number，且缓冲量 >= 所需字节
+       -> s.read_required=nil
+       -> wakeup(s) -> skynet.wakeup(s.co)
+G-read 后续恢复
+  -> driver.pop(...,size)
+  -> socket.read 返回 bytes
+  -> Gateway.read_exact 检查 closed 和实际长度
+  -> 回到 run_tcp 当前 header/body 读取阶段
+```
+
+**【真实源码局部：固定 Skynet `lualib/skynet/socket.lua` / `socket.read()`】**：
+
+```lua
+local ret = driver.pop(s.buffer, s.pool, sz)
+if ret then
+    return ret
+end
+if s.closing or not s.connected then
+    return false, driver.readall(s.buffer, s.pool)
+end
+assert(not s.read_required)
+s.read_required = sz
+suspend(s)
+ret = driver.pop(s.buffer, s.pool, sz)
+```
+
+`suspend(s)` 将当前协程保存到 `s.co` 并执行 `skynet.wait(s.co)`。当达到读取要求时，`socket_message[1]` 由 Socket 协议分发器处理，调用 `wakeup(s)` 触发恢复。不要误以为 `socket.read(fd,size)` 在读不到数据时占住整个 OS Worker Thread；**等待的是这条协程**，其他连接协程以及 Service 的其他消息可继续运行。
+
+但也别把“同一个 Service”简单理解为“永远只有一个正在使用的 coroutine”。一个 Gateway Lua State 中可以存在多条协程，`timeout_loop` 和 `run_tcp` 共享 `module_state.connections`。所以跨 yield 以后检查 `closed` 是必要的运行时约束。
+
+### 6.3.4 为什么长度检查发生在 body 读取前
+
+当 `run_tcp` 读取长度头 `00 43` 时，若该连接还在 HELLO 阶段，要求精确 67；若读到 `01 F4`（500），立即报 `FRAME_LIMIT`。此时不会再尝试 `read_exact(connection,500)`。一旦 ready，长度必须在 `1..MAX_FRAME_BYTES` 以内，才会执行 body 读取。
+
+注意两个不同上限：
+
+- `MAX_FRAME_BYTES`：Gateway 用 TCP 长度头和解码前大小检查限制**业务 Envelope**；它是业务单帧边界。
+- Skynet 的 socket 接收缓存：并不是因为采用了固定协议帧长上限 就有同样大小的底层内存硬限制。之前无效的 `socket.limit(fd,MAX_FRAME_BYTES+2)` 已从生产 TCP 定长读取路径删除。
+
+固定 `lualib/skynet/socket.lua` 中，`socket_message[1]` 在 `read_required` 为 number 时检查是否已读满并唤醒协程；这条分支并不执行通用 `s.buffer_limit` 检查。因此课程应区分**在读取 body 前验证协议长度**与**给所有 TCP/WS 内存加硬上限**，两者不是同一回事。
+
+### 6.3.5 TCP 与 WS 最终在哪一点合流
+
+```text
+TCP: accept_client
+       -> run_tcp
+       -> read_exact(2) / read_exact(size)
+       -> process_handshake（未ready）或 dispatch_payload（已ready）
+
+WS:  accept_client
+       -> websocket.accept / resolve_accept / read_frame
+       -> ws_handler.message
+       -> process_handshake（未ready）或 dispatch_payload（已ready）
+
+两者在 Gateway 内共用：Handshake / Codec / Registry / dispatch_payload
+                       -> skynet.send(WorldService,"send_data",...)
+```
+
+二者传入 `process_handshake` 的都是**不带传输帧头**的应用消息原始字节。协议版本、命令编号、业务字段不需要因传输方式不同而重新定义。`WorldService` 的 `on_enter_world` 因而可以完全不变。
+
+**阶段验收实验**：运行第 4.3 节 C++ TCP 的 A/B 两人流程后，手工记录 TCP 收到的 `00 0A + 10B Envelope`，再在源码里定位 `read_exact(2)` 和 `socket.read(fd,size)` 的两次可能 yield；能够从一条断开的连接，独立推导“读取协程恢复后为什么会返回 nil”。
+
+---
+
+### 6.4 你应该能回答的区别
+
+| 问题                              | WebSocket                                            | TCP                              |
+| --------------------------------- | ---------------------------------------------------- | -------------------------------- |
+| 谁组装网络消息边界？              | 固定 `http.websocket`                                | Gateway `run_tcp` + `read_exact` |
+| 是否需要额外 2-byte 长度头？      | 否                                                   | 是                               |
+| 应用层四段握手是否不同？          | 相同 payload                                         | 相同 payload，外加 TCP 长度头    |
+| Protobuf Envelope 是否不同？      | 相同                                                 | 相同                             |
+| 业务 Service 是否知道 transport？ | 入站 record 有诊断字段 `transport`，业务流程可不关心 | 同左                             |
+| 谁持有 socket？                   | Gateway                                              | Gateway                          |
+
+**阶段验收**：不修改 WorldService 仍能完成两人流程；给出 `00 0A` 的来源；指出 `socket.read` yield 对应的是哪条 Service 协程，以及另一个客户端为什么不需要等待它。
+
+---
+
+# 第六阶段：故障、连接资源与独立维护
+
+## 7. 用 C++ 逐项验证拒绝、容量与超时清理
+
+正常场景已经成功。现在复用第 4.2 节的连接、握手和编码函数，单独建立故障入口，避免每项实验都修改正常客户端。每项实验启动新的服务端，结束后按 Ctrl+C 停止仍在运行的进程。WorldService 的 30 秒结束等待是教学宿主行为，不应误认为 Gateway 超时。
+
+### 7.1 新建故障实验入口
+
+**新建文件**：gateway/sample/master_course/client/world_faults.cpp。它在同目录包含完整 world_client.cpp，以预处理宏临时重命名正常入口；连接与握手实现仍只有一份。这个写法仅用于课程的第二个可执行程序，不是生产 SDK 的接口设计。
+
+精读 main 的六个分支：输入为实验编号 A～F，输出为断连观察；成功观察断连后返回 0，收到额外数据、超时或握手异常返回 1。服务端日志才用于确认具体拒绝原因，不能只凭客户端断连认定错误码。
+
+~~~cpp
+// 故障入口复用正常客户端；宏只影响包含文件中的 main，随后立即取消定义。
+#define main courseScenarioMain
+#include "world_client.cpp"
+#undef main
+
+// 读取拒绝后的结果：EOF 或连接重置表示对端关闭，超时不能当作拒绝成功。
+// @param connection 当前实验独占的连接，已经发送故障输入或完成空闲握手。
+void expectRejected(Connection& connection)
+{
+    try
+    {
+        connection.receiveFrame();
+    }
+    catch (const std::runtime_error& error)
+    {
+        const std::string reason = error.what(); // readExact 给出的 EOF 或系统调用错误分类。
+        if (reason == "EARLY_EOF" ||
+            (reason == "RECV_OR_TIMEOUT" && errno == ECONNRESET))
+        {
+            std::cout << "FAULT_CONNECTION_CLOSED\n";
+            return;
+        }
+        throw;
+    }
+    throw std::runtime_error("UNEXPECTED_FRAME_INSTEAD_OF_CLOSE");
+}
+
+// 每次只做一个实验，避免连接与连接状态相互污染；端口沿用课程默认 19221。
+int main(int argc, char** argv)
+{
+    try
+    {
+        require(argc == 2, "USAGE: world_faults A|B|C|D|E|F");
+        const std::string mode = argv[1]; // 终端指定的单项故障编号。
+        require(mode.size() == 1 && mode[0] >= 'A' && mode[0] <= 'F', "FAULT_MODE");
+        Connection connection(19221);
+
+        // A/F 在应用握手前破坏输入；其余实验必须先完成真实握手。
+        if (mode == "A")
+        {
+            Bytes hello(67, 0); // 满足 HELLO 长度，但类型 99 不符合握手合同。
+            hello[0] = 99;
+            hello[1] = 1;
+            connection.sendFrame(hello);
+        }
+        else if (mode == "F")
+        {
+            connection.sendFrame(Bytes(500, 0)); // 宣告 500 字节；HELLO 只允许 67。
+        }
+        else if (mode == "D")
+        {
+            // 服务端课程配额为 4；当前 connection 加另外三条未握手连接占满配额。
+            Connection second(19221);
+            Connection third(19221);
+            Connection fourth(19221);
+            Connection rejected(19221);
+            expectRejected(rejected);
+            std::cout << "FAULT_OBSERVED D 连接配额拒绝第五条连接\n";
+            return 0;
+        }
+        else
+        {
+            handshake(connection);
+            if (mode == "B")
+            {
+                // 版本 3、command 1001、player_id 1001；仅版本故意错误。
+                connection.sendFrame(Bytes{8, 3, 16, 0xE9, 7, 26, 3, 8, 0xE9, 7});
+            }
+            else if (mode == "C")
+            {
+                // 版本 4、未知 command 9999、空 body；9999 的 varint 为 8F 4E。
+                connection.sendFrame(Bytes{8, 4, 16, 0x8F, 0x4E, 26, 0});
+            }
+            // E 完成握手后不发送业务包，直接等待 Gateway 空闲清理。
+        }
+
+        expectRejected(connection);
+        std::cout << "FAULT_OBSERVED " << mode << '\n';
+        return 0;
+    }
+    catch (const std::exception& error)
+    {
+        std::cerr << "FAULT_FAILED " << error.what() << '\n';
+        return 1;
+    }
+}
+~~~
+
+编译一次，后续六项复用同一产物：
+
+~~~bash
+g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror \
+    gateway/sample/master_course/client/world_faults.cpp \
+    -lcrypto -o build/gateway-master-course/cpp/world_faults
+~~~
+
+编译选项与第 4.3 节相同。头文件通过双引号 include 从源文件所在目录寻找 world_client.cpp；这里只编译 world_faults.cpp，不能再把 world_client.cpp 作为第二个编译输入，否则会重复定义函数。
+
+### 7.2 实验 A：完整长度但错误 HELLO 类型
+
+终端一启动服务端，终端二执行实验；以下每组两条命令分属两个终端：
+
+~~~bash
+bash gateway/sample/master_course/run.sh tcp server
+timeout 10s build/gateway-master-course/cpp/world_faults A
+~~~
+
+长度 67 通过 TCP framing 检查，process_handshake → handshake.receive 发现类型不是 1，拒绝并关闭。预期服务端握手版本/类型检查失败，没有 COURSE_ENTER；关闭会触发 gateway_disconnect，但业务映射不存在，在线人数不变。
+
+若把 A 的发送改成 Bytes{99}，长度头为 1，会先在 run_tcp 的阶段长度检查失败，不会进入握手版本检查。两种输入必须区分。
+
+### 7.3 实验 B：握手成功但业务版本错误
+
+~~~bash
+bash gateway/sample/master_course/run.sh tcp server
+timeout 10s build/gateway-master-course/cpp/world_faults B
+~~~
+
+先完成握手，再发版本 3 的 Envelope。dispatch_payload 解码 Envelope 后得到 PROTOCOL_VERSION，关闭来源连接，业务不应收到入场请求。客户端应先有 HANDSHAKE_READY，再有 FAULT_CONNECTION_CLOSED。
+
+### 7.4 实验 C：合法版本但未知 command
+
+~~~bash
+bash gateway/sample/master_course/run.sh tcp server
+timeout 10s build/gateway-master-course/cpp/world_faults C
+~~~
+
+版本 4 通过，Registry 查不到 9999，出现 UNKNOWN_COMMAND，随后关闭；不进入 WorldService。命令 1002 虽存在但只有 response_type，也不能作为客户端请求。
+
+### 7.5 实验 D：未完成握手也占连接总配额
+
+~~~bash
+bash gateway/sample/master_course/run.sh tcp server
+timeout 10s build/gateway-master-course/cpp/world_faults D
+~~~
+
+课程宿主显式提供 max_clients=4。D 保持四条尚未发送 HELLO 的连接，再建立第五条，预期日志为 MAX_CONNECTIONS，第五条被关闭；四条已接纳连接不因这次拒绝关闭。实验结束时 C++ 析构器回收其持有的连接，服务端收到对应 disconnect。无连接进入 WorldService，因此不应出现 COURSE_ENTER。
+
+### 7.6 实验 E：不发业务时，区分读取期限与空闲期限
+
+~~~bash
+GATEWAY_COURSE_READ_MS=500 GATEWAY_COURSE_IDLE_MS=500 bash gateway/sample/master_course/run.sh tcp server
+timeout 10s build/gateway-master-course/cpp/world_faults E
+~~~
+
+E 只完成应用握手，run_tcp 随即等待下一条两字节长度头。此时 read_started 非空，timeout_loop 优先检查 read_timeout_ms，因此本实验同时把读取和空闲期限缩到 500ms，实际应验证读取超时分支，而不能把它称为空闲超时分支。扫描每 100ms 一次，实际关闭可能略晚。
+
+只设置 idle_timeout_ms=500 而保留默认 30 秒读取期限，在 TCP 正等待长度头时不会产生预期的半秒空闲关闭；这是当前源码的分支优先级。请对照第 8.4、8.5 节。WebSocket ready 后没有持续设置这个 TCP 读取起点，其纯空闲期限实验保留在 Node 附录；正文 C++ 不虚构对该分支的覆盖。
+
+### 7.7 实验 F：TCP 声明长度不符合握手阶段
+
+~~~bash
+bash gateway/sample/master_course/run.sh tcp server
+timeout 10s build/gateway-master-course/cpp/world_faults F
+~~~
+
+长度头是 01 F4，即 500；当前 HELLO 只能是 67，run_tcp 应报告 FRAME_LIMIT，在读取完整 500 字节载荷前拒绝。客户端为了复用 sendFrame 同时提交了载荷，但服务端不需要读取它即可判错。连接可能表现为 EOF 或因未读数据出现 TCP reset，两者都需结合服务端日志确认，不应出现 COURSE_ENTER。
+
+完成实验后，重新启动正常服务端并运行第 4.3 节双人流程，确认故障实验没有改变协议、配置默认值或正常客户端。
+
+
+## 8. 写缓冲积压、服务端主动停止和回收
+
+### 8.1 已有背压处理的真实边界
+
+**【真实源码】** `gateway/service/flywow_gateway.lua` 的 TCP `socket.warning` 回调、`ws_handler.warning`、`close_transport(force_shutdown)`。固定 Skynet 首次写队列警告约从 1 MiB 发生，后续按底层 warning 粒度触发；Gateway 在收到非零 warning 后关闭对应连接，**不是精确内存硬上限**。`size==0` 是缓冲恢复通知，不属于背压超限。超过配置时 TCP 和 WS 都通过显式 `force_shutdown=true` 使用 `socket.shutdown`，随后仍走对应 transport 清理。
+
+本课程不靠给两名玩家狂发公告模拟一个不受控的真实网络压力测试。使用仓库已有 `gateway/tests/gateway_async_test.lua` 查看模拟 warning 的断言，再结合 Skynet `lualib/skynet/socket.lua` 的 `socket.warning`、`socket.shutdown` 以及 `skynet-src/socket_server.c` 的 warning 机制，理解真实可达的回调时机。**模拟测试通过只证明回调逻辑，不等于真实 TCP/WS 高负载已测。**
+
+### 8.2 stop 的状态和资源 owner
+
+**【真实源码】** `gateway/service/flywow_gateway.lua`：`stop()`：
+
+```text
+WorldService 的监视协程
+  -> skynet.call(gateway,"lua","stop")  [控制面 RPC 等待]
+Gateway Service
+  -> skynet.dispatch("lua", ...)
+  -> stop()
+       phase = "stopping"
+       关闭监听 listen_fd
+       快照当前 connections
+       对每条连接 detach_connection + close_transport
+       phase = "stopped"
+       返回 FlyWowResult<GatewayStopResult>
+WorldService 恢复，检查 ok 与 closed_connections；本课程结束进程
+```
+
+课程的正常场景已经等待 A/B 的断线通知，`stop()` 时通常不再持有两个业务连接，因此 `closed_connections=0` 是合理结果：这个值是**本次 stop 主动关闭的数量**，不是服务创建以来的连接总数。若 stop 发生时尚有活跃连接，它会先快照、逐条摘除和关闭；此时 Socket close 可能 yield，不能把 stop 误认为纯内存操作。
+
+### 8.3 一张连接生命周期状态表
+
+| 阶段             | Gateway 持有什么                           | WorldService 持有什么                       | 可能的退出原因                 |
+| ---------------- | ------------------------------------------ | ------------------------------------------- | ------------------------------ |
+| `accepted`       | fd、逻辑 ID、Handshake context、连接索引   | 尚无玩家记录                                | 容量/接管失败                  |
+| `upgraded`（WS） | WS transport 对象、握手记录                | 尚无玩家记录                                | HTTP/业务握手失败              |
+| `ready`          | 连接索引、计时器字段，Handshake 仅留 ready | 尚无，直到业务请求被处理                    | 业务非法帧、超时、关闭         |
+| `entered`        | 同一连接对象；不存业务请求 pending         | `players[id]=player_id`                     | 客户端断开、服务器 close、错误 |
+| `detached`       | 从连接索引移除，资源释放进入关闭链路       | 收到 `gateway_disconnect` 后删除对应 player | 关闭已提交，不可继续 Push      |
+| `stopped`        | listener 关闭；已登记连接全部清理          | 业务实例可按宿主生命周期退出                | Service 正常停止               |
+
+**重要区别**：业务 `player_id` 存在于 WorldService；Handshake 的 ready 不是登录成功；应用层 ECDH/HMAC 握手也不等于 TCP/WS 自动具备 TLS 和逐包加密。真实公网接入应按既有部署合同在 Gateway 前终止 TLS，不能把此教学握手误认为传输加密。
+
+### 8.4 深入 `timeout_loop()`：一条连接为什么会被判定超时
+
+前面的实验 E 看到了约半秒后连接断开。现在进入执行原因。**调用者**：Gateway `start()` 完成监听后执行 `skynet.fork(timeout_loop)`；它是 Gateway Lua State 中的一条独立扫描协程，不属于某个客户端。该协程每 `skynet.sleep(10)`（按本工程 10ms tick 约 100ms）醒来一次，检查当时登记在 `module_state.connections` 的全部连接。
+
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `timeout_loop()`】**：
+
+```lua
+while module_state.phase == "running" do
+    skynet.sleep(10)
+    local now = skynet.now()
+    local expired = {}
+    for _, connection in pairs(module_state.connections) do
+        local since = connection.read_started or connection.last_message
+        local limit_ms = connection.read_started
+            and module_state.gateway_config.read_timeout_ms
+            or module_state.gateway_config.idle_timeout_ms
+        local elapsed_ms = flywow_common.elapsed_ms(since, now)
+        if handshake_module.expired(connection.handshake) or elapsed_ms >= limit_ms then
+            expired[#expired + 1] = connection
+        end
+    end
+    for _, connection in ipairs(expired) do
+        if detach_connection(connection, "network read timeout") then
+            close_transport(connection, 1001, "network timeout")
+        end
+    end
+end
+```
+
+这是原函数完整控制流程的去注释版；逐字段说明应以真实源码为准。两个超时条件不同：
+
+1. `handshake_module.expired(context)`：从 `handshake.accept()` 记录的 `context.started` 起算，直到 confirm/close 释放 Native 对象之前都是**绝对握手期限**；中间收到 HELLO 并回复 CHALLENGE 也不重置。
+2. `read_started`/`last_message`：若正在一次 TCP 定长读取或 WS HTTP Upgrade，使用读取起点及 `read_timeout_ms`；否则使用最近完整消息活动时刻及 `idle_timeout_ms`。
+
+假设 WebSocket 已在 tick 0 完成应用握手，之后一直没有业务包，`idle_timeout_ms=500`。在 tick 10、20、30、40 的扫描都还没超时；在 tick 50 经过 500ms，满足 `(50-0) * 10 >= 500`，执行 detach 和 transport close。**这是按源码推导的理想化时间线**：实际执行会受到 Skynet 消息调度、计时起点与网络收包时刻影响，不应声称毫秒级精确。
+
+若在 tick 30 收到一个已通过 Registry/Codec 检查的完整业务请求，`dispatch_payload` 更新 `connection.last_message=30`，那么 tick 50 时差值是 20，不会超时，直到新的期限达到。反过来，WebSocket ping/pong 由底层 `http.websocket` 处理，不进入 `dispatch_payload`，因此**不会刷新**本课 Gateway 的业务空闲起点。服务端 Push 走的是 `deliver_outbound_message`，也不会刷新该时间。
+
+`expired` 不是持久的“超时状态表”，而是这次扫描产生的临时快照：遍历期间不删 `module_state.connections`，第二个 for 循环才依次 detach/close；因为 `close_transport` 可能 yield，采用快照后不会因删除键或关闭让出协程而破坏本轮遍历。
+
+### 8.5 具体推演：读协程和扫描协程怎样交错
+
+以 A 的 TCP 客户端为例，假定长度头已经到达并通过校验，但是 body 还欠 3 字节：
+
+```text
+时刻        TCP 读协程 G-read                扫描协程 G-timeout
+----------------------------------------------------------------------
+T0          read_exact(connection,10)
+            read_started=T0
+            socket.read(fd,10) -> wait
+T0+若干                                      skynet.sleep(10) 恢复
+                                              检查 read_started，尚未超时
+T1                                             读期限已到
+                                               detach(connection)
+                                                 closed=true，双索引删除
+                                               close_transport(connection)
+T2          socket.read 因关闭事件恢复
+            read_started=nil
+            发现 connection.closed==true
+            return nil
+T3          run_tcp 得到 nil，退出循环
+            重复 detach 返回 false；transport 关闭以 close_requested 防重复
+```
+
+这是根据源码和 Skynet 的 `socket.read`/`socket.close` 行为推导的**一种可能交错**，不是固定调度顺序。重要的正确性条件是：`G-read` 恢复后不能因为读到了过去的字节又把已关闭连接重新当成有效连接，`read_exact` 的 `closed` 复查正是为此存在。
+
+WS 的对应行为：`websocket.accept` 所在的会话协程正读下一个 WS frame；扫描协程认为超时，先 detach 再 `websocket.close`，后续 WS `close/error` 回调因索引已删除不会重复发 disconnect。它不需要为了超时再创建每连接一个 timer Service。
+
+### 8.6 背压回调与真正的内存限制：按底层事实理解
+
+已有 Gateway 的 TCP `socket.warning(fd,callback)` 和 WS `ws_handler.warning(ws_obj,size)`，最终都依据 非零告警 判断是否 `detach_connection` 并 `close_transport(...,true)`。但触发入口的 `size` 来自**Skynet 底层写缓冲告警，单位 KB**；它不是 Gateway 每次 `socket.write` 之后主动同步检查的队列大小。
+
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `ws_handler.warning()`】**：
+
+```lua
+function ws_handler.warning(ws_object, size)
+    if size == 0 then
+        return
+    end
+    local connection = module_state.connections_by_fd[ws_object.id]
+    if connection then
+        -- 原函数先记录 WRITE_BACKPRESSURE 诊断事件。
+        if size > 0 then
+            detach_connection(connection, "write backpressure")
+            close_transport(connection, 1013, "server backpressure", true)
+        end
+    end
+end
+```
+
+Skynet 的 warning 回调最初在约 1 MiB 写缓冲时触发，后续按底层告警粒度报告。Gateway 在第一次非零告警时关闭对应连接；`size=0` 代表发送缓冲恢复，Gateway 直接忽略。这个限制属于写侧，不能和 `MAX_FRAME_BYTES`（业务接收 Envelope 限长）混为一个“内存 cap”。
+
+**【真实源码局部：固定 Skynet `lualib/skynet/socket.lua` / `socket.shutdown()`】**：
+
+```lua
+function socket.shutdown(id)
+    local s = socket_pool[id]
+    if s then
+        -- the framework would send SKYNET_SOCKET_TYPE_CLOSE , need close(id) later
+        driver.shutdown(id)
+    end
+end
+```
+
+Skynet 源码明确提示 `shutdown` 以后仍需要后续 close；因此当前 Gateway 在 `force_shutdown=true` 时先 `socket.shutdown`，随后继续调用 `websocket.close` 或 `socket.close`。不要将 `shutdown` 误当作“所有 Lua/WS 状态已同步清理完毕”。
+
+本课程的两人业务消息体量很小，不刻意制造数 MiB 的真实写队列。要验证这条分支，使用现成 `gateway/tests/gateway_async_test.lua` 的 warning 替身测试可以证明回调路径，但**不能等价宣称验证过内核层发送缓冲在高负载下的所有时序**。
+
+### 8.7 `stop()` 的真实控制流：为何要先关闭 listener 再清连接
+
+进入终局时，WorldService 的监视协程调用 `skynet.call(state.gateway,"lua","stop")`，这是**控制面 RPC**。Gateway 在自己的消息分发入口进入 `stop()`，等待由它管理的 Socket 资源回收后返回 `FlyWowResult`；并非进程收到一个特殊的全局退出信号。
+
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `stop()`，按阶段整理关键语句】**：
+
+```lua
+if module_state.phase == "stopped" then
+    return flywow_result.success({ closed_connections = 0 })
+end
+module_state.phase = "stopping"
+local listen_fd = module_state.listen_fd
+module_state.listen_fd = nil
+-- 原函数通过 pcall(socket.close,listen_fd) 关闭监听并记录错误。
+
+local closed = 0
+local snapshot = {}
+for _, connection in pairs(module_state.connections) do
+    snapshot[#snapshot + 1] = connection
+end
+for index = 1, #snapshot do
+    local connection = snapshot[index]
+    if not connection.closed then
+        closed = closed + 1
+        detach_connection(connection, "server shutdown")
+        -- 原函数通过 pcall(close_transport,connection,1001,"server shutdown")
+        -- 关闭资源并记录失败，随后仍继续处理其他连接。
+    end
+end
+module_state.phase = "stopped"
+```
+
+`phase="stopping"` 必须在 listener 关闭前设置：如 listener 的关闭期间还有迟到 accept，`accept_client` 一看 phase 不是 running 就按未接管 fd 的规则关闭，不会把新连接登记进来。
+
+`module_state.listen_fd=nil` 是 listener 所有权退出运行状态的标记；后续创建 `snapshot` 是为了避免一边遍历 `connections` 一边删除键。`closed` 统计这一次 stop **新摘除的连接数量**；此前已经正常断开的 A/B 不算入。每个底层关闭错误会累积到 `close_error_count`，最终返回 `GATEWAY_STOP_CLOSE_FAILED`，但不会因为第一条关闭失败就跳过其他连接的处理。
+
+随后 WorldService 的 `skynet.call` 恢复；本课程如果 A/B 已收到断线并被清理，`closed_connections=0` 是正常预期。服务器进程退出只是课程启动器的收尾行为，不要理解为 Gateway 自己自动调用了 `os.exit`。
+
+### 8.8 连接生命周期最终核对：四种资源、三个关闭入口
+
+| 资源/记录                                | 真实 owner                     | 创建或登记                          | 正常释放入口                                       | 异常释放入口                               |
+| ---------------------------------------- | ------------------------------ | ----------------------------------- | -------------------------------------------------- | ------------------------------------------ |
+| GatewayConnection / 双索引               | Gateway Service `module_state` | `create_connection`                 | `detach_connection`                                | 协议失败/超时/stop 调用 detach             |
+| HandshakeContext / Native 引用          | Gateway 中的 Handshake 握手模块 | `M.accept`                    | `M.confirm` 释放 Native 对象；连接 detach 也 close   | `M.receive` 失败/过期时 close        |
+| Native CryptoContext userdata 的内部密钥 | 每连接 userdata                | `crypto.create_context`                        | Native `verify` 清理敏感数据；Lua 握手模块清除引用 | Native 失败与 `M.close`/`__gc`       |
+| Socket pool / WS pool 对象               | 固定 Skynet transport          | `socket.start` / `websocket.accept` | `socket.close` / `websocket.close`                 | 关闭协程/协议 error/stop                   |
+| `state.players[connection_id]`           | WorldService                   | `on_enter_world`                    | `on_disconnect`                                    | 任何 Gateway detach 发出的 disconnect 通知 |
+
+请结合正常 B 主动关闭、错误 HELLO 和 TCP 半包超时三个场景，分别指出：**谁第一次把 `closed` 设为 true、谁发 `gateway_disconnect`、谁最终释放 Socket、WorldService 在何时删除玩家记录**。当你能沿真实函数给出具体顺序，Gateway 生命周期的核心原理才算掌握。
+
+---
+
+## 9. 故障定位的固定顺序
+
+当某阶段和预期不符，不需要重新设计模块，先沿对应的真实责任边界检查：
+
+1. **启动失败**：`COURSE_START_FAILED` 的 `result.code`；检查 `world.pb`、`world_registry.lua`、`lua_path`、`lua_cpath` 与 Native .so。`GATEWAY_REGISTRY_LOAD_FAILED`、`GATEWAY_DESCRIPTOR_READ_FAILED`、`GATEWAY_CRYPTO_LOAD_FAILED` 分属不同入口，不要混为一类。
+2. **连接建立但业务未到**：先辨别 HTTP Upgrade、应用四段握手、`ready`，再查 `ws_handler.message` / `run_tcp`。如果 `COURSE_ENTER` 没出现，先看 Gateway 是否完成 `dispatch_payload`，不先改业务 Service。
+3. **业务到达但没有响应**：确认 WorldService 收到的 `command_id`、`connection_id`、`gateway_epoch`；再查出站 `deliver_outbound_message` 是否因旧 epoch、不在 registry、连接已关闭或编码失败丢弃消息。
+4. **断线后玩家在线数未减**：追踪 `detach_connection` 是否发出 `gateway_disconnect`，以及 `on_disconnect` 查到的逻辑连接是否曾进入新手村。
+5. **测试卡住**：对照 `run.sh` 的服务器日志与 C++ 输出，不仅仅看 20 秒超时。区分没收到 READY、没有业务回包、B 未收到服务器 close 和 WorldService 未观察到两次 disconnect。
+
+---
+
+# 总复盘：离开教程也要能独立回答
+
+## 10. 源码阅读地图
+
+| 真正的生产文件                               | 本课程何时进入              | 阅读后必须掌握的东西                                                                                                                                                                                |
+| -------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gateway/service/flywow_gateway.lua` | 启动、接收请求、回包、关闭  | `start/normalize_config/accept_client/run_tcp/read_exact/ws_handler.message/dispatch_payload/deliver_outbound_message/request_close/detach_connection/close_transport/timeout_loop/stop` 的调用顺序 |
+| `gateway/tools/generate_gateway_registry.py` | 第一阶段生成协议表 | 直接输出按数字 command ID 查询的消息类型映射 |
+| `gateway/lualib/codec.lua`                   | 第一条业务请求              | `init/decode_envelope/decode_request/encode_response`：Descriptor 与 pb 编解码                                                                                                                       |
+| `gateway/lualib/handshake.lua`               | 连接握手                    | `accept/receive/confirm/ready/expired/close` 和握手上下文所有权                                                                                                                                     |
+| `gateway/native/gateway_crypto.cpp`          | 握手源码深挖                | P-256、随机 challenge、HKDF/HMAC 和 Native userdata 生命周期                                                                                                                                        |
+| `gateway/clients/h5/handshake.mjs`           | WebSocket、TCP 客户端       | H5 SDK 的 `connectGateway` 与 `HandshakeClient` 的状态、异步密码学流程                                                                                                                              |
+| 固定 Skynet `lualib/http/websocket.lua`      | WS 升级与消息回调           | `accept/resolve_accept/read_frame/write/close`，业务 callback 何时被触发                                                                                                                            |
+| 固定 Skynet `lualib/skynet/socket.lua`       | TCP read、warning、shutdown | `socket.read` yield/wakeup、读缓冲与 Socket ownership                                                                                                                                               |
+| `gateway/tools/generate_gateway_registry.py` | 构建协议                    | 与运行时隔离的 `CommandId` → Request/Response 类型生成过程                                                                                                                                          |
+
+## 10.1 源码理解的独立验收题（不增加业务代码）
+
+完成六阶段后，合上教程，仅借助真实工程源码回答以下问题。每题要指出真实文件、函数、执行协程、关键变量的 owner、必要时的返回路径；不能只回答抽象原理。
+
+1. 客户端 A 的 TCP HELLO 长度头已到，body 还差 10 字节。此时 `run_tcp` 停在哪个函数？Socket Driver 再收到 10 字节，Skynet 怎样唤醒哪条协程？
+2. WebSocket HTTP Upgrade 已成功，但 A 的 `HandshakeContext.phase="proof"`。A 此时发 `EnterWorldRequest`，Gateway 会把它交给 WorldService 吗？依据哪个具体分支？
+3. 两名玩家的底层 fd 是 `18` 和 `21`，业务逻辑 ID 是 `1` 和 `2`。为什么 Gateway 既保存 `connections` 又保存 `connections_by_fd`？哪条入口分别读取？
+4. `crypto.create_context()` 创建的 C++ userdata 与 Lua `HandshakeContext` 是不是同一对象？派生密钥在 proof 验证完毕、Gateway confirm、连接断开这三个时刻分别发生什么？
+5. 同一条 WS 连接只发底层 ping/pong，从不发业务 Envelope，为什么 `idle_timeout_ms` 仍会触发？`last_message` 实际在哪些代码分支更新？
+6. Gateway 接受第一条 A 请求后执行 `skynet.send(WorldService,...)`。它随后等待的是 WorldService 回包，还是下一个 TCP 长度头？如果 WorldService 迟迟不处理，Gateway 自己保留了哪些 pending 状态？
+7. B 刚 detach，但底层 transport close 正在 yield。WorldService 又发一次旧 B 的单播和 close，哪个路径拒绝？`closed` 和 `close_requested` 的职责分别是什么？
+8. B 的 Socket fd 被后来连接重用，但 WorldService 迟到的 A/B 响应仍带旧 `gateway_epoch/connection_id`。为什么不会发给新连接？
+9. TCP 一次性收到长度头 `01 F4`，握手阶段要求 HELLO 67 字节。源码哪一层拒绝？为什么没有先给 500 字节分配业务包？这个检查是否等于底层 Socket 接收内存硬上限？
+10. 一轮 `stop()` 关闭 3 条当前活跃连接，但此前已经断开 2 条。`closed_connections` 应该怎样理解？为什么需要快照表，哪里可能发生 yield？
+
+建议你将第 1、6、7、10 题各画一张只有 **两个 Service 和相关协程** 的时序图；能从代码推导，不需要凭日志猜。遇到问题回看本教程对应的实战步骤，而不是额外编造新组件。
+
+---
+
+## 11. 综合验收清单
+
+- [ ] 从空的 `gateway/sample/master_course/` 开始，亲手创建所有源文件，没有从旧课程复制业务协议产物。
+- [ ] `build_protocol.sh` 能生成本课程 `.pb` 和 Registry，并解释构建期与运行期职责边界。
+- [ ] 手动模式 `run.sh tcp server` 能启动真实 Gateway，Result 的 `command_count` 为 2。
+- [ ] `run.sh tcp` 中，玩家 A/B 完成真实四段握手，并接收 1、2 人在线的 EnterWorldResponse。
+- [ ] B 独占私信，A/B 都收到广播；B 由 Gateway close，A 主动关闭；业务收到两个 disconnect，Gateway 正常 stop。
+- [ ] `run.sh tcp` 使用同一协议/业务处理跑通等价流程，并能画出 TCP framing。
+- [ ] 至少亲手重复错误握手、错误版本、未知 command、连接容量、无业务时的读取超时、TCP 错误长度六类故障实验。
+- [ ] 能画出 **两个 Service、两份 Lua State、读协程和 timeout_loop** 的真实关系；知道哪个 RPC yield，哪个 send 不等待。
+- [ ] 能沿源码解释每个连接 ID、epoch、fd、Handshake context、WorldService 玩家映射各自的 owner 与释放时机。
+- [ ] 能根据实验日志辨别「真实运行结果」「源码可确定的行为」「没有做过的压力/安全验证」。
+
+最后可以自己做一个不增加代码的推演：**如果玩家 A 的连接在 WorldService 发回 EnterWorldResponse 之前已经关闭，Gateway 为什么不会把这个响应发送给后来复用相同 fd 的另一条连接？** 答案应该能从 `gateway_epoch`、递增的逻辑 `connection_id`、`module_state.connections` 索引和 `detach_connection` 的顺序推导出来，而不是靠猜测 Socket 的行为。
+
+---
+
+## 版本与验证说明
+
+服务端深读保留原教程 7509b289 的历史源码基线；第 4 节 C++ 和第 7 节故障入口按当前工作区的公开协议编写。个别标为当前工作区的局部代码使用当前签名，不视为原提交的逐字摘录。当前调用链已核对；未覆盖的历史源码片段不因此获得重新运行验证。
+
+正文主线为 C++17/OpenSSL 3 TCP，Node 的四个客户端文件和六项故障实验保留在文末可选附录。第一、二阶段准备和服务端编写完成后，从第 3、4 节顺序阅读即可；不需要切换到附录。
+
+本次只改教程，不改变生产 Gateway、SDK、真实课程脚本或第三方源码。教程内的完整新建文件由学习者按步骤实施；C++ 使用 POSIX Socket，未验证 Windows Winsock、生产安全或性能。
+
+本轮验证（2026-11-05）：正文两份 C++ 文件以 C++17 和严格警告编译通过；提取本文 3.1 服务端，实际跑通双人流程和 A～F 六项实验，其中 D 为总连接容量，E 为 TCP 读取超时。Node 附录 TCP/WS 双人流程和新容量实验也已实跑通过。Gateway 回归 18 项、质量检查器单测 52 项及仓库/Skill 门禁通过。宿主真实 TCP/WS 集成与单进程课程路径通过；更广的 Cluster 集成在 Battle 启动阶段遇到既有 shutdown_coordinator.lua 中未定义的 module_module_state，未能完成，不能声称跨进程全链路通过。未进行容量或性能压测。
+
+# 可选附录：原 Node 客户端与 WebSocket/TCP 实验
+
+正文已用 C++ 完成业务与故障验收，附录无需作为前置阅读。希望学习 H5 接入时，再创建这里的四个 Node 文件，使用 Node.js 22+（支持 Web Crypto 和 WebSocket）。服务端和协议沿用正文。
+
+WebSocket 使用 run.sh websocket/client 分支；Node TCP 使用 N.3 双终端命令。正文 run.sh tcp/client 已用于 C++。每轮只运行一套客户端，实验之间重启服务端。下面保留原 Node 代码与六项故障实验。
+
+## N.1 Node Protobuf 编解码与 WebSocket Client
 
 正式商业客户端应使用对应 `.proto` 生成的 Protobuf SDK。本教程只使用 `uint32/string/bytes` 三种基础字段，为了让网络上到底发送了哪些字节更直观，用一个小文件手写本示例所需的 wire format。它**不替代 Gateway 的真实 `pb` Codec**，也不扩张成通用 Protobuf 框架。
 
-### 4.1 亲手新建 `client/protobuf.mjs`
+### N.1.1 亲手新建 `client/protobuf.mjs`
 
 此文件被 WebSocket 和 TCP 两个真实客户端共同使用。`encodeEnterWorld()` 生成的 `Uint8Array` 是不带 TCP 长度头、也不带 WebSocket 帧头的完整 Envelope；TCP 的 2-byte framing 由 TCP 客户端另外添加。
 
@@ -1451,7 +3354,7 @@ export function decodeServerMessage(bytes) {
 
 这 10 字节是**业务 Envelope**。走 TCP 时还要再加 `00 0A` 两字节长度头；走 WebSocket 时它是单条 WebSocket binary message 的 payload，**不另外加 TCP 头**。后面会拿同一组数据对比 `ws_handler.message()` 与 `run_tcp()`。
 
-### 4.2 亲手新建 `client/world_scenario.mjs`
+### N.1.2 亲手新建 `client/world_scenario.mjs`
 
 此文件只组织本课程的**两名玩家真实业务流程**，由 WS/TCP 各自注入连接函数；不用额外的 PlayerManager。注意 Node `next()` 是测试代码等待网络消息，和 Gateway 是否 `skynet.call` 是两码事。
 
@@ -1508,7 +3411,7 @@ export async function runWorldScenario(connector) {
 }
 ```
 
-### 4.3 亲手新建 `client/websocket_client.mjs`
+### N.1.3 亲手新建 `client/websocket_client.mjs`
 
 **文件归属**：本课程客户端入口；它依赖的是生产代码 `gateway/clients/h5/handshake.mjs` 所提供的 `connectGateway()`，该 SDK 自己创建 WebSocket 并执行应用层握手。`connector(onmessage)` 只有完成 READY 校验才返回可发送业务数据的对象。
 
@@ -1525,9 +3428,9 @@ await runWorldScenario(onmessage =>
 
 > 从 `master_course/client/` 向上三层是 `gateway/`，所以 `../../../clients/h5/handshake.mjs` 指向真正的 FlyWow SDK，并非 Lesson 3 的演示脚本。
 
-### 4.4 真正运行 WebSocket 双人流程
+### N.1.4 真正运行 WebSocket 双人流程
 
-现在第四阶段所需的双人逻辑已经具备，可完整运行一次，用 A 的第一条响应开始分析：
+现在原教程双人逻辑已经具备，可完整运行一次，用 A 的第一条响应开始分析：
 
 ```bash
 bash gateway/sample/master_course/run.sh websocket
@@ -1546,747 +3449,10 @@ COURSE_CLIENT_OK ...
 
 Server 日志（位于 `build/gateway-master-course/websocket/server.log`）**预期**含 `COURSE_ENTER player=1001`、`COURSE_ENTER player=1002`、两个 `COURSE_DISCONNECT` 和最终 `COURSE_GATEWAY_OK`。这些是预期标记，实际打印格式由 Skynet 日志封装决定；请以真实输出核对。
 
-### 4.5 源码深挖（一）：从 Socket 到 READY
 
-**【真实源码】**：
+## N.2 亲手新建 `client/tcp_client.mjs`
 
-- `gateway/service/flywow_gateway.lua`：`accept_client(fd,peer)` → `websocket.accept(fd,ws_handler,"ws",peer)` → `ws_handler.handshake`/`ws_handler.message`。
-- `gateway/lualib/handshake.lua`：`init`、`accept`、`receive`、`confirm`、`ready`、`close`。
-- `gateway/native/gateway_crypto.cpp`：真实 P-256 ECDH、HKDF-SHA256、HMAC-SHA256。
-- `gateway/clients/h5/handshake.mjs`：`HandshakeClient.begin/respond/complete` 和 `connectGateway`。
-- 固定 Skynet `lualib/http/websocket.lua`：`M.accept`、`resolve_accept`、`read_frame`。
-
-**按真实发生的顺序观察**：
-
-1. Socket Driver 的 accept 事件交给 Gateway Service 的 `accept_client(fd,peer)`；它调用 `create_connection`，占用 `max_clients`/握手名额，建立 `connection_id=1` 与 `fd` 两张索引。
-2. Gateway fork 一条 WebSocket 会话协程；`websocket.accept` 先 `socket.start`，做 HTTP Upgrade，然后回调 Gateway 的 `ws_handler.handshake`。此时**只是 WebSocket 升级成功，不代表业务握手 ready**。
-3. 客户端 SDK 发送 **67 字节** `CLIENT_HELLO`。`ws_handler.message` 发现尚未 ready，调用 `process_handshake` → `handshake.receive` → Native。Gateway 把 **99 字节** `SERVER_CHALLENGE` 写给客户端。
-4. 客户端 SDK 校验 challenge 并发送 **33 字节** `CLIENT_PROOF`。Gateway 验证证明，先写 **33 字节** `SERVER_READY`，再调用 `handshake.confirm` 进入 ready。
-5. SDK 的 `complete` 验证服务端 HMAC，清除握手密钥引用；`connectGateway` Promise 此时才 resolve，业务代码才可 `send(Envelope)`。
-
-四段字节合同：`67 → 99 → 33 → 33`。TCP 在每条应用握手消息外额外有 2 字节长度头，WebSocket 则是独立 binary message。
-
-**执行环境**：客户端 Web Crypto 的 Promise 可能等待平台密码运算；服务端 Native 密码计算是 Gateway Service 内同步调用，不因为使用 C++ 就自动切到其他 OS 线程。Gateway 的 WebSocket 会话读 Socket 时可能 yield；独立的 `timeout_loop` 由 Skynet 调度。密钥 userdata 归该连接的 Handshake 上下文，连接 detach 时释放。
-
-**回到主线**：`ws_handler.message` 完成握手处理后返回给 WebSocket `resolve_accept` 的读循环，等待**下一条完整 binary message**。A 的 `encodeEnterWorld(1001)` 下一条消息才进入业务 `dispatch_payload()`。
-
-#### 4.5.1 拿到 fd 的第一行代码在哪里
-
-先观察客户端 A 的 WebSocket 已建立但尚未 `connectGateway()` resolve。此时进入 Gateway Service 的 `accept_client(fd,peer)`，调用者是 **Skynet listener 的 accept 回调**，而不是 WorldService 的 `skynet.dispatch`。`fd` 是底层 Socket Driver 分配的整数，`peer` 是诊断用对端地址。
-
-**【真实源码局部：`gateway/service/flywow_gateway.lua` / `accept_client()`】**：
-
-```lua
-if module_state.gateway_config.transport == "websocket" then
-    local accepted = create_connection(fd, peer, "websocket")
-    if not accepted then
-        socket.close_fd(fd)
-        return
-    end
-
-    accepted.read_started = skynet.now()
-    skynet.fork(function()
-        if accepted.closed then
-            return
-        end
-        local call_succeeded, accepted_by_websocket, failure = pcall(
-            websocket.accept, fd, ws_handler, "ws", peer
-        )
-        -- 此后还会检查 accept 结果并清理；这里没有展示整个分支。
-    end)
-    return
-end
-```
-
-这段分出两条不同的执行路径：监听回调完成 `create_connection` 并启动一个协程后**直接返回**；真正的 WS Upgrade 和持续收消息都在新 fork 的协程中。`accepted.read_started` 的用途是让扫描协程在 Upgrade 期间检查读取超时；它不是客户端业务消息时间。
-
-`create_connection(fd, peer, "websocket")` 发生在**底层 `websocket.accept` 接管 fd 之前**。失败时尚未进入 Skynet `socket_pool`，所以这里选择 `socket.close_fd(fd)`，与已接管连接使用的 `socket.close(fd)` 不同。
-
-#### 4.5.2 两张连接索引为什么都存在
-
-进入 `create_connection`（真实路径仍为 `gateway/service/flywow_gateway.lua`），按顺序做三件事：检查 `client_count` 和 `next_connection_id` 上限、通过 `handshake_module.accept()` 占一个握手名额、构造 `connection` 并同时登记两张索引。
-
-**【真实源码局部：`create_connection()`，省略容量拒绝与日志分支】**：
-
-```lua
-local handshake_result = handshake_module.accept()
-if not handshake_result.ok then
-    return nil
-end
-local handshake = handshake_result.value
-module_state.next_connection_id = module_state.next_connection_id + 1
-local connection =
-{
-    handshake       = handshake,
-    id              = module_state.next_connection_id,
-    fd              = fd,
-    peer            = peer,
-    transport       = transport,
-    close_requested = false,
-    closed          = false,
-    read_started    = nil,
-    last_message    = skynet.now(),
-    rate_started    = skynet.now(),
-    rate_count      = 0,
-}
-module_state.connections[connection.id] = connection
-module_state.connections_by_fd[fd] = connection
-module_state.client_count = module_state.client_count + 1
-```
-
-所有字段均是一个 **GatewayConnection** 的属性，`handshake` 指向该连接自己的 HandshakeContext。上述摘录删除了源码中的逐字段注释以便聚焦，但记录字段和赋值顺序与仓库一致。
-
-举例：A 的 fd 假设为 `18`，Gateway 给它逻辑连接号 `1`。此时两张表实际指向的是**同一个连接对象**：
-
-```text
-module_state.connections[1] -----------+
-                                       +--> connectionA {id=1, fd=18, ...}
-module_state.connections_by_fd[18] ----+
-connectionA.handshake ----------------------> handshakeContextA {phase="hello"}
-```
-
-这里没有复制两个对象；两张索引用于不同入口：WorldService 的出站命令拿的是 `connection_id`，所以查 `connections[1]`；WebSocket 回调给的是 `fd`，所以查 `connections_by_fd[18]`。将 `player_id=1001` 塞进这两张表会跨越网关与业务的职责边界。
-
-**生命周期验证**：连接未 ready 就关闭时，也应从两张表删除并释放握手名额。你可以在第六阶段发送错误 HELLO，再看 `gateway_disconnect` 及后续新连接是否仍能被接受；不能因为失败发生在业务之前就假定它不会占资源。
-
-#### 4.5.3 HTTP WebSocket Upgrade 与 FlyWow 应用握手的层次
-
-进入固定 Skynet `v1.8.0` 的 `lualib/http/websocket.lua`，`M.accept()` 会调用 `socket.start(socket_id)`，创建 `ws_obj`，注册 warning，然后进入 `resolve_accept()`。这段逻辑在 **Gateway Service fork 的 WS 会话协程**中执行，读取网络时可能挂起。HTTP Upgrade 成功，`resolve_accept()` 调用 `try_handle(self,"handshake",header,url)`，触发 `ws_handler.handshake(id,...)`。
-
-**【真实源码局部：固定 Skynet `lualib/http/websocket.lua` / `resolve_accept()`】**：
-
-```lua
-local header = err
-try_handle(self, "handshake", header, url)
-local recv_count = 0
-local recv_buf = {}
-local first_op
-while true do
-    if _isws_closed(self.id) then
-        try_handle(self, "close")
-        return
-    end
-    local fin, op, payload_data = read_frame(self)
-    -- 接下来分流 close / ping / pong / message；这里仅展示进入读循环。
-end
-```
-
-此处的 `"handshake"` 是**HTTP WebSocket 升级回调名称**，并不等于应用层的 P-256 握手完成。真实 `ws_handler.handshake()` 此时只清空 `connection.read_started` 并设置 `last_message`；它不会调用 `handshake.confirm()`。
-
-之后客户端发来的 67 字节 HELLO 才被 `read_frame` 解成一条 `binary message`，经 `try_handle(self,"message",payload_data,op)` 进入 `ws_handler.message()`。
-
-**回到调用者**：`ws_handler.handshake` 返回后，Skynet 的 `resolve_accept` 继续 while 读帧；`ws_handler.message` 返回后也是继续 while 读下一帧。Gateway 并没有另起一个线程执行 WS 回调。
-
-#### 4.5.4 Handshake 的状态不是一个 ready 布尔值
-
-**【真实源码：`gateway/lualib/handshake.lua` / `M.init()` 模块函数】**。`M.accept()` 由 `create_connection` 调用；`M.receive()` 由 `process_handshake` 调用；`M.confirm()` 由 Gateway 在 SERVER_READY 写成功之后调用；`M.close()` 在确认 ready 或连接 detach 时释放资源。
-
-| `context.phase` | 客户端下一条消息     | 状态变更                                     | Native/名额状态                   |
-| --------------- | -------------------- | -------------------------------------------- | --------------------------------- |
-| `hello`         | `CLIENT_HELLO` 67B   | `receive()` 成功后变 `proof`                 | Native userdata 创建，pending=1   |
-| `proof`         | `CLIENT_PROOF` 33B   | 验证成功后变 `confirm`                       | Native 擦除验证密钥，仍占握手名额 |
-| `confirm`       | **不应再接收下一条** | SERVER_READY 写成功后 `confirm()` 变 `ready` | 归还 pending 名额                 |
-| `ready`         | 业务 Envelope        | `ready()` 返回 true                          | 不再持有 Native 密钥              |
-| `closed`        | 无                   | 失败释放/关闭                                | 令牌释放，拒绝继续推进            |
-
-pending 是 handshake 模块在当前 Service Lua State 中持有的私有计数。模块加载时为 0；init 只在接受连接前配置依赖，不重置名额。accept 增加名额并创建连接 context；close 在活动阶段释放一次。
-
-- `client_count` 统计已经登记的连接，包括 ready 和未 ready。
-- `pending` 统计仍占用握手名额的连接；握手成功时即释放，连接可能继续在线很久。
-- `phase` 是握手名额的权威状态：`hello/proof/confirm` 占用 pending，`ready/closed` 不占用；转入终态后重复 close 不会重复扣减。
-
-**【真实源码局部：`gateway/lualib/handshake.lua` / `M.receive()`，HELLO 分支】**：
-
-```lua
-if context.phase == "hello" then
-    if bytes:byte(1) ~= 1 or bytes:byte(2) ~= 1 then
-        M.close(context)
-        return flywow_result.failure(
-            "HANDSHAKE_VERSION",
-            "unsupported handshake message type or version"
-        )
-    end
-    local call_succeeded, native_or_error, challenge_or_error =
-        pcall(crypto_module.create_context, bytes)
-    -- 失败后 M.close(context)，返回 HANDSHAKE_CRYPTO。
-    -- 成功分支如下：
-    context.crypto_context = native_or_error
-    context.phase = "proof"
-    return flywow_result.success(
-    {
-        response_bytes = challenge_or_error,
-        needs_confirmation = false,
-    })
-end
-```
-
-这里的 `crypto.create_context` 对应 Native 的公开 `create_context(hello)`，**不是 Lua 的 `handshake.init()`**。它返回 userdata 加 99 字节 challenge。失败时 Lua 状态机转换为 `FlyWowResult`，不会把 OpenSSL 异常作为业务响应抛给客户端。
-
-**【真实源码局部：`gateway/lualib/handshake.lua` / `M.receive()`，PROOF 分支与 `confirm()`】**：
-
-```lua
-context.phase = "confirm"
-return flywow_result.success(
-{
-    response_bytes = ready_or_error,
-    needs_confirmation = true,
-})
-```
-
-上面发生在 `context.crypto_context.verify(...)` 验证成功之后。`M.confirm()` 必须在确认仍为 `confirm`、未过期后先调用 `M.close(context)` 释放名额，再设置 `context.phase="ready"`，归还名额。这个顺序对应真实网络行为：**客户端看到的 SERVER_READY 证明已经被本地发送接口接受，Gateway 才允许业务包进入**。
-
-#### 4.5.5 Gateway 是怎样决定何时调用 `confirm()` 的
-
-执行现场重新回到 Gateway Service 的 `process_handshake(connection,bytes)`。它把 `connection.handshake` 和当前完整帧借给状态机；`handshake.receive` 不知道 Socket fd，也不负责写网络。
-
-**【真实源码局部：`gateway/service/flywow_gateway.lua` / `process_handshake()`】**：
-
-```lua
-local handshake_result = handshake_module.receive(
-{
-    context = connection.handshake,
-    bytes   = bytes,
-})
-if not handshake_result.ok then
-    -- 记录原有错误码并返回失败 Result；调用者负责关闭连接。
-end
-local handshake_output = handshake_result.value
-local response_bytes = handshake_output.response_bytes
--- TCP 用 socket.write 写长度头+response；WS 用 websocket.write 写 binary。
--- 若写入失败或连接已摘除，返回 HANDSHAKE_WRITE_FAILED。
-connection.last_message = skynet.now()
-if handshake_output.needs_confirmation then
-    local confirm_result = handshake_module.confirm(connection.handshake)
-    if not confirm_result.ok then
-        return confirm_result
-    end
-end
-return flywow_result.success()
-```
-
-这是**按实际源码顺序摘录的连续关键语句，中间写入分支做了注释省略**，不是一个可直接替换源码的函数。`connection.last_message` 是成功完成握手消息写入后的活动时间，和 `context.started`（绝对握手期限起点）不同。发送 CHALLENGE 不重置握手的绝对期限。
-
-实际到达 `confirm` 时，`SERVER_READY` 已经生成并交给 `socket.write`/`websocket.write`，因此 `confirm()` 才把状态切到 `ready`。如果写失败，`process_handshake` 返回错误，`ws_handler.message` 或 `run_tcp` 沿失败路径关闭连接；没有“客户端提前发送业务包就自动缓存”的行为。
-
-#### 4.5.6 Native 层究竟保存了什么，又什么时候释放
-
-打开 `gateway/native/gateway_crypto.cpp`。入口是 `luaopen_flywow_gateway_crypto()`，它向 Lua 注册模块 `create_context` 以及 userdata 的 `verify/close`；不是直接向 Skynet 注册 Service。Lua 调用 `crypto.create_context(bytes)` 进入 C++ `create_context(lua_State*)`，成功时创建独占的 `CryptoContext`，调用 `buildChallenge()`。
-
-**【真实源码局部：`gateway/native/gateway_crypto.cpp`】**：
-
-```cpp
-struct CryptoContext
-{
-    std::array<unsigned char, 32> proof_key = {};
-    std::array<unsigned char, 32> transcript_hash = {};
-    bool active = false;
-    ~CryptoContext() noexcept;
-};
-```
-
-这个 C++ record 由一个 Lua userdata 拥有。`buildChallenge()` 调用 OpenSSL EVP 生成 P-256 临时密钥对，验证客户端公钥点，计算原始 ECDH `Z`，再按合同生成：
-
-```text
-HELLO    = 01 01 + 客户端公钥65B
-CHALLENGE= 02 01 + 服务端公钥65B + 32B随机挑战
-T        = SHA256(HELLO || CHALLENGE)
-Z        = ECDH(server_private, client_public) 原始32B
-K        = HKDF-SHA256(Z, salt=随机挑战32B,
-           info="flywow/handshake/v1" || T, length=32)
-PROOF    = 03 + HMAC-SHA256(K,"client-proof" || T)
-READY    = 04 + HMAC-SHA256(K,"server-ready" || T)
-```
-
-这段是**协议推导式，不是 C++ 源码**。`Z` 的作用域使用 RAII `SharedSecret` 析构时擦除；`server_key` 由 `buildChallenge` 的局部 RAII owner 持有，正常返回和异常退出都会释放，不保存在 userdata 中。此后 userdata 保存 `proof_key`、`transcript_hash` 和 `active=true`，等待客户端 proof。
-
-客户端发回 PROOF 后，C++ `verify()` 用 `CRYPTO_memcmp` 比较客户端 HMAC，构造 READY，调用 `clearCryptoContext()` 擦除 `proof_key`/`transcript_hash` 并设置 `active=false`。`M.confirm()` 再调用 `M.close(context)`，将 userdata 引用清空、释放握手名额。
-
-**正常与失败路径的清理必须区分**：正常情况下密钥在 `verify()` 成功时已经擦除，`confirm()` 负责转 ready 和释放 Lua 持有关系；非法公钥、错误 proof 或超时时，`M.close()`/Native close 走失败清理。C++ userdata 的内存最终由 Lua GC 回收，`__gc` 的重复清理是幂等的；不能把“清理内部密钥”误说成“立即释放 Lua userdata 内存”。
-
-最后返回客户端：`gateway/clients/h5/handshake.mjs` 的 `HandshakeClient.complete()` 用 Web Crypto 验证服务器证明，成功后把自身阶段切 `ready` 并清掉密钥引用；`connectGateway()` Promise 随后 resolve。**服务端 ready 与客户端 SDK ready 是两次不同的确认动作**。
-
-#### 4.5.7 本阶段动手验证什么
-
-本课程的端到端流程检查 Gateway、Native 加载、握手和客户端协议。LuaBinding 另有一组固定 Skynet Lua ABI 的 Native 回归测试，覆盖参数/table 操作、真实 upvalue 编号、异常边界、Lua 分配失败时的资源展开，以及动态和静态 userdata 注册与析构。新增的静态注册用例通过 Lua `package.preload` 调用模块入口，核对静态 `luaL_Reg` 方法表、userdata 方法和 GC；它不等同于加载真实 `.so` 或运行 Gateway 集成。
-
-从 FlyWow 根目录可运行该 Binding 回归（参数需指向已构建的 Skynet 根目录）：
-
-~~~bash
-bash scripts/build_flywow.sh /path/to/skynet lua_binding
-~~~
-
-该目标链接指定 Skynet 自带的 Lua 5.4.7，而不是系统 Lua。它用于验证 Binding 的 ABI 与生命周期合同，不能替代下方 WS/TCP 课程实验。
-
-保持现有客户端代码不变，先执行正常 WS 流程，再使用第六阶段实验 A 的错误 HELLO：
-
-1. 正常流程中，观察 `FLYWOW_GATEWAY_OPEN`、`FLYWOW_GATEWAY_READY` 及第一条 `COURSE_ENTER` 的先后关系。前者的 `READY` 在真实日志里有 Gateway 监听 ready 与连接 ready 两类上下文，必须读出具体字段与时间，不应只按字符串混为一类。
-2. 错误 HELLO `Uint8Array([99])`：它只有 1 字节，会在 `M.receive` 的**长度检查**阶段得到 `HANDSHAKE_FRAME`，不会执行 `crypto.create_context`；若要验证 `HANDSHAKE_VERSION`，应先发送**67 字节**、但类型/版本不符的消息。这两个实验的触发位置完全不同。
-3. 根据错误路径画出 `accept → handshake.accept → receive失败 → detach → handshake.close → transport close`，检查从未进入 WorldService 的请求也会触发 `gateway_disconnect`。
-
-**返回主线**：A 握手后 `ws_handler.message` 返回 Skynet 的 WS 读循环，下一条完整 binary message 才进入 `dispatch_payload`。下面继续从这条入站业务包追踪到 WorldService。
-
----
-
-### 4.6 源码深挖（二）：A 的业务请求如何穿过两个 Service
-
-执行现场：A 已 ready，Gateway 收到上述 10 字节 Envelope。仍在 Gateway Service 的 WS 消息回调，**未进入 WorldService**。
-
-**【真实源码】** `gateway/service/flywow_gateway.lua`：`ws_handler.message` → `dispatch_payload(connection,payload)`：
-
-1. `#payload` 检查 `max_frame_bytes`；不是 Skynet 接收内存的硬上限。
-2. `codec_module.decode_envelope(payload)` → `gateway/lualib/codec.lua` 中 `pb.decode(Envelope,bytes)`；得到版本 4、command 1001、三字节 body。
-3. Codec 内部的 `registry.commands[1001]` → 直接查询生成表；得到 `.flywow.gateway.course.EnterWorldRequest`。
-4. `codec_module.decode_request(command_id,body)` → `pb.decode`，获得 `{player_id=1001}`。
-5. 检查连接级/实例级每秒速率，刷新成功接纳的业务消息活动时间。
-6. 构造 `inbound_request = {gateway_epoch,connection_id,command_id,data}`，以 `skynet.send(handler_service,"lua","send_data",inbound_request)` 异步投递。
-
-**重要区分**：
-
-```text
-Gateway Lua State                         WorldService Lua State
------------------                         ----------------------
-dispatch_payload(connection,payload)
-  codec/registry/限流
-  skynet.send(".gateway_course_world", "lua", "send_data", request)
-  return FlyWowResult.success()  ----->     skynet.dispatch("lua", ...)
-                                           on_enter_world(request)
-                                           state.players[connection_id] = 1001
-                                           skynet.send(gateway,"lua","send_data", response)
-                                             |
-Gateway 接收新的消息 <-------------------------+
-  deliver_outbound_message(response)
-  -> codec.encode_response
-  -> write_connection -> websocket.write
-```
-
-这里 **没有 Gateway 等待 WorldService 回包的 `skynet.call`，也没有保存 pending request 或 `request_id`**。WorldService 处理请求的时间不会延迟 Gateway 对这一请求的异步投递完成。两个 Service 的 Lua table 不共享内存，消息需要经过 Skynet 的序列化与投递。
-
-**【真实源码】** `deliver_outbound_message` 校验 `gateway_epoch`、逻辑 `connection_id`、command 和 ready，调用 `codec.encode_response` 生成 Envelope，再通过 `write_connection` 发送。`WorldService` 的 `{player_id=1001,scene_id=7,online_count=1}` 经过其 Registry `response_type` 编码，客户端按 command 1001 重新解码。这才算完整的一次请求响应。
-
-**阶段验收**：沿程序实际位置画出 Gateway 与 WorldService 的两条协程/消息执行链，明确哪里产生网络读等待、哪里 RPC 等待、哪里只有异步 send。能解释 `0` 代表 Skynet 普通 `send` 已接受投递，而不是业务已处理成功。
-
----
-
-### 4.7 源码精读：10 字节请求从哪里变成业务 table
-
-先把上节的 `encodeEnterWorld(1001)` 写成可见字节，避免把 `Envelope` 与 TCP framing 混淆。客户端从 `client/protobuf.mjs` 得到的完整 **Protobuf Envelope** 是：
-
-```text
-08 04                       Envelope.protocol_version = 4
-10 E9 07                    Envelope.command = 1001
-1A 03                       Envelope.body 长度 = 3
-   08 E9 07                 EnterWorldRequest.player_id = 1001
--------------------------
-总计 10B（无 TCP 长度头 / WS 帧头）
-```
-
-`10` 是十六进制字节 `0x10`，不是业务 command；Protobuf key 使用 `field_number << 3 | wire_type`。实际把它发进 WebSocket 时，`http.websocket` 已经拼出单条完整 binary message，Gateway 不再执行 TCP `read_exact(2)`。
-
-当前执行上下文仍为 **Gateway Service** 的 WebSocket 会话协程，文件 `gateway/service/flywow_gateway.lua`，函数 `ws_handler.message(id,payload,"binary")`。它取 `module_state.connections_by_fd[id]`，再判断：
-
-```lua
-if handshake_module.ready(connection.handshake) then
-    frame_result = dispatch_payload(connection, payload)
-else
-    frame_result = process_handshake(connection, payload)
-end
-```
-
-这是两个互斥分支。A 已 ready，因此这条 10 字节消息不可能再被当作 `CLIENT_HELLO`；如果 SDK 在未 ready 时误发 Protobuf，Handshake 会依据当前固定长度/阶段拒绝。
-
-#### 4.7.1 `dispatch_payload()` 第一段：帧和 Envelope
-
-**【真实源码局部：`gateway/service/flywow_gateway.lua` / `dispatch_payload()`】**：
-
-```lua
-if connection.closed or #payload == 0 or
-    #payload > module_state.gateway_config.max_frame_bytes then
-    -- 记录 FRAME_LIMIT 并返回失败结果，原文件包含完整 log_event 构造。
-end
-
-local envelope_result = codec_module.decode_envelope(payload)
-if not envelope_result.ok then
-    -- 返回 ENVELOPE_DECODE，details.cause_code 保留 Codec 错误类别。
-end
-local envelope = envelope_result.value
-if envelope.protocol_version ~= module_state.gateway_config.protocol_version then
-    -- 返回 PROTOCOL_VERSION。
-end
-```
-
-这一段分开三类错误：大小或空帧属于 `FRAME_LIMIT`；bytes 无法按 `Envelope` 解码属于 `ENVELOPE_DECODE`；成功解码但业务版本不兼容属于 `PROTOCOL_VERSION`。不能只说“解包失败”。本课的 10 字节成功得到 `envelope={protocol_version=4, command=1001, body=<3字节>}`；Lua 的 `body` 是 bytes string，还不是 `EnterWorldRequest` table。
-
-`codec.decode_envelope` 来自 `gateway/lualib/codec.lua`，内部调用 `pb.decode(codec_config.registry.envelope_type,payload)`。`pb` 加载的类型描述来自第一阶段生成的 `.pb`，不会每帧再加载文件；失败被 `pcall(pb.decode,...)` 转成 `FlyWowResult`。
-
-#### 4.7.2 第二段：Registry 决定如何解释 body
-
-**【真实源码局部：同一 `dispatch_payload()`】**：
-
-```lua
-if not codec_module.has_command(envelope.command) then
-    -- 记录 UNKNOWN_COMMAND 并返回失败 Result。
-end
-
-local request_result = codec_module.decode_request(
-    envelope.command, envelope.body
-)
-if not request_result.ok then
-    -- 记录 REQUEST_DECODE 并返回失败 Result。
-end
-local request = request_result.value
-```
-
-`definition` 来自 `world_registry.lua` 的生成命令表。本例的 `request_type=".flywow.gateway.course.EnterWorldRequest"`，Codec 内部再调用 `pb.decode(definition.request_type,body)`，最终得到 `{player_id=1001}`。
-
-如果客户端发送 `SYSTEM_NOTICE=1002`，Registry 能找到定义，但 `request_type=nil`。这时**不是 `UNKNOWN_COMMAND`**，而是 Codec 的 `decode_request` 按不支持入站类型返回错误，Gateway 对外记 `REQUEST_DECODE`。要能准确描述“命令号不存在”与“命令仅允许服务端下发”这两种失败。
-
-#### 4.7.3 第三段：限流、活动时间和跨 Service 投递
-
-只有成功完成两层解码，才进入连接级/实例级请求速率统计。`connection.rate_started/rate_count` 属于这一条连接；`module_state.rate_started/rate_count` 属于当前 Gateway Service。两者均按约 100 tick 的窗口检查，**只在通过上限后增加接纳计数**。
-
-**【真实源码局部：同一 `dispatch_payload()`，省略前面两套计数窗口重置】**：
-
-```lua
-if connection.rate_count >= module_state.gateway_config.max_requests_per_second or
-    module_state.rate_count >= module_state.gateway_config.max_total_requests_per_second then
-    -- 记录 INGRESS_RATE_LIMIT 并返回失败 Result。
-end
-connection.rate_count = connection.rate_count + 1
-module_state.rate_count = module_state.rate_count + 1
-connection.last_message = now
-
-local inbound_request =
-{
-    gateway_epoch = module_state.epoch,
-    connection_id = connection.id,
-    command_id    = envelope.command,
-    data          = request,
-}
-local call_succeeded, send_result_or_error = pcall(
-    skynet.send,
-    module_state.gateway_config.handler_service,
-    "lua", "send_data", inbound_request
-)
-```
-
-`inbound_request` 是**跨 Service 消息**，不是网络上的 Protobuf Envelope。此刻它只装有 `gateway_epoch`、`connection_id`、`command_id` 和已解码的 `data={player_id=1001}`；连接 peer/transport 保留在 Gateway 内部，不进入业务消息。
-
-接着代码判断 `not call_succeeded` 或 `send_result_or_error==nil/false`：失败记录 `HANDLER_SEND` 并返回失败 Result；成功时普通 Skynet `send` 返回 `0`，`dispatch_payload` 返回 `FlyWowResult.success()`。**成功只表示本地异步投递被 Skynet 接受**；业务还没完成，可能连 WorldService 的消息回调都还没执行。
-
-回到 `ws_handler.message()`：收到成功 Result 便结束本次回调；Skynet 的 WS 循环继续下一条消息。**网关没有 `pending[request_id]`、没有等待业务回包的 RPC，也没有阻塞客户端 A 直到 WorldService 返回。**
-
-### 4.8 在两份 Lua State 之间追踪一次请求与响应
-
-注意这里不是普通 Lua 函数调用：`WorldService` 和 `Gateway` 通过 Skynet 消息队列传递值，业务消息的接收由各自 `skynet.dispatch("lua",...)` 执行。
-
-```text
-Gateway Service，Lua State G            WorldService，Lua State W
-  WS 会话协程 G-read                       业务消息协程 W-msg
-  │                                       │
-  ├─ dispatch_payload                     │
-  ├─ skynet.send(".gateway_course_world", ───> Skynet 投递消息
-  │    "lua","send_data",record)         ├─ skynet.dispatch("lua",...)
-  ├─ return success                       ├─ on_enter_world(record)
-  └─ 回到 WS read_frame 等待下一帧          ├─ state.players[id]=1001
-                                          ├─ send_to_gateway(epoch,id,1001,response)
-                                          └─ skynet.send(gateway,"lua","send_data",...)
-           Gateway 后续收到独立的出站消息 <───┘
-  Gateway 另一条消息分发协程 G-send
-  ├─ deliver_outbound_message(outbound)
-  ├─ codec.encode_response(...)
-  ├─ write_connection(...)
-  └─ return（无业务 RPC 返回）
-```
-
-两个接收回调在各自的 Service 内调度，不能假设它们共用一次 C++ 调用栈。WorldService 的 `state.players` 也**不会因为 Gateway 把 `connection.closed=true` 而被自动修改**；只有 `gateway_disconnect` 消息在 WorldService 被处理之后才删除该玩家记录。
-
-### 4.9 出站源码精读：为什么回包能找到原来的连接
-
-现在从 WorldService 的 `send_to_gateway(epoch,connection_id,1001,data)` 返回到 Gateway Service 的 `skynet.dispatch`。该入口匹配 `command="send_data"`，调用 `deliver_outbound_message(outbound_message)`；和前面的入站同名 `send_data` **只代表宿主与网关互发的消息命令**，消息方向由发起者决定。
-
-**【真实源码局部：`gateway/service/flywow_gateway.lua` / `deliver_outbound_message()`】**：
-
-```lua
-if not module_state.gateway_config or type(outbound_message) ~= "table" or
-    outbound_message.gateway_epoch ~= module_state.epoch or
-    module_state.phase ~= "running" then
-    return
-end
-
-if not codec_module.has_response(outbound_message.command_id) then
-    return
-end
-local encode_result = codec_module.encode_response(
-    outbound_message.command_id,
-    module_state.gateway_config.protocol_version,
-    outbound_message.data
-)
-```
-
-此前还存在对 `connection_id/command_id/data` 的类型检查，此处为聚焦主线略去。出站先校验 `epoch`，防止上一 Gateway 实例迟到响应；再通过 `response_type` 选择 protobuf 类型并编码。`codec.encode_response` 在 `gateway/lualib/codec.lua` 中先 `pb.encode(EnterWorldResponse,data)`，再包 `{protocol_version=4,command=1001,body=...}` 并 `pb.encode(Envelope,...)`。
-
-**【真实源码局部：同一函数的目标连接选择】**：
-
-```lua
-if outbound_message.connection_id == 0 then
-    for _, connection in pairs(module_state.connections) do
-        if not connection.closed and
-            handshake_module.ready(connection.handshake) then
-            write_connection(connection, encoded)
-        end
-    end
-    return
-end
-
-local connection = module_state.connections[outbound_message.connection_id]
-if not connection or connection.closed or
-    not handshake_module.ready(connection.handshake) then
-    return
-end
-write_connection(connection, encoded)
-```
-
-这个索引就是 `create_connection()` 里创建的 `connections[id]`。若 A 的旧 fd 被后来新客户端复用，旧 A 的逻辑 `connection_id` 也不会被复用；当 A 已 detach 时，`connections[旧id]` 不存在，所以出站消息会被丢弃，不可能“顺手发给使用同一个 fd 的新人”。
-
-`write_connection()` 在 WS 分支调用 `websocket.write(fd,encoded,"binary")`，TCP 分支调用 `socket.write(fd,string.pack(">I2",#encoded)..encoded)`。写失败会记录 `WRITE_FAILED`、摘除连接，并 fork transport 关闭；成功也**只表示本地写操作成功**，不等于客户端应用已经消费响应。
-
-### 4.10 这一条主线结束后，必须能独立推导的问题
-
-**实验**：在第六阶段使用未知 command `9999`，再把它换成合法的服务端专用 command `1002`，对比 Gateway 产生的错误类别。再思考 A 收到 `EnterWorldResponse` 时是否可以证明 WorldService 一定按某个 `request_id` 取回缓存的请求——答案不能这样推导，因为 Gateway 没有这样的关联状态；本例是 WorldService 主动带连接身份发送另一条独立消息。
-
-此节返回第四阶段主线：A 的请求与回包已经完成，B 接入后将触发相同的入站与出站流程；区别是单播和广播由 `connection_id` 的值决定。
-
----
-
-# 第四阶段：双连接、单播、广播、主动关闭
-
-## 5. 为什么不能把 player_id 当成 Socket id
-
-第 3 阶段运行时已经能看到完整两人场景。现在不增添模块，只观察**同一次运行中的第二条连接**，并沿源码解释它为什么不会误发到玩家 A。
-
-| 业务事实           | Gateway 实际管理的东西                                       | WorldService 保存的东西                      |
-| ------------------ | ------------------------------------------------------------ | -------------------------------------------- |
-| 玩家 A（1001）接入 | fd、当前实例的 `connection_id=1`（示意值）和 `gateway_epoch` | `players[1]=1001`                            |
-| 玩家 B（1002）接入 | 另一条 fd、另一 `connection_id=2`（示意值）                  | `players[2]=1002`                            |
-| 发送 B 私信        | `send_data` 按 `connection_id=2` 选目标                      | 业务决定公告内容                             |
-| 广播               | `connection_id=0`，当前 Gateway 的 ready 连接                | 不需要业务循环逐个写 Socket                  |
-| B 主动断开         | `close` 指向 B 的逻辑连接                                    | `gateway_disconnect` 到达后删除 `players[2]` |
-
-`fd` 是 Skynet Socket Driver 的底层编号，Gateway 不把它交给业务 Service；`connection_id` 是本 Gateway 实例内递增分配的逻辑编号，两个不同实例可能都有 `connection_id=1`。所以出站 `send_data`、`close` 必须带入本次请求携带的 `gateway_epoch`，而且广播 `0` **只到当前 Gateway 实例**，不是全服跨节点广播。
-
-## 5.1 整体运行与逐步观察
-
-从 FlyWow 根目录运行：
-
-```bash
-bash gateway/sample/master_course/run.sh websocket
-```
-
-观察 `WorldService` 源码 `on_enter_world` 中 B 分支的确切发送顺序：
-
-```text
-收到 B 的 EnterWorldRequest
-    -> 回 B 的 EnterWorldResponse（1001）
-    -> 单播 B 的 SystemNoticeResponse（1002，"欢迎玩家1002"）
-    -> 广播 SystemNoticeResponse（1002，"新手村已开放"）
-    -> 30 tick 后投递 close(B)
-客户端 A 收到广播 -> A 自己调用 SDK.close()
-网关分别收到 A/B 的 close -> 回报两个 gateway_disconnect
-WorldService 清理 players，并调用 Gateway.stop()
-```
-
-本例 `skynet.timeout(30, ...)` 只是用于让教学过程的“先收到消息、再被主动断开”清晰可见，**不是 Gateway 的可靠送达 ACK**。正式业务若必须确认某条消息已被客户端处理，应在业务协议中另行定义确认合同；Gateway 当前不提供这种机制。
-
-### 5.2 源码深入：单播与广播
-
-**执行位置**：`gateway/service/flywow_gateway.lua` 的 `skynet.dispatch` 收到 `send_data`，调用 `deliver_outbound_message(outbound_message)`；其参数正是上一步 WorldService 的 `send_to_gateway()` 构造的 table。
-
-1. 检查 `gateway_epoch` 和当前 Gateway 阶段；旧实例消息立即丢弃。
-2. 直接查询 `registry.commands[1002]` 并检查 `1002` 的 `response_type`（本例仅下行，所以客户端不能用 `1002` 发请求）。
-3. `codec.encode_response` 将 `{content="新手村已开放"}` 编为 `SystemNoticeResponse` 再包入 Envelope。
-4. `connection_id>0`：只查 `module_state.connections[connection_id]`，连接存在且 ready 才写。
-5. `connection_id==0`：遍历**当前 Gateway Service** 的 `module_state.connections`，只向尚未关闭且 ready 的连接写同一份已编码 bytes。
-6. `write_connection`：WebSocket 调用 `websocket.write`；TCP 则在同一 Envelope 前添加两字节网络序长度。
-
-本次广播的两个接收者在 Gateway 内只共享一次编码得到的不可变 bytes；业务 Service 没有直接遍历/拥有 Gateway 的 Socket。发送结果只表示本地写入尝试，**不是对端应用已处理**。
-
-### 5.3 源码深入：close 与 gateway_disconnect
-
-**调用方**：`WorldService.on_enter_world` 注册的延迟回调向 Gateway 发出：
-
-```lua
-skynet.send(state.gateway, "lua", "close",
-{
-    gateway_epoch = epoch, -- B 的请求对应的当前 Gateway 实例身份。
-    connection_id = target_id, -- B 的逻辑连接编号，而不是 fd。
-})
-```
-
-**【真实源码】** `gateway/service/flywow_gateway.lua`：
-
-```text
-Gateway 的 skynet.dispatch("lua", ...) 收到 command="close"
-  -> request_close(close_request)
-       -> 校验 gateway_epoch、connection_id
-       -> module_state.connections[id]
-       -> detach_connection(connection, "closed by handler")
-            closed=true；释放 Handshake 上下文；移除 id/fd 双索引
-            发送 skynet.send(handler, "lua", "gateway_disconnect", ...)
-       -> skynet.fork(function() close_transport(connection,1008,"closed by server") end)
-  -> 返回 Gateway 消息分发
-关闭协程：
-  -> close_transport()
-       -> close_requested 标记；选择 websocket.close 或 socket.close
-       -> 底层关闭可能 yield
-WorldService 收到 gateway_disconnect
-  -> on_disconnect(message)
-       -> 从 state.players 删除 B；在线人数减 1
-```
-
-为什么 `detach_connection` 在底层关闭之前？因为 Socket close 可能 yield，不能让旧连接在等待过程中仍接受出站消息；而 `close_requested` 又避免两个关闭协程重复操作同一个 Socket。这里区分**逻辑摘除**和**物理传输关闭**，是理解 Gateway 生命周期的关键。
-
-**回到主线**：B 被清理之后，A 的客户端 `close()` 也会触发自己的断开通知。`state.disconnected==2`，WorldService 的监视协程 `skynet.call(gateway,"lua","stop")`，Gateway 进入停止阶段，关闭监听；本例已无在线连接，所以 `closed_connections` 预期是 `0`。
-
-**阶段验收**：能说明 `connection_id=0` 不会变成客户端 0；能区分 fd、connection_id、player_id、gateway_epoch；能追踪 B 的“请求关闭 → 摘除 → 发送通知 → transport 关闭”全过程，以及 A/B 各自独立的退出路径。
-
----
-
-### 5.4 源码精读：为什么同一份出站消息可以广播
-
-上一节 B 入场后，`WorldService.on_enter_world()` 连续发出三条 `skynet.send`：B 的响应、B 的私信、面向当前 Gateway 的公告。Gateway 收到的是**三条独立的 Service 消息**，每条单独进入 `deliver_outbound_message()`；并不是在一次 RPC 中返回三个值。
-
-广播时 `connection_id=0` 并非特殊的 fd。Gateway 先根据 `command=1002` 将 `{content="新手村已开放"}` 编成**一份** Envelope bytes，再遍历当时存活的连接。它在读循环里不会向 WorldService 查询“谁属于新手村”，只判断连接尚未 `closed` 且握手 `ready`。因此两条 ready 连接都能收到，未 ready 的连接即使已占据 `max_clients` 名额也不能收到业务公告。
-
-源码路径：`skynet.dispatch("lua", ...)` → `deliver_outbound_message()` → `codec.encode_response()` → `write_connection()`。这里没有 `skynet.call(handler)`，也没有广播批次的 ACK 状态；多 Gateway 节点的全局广播需要宿主分别向每个 Gateway 实例发送，当前 `connection_id=0` 的范围只限本实例。
-
-**针对本案例的可观察推演**：
-
-```text
-A 已 ready: connection_id=1
-B 已 ready: connection_id=2
-A/B 对应不同 Socket fd（示意）
-
-send_data(epoch, connection_id=2, command_id=1002, "欢迎玩家1002")
-    -> connections[2] -> write(B)                 只一条
-
-send_data(epoch, connection_id=0, command_id=1002, "新手村已开放")
-    -> 遍历 connections
-         A: closed=false, ready=true -> write(A)
-         B: closed=false, ready=true -> write(B)   共两条
-```
-
-**实验**：在正常流程中核对客户端 A 并未收到 B 的私信，而两人都收到了广播。观察结果之后再按上面的源代码分支解释：不是业务客户端自己过滤了私信，而是 Gateway 只向 B 的 fd 执行了本地写入。
-
-### 5.5 源码精读：逻辑摘除与物理关闭是两个阶段
-
-现在看 B 被主动断开的过程。`WorldService` 30 tick 后 `skynet.send(gateway,"lua","close",{gateway_epoch,connection_id})`。Gateway **文件末尾的 Service 分发入口**先调用 `request_close(close_request)`；该函数不执行同步 RPC 给业务 Service。
-
-**【真实源码局部：`gateway/service/flywow_gateway.lua` / `request_close()`，省略初始参数类型校验】**：
-
-```lua
-local connection = module_state.connections[close_request.connection_id]
-if not connection or not detach_connection(connection, "closed by handler") then
-    return
-end
-skynet.fork(function()
-    close_transport(connection, 1008, "closed by server")
-end)
-```
-
-`detach_connection` 是**当前 Gateway Service 内部的同步状态更改**，它先标记 `connection.closed=true`，释放握手 握手模块 对这条连接的引用，把 `connections[id]` 和 `connections_by_fd[fd]` 都删除，减少 `client_count`，最后异步投递 `gateway_disconnect` 给 WorldService。它本身不做 `socket.close`；出站路径从此立即查不到 B 了。
-
-**【真实源码局部：同一文件 / `detach_connection()`】**：
-
-```lua
-if connection == nil or connection.closed then
-    return false
-end
-connection.closed = true
-handshake_module.close(connection.handshake)
-module_state.connections[connection.id] = nil
-module_state.connections_by_fd[connection.fd] = nil
-module_state.client_count = module_state.client_count - 1
-skynet.send(module_state.gateway_config.handler_service, "lua", "gateway_disconnect",
-{
-    gateway_epoch = module_state.epoch,
-    connection_id = connection.id,
-})
--- 原函数接着记录 close 日志，最后 return true。
-```
-
-这段仅省略最终 `log_event`。它给出一个非常重要的阶段区分：
-
-| 时刻                        | Gateway 内部状态                      | Socket 层                              | WorldService                     |
-| --------------------------- | ------------------------------------- | -------------------------------------- | -------------------------------- |
-| B 还在线                    | 双索引能找到 B，`closed=false`        | WS 读循环仍在运行                      | `players[B_id]=1002`             |
-| `detach_connection` 已完成  | 查不到 B；`closed=true`；握手资源释放 | fd 可能尚未关完                        | 断开通知可能尚在消息队列         |
-| `close_transport` 执行中    | B 已不可出站/广播                     | 调用 WS close 或 TCP close，可能 yield | 正在处理或等待 disconnect        |
-| `gateway_disconnect` 已处理 | B 仍不在连接表                        | 具体 Socket 释放按 transport 完成      | 删除 `players[B_id]`，在线数减 1 |
-
-这正是传统 C++ MMO 网关里“先从玩家/连接管理结构摘除，再异步释放网络资源”常见做法的对应关系；Skynet 的不同点是后面的 Socket close 可能让出协程，而不是通过共享内存直接在另一个线程执行删除。
-
-### 5.6 `close_requested` 与 `closed` 不是重复字段
-
-**【真实源码局部：`gateway/service/flywow_gateway.lua` / `close_transport()`】**：
-
-```lua
-if connection.close_requested then
-    return
-end
-local current = module_state.connections_by_fd[connection.fd]
-if current and current ~= connection then
-    return
-end
-connection.close_requested = true
-if force_shutdown and not socket.invalid(connection.fd) then
-    socket.shutdown(connection.fd)
-end
-if connection.transport == "websocket" and not websocket.is_close(connection.fd) then
-    websocket.close(connection.fd, code or 1001, reason or "closed")
-elseif socket.invalid(connection.fd) then
-    socket.close_fd(connection.fd)
-else
-    socket.close(connection.fd)
-end
-```
-
-`closed` 表示**逻辑身份已经摘除**；`close_requested` 表示**底层关闭已提交**。同一条连接可能先被超时扫描发现，随后又收到业务 `close` 或传输 error；`detach` 必须保证只减一次 `client_count`、只通知一次业务，而 `close_transport` 必须保证不在多个协程中反复关闭同一个 fd。
-
-`current` 是从 `connections_by_fd[fd]` 反查当前 owner；如果 fd 已分配给新连接，旧 context 不能把它关掉。与 `next_connection_id` 单调递增一起，形成两层不同的保护：**业务消息按逻辑 ID 查找，物理清理按当下 fd 所有权检查**。这并非新加的设计，正是已有源码行为。
-
-`force_shutdown` 仅背压超限时为 true。正常关连接调用 `websocket.close` 或 `socket.close`；WS close 内部会尝试发送关闭帧并清理 WebSocket 对象。需要精确理解“本地提交了关闭”与“客户端必定收到一个有序 close frame”的差别：后者不是 Gateway 当前可证明的 ACK 合同。
-
-### 5.7 追到 Skynet 的 `websocket.close()`：谁释放 WS pool
-
-固定 Skynet `v1.8.0` `lualib/http/websocket.lua` 自身管理 `ws_pool[id]`。`M.close(id,code,reason)` 找到 `ws_obj` 后尝试写 close frame，最后调用 `_close_websocket(ws_obj)`，后者移除 WS pool 对象并调用其 `close()`（普通 WS 进一步调用 `socket.close(id)`）。这是**Skynet 第三方已实现的逻辑**，教程只读取，不修改。
-
-这一层不归 Gateway `module_state.connections` 管理。Gateway 维护的是本模块的业务连接记录；WebSocket 库维护的是 WS 协议对象；Skynet Socket 库维护的是 fd 对应的 socket pool 记录。正常断开时三层要分别结束各自持有的状态，但不需要 Gateway 为 Skynet 再建一张 WS pool。
-
-```text
-Gateway connections       http.websocket ws_pool         skynet.socket socket_pool
-       │                         │                                │
-       ├─ detach: 删除 A/B       │                                │
-       └─ close_transport ------> M.close(fd) --------------------> socket.close(fd)
-                                  删除 ws_obj                       底层释放，可能等待
-```
-
-**实验与回主线**：按第六阶段的握手失败实验检查关闭一次即可释放握手名额；再正常接入新客户端，确认 `connections` 不会返回旧编号。回到课程 WorldService：收到 `gateway_disconnect` 后删除的是 `players[connection_id]`，从不调用 `socket.close(fd)`。
-
----
-
-# 第五阶段：换成 TCP，业务协议与 WorldService 不动
-
-## 6. TCP 只有字节流，没有 WebSocket 的消息边界
-
-前四阶段已经完整使用 WS。现在切换为 TCP，**不改 `.proto`、WorldService、Codec、Registry、业务响应或广播**。真正要更换的只有客户端连接方式以及 Gateway 的监听 `transport` 配置。
-
-WebSocket 交给 Gateway 的是完整 `binary message`；TCP 则需要先读 **2 字节 uint16 big-endian 长度**，再按长度读 body。由于示例 Envelope 是 10 字节，所以 TCP 线上发送 `00 0A` + 上面的 10 字节。握手每条消息也有相同的两字节 TCP 长度头。
-
-我们复用生产级握手算法 `HandshakeClient.begin/respond/complete`，只自己实现最小 TCP framing，不复制现有 `gateway/sample/gateway_tcp_support.mjs`。
-
-## 6.1 亲手新建 `client/tcp_client.mjs`
-
-此文件包含 TCP Socket 连接、拼帧、三个应用握手步骤，以及把完整业务帧交给第四阶段已经写好的 `runWorldScenario`。**每个新 TCP 客户端实例拥有自己的接收缓冲和握手对象**；共享的只有业务流程函数和 Protobuf 编解码器。
+此文件包含 TCP Socket 连接、拼帧、三个应用握手步骤，以及把完整业务帧交给N.1.2 已经写好的 `runWorldScenario`。**每个新 TCP 客户端实例拥有自己的接收缓冲和握手对象**；共享的只有业务流程函数和 Protobuf 编解码器。
 
 ```javascript
 import net from "node:net";
@@ -2374,201 +3540,18 @@ await runWorldScenario(connectTcp);
 
 **为何这里有 `buffer` / `frames` / `waiters`？** TCP 的一个 `data` 事件可能只有半条帧，也可能包含两条帧；`readFrame()` 必须拿到完整一条消息才能交给 `HandshakeClient`。这些字段是**客户端 TCP 拼帧真实需要的状态**，不属于服务端 Gateway，也不形成框架级队列。与此相对，WS SDK 已经把 framing 和异步握手封装在 `connectGateway()` 里。
 
-## 6.2 实际运行 TCP 全流程
+## N.3 实际运行 TCP 全流程
 
 ```bash
-bash gateway/sample/master_course/run.sh tcp
+bash gateway/sample/master_course/run.sh tcp server
+# 在第二个终端运行：
+timeout 20s node gateway/sample/master_course/client/tcp_client.mjs 19221
 ```
 
 **预期**：服务端 READY 显示 `transport=tcp`；业务客户端依然先得到 A/B 两个进入结果，再收到 B 的单播、两人公告，B 由服务端 `close`，A 通过 `socket.end` 主动退出，最终 `COURSE_GATEWAY_OK`。与 WebSocket 的区别只在传输层；业务 table 和 command 完全不变。
 
-### 6.3 源码深入：run_tcp 和 read_exact
 
-**【真实源码】** `gateway/service/flywow_gateway.lua`：`accept_client` → `skynet.fork(run_tcp)` → `socket.start(fd)` → `socket.warning` → `read_exact(connection,2)` → `string.unpack(">I2",header)` → 检查阶段所允许的长度 → `read_exact(connection,size)` → `process_handshake` 或 `dispatch_payload`。
-
-`read_exact()` 调用固定 Skynet 的 `socket.read(fd,size)`；如果底层数据未读满，当前 **Gateway 的 TCP 读协程挂起**，Socket Driver 持续接收并在满足条件时唤醒它；其他客户端各自的读取协程和其他 Service 不因此全局阻塞。读取前 `connection.read_started=skynet.now()`，读取返回后清除，以供 timeout_loop 判断**当前这一次定长读取**是否超时。
-
-第一次客户端发送 `00 43` 加 67 字节 HELLO，Gateway 在 `handshake.ready=false` 时要求当前握手阶段的**精确长度**，不能提前把任意字节当成业务 Envelope。四段握手结束后，同一个循环改为读取正常业务帧，验证 `size <= max_frame_bytes` 再解码。
-
-这里有一个容易误解的边界：`max_frame_bytes` 限制**业务 Envelope 长度**，不是 TCP 或 WebSocket 的底层接收内存硬上限。源码已经移除了无效的 `socket.limit(fd,max_frame_bytes+2)`；不能在教程里把它说成“完整内存防护”。
-
-**返回主线**：TCP `dispatch_payload` 完毕返回到 `run_tcp` 读取循环，继续等待下一条长度头。WorldService 接收到的 record 与 WS 完全一致，业务不知道 TCP 何时收满每个字节。
-
-### 6.3.1 把 TCP 读拆成真正的两个等待点
-
-回到 `gateway/service/flywow_gateway.lua` 的 `run_tcp(connection)`。调用者是 `accept_client` 为每一条 TCP 连接 fork 的读协程，传入的 `connection` 已经存入双索引，但 `socket.start(fd)` 可能尚未完成 Socket pool 接管。
-
-**【真实源码局部：`run_tcp()`，已省略 warning 注册与错误日志】**：
-
-```lua
-local fd = connection.fd
-local opened, open_error = socket.start(fd)
--- 检查 socket.start 的结果以及连接是否已被关闭。
-
-while not connection.closed and module_state.phase == "running" do
-    local header = read_exact(connection, 2)
-    if not header then
-        break
-    end
-    local size = string.unpack(">I2", header)
-    local ready = handshake_module.ready(connection.handshake)
-    if (not ready and size ~= handshake_module.expected_size(connection.handshake)) or
-        (ready and (size < 1 or size > module_state.gateway_config.max_frame_bytes)) then
-        -- 记录 FRAME_LIMIT 并 break。
-    end
-    local payload = read_exact(connection, size)
-    if not payload then
-        break
-    end
-    local frame_result
-    if ready then
-        frame_result = dispatch_payload(connection, payload)
-    else
-        frame_result = process_handshake(connection, payload)
-    end
-    if not frame_result.ok then
-        break
-    end
-end
--- 最终 detach_connection + close_transport。
-```
-
-这段并非完整函数，注释明确了所省略的注册/清理分支。**第一次 read_exact(2)** 是读网络序长度头；**第二次 read_exact(size)** 是读当前阶段的完整应用消息。对于应用握手 HELLO：必须先读到 `00 43`（十六进制 67），长度才能通过 `expected_size(context)=67`。对于业务 `EnterWorld`：先读到 `00 0A`（十六进制 10），才按 10 字节解析 Envelope。
-
-**真实客户端可能把这些字节分三次送达**：
-
-```text
-Socket 收到第1批: 00                   -> header 还差 1 字节，读协程挂起
-Socket 收到第2批: 0A 08 04 10          -> header 满2B，返回；body 只有3B，第二次读挂起
-Socket 收到第3批: E9 07 1A 03 08 E9 07 -> body 满10B，read_exact 返回完整 Envelope
-```
-
-这里表中的 1、3、7 字节只是**教学设定的分批到达情况**；网络的实际分包由 OS、TCP 和发送时机决定，不能把三次 `data` 当成协议固定行为。
-
-### 6.3.2 `read_exact()` 为什么要在 yield 后再次检查 `closed`
-
-**【真实源码：`gateway/service/flywow_gateway.lua` / `read_exact()` 关键实现】**：
-
-```lua
-local function read_exact(connection, size)
-    connection.read_started = skynet.now()
-    local received_bytes = socket.read(connection.fd, size)
-    connection.read_started = nil
-    if connection.closed then
-        return nil
-    end
-    if not received_bytes then
-        return nil
-    end
-    if #received_bytes ~= size then
-        return nil
-    end
-    return received_bytes
-end
-```
-
-`connection.read_started` 表示**这一轮定长读取开始的 tick**；timeout_loop 判断读超时时使用它。`socket.read` 可能 yield，恢复回来时连接可能已经被另一条超时/关闭路径逻辑摘除，因此首先判断 `connection.closed`，不允许把迟到 bytes 再当成有效业务请求。
-
-### 6.3.3 深挖固定 Skynet：协程究竟在哪一行挂起
-
-文件：固定 Skynet `v1.8.0` `lualib/skynet/socket.lua`。调用链不是简单的“Lua 读一个系统调用”：
-
-```text
-Gateway.run_tcp 的读协程 G-read
-  -> read_exact(connection, size)
-  -> skynet.socket.read(fd,size)
-       -> driver.pop(socket.buffer, socket.pool, size)
-          ├─ 已足够：直接返回 bytes
-          └─ 不足：s.read_required=size
-                   -> suspend(s)
-                      -> s.co=coroutine.running()
-                      -> skynet.wait(s.co)               [G-read yield]
-Socket Driver 有更多数据到达
-  -> Skynet 的 socket 消息分发协程
-       -> socket_message[1](fd,size,data)
-       -> driver.push(s.buffer,s.pool,data,size)
-       -> 检查 s.read_required 是 number，且缓冲量 >= 所需字节
-       -> s.read_required=nil
-       -> wakeup(s) -> skynet.wakeup(s.co)
-G-read 后续恢复
-  -> driver.pop(...,size)
-  -> socket.read 返回 bytes
-  -> Gateway.read_exact 检查 closed 和实际长度
-  -> 回到 run_tcp 当前 header/body 读取阶段
-```
-
-**【真实源码局部：固定 Skynet `lualib/skynet/socket.lua` / `socket.read()`】**：
-
-```lua
-local ret = driver.pop(s.buffer, s.pool, sz)
-if ret then
-    return ret
-end
-if s.closing or not s.connected then
-    return false, driver.readall(s.buffer, s.pool)
-end
-assert(not s.read_required)
-s.read_required = sz
-suspend(s)
-ret = driver.pop(s.buffer, s.pool, sz)
-```
-
-`suspend(s)` 将当前协程保存到 `s.co` 并执行 `skynet.wait(s.co)`。当达到读取要求时，`socket_message[1]` 由 Socket 协议分发器处理，调用 `wakeup(s)` 触发恢复。不要误以为 `socket.read(fd,size)` 在读不到数据时占住整个 OS Worker Thread；**等待的是这条协程**，其他连接协程以及 Service 的其他消息可继续运行。
-
-但也别把“同一个 Service”简单理解为“永远只有一个正在使用的 coroutine”。一个 Gateway Lua State 中可以存在多条协程，`timeout_loop` 和 `run_tcp` 共享 `module_state.connections`。所以跨 yield 以后检查 `closed` 是必要的运行时约束。
-
-### 6.3.4 为什么长度检查发生在 body 读取前
-
-当 `run_tcp` 读取长度头 `00 43` 时，若该连接还在 HELLO 阶段，要求精确 67；若读到 `01 F4`（500），立即报 `FRAME_LIMIT`。此时不会再尝试 `read_exact(connection,500)`。一旦 ready，长度必须在 `1..max_frame_bytes` 以内，才会执行 body 读取。
-
-注意两个不同上限：
-
-- `max_frame_bytes`：Gateway 用 TCP 长度头和解码前大小检查限制**业务 Envelope**；它是业务单帧边界。
-- Skynet 的 socket 接收缓存：并不是因为设置了 `max_frame_bytes` 就有同样大小的底层内存硬限制。之前无效的 `socket.limit(fd,max_frame_bytes+2)` 已从生产 TCP 定长读取路径删除。
-
-固定 `lualib/skynet/socket.lua` 中，`socket_message[1]` 在 `read_required` 为 number 时检查是否已读满并唤醒协程；这条分支并不执行通用 `s.buffer_limit` 检查。因此课程应区分**在读取 body 前验证协议长度**与**给所有 TCP/WS 内存加硬上限**，两者不是同一回事。
-
-### 6.3.5 TCP 与 WS 最终在哪一点合流
-
-```text
-TCP: accept_client
-       -> run_tcp
-       -> read_exact(2) / read_exact(size)
-       -> process_handshake（未ready）或 dispatch_payload（已ready）
-
-WS:  accept_client
-       -> websocket.accept / resolve_accept / read_frame
-       -> ws_handler.message
-       -> process_handshake（未ready）或 dispatch_payload（已ready）
-
-两者在 Gateway 内共用：Handshake / Codec / Registry / dispatch_payload
-                       -> skynet.send(WorldService,"send_data",...)
-```
-
-二者传入 `process_handshake` 的都是**不带传输帧头**的应用消息原始字节。协议版本、命令编号、业务字段不需要因传输方式不同而重新定义。`WorldService` 的 `on_enter_world` 因而可以完全不变。
-
-**阶段验收实验**：运行 WS 和 TCP 的 A/B 两人流程后，手工记录 TCP 收到的 `00 0A + 10B Envelope`，再在源码里定位 `read_exact(2)` 和 `socket.read(fd,size)` 的两次可能 yield；能够从一条断开的连接，独立推导“读取协程恢复后为什么会返回 nil”。
-
----
-
-### 6.4 你应该能回答的区别
-
-| 问题                              | WebSocket                                            | TCP                              |
-| --------------------------------- | ---------------------------------------------------- | -------------------------------- |
-| 谁组装网络消息边界？              | 固定 `http.websocket`                                | Gateway `run_tcp` + `read_exact` |
-| 是否需要额外 2-byte 长度头？      | 否                                                   | 是                               |
-| 应用层四段握手是否不同？          | 相同 payload                                         | 相同 payload，外加 TCP 长度头    |
-| Protobuf Envelope 是否不同？      | 相同                                                 | 相同                             |
-| 业务 Service 是否知道 transport？ | 入站 record 有诊断字段 `transport`，业务流程可不关心 | 同左                             |
-| 谁持有 socket？                   | Gateway                                              | Gateway                          |
-
-**阶段验收**：不修改 WorldService 仍能完成两人流程；给出 `00 0A` 的来源；指出 `socket.read` yield 对应的是哪条 Service 协程，以及另一个客户端为什么不需要等待它。
-
----
-
-# 第六阶段：故障、连接资源与独立维护
-
-## 7. 故障实验的统一执行方式
+## N.4. 故障实验的统一执行方式
 
 我们不是靠“想象一下失败”学习 Gateway。每个实验都会真正向 Gateway 发送错误输入，观察**哪一层拒绝、有没有进入 WorldService、何时释放连接**。实验之间重新启动进程，清空上一轮的内存状态，不复用上一次的连接、计数和日志。
 
@@ -2580,7 +3563,7 @@ bash gateway/sample/master_course/run.sh websocket server
 
 终端 B 执行各实验的 Node 命令。**每做完一项，终端 A 结束进程并重新执行启动命令**。本课程的 WorldService 有 30 秒双人结束等待；故障实验不产生两次正常入场和退出，超时自动退出是测试宿主行为，不要当成 Gateway 的连接超时错误。
 
-### 7.1 实验 A：握手消息类型错误
+### N.4.1 实验 A：握手消息类型错误
 
 **初始条件**：Gateway 正常监听 WebSocket，客户端只完成 HTTP Upgrade，还没完成应用握手。终端 B：
 
@@ -2594,11 +3577,11 @@ ws.onerror = () => console.log("传输层观察到错误");
 JS
 ```
 
-**执行链**：`http.websocket` 完成 HTTP Upgrade → `ws_handler.message(id, bytes, "binary")` → `process_handshake` → `handshake.receive(context,bytes)`。此时固定 HELLO 必须是 67 字节、类型 1、版本 1；传入的 `[99]` 被握手状态机拒绝，Gateway 摘除连接，`close_transport` 关闭 WS。Handshake 握手模块 释放该连接的 Native/握手名额。
+**执行链**：`http.websocket` 完成 HTTP Upgrade → `ws_handler.message(id, bytes, "binary")` → `process_handshake` → `handshake.receive(context,bytes)`。此时固定 HELLO 必须是 67 字节、类型 1、版本 1；传入的 `[99]` 被握手状态机拒绝，Gateway 摘除连接，`close_transport` 关闭 WS。Handshake 握手模块 释放该连接的 Native 对象与握手记录。
 
 **观察**：客户端连接被关闭；WorldService 的 `on_enter_world` 不应被调用；可能收到 `gateway_disconnect`，但因它没有进入过业务，`state.players` 不存在相应记录，因此在线人数保持 0。用真实日志判断具体失败错误码，不把这里的客户端提示文本冒充框架稳定错误码。
 
-### 7.2 实验 B：合法握手后的错误协议版本
+### N.4.2 实验 B：合法握手后的错误协议版本
 
 **初始条件**：重启 Gateway，SDK 正常完成握手，之后故意发送 `protocol_version=3`，而 Gateway 配置要求 4。终端 B：
 
@@ -2616,7 +3599,7 @@ JS
 
 **观察**：服务端应出现稳定错误类别 `PROTOCOL_VERSION`，没有 `COURSE_ENTER player=1001`。请指出：协议版本错误是在 Envelope **成功解码之后**被发现的，不是握手失败。
 
-### 7.3 实验 C：合法版本、未知 command
+### N.4.3 实验 C：合法版本、未知 command
 
 重启后在终端 B：
 
@@ -2632,33 +3615,35 @@ JS
 
 **执行链**：Envelope 版本 4 通过 → `registry.commands[9999]` 返回 nil → `UNKNOWN_COMMAND` → 关闭当前连接。`SystemNoticeResponse` 的 command 1002 虽然存在，但它没有 `request_type`，同样不能当客户端请求使用，实际会在 `codec.decode_request` 失败路径被拒绝。
 
-### 7.4 实验 D：单连接请求速率上限
+### N.4.4 实验 D：连接总配额
 
-把 Gateway 的每秒接纳上限缩小为 1。终端 A：
+终端 A 启动新的 WebSocket 服务端；终端 B 创建五条完成应用握手、但不发送业务的连接：
 
 ```bash
-GATEWAY_COURSE_RPS=1 bash gateway/sample/master_course/run.sh websocket server
+bash gateway/sample/master_course/run.sh websocket server
 ```
-
-终端 B：
 
 ```bash
 node --input-type=module <<'JS'
 import { connectGateway } from "./gateway/clients/h5/handshake.mjs";
-import { encodeEnterWorld } from "./gateway/sample/master_course/client/protobuf.mjs";
-const connection = await connectGateway("ws://127.0.0.1:19221");
-const request = encodeEnterWorld(1001);
-connection.send(request);
-connection.send(request);
-console.log("同一连接连续发送两条完整业务请求");
+const held = [];
+try {
+    for (let i = 0; i < 5; ++i) {
+        held.push(await connectGateway("ws://127.0.0.1:19221"));
+    }
+    throw new Error("第五条连接不应被接纳");
+} catch (error) {
+    console.log("已建立连接数", held.length, "关闭观察", error.message);
+    if (held.length !== 4) process.exitCode = 1;
+} finally {
+    for (const connection of held) connection.close();
+}
 JS
 ```
 
-**执行链**：两个消息经过 WS framing → `dispatch_payload` → 解码后检查连接级 `rate_count`。第一条被接纳、计数加 1；第二条在同一秒窗口遇到 `max_requests_per_second=1`，报告 `INGRESS_RATE_LIMIT`，并关闭来源连接。WorldService **至多应接收到第一条**；它不会获得 Gateway 已拒绝的第二条。
+确认服务端记录 MAX_CONNECTIONS，第五条连接未创建业务映射；其余四条最终由客户端主动关闭。这个实验检查总连接接纳容量，不按每秒消息条数作判定。
 
-注意这是已有 Gateway 自带的速率限制机制；教程只是配置它，不在业务 Service 另造限流器。
-
-### 7.5 实验 E：只有 Ping/Pong 或完全无业务的空闲连接
+### N.4.5 实验 E：只有 Ping/Pong 或完全无业务的空闲连接
 
 重启，缩短业务消息空闲时间为 500ms（时钟每 10ms 前进一步）：
 
@@ -2680,7 +3665,7 @@ JS
 
 在生产中，心跳是否应算业务活动取决于宿主是否定义了真正的业务命令；TCP 可以在应用层定义心跳 command，但课程**不为了演示空闲机制额外添加新的业务协议**。
 
-### 7.6 实验 F：TCP 长度头与握手阶段不符
+### N.4.6 实验 F：TCP 长度头与握手阶段不符
 
 重启为 TCP：
 
@@ -2704,282 +3689,3 @@ JS
 **执行链**：`run_tcp` → `read_exact(connection,2)` 得到 `0x01F4=500` → 此时握手尚未 ready，`handshake.expected_size(...)` 要求 67 → `FRAME_LIMIT`，**在读取完整 500 字节 body 前直接拒绝**。检查本例是否出现 `COURSE_ENTER`：不应出现。
 
 这跟实验 B 不同：长度错误在 TCP framing 层发生，连完整的应用握手消息都没交给 `handshake.receive`。
-
-## 8. 写缓冲积压、服务端主动停止和回收
-
-### 8.1 已有背压处理的真实边界
-
-**【真实源码】** `gateway/service/flywow_gateway.lua` 的 TCP `socket.warning` 回调、`ws_handler.warning`、`close_transport(force_shutdown)`。固定 Skynet 首次写队列警告约从 1 MiB 发生，后续按底层 warning 粒度触发；`write_warning_close_kb` 只在**收到 warning 时**判断，**不是精确的 1 KiB/64 KiB 内存硬阈值**。`size==0` 是缓冲恢复通知，不属于背压超限。超过配置时 TCP 和 WS 都通过显式 `force_shutdown=true` 使用 `socket.shutdown`，随后仍走对应 transport 清理。
-
-本课程不靠给两名玩家狂发公告模拟一个不受控的真实网络压力测试。使用仓库已有 `gateway/tests/gateway_async_test.lua` 查看模拟 warning 的断言，再结合 Skynet `lualib/skynet/socket.lua` 的 `socket.warning`、`socket.shutdown` 以及 `skynet-src/socket_server.c` 的 warning 机制，理解真实可达的回调时机。**模拟测试通过只证明回调逻辑，不等于真实 TCP/WS 高负载已测。**
-
-### 8.2 stop 的状态和资源 owner
-
-**【真实源码】** `gateway/service/flywow_gateway.lua`：`stop()`：
-
-```text
-WorldService 的监视协程
-  -> skynet.call(gateway,"lua","stop")  [控制面 RPC 等待]
-Gateway Service
-  -> skynet.dispatch("lua", ...)
-  -> stop()
-       phase = "stopping"
-       关闭监听 listen_fd
-       快照当前 connections
-       对每条连接 detach_connection + close_transport
-       phase = "stopped"
-       返回 FlyWowResult<GatewayStopResult>
-WorldService 恢复，检查 ok 与 closed_connections；本课程结束进程
-```
-
-课程的正常场景已经等待 A/B 的断线通知，`stop()` 时通常不再持有两个业务连接，因此 `closed_connections=0` 是合理结果：这个值是**本次 stop 主动关闭的数量**，不是服务创建以来的连接总数。若 stop 发生时尚有活跃连接，它会先快照、逐条摘除和关闭；此时 Socket close 可能 yield，不能把 stop 误认为纯内存操作。
-
-### 8.3 一张连接生命周期状态表
-
-| 阶段             | Gateway 持有什么                           | WorldService 持有什么                       | 可能的退出原因                 |
-| ---------------- | ------------------------------------------ | ------------------------------------------- | ------------------------------ |
-| `accepted`       | fd、逻辑 ID、Handshake context、连接索引   | 尚无玩家记录                                | 容量/接管失败                  |
-| `upgraded`（WS） | WS transport 对象、握手名额                | 尚无玩家记录                                | HTTP/业务握手失败              |
-| `ready`          | 连接索引、计时器字段，Handshake 仅留 ready | 尚无，直到业务请求被处理                    | 业务非法帧、超时、关闭         |
-| `entered`        | 同一连接对象；不存业务请求 pending         | `players[id]=player_id`                     | 客户端断开、服务器 close、错误 |
-| `detached`       | 从连接索引移除，资源释放进入关闭链路       | 收到 `gateway_disconnect` 后删除对应 player | 关闭已提交，不可继续 Push      |
-| `stopped`        | listener 关闭；已登记连接全部清理          | 业务实例可按宿主生命周期退出                | Service 正常停止               |
-
-**重要区别**：业务 `player_id` 存在于 WorldService；Handshake 的 ready 不是登录成功；应用层 ECDH/HMAC 握手也不等于 TCP/WS 自动具备 TLS 和逐包加密。真实公网接入应按既有部署合同在 Gateway 前终止 TLS，不能把此教学握手误认为传输加密。
-
-### 8.4 深入 `timeout_loop()`：一条连接为什么会被判定超时
-
-前面的实验 E 看到了约半秒后连接断开。现在进入执行原因。**调用者**：Gateway `start()` 完成监听后执行 `skynet.fork(timeout_loop)`；它是 Gateway Lua State 中的一条独立扫描协程，不属于某个客户端。该协程每 `skynet.sleep(10)`（按本工程 10ms tick 约 100ms）醒来一次，检查当时登记在 `module_state.connections` 的全部连接。
-
-**【真实源码局部：`gateway/service/flywow_gateway.lua` / `timeout_loop()`】**：
-
-```lua
-while module_state.phase == "running" do
-    skynet.sleep(10)
-    local now = skynet.now()
-    local expired = {}
-    for _, connection in pairs(module_state.connections) do
-        local since = connection.read_started or connection.last_message
-        local limit_ms = connection.read_started
-            and module_state.gateway_config.read_timeout_ms
-            or module_state.gateway_config.idle_timeout_ms
-        local elapsed_ms = flywow_common.elapsed_ms(since, now)
-        if handshake_module.expired(connection.handshake) or elapsed_ms >= limit_ms then
-            expired[#expired + 1] = connection
-        end
-    end
-    for _, connection in ipairs(expired) do
-        if detach_connection(connection, "network read timeout") then
-            close_transport(connection, 1001, "network timeout")
-        end
-    end
-end
-```
-
-这是原函数完整控制流程的去注释版；逐字段说明应以真实源码为准。两个超时条件不同：
-
-1. `handshake_module.expired(context)`：从 `handshake.accept()` 记录的 `context.started` 起算，直到 confirm/close 归还名额之前都是**绝对握手期限**；中间收到 HELLO 并回复 CHALLENGE 也不重置。
-2. `read_started`/`last_message`：若正在一次 TCP 定长读取或 WS HTTP Upgrade，使用读取起点及 `read_timeout_ms`；否则使用最近完整消息活动时刻及 `idle_timeout_ms`。
-
-假设 WebSocket 已在 tick 0 完成应用握手，之后一直没有业务包，`idle_timeout_ms=500`。在 tick 10、20、30、40 的扫描都还没超时；在 tick 50 经过 500ms，满足 `(50-0) * 10 >= 500`，执行 detach 和 transport close。**这是按源码推导的理想化时间线**：实际执行会受到 Skynet 消息调度、计时起点与网络收包时刻影响，不应声称毫秒级精确。
-
-若在 tick 30 收到一个已通过 Registry/Codec/速率检查的完整业务请求，`dispatch_payload` 更新 `connection.last_message=30`，那么 tick 50 时差值是 20，不会超时，直到新的期限达到。反过来，WebSocket ping/pong 由底层 `http.websocket` 处理，不进入 `dispatch_payload`，因此**不会刷新**本课 Gateway 的业务空闲起点。服务端 Push 走的是 `deliver_outbound_message`，也不会刷新该时间。
-
-`expired` 不是持久的“超时状态表”，而是这次扫描产生的临时快照：遍历期间不删 `module_state.connections`，第二个 for 循环才依次 detach/close；因为 `close_transport` 可能 yield，采用快照后不会因删除键或关闭让出协程而破坏本轮遍历。
-
-### 8.5 具体推演：读协程和扫描协程怎样交错
-
-以 A 的 TCP 客户端为例，假定长度头已经到达并通过校验，但是 body 还欠 3 字节：
-
-```text
-时刻        TCP 读协程 G-read                扫描协程 G-timeout
-----------------------------------------------------------------------
-T0          read_exact(connection,10)
-            read_started=T0
-            socket.read(fd,10) -> wait
-T0+若干                                      skynet.sleep(10) 恢复
-                                              检查 read_started，尚未超时
-T1                                             读期限已到
-                                               detach(connection)
-                                                 closed=true，双索引删除
-                                               close_transport(connection)
-T2          socket.read 因关闭事件恢复
-            read_started=nil
-            发现 connection.closed==true
-            return nil
-T3          run_tcp 得到 nil，退出循环
-            重复 detach 返回 false；transport 关闭以 close_requested 防重复
-```
-
-这是根据源码和 Skynet 的 `socket.read`/`socket.close` 行为推导的**一种可能交错**，不是固定调度顺序。重要的正确性条件是：`G-read` 恢复后不能因为读到了过去的字节又把已关闭连接重新当成有效连接，`read_exact` 的 `closed` 复查正是为此存在。
-
-WS 的对应行为：`websocket.accept` 所在的会话协程正读下一个 WS frame；扫描协程认为超时，先 detach 再 `websocket.close`，后续 WS `close/error` 回调因索引已删除不会重复发 disconnect。它不需要为了超时再创建每连接一个 timer Service。
-
-### 8.6 背压回调与真正的内存限制：按底层事实理解
-
-已有 Gateway 的 TCP `socket.warning(fd,callback)` 和 WS `ws_handler.warning(ws_obj,size)`，最终都依据 `size >= write_warning_close_kb` 判断是否 `detach_connection` 并 `close_transport(...,true)`。但触发入口的 `size` 来自**Skynet 底层写缓冲告警，单位 KB**；它不是 Gateway 每次 `socket.write` 之后主动同步检查的队列大小。
-
-**【真实源码局部：`gateway/service/flywow_gateway.lua` / `ws_handler.warning()`】**：
-
-```lua
-function ws_handler.warning(ws_object, size)
-    if size == 0 then
-        return
-    end
-    local connection = module_state.connections_by_fd[ws_object.id]
-    if connection then
-        -- 原函数先记录 WRITE_BACKPRESSURE 诊断事件。
-        if size >= module_state.gateway_config.write_warning_close_kb then
-            detach_connection(connection, "write backpressure")
-            close_transport(connection, 1013, "server backpressure", true)
-        end
-    end
-end
-```
-
-Skynet 的 warning 回调最初在约 1 MiB 写缓冲时触发，后续按底层告警粒度报告。设置 `write_warning_close_kb=64` **不表示 64 KiB 时必定及时断开**，因为当时尚未必有 warning 回调；`size=0` 代表发送缓冲恢复，Gateway 直接忽略。这个限制属于写侧，不能和 `max_frame_bytes`（业务接收 Envelope 限长）混为一个“内存 cap”。
-
-**【真实源码局部：固定 Skynet `lualib/skynet/socket.lua` / `socket.shutdown()`】**：
-
-```lua
-function socket.shutdown(id)
-    local s = socket_pool[id]
-    if s then
-        -- the framework would send SKYNET_SOCKET_TYPE_CLOSE , need close(id) later
-        driver.shutdown(id)
-    end
-end
-```
-
-Skynet 源码明确提示 `shutdown` 以后仍需要后续 close；因此当前 Gateway 在 `force_shutdown=true` 时先 `socket.shutdown`，随后继续调用 `websocket.close` 或 `socket.close`。不要将 `shutdown` 误当作“所有 Lua/WS 状态已同步清理完毕”。
-
-本课程的两人业务消息体量很小，不刻意制造数 MiB 的真实写队列。要验证这条分支，使用现成 `gateway/tests/gateway_async_test.lua` 的 warning 替身测试可以证明回调路径，但**不能等价宣称验证过内核层发送缓冲在高负载下的所有时序**。
-
-### 8.7 `stop()` 的真实控制流：为何要先关闭 listener 再清连接
-
-进入终局时，WorldService 的监视协程调用 `skynet.call(state.gateway,"lua","stop")`，这是**控制面 RPC**。Gateway 在自己的消息分发入口进入 `stop()`，等待由它管理的 Socket 资源回收后返回 `FlyWowResult`；并非进程收到一个特殊的全局退出信号。
-
-**【真实源码局部：`gateway/service/flywow_gateway.lua` / `stop()`，按阶段整理关键语句】**：
-
-```lua
-if module_state.phase == "stopped" then
-    return flywow_result.success({ closed_connections = 0 })
-end
-module_state.phase = "stopping"
-local listen_fd = module_state.listen_fd
-module_state.listen_fd = nil
--- 原函数通过 pcall(socket.close,listen_fd) 关闭监听并记录错误。
-
-local closed = 0
-local snapshot = {}
-for _, connection in pairs(module_state.connections) do
-    snapshot[#snapshot + 1] = connection
-end
-for index = 1, #snapshot do
-    local connection = snapshot[index]
-    if not connection.closed then
-        closed = closed + 1
-        detach_connection(connection, "server shutdown")
-        -- 原函数通过 pcall(close_transport,connection,1001,"server shutdown")
-        -- 关闭资源并记录失败，随后仍继续处理其他连接。
-    end
-end
-module_state.phase = "stopped"
-```
-
-`phase="stopping"` 必须在 listener 关闭前设置：如 listener 的关闭期间还有迟到 accept，`accept_client` 一看 phase 不是 running 就按未接管 fd 的规则关闭，不会把新连接登记进来。
-
-`module_state.listen_fd=nil` 是 listener 所有权退出运行状态的标记；后续创建 `snapshot` 是为了避免一边遍历 `connections` 一边删除键。`closed` 统计这一次 stop **新摘除的连接数量**；此前已经正常断开的 A/B 不算入。每个底层关闭错误会累积到 `close_error_count`，最终返回 `GATEWAY_STOP_CLOSE_FAILED`，但不会因为第一条关闭失败就跳过其他连接的处理。
-
-随后 WorldService 的 `skynet.call` 恢复；本课程如果 A/B 已收到断线并被清理，`closed_connections=0` 是正常预期。服务器进程退出只是课程启动器的收尾行为，不要理解为 Gateway 自己自动调用了 `os.exit`。
-
-### 8.8 连接生命周期最终核对：四种资源、三个关闭入口
-
-| 资源/记录                                | 真实 owner                     | 创建或登记                          | 正常释放入口                                       | 异常释放入口                               |
-| ---------------------------------------- | ------------------------------ | ----------------------------------- | -------------------------------------------------- | ------------------------------------------ |
-| GatewayConnection / 双索引               | Gateway Service `module_state` | `create_connection`                 | `detach_connection`                                | 协议失败/超时/stop 调用 detach             |
-| HandshakeContext / pending 名额          | Gateway 中的 Handshake 握手模块 | `M.accept`                    | `M.confirm` 归还名额；连接 detach 也 close   | `M.receive` 失败/过期时 close        |
-| Native CryptoContext userdata 的内部密钥 | 每连接 userdata                | `crypto.create_context`                        | Native `verify` 清理敏感数据；Lua 握手模块清除引用 | Native 失败与 `M.close`/`__gc`       |
-| Socket pool / WS pool 对象               | 固定 Skynet transport          | `socket.start` / `websocket.accept` | `socket.close` / `websocket.close`                 | 关闭协程/协议 error/stop                   |
-| `state.players[connection_id]`           | WorldService                   | `on_enter_world`                    | `on_disconnect`                                    | 任何 Gateway detach 发出的 disconnect 通知 |
-
-请结合正常 B 主动关闭、错误 HELLO 和 TCP 半包超时三个场景，分别指出：**谁第一次把 `closed` 设为 true、谁发 `gateway_disconnect`、谁最终释放 Socket、WorldService 在何时删除玩家记录**。当你能沿真实函数给出具体顺序，Gateway 生命周期的核心原理才算掌握。
-
----
-
-## 9. 故障定位的固定顺序
-
-当某阶段和预期不符，不需要重新设计模块，先沿对应的真实责任边界检查：
-
-1. **启动失败**：`COURSE_START_FAILED` 的 `result.code`；检查 `world.pb`、`world_registry.lua`、`lua_path`、`lua_cpath` 与 Native .so。`GATEWAY_REGISTRY_LOAD_FAILED`、`GATEWAY_DESCRIPTOR_READ_FAILED`、`GATEWAY_CRYPTO_LOAD_FAILED` 分属不同入口，不要混为一类。
-2. **连接建立但业务未到**：先辨别 HTTP Upgrade、应用四段握手、`ready`，再查 `ws_handler.message` / `run_tcp`。如果 `COURSE_ENTER` 没出现，先看 Gateway 是否完成 `dispatch_payload`，不先改业务 Service。
-3. **业务到达但没有响应**：确认 WorldService 收到的 `command_id`、`connection_id`、`gateway_epoch`；再查出站 `deliver_outbound_message` 是否因旧 epoch、不在 registry、连接已关闭或编码失败丢弃消息。
-4. **断线后玩家在线数未减**：追踪 `detach_connection` 是否发出 `gateway_disconnect`，以及 `on_disconnect` 查到的逻辑连接是否曾进入新手村。
-5. **测试卡住**：对照 `run.sh` 的服务器日志与 Node 输出，不仅仅看 20 秒超时。区分没收到 READY、没有业务回包、B 未收到服务器 close 和 WorldService 未观察到两次 disconnect。
-
----
-
-# 总复盘：离开教程也要能独立回答
-
-## 10. 源码阅读地图
-
-| 真正的生产文件                               | 本课程何时进入              | 阅读后必须掌握的东西                                                                                                                                                                                |
-| -------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gateway/service/flywow_gateway.lua` | 启动、接收请求、回包、关闭  | `start/normalize_config/accept_client/run_tcp/read_exact/ws_handler.message/dispatch_payload/deliver_outbound_message/request_close/detach_connection/close_transport/timeout_loop/stop` 的调用顺序 |
-| `gateway/tools/generate_gateway_registry.py` | 第一阶段生成协议表 | 直接输出按数字 command ID 查询的消息类型映射 |
-| `gateway/lualib/codec.lua`                   | 第一条业务请求              | `init/decode_envelope/decode_request/encode_response`：Descriptor 与 pb 编解码                                                                                                                       |
-| `gateway/lualib/handshake.lua`               | 连接握手                    | `accept/receive/confirm/ready/expired/close` 和握手上下文所有权                                                                                                                                     |
-| `gateway/native/gateway_crypto.cpp`          | 握手源码深挖                | P-256、随机 challenge、HKDF/HMAC 和 Native userdata 生命周期                                                                                                                                        |
-| `gateway/clients/h5/handshake.mjs`           | WebSocket、TCP 客户端       | H5 SDK 的 `connectGateway` 与 `HandshakeClient` 的状态、异步密码学流程                                                                                                                              |
-| 固定 Skynet `lualib/http/websocket.lua`      | WS 升级与消息回调           | `accept/resolve_accept/read_frame/write/close`，业务 callback 何时被触发                                                                                                                            |
-| 固定 Skynet `lualib/skynet/socket.lua`       | TCP read、warning、shutdown | `socket.read` yield/wakeup、读缓冲与 Socket ownership                                                                                                                                               |
-| `gateway/tools/generate_gateway_registry.py` | 构建协议                    | 与运行时隔离的 `CommandId` → Request/Response 类型生成过程                                                                                                                                          |
-
-## 10.1 源码理解的独立验收题（不增加业务代码）
-
-完成六阶段后，合上教程，仅借助真实工程源码回答以下问题。每题要指出真实文件、函数、执行协程、关键变量的 owner、必要时的返回路径；不能只回答抽象原理。
-
-1. 客户端 A 的 TCP HELLO 长度头已到，body 还差 10 字节。此时 `run_tcp` 停在哪个函数？Socket Driver 再收到 10 字节，Skynet 怎样唤醒哪条协程？
-2. WebSocket HTTP Upgrade 已成功，但 A 的 `HandshakeContext.phase="proof"`。A 此时发 `EnterWorldRequest`，Gateway 会把它交给 WorldService 吗？依据哪个具体分支？
-3. 两名玩家的底层 fd 是 `18` 和 `21`，业务逻辑 ID 是 `1` 和 `2`。为什么 Gateway 既保存 `connections` 又保存 `connections_by_fd`？哪条入口分别读取？
-4. `crypto.create_context()` 创建的 C++ userdata 与 Lua `HandshakeContext` 是不是同一对象？派生密钥在 proof 验证完毕、Gateway confirm、连接断开这三个时刻分别发生什么？
-5. 同一条 WS 连接只发底层 ping/pong，从不发业务 Envelope，为什么 `idle_timeout_ms` 仍会触发？`last_message` 实际在哪些代码分支更新？
-6. Gateway 接受第一条 A 请求后执行 `skynet.send(WorldService,...)`。它随后等待的是 WorldService 回包，还是下一个 WS frame？如果 WorldService 迟迟不处理，Gateway 自己保留了哪些 pending 状态？
-7. B 刚 detach，但底层 WS close 正在 yield。WorldService 又发一次旧 B 的单播和 close，哪个路径拒绝？`closed` 和 `close_requested` 的职责分别是什么？
-8. B 的 Socket fd 被后来连接重用，但 WorldService 迟到的 A/B 响应仍带旧 `gateway_epoch/connection_id`。为什么不会发给新连接？
-9. TCP 一次性收到长度头 `01 F4`，握手阶段要求 HELLO 67 字节。源码哪一层拒绝？为什么没有先给 500 字节分配业务包？这个检查是否等于底层 Socket 接收内存硬上限？
-10. 一轮 `stop()` 关闭 3 条当前活跃连接，但此前已经断开 2 条。`closed_connections` 应该怎样理解？为什么需要快照表，哪里可能发生 yield？
-
-建议你将第 1、6、7、10 题各画一张只有 **两个 Service 和相关协程** 的时序图；能从代码推导，不需要凭日志猜。遇到问题回看本教程对应的实战步骤，而不是额外编造新组件。
-
----
-
-## 11. 综合验收清单
-
-- [ ] 从空的 `gateway/sample/master_course/` 开始，亲手创建所有源文件，没有从旧课程复制业务协议产物。
-- [ ] `build_protocol.sh` 能生成本课程 `.pb` 和 Registry，并解释构建期与运行期职责边界。
-- [ ] 手动模式 `run.sh websocket server` 能启动真实 Gateway，Result 的 `command_count` 为 2。
-- [ ] `run.sh websocket` 中，玩家 A/B 完成真实四段握手，并接收 1、2 人在线的 EnterWorldResponse。
-- [ ] B 独占私信，A/B 都收到广播；B 由 Gateway close，A 主动关闭；业务收到两个 disconnect，Gateway 正常 stop。
-- [ ] `run.sh tcp` 使用同一协议/业务处理跑通等价流程，并能画出 TCP framing。
-- [ ] 至少亲手重复错误握手、错误版本、未知 command、速率限制、空闲超时、TCP 错误长度六类故障实验。
-- [ ] 能画出 **两个 Service、两份 Lua State、读协程和 timeout_loop** 的真实关系；知道哪个 RPC yield，哪个 send 不等待。
-- [ ] 能沿源码解释每个连接 ID、epoch、fd、Handshake context、WorldService 玩家映射各自的 owner 与释放时机。
-- [ ] 能根据实验日志辨别「真实运行结果」「源码可确定的行为」「没有做过的压力/安全验证」。
-
-最后可以自己做一个不增加代码的推演：**如果玩家 A 的连接在 WorldService 发回 EnterWorldResponse 之前已经关闭，Gateway 为什么不会把这个响应发送给后来复用相同 fd 的另一条连接？** 答案应该能从 `gateway_epoch`、递增的逻辑 `connection_id`、`module_state.connections` 索引和 `detach_connection` 的顺序推导出来，而不是靠猜测 Socket 的行为。
-
----
-
-## 本次深入增强说明
-
-相对初版，本次保持了所有「亲手新建」的业务文件与六阶段流程，讲清了构建期 Registry 被 Gateway 直接使用的关系、Gateway `module_state` 字段所有权、RPC 等待、Socket accept 与双索引、Handshake Lua 五阶段与 Native userdata、实际请求的 Protobuf 字节、`dispatch_payload` 三段解码/限流/投递、跨 Service 时序、出站编解码与广播、逻辑摘除/物理关闭、Skynet `socket.read` yield/wakeup、读超时与业务空闲超时的交错、背压的底层语义、`stop` 的实际释放顺序，以及十道独立源码推演题。
-
-**源码基线仍为 `7509b289`**。所有新增的“预期、推导、示意”仍需使用你自己的固定 Skynet 环境验证；本次补充是**源码分析和教学内容增强**，没有声称已经运行新的端到端 Sample，更没有修改生产仓库。
-
-## 版本与教学交付说明
-
-1. 本文以 `7509b289` 为代码基线，不把之后的变更自动视为兼容；正式实施前若已切换提交，应先核对 Gateway/SDK/生成器与现有签名。
-2. 命令和代码均已按该基线的公开接口设计；**本次环境没有固定 Skynet、protoc 和对应宿主编译产物，因此未实际运行这一套新 Sample**。完成课程时应以你运行的真实日志为准；出现不一致应先检查教程与当前源码/依赖，不修改第三方源码，也不通过伪造日志交付。
-3. 教程里的 WorldService 是极小的宿主业务示例；它不是一个 MMO 玩家管理系统。没有会话鉴权、持久化、路由重试、跨 Gateway 广播或可靠客户端 ACK。学习 Gateway 不需要为这些未承诺功能增加新的框架层。
-4. 本教程遵循 `.agents/skills/source-based-practical-teaching/SKILL.md` 的从零实施、真实源码调用链和阶段验收规则；代码注释与状态所有权遵守工程 Skill。原 Gateway/Skynet/客户端 SDK 的既有代码均保持不变。

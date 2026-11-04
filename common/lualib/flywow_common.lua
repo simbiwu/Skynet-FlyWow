@@ -2,6 +2,9 @@
 --- elapsed_ticks 与 elapsed_ms 分别返回 Skynet 时钟差值的 tick 数和毫秒数，并统一处理回绕。
 local M = {}
 
+-- 超时合同要求期限短于半个 32 位 tick 周期；对外单位毫秒，Gateway 与 Handshake 共用校验边界。
+M.MAX_TIMEOUT_MS = 0x80000000 * 10 - 1
+
 local TICK_COUNT_PER_CYCLE = 0x100000000 -- skynet.now() 的 32 位计数完整回绕周期。
 local MILLISECONDS_PER_TICK = 10 -- Skynet 时钟每递增一个 tick 经过 10ms；换算精度因此为 10ms。
 

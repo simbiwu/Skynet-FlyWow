@@ -86,19 +86,23 @@ Gateway 只处理本地传输结果：
 - 未知连接、旧 gateway_epoch 或未握手连接：丢弃
 - 编码失败：记录错误并拒绝本次发送
 - Socket 写失败：摘除连接并关闭 transport
-- 单连接或 Gateway 实例每秒接纳请求数超限：拒绝当前帧并关闭触发超限的连接
 - Battle 业务失败、业务超时、重试和顺序：由业务 Service 负责
 
-入口速率分别由 `max_requests_per_second` 和 `max_total_requests_per_second` 限制，
-默认每连接 200 个、每实例 10000 个请求/秒；两项可按部署容量调低或调高。
+Gateway 不按请求条数维护每秒接纳窗口，也不根据全实例请求总数关闭当前来源连接。业务请求频率和业务处理容量由宿主按自身合同处理。
+
+## 接纳与配置
+
+宿主必须显式提供正整数 max_clients，作为当前 Gateway 实例的连接配额；已接纳但尚未完成握手的连接同样占用它。达到配额时拒绝新连接，不影响已有连接；关闭后归还配额。握手模块只管理逐连接状态、Native 生命周期和绝对期限。
+
+监听使用 socket.listen(host, port)，backlog 由固定 Skynet 默认处理（当前为 32）。TCP/WS 共用 65535 字节业务 Envelope 上限，不提供帧长配置。三项超时继续以毫秒配置，共用 flywow_common.MAX_TIMEOUT_MS 边界，正整数且短于半个 32 位 tick 周期，不施加部署无关的一小时上界。
 
 ## Transport
 
-TCP 使用 uint16 big-endian 长度和 Envelope bytes；Gateway 在读取完整 body 前校验 TCP 长度头。`max_frame_bytes` 限制单条业务 Envelope 的大小，不限制底层传输层接收内存，也不提供传输内存硬上限。WebSocket 使用明文 `ws`，TLS/WSS 由宿主外部终止；底层使用 Skynet 固定 http.websocket，复用相同 Envelope 和 registry。WebSocket 的 ping/pong、fragment 和 close frame 由底层 transport 处理；TCP 应用层心跳由宿主协议按 command 定义。
+TCP 使用 uint16 big-endian 长度和 Envelope bytes；Gateway 在读取完整 body 前校验 TCP 长度头。固定协议上限 65535 字节限制单条业务 Envelope 的大小，不限制底层传输层接收内存，也不提供传输内存硬上限。WebSocket 使用明文 `ws`，TLS/WSS 由宿主外部终止；底层使用 Skynet 固定 http.websocket，复用相同 Envelope 和 registry。WebSocket 的 ping/pong、fragment 和 close frame 由底层 transport 处理；TCP 应用层心跳由宿主协议按 command 定义。
 
-写缓冲关闭阈值只在 Skynet warning 回调到达后判断：回调 `size` 非零且达到 `write_warning_close_kb` 时关闭连接，`size=0` 表示发送缓冲恢复并被忽略。Skynet 首次在 1 MiB 缓冲量时告警，后续按底层告警粒度递增，因此该配置不是精确内存上限。
+收到 Skynet 非零写缓冲 warning 时，Gateway 摘除对应连接并执行强制传输关闭；size=0 为恢复通知，忽略。固定 Skynet 首次约在 1 MiB 积压时告警，该机制不是精确内存硬上限。
 
-`read_timeout_ms`、`idle_timeout_ms` 和 `handshake_timeout_ms` 均以毫秒配置。Skynet 时钟每 10ms 前进一步，Gateway 每 100ms 扫描超时连接，因此实际关闭可能晚于配置期限。`idle_timeout_ms` 限制客户端完整业务消息之间的空闲时间。WebSocket ping/pong 与服务端 Push 不重置该计时；TCP 正在读取定长数据时使用独立的 `read_timeout_ms`，同样以毫秒配置。旧的 `*_timeout_ticks` 配置字段会作为配置错误拒绝，需迁移到对应的 `*_timeout_ms` 字段。
+`read_timeout_ms`、`idle_timeout_ms` 和 `handshake_timeout_ms` 均以毫秒配置。Skynet 时钟每 10ms 前进一步，Gateway 每 100ms 扫描超时连接，因此实际关闭可能晚于配置期限。`idle_timeout_ms` 限制客户端完整业务消息之间的空闲时间。WebSocket ping/pong 与服务端 Push 不重置该计时；TCP 正在读取定长数据时使用独立的 `read_timeout_ms`，同样以毫秒配置。
 
 ## 连接广播
 
@@ -135,8 +139,8 @@ connection_id=0 的广播只作用于当前 Gateway 实例。多 Gateway 节点�
 
 验证结果：Gateway Python 测试 15 项通过（包含新增 Lua/H5 场景及真实 Native 互通）；Gateway Native 重新构建成功；质量检查器单测 52 项通过；Skill 结构检查和 git diff --check 通过。仓库总门禁失败的 3 条均位于本轮未修改的既有脏文件 gateway/sample/master_course/service/world_service.lua：缺末尾换行及两处阶段说明缺失。
 
-历史 CI 基线 a67a6ee9 的 WebSocket 步骤失败，后续 TCP 步骤被跳过。临时诊断确认根因为宿主配置仍使用旧 *_timeout_ticks 字段。随后 Server 各 Gateway 课程配置及 master_course Service 已迁移为毫秒字段；本地 WebSocket、TCP Protobuf、TCP Binary 三个 Sample 均实际运行并成功，输出对应 FLYWOW_GATEWAY_SAMPLE_OK 标记。
+本地 WebSocket、TCP Protobuf、TCP Binary 三个 Sample 均实际运行并成功，输出对应 FLYWOW_GATEWAY_SAMPLE_OK 标记。
 
-待确认：第 9 项 Registry 重复查询暂不实施；has_command/has_response 与未知命令、缺少请求/响应类型的错误区分继续保留。Sample 宿主超时配置已迁移至毫秒合同并完成三种传输 Sample 验证。本机缺少 Unity/C# 编译工具，Unity SDK 的内部重命名和枚举仅完成静态核对，未完成 Unity 编译验证。
+待确认：第 9 项 Registry 重复查询暂不实施；has_command/has_response 与未知命令、缺少请求/响应类型的错误区分继续保留。Sample 宿主超时配置使用毫秒字段，并完成三种传输 Sample 验证。本机缺少 Unity/C# 编译工具，Unity SDK 的内部重命名和枚举仅完成静态核对，未完成 Unity 编译验证。
 
 公开 Service/SDK API、协议字段与握手字节合同保持原有约定；本轮指定的停止竞态修复及 H5 异步回调等待按整改清单落实。后续最小化收尾已恢复显式逐字段配置校验，并删除并发 stop 的等待及结果共享；stopping 重复调用立即返回零，不代表首次清理完成。未修改第三方源码，未提交或推送。
