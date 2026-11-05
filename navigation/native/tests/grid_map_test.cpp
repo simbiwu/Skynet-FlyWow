@@ -34,19 +34,19 @@ int main()
     const GridMap map(metadata, std::move(cells));
 
     // 原点加半格正好是 (0,0) 的中心；验证毫米到 Cell 的换算。
-    const auto first = map.WorldToGrid(WorldPosition{-250, 0, 1250});
+    const auto first = map.worldToGrid(WorldPosition{-250, 0, 1250});
     assert(first.ok());
     assert(first.value.x == 0 && first.value.z == 0);
 
     // 只比 X 原点少 1mm：若使用 C++ 向 0 截断，会误落在第 0 格。
-    const auto before_origin = map.WorldToGrid(WorldPosition{-501, 0, 1250});
+    const auto before_origin = map.worldToGrid(WorldPosition{-501, 0, 1250});
     assert(!before_origin.ok());
     assert(before_origin.error == flywow_navigation::NavError::kOutOfBounds);
 
     // 请求故意带错误高度；查询必须返回地图的 100mm，而非客户端给出的 9999。
-    const auto query = map.QueryWorld(WorldPosition{-250, 9999, 1250});
+    const auto query = map.queryWorld(WorldPosition{-250, 9999, 1250});
     assert(query.ok());
-    assert(query.value.IsWalkable());
+    assert(query.value.isWalkable());
     assert(query.value.height_mm == 100);
 
     std::cout << "GRID_MAP_TEST_OK\n";

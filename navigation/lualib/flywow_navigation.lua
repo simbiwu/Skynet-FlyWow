@@ -21,11 +21,14 @@
 ---@field area_cost_permille? table<integer,integer> Area 0..255 成本；未配置默认 1000。
 ---@field area_allowed? table<integer,boolean> Area 0..255 通行开关；未配置使用 Native 默认。
 
+---@alias FlyWowNavigationPathStatus "reached"|"partial"
+---@alias FlyWowNavigationAdvanceStatus "moving"|"reached"|"blocked"
+
 ---@class FlyWowNavigationPath
----@field status fun(self:FlyWowNavigationPath):string 查询终点 reached/partial；不是推进状态。
----@field count fun(self:FlyWowNavigationPath):integer 点数；只读、不 yield。
----@field world_point fun(self:FlyWowNavigationPath,index:integer):FlyWowNavigationPosition 下标从 1 开始；越界抛错。
----@field length_mm fun(self:FlyWowNavigationPath):integer XZ 路径长度；毫米。
+---@field status fun(self:FlyWowNavigationPath):FlyWowNavigationPathStatus?,FlyWowNavigationError? 查询终点 reached/partial；不是推进状态。
+---@field count fun(self:FlyWowNavigationPath):integer?,FlyWowNavigationError? 点数；只读、不 yield。
+---@field world_point fun(self:FlyWowNavigationPath,index:integer):FlyWowNavigationPosition?,FlyWowNavigationError? 下标从 1 开始；越界返回 nil,error。
+---@field length_mm fun(self:FlyWowNavigationPath):integer?,FlyWowNavigationError? XZ 路径长度；毫米。
 
 ---@class FlyWowNavigationAdvanceRequest
 ---@field unit_id integer 静态 Unit 类型 ID；每次调用从当前 Registry 查询。
@@ -35,7 +38,7 @@
 ---@field distance_mm integer 本 Tick 非负 uint32 距离预算，毫米。
 
 ---@class FlyWowNavigationAdvanceResult
----@field status string moving/reached/blocked；代表本次已提交的推进结果。
+---@field status FlyWowNavigationAdvanceStatus moving/reached/blocked；代表本次已提交的推进结果。
 ---@field position FlyWowNavigationPosition 最后成功提交的位置，供业务保存。
 ---@field consumed_mm integer 实际消费预算；毫米，不是 Tick 数。
 ---@field moved boolean 是否有已成功提交的 XZ 变化。
@@ -122,6 +125,7 @@
 ---@class FlyWowNavigationIdentity
 ---@field map_id integer BMAP 实际地图身份；不能忽略并只相信输入文件名。
 ---@field map_version integer BMAP 实际内容版本；不可用 format_version 代替。
+---@field content_sha256 string 完整 BMAP 字节的小写 SHA-256；加载时计算，供宿主校验身份。
 
 ---@class FlyWowNavigationCell
 ---@field grid_x integer 当前 Grid 的调试列下标；不是长期位置合同。
@@ -132,7 +136,7 @@
 ---@field walkable boolean 静态 Walkable bit；不代表所有 Agent 都能站立。
 
 ---@class FlyWowNavigationModule
----@field load_navigation_profiles fun(profiles:FlyWowNavigationProfile[]):boolean?,FlyWowNavigationError? 校验并原子替换进程当前导航配置；已有 Context 下一次调用即使用新表。
+---@field load_navigation_profiles fun(profiles:FlyWowNavigationProfile[]):boolean?,FlyWowNavigationError? 校验并原子替换导航配置；存在未关闭/未回收的 Context 时返回 PROFILES_IN_USE。
 ---@field load_map fun(path:string,airnav_path?:string):FlyWowNavigationIdentity?,FlyWowNavigationError? 加载并按 map_id 替换当前地图；执行文件 I/O；已有 Context 保留旧地图。
 ---@field query_cell fun(map_id:integer,map_version:integer,position:FlyWowNavigationPosition):FlyWowNavigationCell?,FlyWowNavigationError? 只读同步查询；Registry 查找短锁。
 ---@field new_context fun(map_id:integer,air_limits?:FlyWowNavigationAirLimits):FlyWowNavigationContext?,FlyWowNavigationError? 固定当前地图并分配私有 scratch/occupancy；不缓存 Profile，返回调用方独占 userdata.

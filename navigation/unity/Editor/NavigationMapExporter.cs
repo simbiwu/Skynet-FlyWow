@@ -8,6 +8,7 @@ using System.IO;
 using System.Linq;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace FlyWow.Navigation.Editor
 {
@@ -30,7 +31,14 @@ namespace FlyWow.Navigation.Editor
         /// 执行磁盘 I/O 并更新 Editor Session 内的 Overlay Snapshot；不提交 Git，也不通知运行中的 Server。
         /// </remarks>
         [MenuItem("Tools/FlyWow/Navigation/03 导出当前场景 BMAP", false, 103)]
-        public static void Export()
+        private static void ExportActiveScene()
+        {
+            Export(SceneManager.GetActiveScene());
+        }
+
+        /// <summary>导出调用方指定的已加载场景，供菜单和 Bake 完成回调共用。</summary>
+        /// <param name="scene">手动导出时为活动场景，自动导出时为已完成 Bake 的 Surface 所属场景。</param>
+        public static void Export(Scene scene)
         {
             try
             {
@@ -38,8 +46,7 @@ namespace FlyWow.Navigation.Editor
                 NavigationMapRoot[] roots =
                     UnityEngine.Object
                         .FindObjectsByType<NavigationMapRoot>(FindObjectsSortMode.None)
-                        .Where(item => item.gameObject.scene ==
-                                       UnityEngine.SceneManagement.SceneManager.GetActiveScene())
+                        .Where(root => root.gameObject.scene == scene)
                         .ToArray();
                 if (roots.Length != 1)
                 {

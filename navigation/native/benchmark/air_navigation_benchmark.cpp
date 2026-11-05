@@ -61,19 +61,19 @@ void run(const char *name, unsigned width, unsigned height, unsigned wall, unsig
         const auto result = findAirPath(ctx, start, end, 1000, {50, 100});
         const auto finish = std::chrono::steady_clock::now();
         times.push_back(std::chrono::duration<double, std::micro>(finish - begin).count());
-        ++statuses[result.ok() ? "OK" : NavErrorName(result.error)];
+        ++statuses[result.ok() ? "OK" : navErrorName(result.error)];
         const auto &s = ctx.airState().stats;
         expanded += s.expanded;
         tests += s.tests;
         buckets += s.buckets;
         if (result.ok())
-            length = result.value.length_mm();
+            length = result.value.lengthMm();
     }
 
     std::sort(times.begin(), times.end());
     const auto dense =
-        map->cell_count() * (sizeof(NavigationContext::NodeScratch) + sizeof(std::int32_t) +
-                             sizeof(std::vector<NavigationAgentHandle>));
+        map->cellCount() * (sizeof(NavigationContext::NodeScratch) + sizeof(std::int32_t) +
+                            sizeof(std::vector<NavigationAgentHandle>));
     std::cout << "AIR_BENCH case=" << name << " grid=" << width << "x" << height
               << " cell_mm=500 queries=10000 threads=1"
               << " static_intervals=" << wall << " dynamic_objects=" << objects
@@ -81,7 +81,7 @@ void run(const char *name, unsigned width, unsigned height, unsigned wall, unsig
               << " p95_us=" << times[9499] << " p99_us=" << times[9899]
               << " max_us=" << times.back() << " avg_expanded=" << expanded / 10000.0
               << " avg_buckets=" << buckets / 10000.0 << " avg_tests=" << tests / 10000.0
-              << " static_bytes=" << map->memory_bytes() << " ground_context_payload_est=" << dense
+              << " static_bytes=" << map->memoryBytes() << " ground_context_payload_est=" << dense
               << " air_context_bytes_est=" << ctx.airMemoryBytes();
     for (auto &status : statuses)
         std::cout << " " << status.first << "=" << status.second;

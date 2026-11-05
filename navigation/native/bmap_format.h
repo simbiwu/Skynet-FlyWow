@@ -44,7 +44,7 @@ struct NavCell
 
     // 只读取 Walkable bit，不会把其他 flags 误当成布尔值。
     // 例如 flags=2 虽是非零，但 bit 0 未设置，仍不可走。
-    bool IsWalkable() const noexcept
+    bool isWalkable() const noexcept
     {
         return (flags & kWalkableFlag) != 0;
     }

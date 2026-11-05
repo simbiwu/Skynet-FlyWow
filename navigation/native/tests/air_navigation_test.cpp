@@ -3,42 +3,11 @@
 #include "grid_pathfinder.h"
 #include "map_registry.h"
 #include "navigation_context.h"
-#include <atomic>
 #include <cassert>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <new>
 #include <thread>
-// 测试注入一次 C++ 分配失败；不替换生产 allocator，也不降低真实资源门禁。
-std::atomic<int> allocation_failure{-1};
-void            *operator new(std::size_t size)
-{
-    int remaining = allocation_failure.load();
-    if (remaining >= 0)
-    {
-        if (remaining == 0)
-        {
-            allocation_failure = -1;
-            throw std::bad_alloc();
-        }
-        allocation_failure = remaining - 1;
-    }
-    if (void *memory = std::malloc(size ? size : 1))
-        return memory;
-    throw std::bad_alloc();
-}
-void operator delete(void *memory) noexcept
-{
-    std::free(memory);
-}
-
-void operator delete(void *memory, std::size_t) noexcept
-{
-    std::free(memory);
-}
-
 using namespace flywow_navigation;
 namespace
 {
@@ -109,11 +78,11 @@ void assets()
     write("map.airnav", air);
 
     const auto path = (base / "map.bmap").string(), component = (base / "map.airnav").string();
-    auto      &registry = MapRegistry::Instance();
-    auto       old      = registry.Load(path, component);
+    auto      &registry = MapRegistry::instance();
+    auto       old      = registry.load(path, component);
     assert(old.ok() && old.value->airAsset().present);
     NavigationContext ctx(old.value);
-    auto              replacement = registry.Load(path);
+    auto              replacement = registry.load(path);
     assert(replacement.ok() && !replacement.value->airAsset().present);
     assert(ctx.map()->airAsset().present && ctx.map() != replacement.value);
 
@@ -123,22 +92,22 @@ void assets()
         auto corrupt = air;
         corrupt[at] ^= 255;
         write("map.airnav", corrupt);
-        assert(!registry.Load(path, component).ok());
-        assert(registry.Find(17).value == replacement.value);
+        assert(!registry.load(path, component).ok());
+        assert(registry.find(17).value == replacement.value);
     }
 
     auto truncated = air;
     truncated.pop_back();
     write("map.airnav", truncated);
-    assert(!registry.Load(path, component).ok());
+    assert(!registry.load(path, component).ok());
     auto trailing = air;
     trailing.push_back(0);
     write("map.airnav", trailing);
-    assert(!registry.Load(path, component).ok());
+    assert(!registry.load(path, component).ok());
     write("map.airnav", air);
     std::filesystem::resize_file(base / "map.airnav", 32 * 1024 * 1024 + 1);
-    assert(!registry.Load(path, component).ok());
-    assert(!registry.Load(path, (base / "missing.airnav").string()).ok());
+    assert(!registry.load(path, component).ok());
+    assert(!registry.load(path, (base / "missing.airnav").string()).ok());
 
     std::filesystem::remove_all(base);
 }
@@ -167,9 +136,9 @@ void geometry()
     assert(again.ok() && again.value.count() == path.value.count());
     for (std::size_t i = 0; i < path.value.count(); ++i)
     {
-        assert(path.value.WorldPoint(i).x_mm == again.value.WorldPoint(i).x_mm);
+        assert(path.value.worldPoint(i).x_mm == again.value.worldPoint(i).x_mm);
         if (i)
-            assert(sweepAir(ctx, path.value.WorldPoint(i - 1), path.value.WorldPoint(i), body)
+            assert(sweepAir(ctx, path.value.worldPoint(i - 1), path.value.worldPoint(i), body)
                        .value.kind == AirHitKind::kClear);
     }
     // 改变高度的完整扫掠必须拦住中间区间，不能只检查端点。
@@ -218,9 +187,9 @@ void dynamicAndAdvance()
     assert(advanced.value.position.x_mm == end.x_mm);
     assert(moveAir(ctx, {1}, point(3250, 2000, -750)).ok());
     assert(advanceAirPath(ctx, {1}, path.value, cursor, 10).error == NavError::kInvalidArgument);
-    NavigationProfile profile = MakeDefaultNavigationProfile(1);
+    NavigationProfile profile = makeDefaultNavigationProfile(1);
     assert(
-        GridPathfinder::AdvancePath(ctx, {{1}, &profile}, path.value, cursor, end, 10, {}).error ==
+        GridPathfinder::advancePath(ctx, {{1}, &profile}, path.value, cursor, end, 10, {}).error ==
         NavError::kInvalidArgument);
     Path             ground({start, end}, 4000);
     PathFollowCursor gc;
@@ -243,23 +212,25 @@ void resourceBoundaries()
            box.max.y_mm - box.min.y_mm == 101);
     assert(box.min.y_mm == 950 && box.max.y_mm == 1051);
 
-    const auto count = ctx.airState().links.size();
-    for (int k = 0; k < 25; ++k)
-    {
-        allocation_failure = k;
-        const auto changed = setAirObstacle(ctx, {1}, {{100, 0, 100}, {1200, 10, 1200}});
-        allocation_failure = -1;
-        if (!changed.ok())
-        {
-            assert(changed.error == NavError::kCapacityExceeded);
-            assert(ctx.airState().objects.at(1).min.x_mm == box.min.x_mm);
-            assert(ctx.airState().links.size() == count);
-        }
-        else
-        {
-            assert(setAirObstacle(ctx, {1}, box).ok());
-        }
-    }
+    // 现有对象扩张触发总关联超限时，不能先删除旧索引；缩小另一对象后可正常扩张。
+    NavigationContext bounded(map(false));
+    AirLimits         limits; // 仅降低总关联数，让旧对象更新实际走到总容量拒绝边界。
+    limits.links = 3;
+    assert(bounded.setAirLimits(limits).ok());
+    assert(setAirObstacle(bounded, {1}, {{1, 100, 1}, {2, 200, 2}}).ok());
+    assert(setAirObstacle(bounded, {2}, {{501, 100, 1}, {1001, 200, 2}}).ok());
+    const auto old_links = bounded.airState().links; // 失败前的已登记关联，拒绝后应完整保留。
+    assert(setAirObstacle(bounded, {1}, {{1, 100, 1}, {501, 200, 2}}).error ==
+           NavError::kCapacityExceeded);
+    assert(bounded.airState().objects.at(1).max.x_mm == 2);
+    assert(bounded.airState().links == old_links);
+    const auto unchanged =
+        sweepAir(bounded, {300, 150, 1}, {300, 150, 1}, {}); // 被拒绝的新盒不能产生幽灵阻挡。
+    assert(unchanged.ok() && unchanged.value.kind == AirHitKind::kClear);
+    assert(setAirObstacle(bounded, {2}, {{501, 100, 1}, {502, 200, 2}}).ok());
+    assert(setAirObstacle(bounded, {1}, {{1, 100, 1}, {501, 200, 2}}).ok());
+    assert(bounded.airState().links.size() == 3);
+
     NavigationContext objects(map(false));
     for (unsigned i = 1; i <= 4096; ++i)
         assert(setAirObstacle(objects, {i}, {{1, 0, 1}, {2, 10, 2}}).ok());

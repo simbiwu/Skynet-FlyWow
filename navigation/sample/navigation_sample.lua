@@ -1,5 +1,7 @@
 -- 通过公开 Lua API 加载地图、规划并提交一次单位移动，然后释放 Context。
 local skynet = require "skynet"
+--- 在示例 Service 中加载地图、规划路线并验证一次推进，最后释放会话。
+---@return nil 示例结果通过日志和进程退出码报告。
 local function run_navigation_sample()
     local bmap_path = assert(os.getenv("FLYWOW_NAVIGATION_SAMPLE_MAP"))
     local navigation = require "flywow_navigation"
@@ -19,8 +21,11 @@ local function run_navigation_sample()
     assert(path and path_error == nil and path:count() > 1 and path:status() == "reached")
 
     local movement, movement_error = context:advance_path({
-        unit_id = 1, unit_instance_id = 7, distance_mm = 10000,
-        path = path, from_world = start,
+        unit_id          = 1,     -- 选择启动时登记的导航体型。
+        unit_instance_id = 7,     -- 对应刚登记占位的实体。
+        distance_mm      = 10000, -- 本次提供足以走完示例路线的毫米预算。
+        path             = path,  -- 消费前一步规划的路线游标。
+        from_world       = start, -- 推进前已提交的世界位置。
     })
     assert(movement and movement_error == nil)
     assert(movement.status == "reached" and movement.moved)
@@ -33,8 +38,11 @@ local function run_navigation_sample()
 end
 skynet.start(function()
     local ok, message = xpcall(run_navigation_sample, debug.traceback)
-    if ok then print("FLYWOW_NAVIGATION_SAMPLE_OK")
-    else skynet.error("FLYWOW_NAVIGATION_SAMPLE_FAILED: " .. tostring(message)) end
+    if ok then
+        print("FLYWOW_NAVIGATION_SAMPLE_OK")
+    else
+        skynet.error("FLYWOW_NAVIGATION_SAMPLE_FAILED: " .. tostring(message))
+    end
 
     io.stdout:flush()
     io.stderr:flush()

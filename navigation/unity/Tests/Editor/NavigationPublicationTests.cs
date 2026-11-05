@@ -7,6 +7,9 @@ using NUnit.Framework;
 using Unity.AI.Navigation;
 using UnityEngine;
 using UnityEngine.AI;
+using UnityEngine.SceneManagement;
+using UnityEditor.SceneManagement;
+using UnityEditor;
 using FlyWow.Navigation.Editor;
 
 namespace FlyWow.Navigation.Tests
@@ -17,7 +20,11 @@ namespace FlyWow.Navigation.Tests
         [Test]
         public void NewSceneBakesSamplesAndPublishesCompleteCandidate()
         {
-            var    container = new GameObject("NavigationPackageTest");
+            // 独立 EditMode 夹具使用临时场景资产，满足编辑器 Additive 打开前的保存要求。
+            var originalSetup = EditorSceneManager.GetSceneManagerSetup();
+            string scenePath = "Assets/FlyWowNavTest-" + Guid.NewGuid().ToString("N") + ".unity";
+            Scene bakedScene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
+            var container = new GameObject("NavigationPackageTest");
             string output =
                 Path.Combine(Path.GetTempPath(), "flywow-nav-" + Guid.NewGuid().ToString("N"));
             NavMeshSurface surface = null;
@@ -55,6 +62,24 @@ namespace FlyWow.Navigation.Tests
                 // 相同内容重复导出复用完整目录，不产生新版本、不覆盖已有文件。
                 Assert.That(NavigationAssetPublisher.WriteCandidate(snapshot, output),
                             Is.EqualTo(candidate));
+                // 模拟 Bake 等待期间切换活动场景。导出仍使用持有已烘焙 Surface 的场景。
+                Assert.That(EditorSceneManager.SaveScene(bakedScene, scenePath), Is.True);
+                Scene otherScene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Additive);
+                try
+                {
+                    SceneManager.SetActiveScene(otherScene);
+                    Assert.That(SceneManager.GetActiveScene(), Is.EqualTo(otherScene));
+                    root.exportDirectory = output;
+                    NavigationMapExporter.Export(bakedScene);
+                    Assert.That(NavigationMapExporter.LastSnapshot.mapId, Is.EqualTo(root.mapId));
+                    Assert.That(SceneManager.GetActiveScene(), Is.EqualTo(otherScene));
+                }
+                finally
+                {
+                    SceneManager.SetActiveScene(bakedScene);
+                    EditorSceneManager.CloseScene(otherScene, true);
+                }
+
                 // 即使目录名正确，旧 Manifest 被损坏也必须拒绝；清理未提交 staging。
                 File.WriteAllText(Path.Combine(candidate, "map.manifest.json"), "{}");
                 Assert.Throws<IOException>(
@@ -68,6 +93,15 @@ namespace FlyWow.Navigation.Tests
                     surface.RemoveData();
                 }
                 UnityEngine.Object.DestroyImmediate(container);
+                if (Array.Exists(originalSetup, item => item.isLoaded && !string.IsNullOrEmpty(item.path)))
+                {
+                    EditorSceneManager.RestoreSceneManagerSetup(originalSetup);
+                }
+                else
+                {
+                    EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
+                }
+                AssetDatabase.DeleteAsset(scenePath);
                 if (Directory.Exists(output))
                 {
                     Directory.Delete(output, true);

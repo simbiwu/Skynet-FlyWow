@@ -1,7 +1,7 @@
 // 职责：定义 GridPathfinder 查询动态业务规则时使用的无分配回调合同。
 // 边界：Server Runtime Native Navigation；只描述查询参数，不拥有 Battle 状态。
 // 输入/输出：当前 NavigationAgent、候选 Cell、DynamicOccupancy 事实 -> 业务层允许/拒绝。
-// 生命周期：回调 user_data 和其中引用必须覆盖一次 FindPath/MoveUnit 调用；查询不保存它们。
+// 生命周期：回调 user_data 和其中引用必须覆盖一次 findPath/moveUnit 调用；查询不保存它们。
 // 不负责：不实现阵营、实体类型、技能、碰撞规则，也不执行 I/O、Skynet call 或 yield。
 #pragma once
 

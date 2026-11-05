@@ -30,7 +30,7 @@ C++17、CMake/Linux/WSL2、Skynet v1.8.0 自带修改版 Lua 5.4.7；团结引�
 - [公开合同与生命周期](CONTRACT.md)：坐标、资产、Lua 返回值、状态归属和失败处理。
 - [迁移与回滚](UPGRADE.md)：旧路径、旧模块名以及成套升级范围。
 
-Server 启动时调用 load_navigation_profiles 加载导航专用配置，并主动加载配置列出的全部地图。NavigationProfile Registry 只保留当前表；每次 Native 导航调用临时持有不可变表并按 unit_id 二分查找。new_context 只固定地图并拥有本 Battle 的动态占位与 scratch。UnitProfile 是独立业务配置，由进程入口发布到 sharedata，Battle Core 从中读取 combat.attack_range_mm。
+Server 启动时调用 load_navigation_profiles 加载导航专用配置，并主动加载配置列出的全部地图。NavigationProfile Registry 只保留当前表；每次 Native 导航调用临时持有不可变表并按 unit_id 二分查找。new_context 固定地图并拥有本 Battle 的动态占位与 scratch；存在活跃 Context 时拒绝替换导航表，必须先关闭/回收全部会话。UnitProfile 是独立业务配置，由进程入口发布到 sharedata，Battle Core 从中读取 combat.attack_range_mm。
 
 可运行的最小新场景入口是 `Tools/FlyWow/Navigation/创建最小接入场景`。`NavigationPublicationTests` 使用公开组件与方法完成 Bake→采样→Clearance→校验→导出，不依赖课程代码；它同时锁定幂等导出和损坏清单拒绝。
 

@@ -64,12 +64,10 @@ local updated_profiles = {
     },
     profiles[1],
 }
-assert(navigation.load_navigation_profiles(updated_profiles))
-assert(first:unit_radius_mm(1) == 100) -- 已有 Context 的后续调用读取新 Registry 表。
-local updated_context = assert(navigation.new_context(17))
-assert(updated_context:unit_radius_mm(1) == 100)
-updated_context:close()
-assert(navigation.load_navigation_profiles(profiles)) -- 恢复本测试的当前导航配置。
+-- 活跃会话必须保持原占位规则，不能只保证本次读取快照仍有效。
+local denied_profiles, denied_profile_error = navigation.load_navigation_profiles(updated_profiles)
+assert(denied_profiles == nil and denied_profile_error.code == "PROFILES_IN_USE")
+assert(first:unit_radius_mm(1) == 0)
 assert(first:map_version() == 2)
 local start = { x_mm = 750, y_mm = 0, z_mm = 750 }
 local goal = { x_mm = 1750, y_mm = 0, z_mm = 1750 }
@@ -127,6 +125,11 @@ local closed, closed_error = first:find_path(1, start, goal, 1)
 assert(closed == nil and closed_error.code == "CONTEXT_CLOSED")
 assert(second:release_unit(1))
 second:close()
+assert(navigation.load_navigation_profiles(updated_profiles))
+local updated_context = assert(navigation.new_context(17))
+assert(updated_context:unit_radius_mm(1) == 100)
+updated_context:close()
+assert(navigation.load_navigation_profiles(profiles))
 
 -- 真实调用覆盖 record 中的 Path userdata、推进结果和 Range 查询，确保迁移保持合同。
 local third = assert(navigation.new_context(17))
@@ -172,5 +175,15 @@ path_meta.__gc(third_path)
 path_meta.__gc(third_path) -- 重复 GC 不允许二次析构 Native Path。
 local dead_path, dead_path_error = third_path:count()
 assert(dead_path == nil and dead_path_error.code == "INVALID_ARGUMENT")
+-- 未显式 close 的会话由 GC 注销；独立 Path 不应阻止换表。
+local gc_context = assert(navigation.new_context(17))
+gc_context = nil
+collectgarbage("collect")
+assert(navigation.load_navigation_profiles(updated_profiles))
+
+-- 创建失败必须立即注销，不等待 GC 才允许换表。
+local invalid_context, invalid_context_error = navigation.new_context(17, { nodes = 0 })
+assert(invalid_context == nil and invalid_context_error.code == "INVALID_ARGUMENT")
+assert(navigation.load_navigation_profiles(profiles))
 collectgarbage("collect")
 print("FLYWOW_NAVIGATION_BINDING_OK")

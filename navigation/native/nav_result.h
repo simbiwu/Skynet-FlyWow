@@ -44,14 +44,15 @@ enum class NavError
     kQueryBudgetExceeded,  // 扫掠桶或候选测试预算耗尽。
     kCapacityExceeded,     // 动态资源容量不足；旧状态不变。
     kBlocked,              // 连续移动遭到阻挡。
-    kInternalError,        // Binding 用此码报告无法继续处理的内部错误，并转换为 Lua 的 INTERNAL_ERROR。
+    kInternalError, // Binding 用此码报告无法继续处理的内部错误，并转换为 Lua 的 INTERNAL_ERROR。
+    kProfilesInUse, // 仍有活跃 Context，不能替换其占位所依赖的导航配置。
 };
 
 // 返回便于日志和 Lua 错误结果使用的稳定 ASCII 名称。
-const char *NavErrorName(NavError error) noexcept;
+const char *navErrorName(NavError error) noexcept;
 
 // 一次 Native 操作的返回值。先检查 ok()，成功才读 value，失败读 error/detail。
-// NavResult<bool>::Success(false) 仍是成功，例如重复 Freeze；不要把 value 当成功标志。
+// NavResult<bool>::success(false) 仍是成功，例如重复 Freeze；不要把 value 当成功标志。
 template <typename T> struct NavResult
 {
     NavError    error = NavError::kOk; // 稳定机器错误码；kOk 表示成功。
@@ -67,7 +68,7 @@ template <typename T> struct NavResult
     // 构造成功结果；error 保持 kOk，并把结果值移动进返回对象。
     // 对 vector/shared_ptr 等结果，move 可交接其资源而不复制全部数据；
     // 返回对象拥有自己的结果，调用方无需依赖此 helper 的局部变量生命周期。
-    static NavResult Success(T result)
+    static NavResult success(T result)
     {
         NavResult output;
         output.value = std::move(result);
@@ -75,7 +76,7 @@ template <typename T> struct NavResult
     }
 
     // 构造失败结果；value 保持默认值，调用方不得读取它作为业务结果。
-    static NavResult Failure(NavError code, std::string message)
+    static NavResult failure(NavError code, std::string message)
     {
         NavResult output;
         output.error  = code;

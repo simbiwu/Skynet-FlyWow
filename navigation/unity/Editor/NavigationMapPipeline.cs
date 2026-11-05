@@ -110,8 +110,14 @@ namespace FlyWow.Navigation.Editor
         /// </summary>
         private static void CompleteBakeWhenReady()
         {
-            if (pendingSurface == null ||
-                NavMeshAssetManager.instance.IsSurfaceBaking(pendingSurface))
+            if (pendingSurface == null)
+            {
+                // 关闭场景或删除 Surface 会使等待对象失效，同时解除本轮 update 订阅。
+                ResetPendingBake();
+                return;
+            }
+
+            if (NavMeshAssetManager.instance.IsSurfaceBaking(pendingSurface))
             {
                 return;
             }
@@ -138,7 +144,7 @@ namespace FlyWow.Navigation.Editor
 
                 if (shouldExport)
                 {
-                    NavigationMapExporter.Export();
+                    NavigationMapExporter.Export(scene);
                     Debug.Log("BATTLE_MAP_PIPELINE_OK scene=" + scene.path);
                 }
             }

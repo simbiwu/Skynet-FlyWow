@@ -7,7 +7,7 @@
 namespace flywow_navigation
 {
 
-const char *NavErrorName(NavError error) noexcept
+const char *navErrorName(NavError error) noexcept
 {
     // switch 保持穷举可审查；新增 NavError 时必须同步增加对应名称。
     switch (error)
@@ -72,6 +72,8 @@ const char *NavErrorName(NavError error) noexcept
         return "CAPACITY_EXCEEDED";
     case NavError::kBlocked:
         return "BLOCKED";
+    case NavError::kProfilesInUse:
+        return "PROFILES_IN_USE";
     case NavError::kInternalError:
         return "INTERNAL_ERROR";
     }

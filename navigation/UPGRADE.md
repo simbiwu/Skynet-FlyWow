@@ -42,3 +42,9 @@ mover_unit_instance_id[, allow_partial]) 使用双方当前 NavigationProfile �
 没有更接近目标的实际移动仍返回 NO_PATH。精确终点不可站立时默认返回
 END_NOT_NAVIGABLE；开启 partial 后继续搜索。查询状态与 advance_path 的执行状态独立。
 单位接近 Lua API 已移除 edge_range_mm 参数，所有仓库调用点与签名同步更新；C++ 使用者需重新编译。
+
+## NAV 最小化收口的合同变化
+
+`load_navigation_profiles` 不再允许在活跃 Context 存在时替换配置，失败返回 `PROFILES_IN_USE`，旧表和占位保持不变。启动时先加载导航表再创建会话；运行期如需换表，宿主先结束并关闭/回收本进程全部 Context（包括纯空中会话），再发布新表、创建新会话。独立 Path 不占用此门禁；地图替换仍保留旧 Context 的地图快照。
+
+普通参数、越界、碰撞和配置容量失败的处理保持不变。`bad_alloc` 不再作为 `CAPACITY_EXCEEDED` 业务错误交付，也不承诺 OOM 后恢复占位或继续运行；统一 LuaBinding 异常边界仍保留。C++ 使用者须重新编译，Lua 与 Native 应成套更新；BMAP/AIRN 字节格式不变。

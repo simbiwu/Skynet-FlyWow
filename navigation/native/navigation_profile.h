@@ -18,7 +18,7 @@ namespace flywow_navigation
 
 struct NavigationProfile
 {
-    std::uint32_t unit_id = 0; // Battle 内稳定 Profile ID；0 保留为非法值。
+    std::uint32_t unit_id     = 0; // Battle 内稳定 Profile ID；0 保留为非法值。
     std::int32_t  radius_mm   = 0; // 地面圆形 footprint 半径，毫米；合法范围 [0, INT32_MAX]。
     std::int32_t  max_step_mm = 0; // 相邻 Cell 允许的最大高度跳变，毫米；必须 >=0。
     std::uint32_t max_slope_permille = 0; // 高差/水平距离 *1000 的上限。
@@ -30,7 +30,7 @@ struct NavigationProfile
 
 // 构造一份最常用的“全部 Area 允许、基础成本 1000”默认表。
 // 仅分配/返回一个小值对象；不访问地图、不加锁、不 yield。
-inline NavigationProfile MakeDefaultNavigationProfile(std::uint32_t unit_id)
+inline NavigationProfile makeDefaultNavigationProfile(std::uint32_t unit_id)
 {
     NavigationProfile profile;
     profile.unit_id = unit_id;
@@ -39,13 +39,13 @@ inline NavigationProfile MakeDefaultNavigationProfile(std::uint32_t unit_id)
     return profile;
 }
 
-// 验证 Profile 是否满足本课 A* 的整数成本与 Heuristic 前提。
+// 验证 Profile 是否满足本课 A* 的整数成本与 heuristic 前提。
 // 成功返回 true；失败返回 kInvalidAgent + detail。
-inline NavResult<bool> ValidateNavigationProfile(const NavigationProfile &profile)
+inline NavResult<bool> validateNavigationProfile(const NavigationProfile &profile)
 {
     if (profile.unit_id == 0 || profile.radius_mm < 0 || profile.max_step_mm < 0)
     {
-        return NavResult<bool>::Failure(NavError::kInvalidAgent,
+        return NavResult<bool>::failure(NavError::kInvalidAgent,
                                         "agent id/radius/max_step is invalid");
     }
 
@@ -59,16 +59,17 @@ inline NavResult<bool> ValidateNavigationProfile(const NavigationProfile &profil
         // “至少还要花多少成本”可能高估，出堆后不重开 CLOSED 的前提就不成立。
         if (profile.area_cost_permille[area] < 1000)
         {
-            return NavResult<bool>::Failure(NavError::kInvalidAgent,
+            return NavResult<bool>::failure(NavError::kInvalidAgent,
                                             "allowed area cost must be >= 1000 permille");
         }
     }
-    return NavResult<bool>::Success(true);
+    return NavResult<bool>::success(true);
 }
 
 // 把毫米制半径转换为第一课 clearance_cells 的保守需求。
 // cell_size_mm 必须 >0；返回值至少为 1，并在 uint8 范围饱和。
-inline std::uint8_t RequiredClearanceCells(const NavigationProfile &profile, std::uint32_t cell_size_mm)
+inline std::uint8_t requiredClearanceCells(const NavigationProfile &profile,
+                                           std::uint32_t            cell_size_mm)
 {
     if (cell_size_mm == 0)
     {

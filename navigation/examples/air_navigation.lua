@@ -7,10 +7,11 @@ package.path = root .. "/navigation/lualib/?.lua;" .. package.path
 package.cpath = native_dir .. "/?.so;" .. package.cpath
 local navigation = require "flywow_navigation"
 
----@param x integer
----@param y integer
----@param z integer
----@return FlyWowNavigationPosition
+--- 将共享地图示例中的三个毫米坐标组成 NAV 请求位置。
+---@param x integer 共享地图上的世界 X，单位毫米。
+---@param y integer 盒体中心的世界高度，单位毫米。
+---@param z integer 共享地图上的世界 Z，单位毫米。
+---@return FlyWowNavigationPosition 世界毫米位置，直接传给导航接口。
 local function position(x, y, z)
     return { x_mm = x, y_mm = y, z_mm = z }
 end
@@ -20,17 +21,17 @@ assert(navigation.load_map(bmap_path, airnav_path))
 local context = assert(navigation.new_context(17))
 assert(context:set_air_obstacle
 {
-    handle = 1,
-    min    = position(200, 800, 1700),
-    max    = position(300, 1200, 1800),
+    handle = 1, -- 实体句柄，后续规划时排除自身盒体。
+    min    = position(200, 800, 1700), -- 已登记盒体的世界毫米下界。
+    max    = position(300, 1200, 1800), -- 已登记盒体的世界毫米上界。
 })
 local path = assert(context:find_air_path
 {
-    start          = position(250, 1000, 1750),
-    target         = position(2750, 1000, 1750),
-    flight_y_mm    = 1000,
-    body           = { radius_mm = 50, half_height_mm = 200 },
-    exclude_handle = 1,
+    start          = position(250, 1000, 1750), -- 由初始盒体中心开始规划。
+    target         = position(2750, 1000, 1750), -- 建筑另一侧的目标中心。
+    flight_y_mm    = 1000, -- 保持在指定世界毫米高度规划。
+    body           = { radius_mm = 50, half_height_mm = 200 }, -- 对应已登记盒体的水平半径和垂直半高。
+    exclude_handle = 1, -- 忽略正在移动的实体自身。
 })
 
 for _ = 1, 100 do
@@ -46,10 +47,10 @@ end
 local raised = assert(context:move_air { handle = 1, target = position(2750, 14000, 1750) })
 local sweep = assert(context:sweep_air
 {
-    from           = raised,
-    to             = position(250, 14000, 1750),
-    body           = { radius_mm = 50, half_height_mm = 200 },
-    exclude_handle = 1,
+    from           = raised, -- 从上升后已提交的位置开始扫掠。
+    to             = position(250, 14000, 1750), -- 在新高度扫回建筑另一侧。
+    body           = { radius_mm = 50, half_height_mm = 200 }, -- 对应已登记盒体的水平半径和垂直半高。
+    exclude_handle = 1, -- 忽略正在移动的实体自身。
 })
 assert(sweep.kind == "clear")
 assert(context:remove_air_obstacle { handle = 1 })

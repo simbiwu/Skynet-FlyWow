@@ -65,10 +65,10 @@ WorldPosition RandomWalkable(const GridMap &map, std::uint32_t &seed)
             static_cast<std::int32_t>(Next(seed) % map.metadata().width),
             static_cast<std::int32_t>(Next(seed) % map.metadata().height),
         };
-        const NavCell *cell = map.TryCell(grid);
-        if (cell != nullptr && cell->IsWalkable())
+        const NavCell *cell = map.tryCell(grid);
+        if (cell != nullptr && cell->isWalkable())
         {
-            const auto world = map.GridToWorldCenter(grid);
+            const auto world = map.gridToWorldCenter(grid);
             if (world.ok())
                 return world.value;
         }
@@ -92,7 +92,7 @@ void RunCase(std::uint32_t width, std::uint32_t height)
     constexpr int           kQueries        = 10000;
     auto                    map = MakeSynthetic(width, height, kBlockedPercent, 0x12345678u);
     NavigationContext       context(map);
-    NavigationProfile       profile = MakeDefaultNavigationProfile(1);
+    NavigationProfile       profile = makeDefaultNavigationProfile(1);
     profile.radius_mm               = 200;
     profile.max_step_mm             = 500;
     profile.max_slope_permille      = 1000;
@@ -111,12 +111,12 @@ void RunCase(std::uint32_t width, std::uint32_t height)
     {
         const WorldPosition start  = RandomWalkable(*map, seed);
         const WorldPosition end    = RandomWalkable(*map, seed);
-        // 单次延迟只计 FindPathStatic（含平滑与结果构造），不计端点抽样。
+        // 单次延迟只计 findPathStatic（含平滑与结果构造），不计端点抽样。
         const auto          begin  = std::chrono::steady_clock::now();
-        const auto          result = GridPathfinder::FindPathStatic(context, profile, start, end);
+        const auto          result = GridPathfinder::findPathStatic(context, profile, start, end);
         const auto          finish = std::chrono::steady_clock::now();
         microseconds.push_back(std::chrono::duration<double, std::micro>(finish - begin).count());
-        visited_sum += context.visited_nodes();
+        visited_sum += context.visitedNodes();
         if (result.ok())
         {
             ++success;
@@ -127,13 +127,13 @@ void RunCase(std::uint32_t width, std::uint32_t height)
             ++no_path;
         }
     }
-    const auto   all_end = std::chrono::steady_clock::now();
+    const auto all_end = std::chrono::steady_clock::now();
 
     // 整组 QPS 的时间范围还包括端点抽样、记录统计及循环内结果释放；
     // 因此不能直接用单次延迟的平均值倒数替代这里的 QPS。
     const double seconds = std::chrono::duration<double>(all_end - all_begin).count();
 
-    const std::size_t cells              = map->cell_count();
+    const std::size_t cells = map->cellCount();
 
     // 仅估算 Context 固定数组下界；不包含 vector capacity 余量、footprint、
     // GridMap、Path、allocator metadata，因此不能当作进程实测内存。

@@ -115,7 +115,7 @@ AssetHash sha256(const std::uint8_t *data, std::size_t size)
 NavResult<AirAsset> readAirAsset(const std::string &path, const BMapMetadata &m,
                                  const AssetHash &hash)
 {
-    auto fail = [](NavError e, const char *s) { return NavResult<AirAsset>::Failure(e, s); };
+    auto fail = [](NavError e, const char *s) { return NavResult<AirAsset>::failure(e, s); };
     std::ifstream in(path, std::ios::binary | std::ios::ate);
     if (!in)
     {
@@ -206,6 +206,6 @@ NavResult<AirAsset> readAirAsset(const std::string &path, const BMapMetadata &m,
     {
         return fail(NavError::kInvalidAirAsset, "unreferenced air intervals");
     }
-    return NavResult<AirAsset>::Success(std::move(out));
+    return NavResult<AirAsset>::success(std::move(out));
 }
 } // namespace flywow_navigation

@@ -5,10 +5,10 @@
 // 不负责：不决定实体是否互相阻挡；是否允许进入由业务层回调解释本对象保存的事实。
 #pragma once
 
-#include "navigation_profile.h"
 #include "grid_map.h"
 #include "nav_result.h"
 #include "navigation_agent.h"
+#include "navigation_profile.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -21,29 +21,29 @@ namespace flywow_navigation
 class DynamicOccupancy final
 {
   public:
-    // 按 map 的 cell_count 创建空事实索引；map 必须在本对象生命周期内保持存活。
+    // 按 map 的 cellCount 创建空事实索引；map 必须在本对象生命周期内保持存活。
     explicit DynamicOccupancy(const GridMap &map);
 
     // 返回该 Cell 是否有 handle 之外的动态实体。
     // 越界视为 blocked；这是便捷事实查询，不代表所有业务都必须采用独占规则。
-    bool IsBlocked(const GridPos &grid, NavigationAgentHandle ignore_handle) const noexcept;
+    bool isBlocked(const GridPos &grid, NavigationAgentHandle ignore_handle) const noexcept;
 
     // 使用“任意其他实体都阻挡”的默认规则检查整个 footprint。
     // GridPathfinder 不直接调用它；业务回调可以按需复用或实现自己的规则。
-    bool IsFootprintBlocked(const NavigationProfile &profile, const GridPos &center,
+    bool isFootprintBlocked(const NavigationProfile &profile, const GridPos &center,
                             NavigationAgentHandle ignore_handle) const noexcept;
 
     // 遍历某个 Cell 当前的所有动态实体句柄；callback 返回 false 时提前停止。
     // 不创建临时 ID vector；调用期间不得修改本 Occupancy。
     // 返回 true 表示完整遍历结束（空格也为 true）；false 表示越界或回调主动停止。
     // 回调中的 false 是“停止遍历”，只有调用者约定后才具有“阻挡”的业务意义。
-    template <typename Callback> bool ForEachOccupant(const GridPos &grid, Callback callback) const
+    template <typename Callback> bool forEachOccupant(const GridPos &grid, Callback callback) const
     {
-        if (map_.TryCell(grid) == nullptr)
+        if (map_.tryCell(grid) == nullptr)
         {
             return false;
         }
-        for (const NavigationAgentHandle handle : occupants_[IndexOf(grid)])
+        for (const NavigationAgentHandle handle : occupants_[indexOf(grid)])
         {
             if (!callback(handle))
             {
@@ -56,7 +56,7 @@ class DynamicOccupancy final
     // 根据 Agent 半径遍历保守 footprint；业务回调直接复用它，不重复计算半径覆盖范围。
     // callback 返回 false 时提前停止；不构造临时 Cell vector。
     template <typename Callback>
-    bool ForEachFootprintCell(const NavigationProfile &profile, const GridPos &center,
+    bool forEachFootprintCell(const NavigationProfile &profile, const GridPos &center,
                               Callback callback) const
     {
         const std::int64_t cell       = map_.metadata().cell_size_mm;
@@ -117,7 +117,7 @@ class DynamicOccupancy final
                 const GridPos grid{static_cast<std::int32_t>(grid_x),
                                    static_cast<std::int32_t>(grid_z)};
                 // 任一覆盖格越界或回调拒绝即结束；不能静默裁掉地图外的一半体型。
-                if (map_.TryCell(grid) == nullptr || !callback(grid))
+                if (map_.tryCell(grid) == nullptr || !callback(grid))
                 {
                     return false;
                 }
@@ -128,35 +128,35 @@ class DynamicOccupancy final
 
     // 统一处理首次进入和后续移动：没有旧记录时写入，有旧记录时先清旧再写新。
     // 业务层必须先通过 DynamicNavigationPolicy 判断目标是否允许进入。
-    NavResult<bool> Move(NavigationAgentHandle handle, const NavigationProfile &profile,
+    NavResult<bool> move(NavigationAgentHandle handle, const NavigationProfile &profile,
                          const GridPos &target);
 
-    // 按 handle 释放当前已记录的 footprint；重复 Release 安全。
-    NavResult<bool> Release(NavigationAgentHandle handle);
+    // 按 handle 释放当前已记录的 footprint；重复 release 安全。
+    NavResult<bool> release(NavigationAgentHandle handle);
 
-    // Debug/Test：返回第一个 occupant；多实体 Cell 应使用 ForEachOccupant。
+    // Debug/Test：返回第一个 occupant；多实体 Cell 应使用 forEachOccupant。
     // 越界或空 Cell 返回无效句柄。
-    NavigationAgentHandle FirstOccupantAt(const GridPos &grid) const noexcept;
+    NavigationAgentHandle firstOccupantAt(const GridPos &grid) const noexcept;
 
   private:
     struct AgentFootprint
     {
-        NavigationAgentHandle handle;
-        std::vector<GridPos>  cells; // 该实体当前真实占用的 Cell；由本对象拥有。
+        NavigationAgentHandle handle; ///< 会话内实体句柄，用于清除该实体的格关联。
+        std::vector<GridPos>  cells;  // 该实体当前真实占用的 Cell；由本对象拥有。
     };
 
     // 合法 GridPos -> row-major occupants 数组下标；调用前必须已经确认在地图内。
-    std::size_t IndexOf(const GridPos &grid) const noexcept;
+    std::size_t indexOf(const GridPos &grid) const noexcept;
 
     // 查找当前已经登记的 Agent；找不到返回 nullptr。
-    AgentFootprint       *FindFootprint(NavigationAgentHandle handle) noexcept;
-    const AgentFootprint *FindFootprint(NavigationAgentHandle handle) const noexcept;
+    AgentFootprint       *findFootprint(NavigationAgentHandle handle) noexcept;
+    const AgentFootprint *findFootprint(NavigationAgentHandle handle) const noexcept;
 
     // 从一个 Cell 删除 handle；只影响指定实体，不会误删其他实体。
-    void RemoveHandleAt(const GridPos &grid, NavigationAgentHandle handle);
+    void removeHandleAt(const GridPos &grid, NavigationAgentHandle handle);
 
     // 向一个 Cell 添加 handle；同一实体重复添加时保持一份事实。
-    void AddHandleAt(const GridPos &grid, NavigationAgentHandle handle);
+    void addHandleAt(const GridPos &grid, NavigationAgentHandle handle);
 
     const GridMap &map_; // 非 owning immutable map 引用；由 Context 保证生命周期。
     // 按格索引实体：查询时无临时数组，每个 Cell 可有多个独立句柄。

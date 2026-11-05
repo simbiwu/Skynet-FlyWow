@@ -3,15 +3,16 @@
 // 输入/输出：内存 synthetic GridMap -> assert 或 ALL_TESTS_OK。
 // 生命周期：每个 case 创建独立 map/context；并发 case 共享 const map 但 Context 独立。
 // 不负责：不做性能结论，性能由 navigation_benchmark 单独记录条件。
-#include "navigation_profile.h"
-#include "navigation_profile_registry.h"
 #include "dynamic_occupancy.h"
 #include "grid_map.h"
 #include "grid_pathfinder.h"
 #include "navigation_context.h"
+#include "navigation_profile.h"
+#include "navigation_profile_registry.h"
 
 #include <cassert>
 #include <cstdint>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -72,48 +73,113 @@ std::size_t Idx(std::uint32_t width, int x, int z)
 // 返回测试统一的小型地面 Agent；按值返回，不持有地图或共享状态。
 NavigationProfile Small()
 {
-    NavigationProfile p       = MakeDefaultNavigationProfile(1);
+    NavigationProfile p  = makeDefaultNavigationProfile(1);
     p.radius_mm          = 200;
     p.max_step_mm        = 600;
     p.max_slope_permille = 1000;
     return p;
 }
 
-void TestNavigationProfileRegistry()
+void testNavigationProfileRegistry()
 {
-    auto &registry = NavigationProfileRegistry::Instance();
+    auto &registry = NavigationProfileRegistry::instance();
 
     std::vector<NavigationProfile> profiles;
-    profiles.push_back(MakeDefaultNavigationProfile(10000));
-    profiles.push_back(MakeDefaultNavigationProfile(1));
+    profiles.push_back(makeDefaultNavigationProfile(10000));
+    profiles.push_back(makeDefaultNavigationProfile(1));
     profiles[0].radius_mm = 700;
     profiles[1].radius_mm = 100;
-    const auto loaded = registry.Load(std::move(profiles));
+    const auto loaded     = registry.load(std::move(profiles));
     assert(loaded.ok());
 
-    const auto old_snapshot = registry.Snapshot();
+    const auto old_snapshot = registry.snapshot();
     assert(old_snapshot != nullptr && old_snapshot->size() == 2);
     assert((*old_snapshot)[0].unit_id == 1 && (*old_snapshot)[0].radius_mm == 100);
     assert((*old_snapshot)[1].unit_id == 10000 && (*old_snapshot)[1].radius_mm == 700);
 
     std::vector<NavigationProfile> duplicate_profiles;
-    duplicate_profiles.push_back(MakeDefaultNavigationProfile(1));
-    duplicate_profiles.push_back(MakeDefaultNavigationProfile(1));
-    const auto duplicate = registry.Load(std::move(duplicate_profiles));
+    duplicate_profiles.push_back(makeDefaultNavigationProfile(1));
+    duplicate_profiles.push_back(makeDefaultNavigationProfile(1));
+    const auto duplicate = registry.load(std::move(duplicate_profiles));
     assert(!duplicate.ok() && duplicate.error == NavError::kInvalidAgent);
-    assert(registry.Snapshot() == old_snapshot);
+    assert(registry.snapshot() == old_snapshot);
 
     std::vector<NavigationProfile> replacement;
-    replacement.push_back(MakeDefaultNavigationProfile(1));
+    replacement.push_back(makeDefaultNavigationProfile(1));
     replacement[0].radius_mm = 250;
-    const auto replaced = registry.Load(std::move(replacement));
+    const auto replaced      = registry.load(std::move(replacement));
     assert(replaced.ok());
 
-    const auto current_snapshot = registry.Snapshot();
+    const auto current_snapshot = registry.snapshot();
     assert(current_snapshot != nullptr && current_snapshot != old_snapshot);
     assert(current_snapshot->size() == 1);
     assert((*current_snapshot)[0].unit_id == 1 && (*current_snapshot)[0].radius_mm == 250);
     assert((*old_snapshot)[0].radius_mm == 100); // 本次调用仍持有的快照不受原子替换影响。
+}
+
+// 验证已有占位、多 Context、转移 owner 与其它线程中的会话都阻止换表，析构后解除。
+void testProfileReplacementWithActiveContexts()
+{
+    auto &registry        = NavigationProfileRegistry::instance(); // 公开入口使用的进程 Registry。
+    auto  original        = makeDefaultNavigationProfile(1);       // 旧 footprint 的规则。
+    original.radius_mm    = 100;
+    auto replacement      = original; // 需要等待全部会话释放才能发布的新半径。
+    replacement.radius_mm = 600;
+    assert(registry.load({original}).ok());
+    const auto snapshot = registry.snapshot(); // 拒绝发布时必须保留同一表。
+    const auto map      = MakeMap(8, 8);       // 会话只共享不可变地图。
+    {
+        NavigationContext first(map);
+        assert(first.occupancy().move({1}, original, {3, 3}).ok());
+        {
+            NavigationContext second(map);              // 空占位会话同样占用门禁。
+            NavigationContext moved(std::move(second)); // 转移后仍只登记一个 owner。
+            assert(registry.load({replacement}).error == NavError::kProfilesInUse);
+            assert(registry.snapshot() == snapshot);
+            assert(first.occupancy().firstOccupantAt({3, 3}).value == 1);
+        }
+        assert(registry.load({replacement}).error == NavError::kProfilesInUse);
+    }
+    assert(registry.load({replacement}).ok());
+    assert((*registry.snapshot())[0].radius_mm == 600);
+
+    // 工作线程完成构造后通知主线程；拒绝断言完成后才释放，避免依赖 sleep 猜测时序。
+    std::promise<void> ready;   // 通知主线程：其它线程的 Context 已登记。
+    std::promise<void> release; // 通知工作线程：主线程已完成发布拒绝检查。
+    auto               ready_signal   = ready.get_future();
+    auto               release_signal = release.get_future();
+    std::thread        owner(
+        [&]
+        {
+            NavigationContext context(map);
+            ready.set_value();
+            release_signal.wait();
+        });
+    ready_signal.wait();
+    assert(registry.load({original}).error == NavError::kProfilesInUse);
+    release.set_value();
+    owner.join();
+    assert(registry.load({original}).ok());
+}
+
+// C++ 调用者可直接构造 Profile；所有公开寻路入口仍须拒绝破坏启发式前提的低成本。
+void testInvalidNativeProfiles()
+{
+    NavigationContext context(MakeMap(4, 4));
+    auto              invalid = Small(); // 允许通行的 Area 不能比 A* 启发式使用的基础成本更便宜。
+    invalid.area_cost_permille[0]        = 999;
+    const auto            target_profile = Small(); // 目标本身合法，用于隔离移动者输入错误。
+    const NavigationAgent mover{{1}, &invalid};
+    const WorldPosition   start{750, 0, 750};
+    const WorldPosition   goal{1250, 0, 1250};
+    assert(GridPathfinder::findPathStatic(context, invalid, start, goal).error ==
+           NavError::kInvalidAgent);
+    assert(GridPathfinder::findPath(context, mover, start, goal, {}).error ==
+           NavError::kInvalidAgent);
+    assert(GridPathfinder::findPathToRange(context, mover, start, goal, 500, {}).error ==
+           NavError::kInvalidAgent);
+    assert(GridPathfinder::findPathToUnitRange(context, mover, start, target_profile, goal, {})
+               .error == NavError::kInvalidAgent);
 }
 
 // 默认测试业务规则：目标 footprint 内只能出现移动者自己。
@@ -124,11 +190,11 @@ bool ExclusiveDynamicRule(void *, const DynamicNavigationQuery &query)
     {
         return false;
     }
-    return query.occupancy->ForEachFootprintCell(*query.agent->profile, query.target,
+    return query.occupancy->forEachFootprintCell(*query.agent->profile, query.target,
                                                  [&](const GridPos &grid)
                                                  {
                                                      bool allowed = true;
-                                                     query.occupancy->ForEachOccupant(
+                                                     query.occupancy->forEachOccupant(
                                                          grid,
                                                          [&](NavigationAgentHandle other)
                                                          {
@@ -154,7 +220,7 @@ bool SharedDynamicRule(void *, const DynamicNavigationQuery &query)
 {
     return query.agent != nullptr && query.agent->profile != nullptr &&
            query.occupancy != nullptr &&
-           query.occupancy->ForEachFootprintCell(*query.agent->profile, query.target,
+           query.occupancy->forEachFootprintCell(*query.agent->profile, query.target,
                                                  [](const GridPos &) { return true; });
 }
 
@@ -174,11 +240,11 @@ WorldPosition P(int x_mm, int z_mm)
 void AssertSamePath(const Path &a, const Path &b)
 {
     assert(a.count() == b.count());
-    assert(a.length_mm() == b.length_mm());
+    assert(a.lengthMm() == b.lengthMm());
     for (std::size_t i = 0; i < a.count(); ++i)
     {
-        const auto &pa = a.WorldPoint(i);
-        const auto &pb = b.WorldPoint(i);
+        const auto &pa = a.worldPoint(i);
+        const auto &pb = b.worldPoint(i);
         assert(pa.x_mm == pb.x_mm);
         assert(pa.y_mm == pb.y_mm);
         assert(pa.z_mm == pb.z_mm);
@@ -186,16 +252,16 @@ void AssertSamePath(const Path &a, const Path &b)
 }
 
 // 锁定越界、不可走起点和不可走终点的稳定错误码。
-void TestBoundsAndBlockedEndpoints()
+void testBoundsAndBlockedEndpoints()
 {
-    auto               map = MakeMap(5, 5);
-    NavigationContext  ctx(map);
+    auto                    map = MakeMap(5, 5);
+    NavigationContext       ctx(map);
     const NavigationProfile p = Small();
 
-    auto r = GridPathfinder::FindPathStatic(ctx, p, P(-1, 250), P(2250, 2250));
+    auto r = GridPathfinder::findPathStatic(ctx, p, P(-1, 250), P(2250, 2250));
     assert(!r.ok() && r.error == NavError::kOutOfBounds);
 
-    r = GridPathfinder::FindPathStatic(ctx, p, P(250, 250), P(2500, 250));
+    r = GridPathfinder::findPathStatic(ctx, p, P(250, 250), P(2500, 250));
     assert(!r.ok() && r.error == NavError::kOutOfBounds);
 
     std::vector<NavCell> cells(25);
@@ -209,19 +275,19 @@ void TestBoundsAndBlockedEndpoints()
     auto              blocked = MakeMapFromCells(5, 5, std::move(cells));
     NavigationContext blocked_ctx(blocked);
 
-    r = GridPathfinder::FindPathStatic(blocked_ctx, p, P(250, 250), P(1750, 1750));
+    r = GridPathfinder::findPathStatic(blocked_ctx, p, P(250, 250), P(1750, 1750));
     assert(!r.ok() && r.error == NavError::kStartNotNavigable);
-    r = GridPathfinder::FindPathStatic(blocked_ctx, p, P(750, 250), P(2250, 2250));
+    r = GridPathfinder::findPathStatic(blocked_ctx, p, P(750, 250), P(2250, 2250));
     assert(!r.ok() && r.error == NavError::kEndNotNavigable);
 }
 
 // 锁定直线成功、绕墙成功以及最终 Segment 复验。
-void TestStraightAndAroundWall()
+void testStraightAndAroundWall()
 {
-    auto               map = MakeMap(7, 5);
-    NavigationContext  ctx(map);
+    auto                    map = MakeMap(7, 5);
+    NavigationContext       ctx(map);
     const NavigationProfile p = Small();
-    auto straight        = GridPathfinder::FindPathStatic(ctx, p, P(250, 1250), P(3250, 1250));
+    auto straight             = GridPathfinder::findPathStatic(ctx, p, P(250, 1250), P(3250, 1250));
     assert(straight.ok());
     assert(straight.value.count() == 2); // 开阔直线的中间 Grid 点已被平滑掉。
 
@@ -237,23 +303,23 @@ void TestStraightAndAroundWall()
     }
     auto              wall = MakeMapFromCells(7, 5, std::move(cells));
     NavigationContext wall_ctx(wall);
-    auto around = GridPathfinder::FindPathStatic(wall_ctx, p, P(250, 250), P(3250, 250));
+    auto around = GridPathfinder::findPathStatic(wall_ctx, p, P(250, 250), P(3250, 250));
     assert(around.ok());
     assert(around.value.count() >= 3);
-    assert(GridPathfinder::ValidatePathStatic(wall_ctx, p, around.value).ok());
+    assert(GridPathfinder::validatePathStatic(wall_ctx, p, around.value).ok());
 }
 
 // A/B 位于同一 Cell 时不需要搜索多个 Node，但正式 Path 仍必须到达精确 B。
-void TestSameCellExactEndpoints()
+void testSameCellExactEndpoints()
 {
     auto              map = MakeMap(2, 2);
     NavigationContext ctx(map);
-    const auto result = GridPathfinder::FindPathStatic(ctx, Small(), P(100, 100), P(400, 400));
+    const auto result = GridPathfinder::findPathStatic(ctx, Small(), P(100, 100), P(400, 400));
     assert(result.ok() && result.value.count() == 2);
-    assert(result.value.WorldPoint(0).x_mm == 100);
-    assert(result.value.WorldPoint(0).z_mm == 100);
-    assert(result.value.WorldPoint(1).x_mm == 400);
-    assert(result.value.WorldPoint(1).z_mm == 400);
+    assert(result.value.worldPoint(0).x_mm == 100);
+    assert(result.value.worldPoint(0).z_mm == 100);
+    assert(result.value.worldPoint(1).x_mm == 400);
+    assert(result.value.worldPoint(1).z_mm == 400);
 }
 
 // 障碍迫使 A* 采用一条可被格心直线等成本替代的路线；实际端点偏移时直线会切入阻挡格。
@@ -272,57 +338,57 @@ std::shared_ptr<const GridMap> MakeOffCenterEndpointMap()
 }
 
 // 起点靠近格边时，实际直线会偏离已验证的格心路线；锚点后仍可走完静态路径。
-void TestOffCenterStartAdvancesOnStaticPath()
+void testOffCenterStartAdvancesOnStaticPath()
 {
     const auto                    map = MakeOffCenterEndpointMap();
     NavigationContext             context(map);
-    const NavigationProfile            profile = Small();
+    const NavigationProfile       profile = Small();
     const DynamicNavigationPolicy policy{};
     const WorldPosition           start = P(250, 499);
     const WorldPosition           goal  = P(2250, 750);
-    const auto path = GridPathfinder::FindPathStatic(context, profile, start, goal);
+    const auto path = GridPathfinder::findPathStatic(context, profile, start, goal);
     assert(path.ok() && path.value.count() == 3);
-    assert(path.value.WorldPoint(0).z_mm == start.z_mm);
-    assert(path.value.WorldPoint(1).x_mm == 250 && path.value.WorldPoint(1).z_mm == 250);
-    assert(GridPathfinder::ValidatePathStatic(context, profile, path.value).ok());
+    assert(path.value.worldPoint(0).z_mm == start.z_mm);
+    assert(path.value.worldPoint(1).x_mm == 250 && path.value.worldPoint(1).z_mm == 250);
+    assert(GridPathfinder::validatePathStatic(context, profile, path.value).ok());
 
     const NavigationAgent agent{NavigationAgentHandle{501}, &profile};
-    assert(GridPathfinder::MoveUnit(context, agent, start, start, policy).ok());
+    assert(GridPathfinder::moveUnit(context, agent, start, start, policy).ok());
     PathFollowCursor cursor;
     const auto       advanced =
-        GridPathfinder::AdvancePath(context, agent, path.value, cursor, start, 5000, policy);
+        GridPathfinder::advancePath(context, agent, path.value, cursor, start, 5000, policy);
     assert(advanced.ok() && advanced.value.status == PathAdvanceStatus::kReached);
     assert(advanced.value.position.x_mm == goal.x_mm && advanced.value.position.z_mm == goal.z_mm);
 }
 
 // 终点靠近格边时，实际直线会切入已阻挡格；终点格心锚定后仍可走完静态路径。
-void TestOffCenterGoalAdvancesOnStaticPath()
+void testOffCenterGoalAdvancesOnStaticPath()
 {
     const auto                    map = MakeOffCenterEndpointMap();
     NavigationContext             context(map);
-    const NavigationProfile            profile = Small();
+    const NavigationProfile       profile = Small();
     const DynamicNavigationPolicy policy{};
     const WorldPosition           start = P(250, 250);
     const WorldPosition           goal  = P(2250, 501);
-    const auto path = GridPathfinder::FindPathStatic(context, profile, start, goal);
+    const auto path = GridPathfinder::findPathStatic(context, profile, start, goal);
     assert(path.ok() && path.value.count() == 3);
-    const auto &goal_anchor = path.value.WorldPoint(path.value.count() - 2);
+    const auto &goal_anchor = path.value.worldPoint(path.value.count() - 2);
     assert(goal_anchor.x_mm == 2250 && goal_anchor.z_mm == 750);
-    assert(path.value.WorldPoint(path.value.count() - 1).x_mm == goal.x_mm);
-    assert(path.value.WorldPoint(path.value.count() - 1).z_mm == goal.z_mm);
-    assert(GridPathfinder::ValidatePathStatic(context, profile, path.value).ok());
+    assert(path.value.worldPoint(path.value.count() - 1).x_mm == goal.x_mm);
+    assert(path.value.worldPoint(path.value.count() - 1).z_mm == goal.z_mm);
+    assert(GridPathfinder::validatePathStatic(context, profile, path.value).ok());
 
     const NavigationAgent agent{NavigationAgentHandle{502}, &profile};
-    assert(GridPathfinder::MoveUnit(context, agent, start, start, policy).ok());
+    assert(GridPathfinder::moveUnit(context, agent, start, start, policy).ok());
     PathFollowCursor cursor;
     const auto       advanced =
-        GridPathfinder::AdvancePath(context, agent, path.value, cursor, start, 5000, policy);
+        GridPathfinder::advancePath(context, agent, path.value, cursor, start, 5000, policy);
     assert(advanced.ok() && advanced.value.status == PathAdvanceStatus::kReached);
     assert(advanced.value.position.x_mm == goal.x_mm && advanced.value.position.z_mm == goal.z_mm);
 }
 
 // 锁定无路可达与 8-way 禁止切角规则。
-void TestNoPathAndCornerCutting()
+void testNoPathAndCornerCutting()
 {
     std::vector<NavCell> cells(9);
     for (auto &c : cells)
@@ -335,12 +401,12 @@ void TestNoPathAndCornerCutting()
     cells[Idx(3, 0, 1)].flags = 0;
     auto              map     = MakeMapFromCells(3, 3, std::move(cells));
     NavigationContext ctx(map);
-    auto              r = GridPathfinder::FindPathStatic(ctx, Small(), P(250, 250), P(750, 750));
+    auto              r = GridPathfinder::findPathStatic(ctx, Small(), P(250, 250), P(750, 750));
     assert(!r.ok() && r.error == NavError::kNoPath);
 }
 
 // 锁定 Agent clearance 差异和整数坡度拒绝。
-void TestClearanceAndSlope()
+void testClearanceAndSlope()
 {
     std::vector<NavCell> cells(15);
     for (auto &c : cells)
@@ -356,13 +422,13 @@ void TestClearanceAndSlope()
     auto              map = MakeMapFromCells(5, 3, cells);
     NavigationContext ctx_small(map);
     auto              small = Small();
-    assert(GridPathfinder::FindPathStatic(ctx_small, small, P(250, 750), P(2250, 750)).ok());
+    assert(GridPathfinder::findPathStatic(ctx_small, small, P(250, 750), P(2250, 750)).ok());
 
     auto large      = Small();
-    large.unit_id        = 2;
+    large.unit_id   = 2;
     large.radius_mm = 700; // required_clearance_cells = 2。
     NavigationContext ctx_large(map);
-    auto large_path = GridPathfinder::FindPathStatic(ctx_large, large, P(250, 750), P(2250, 750));
+    auto large_path = GridPathfinder::findPathStatic(ctx_large, large, P(250, 750), P(2250, 750));
     assert(!large_path.ok() && large_path.error == NavError::kNoPath);
 
     // 单独锁定 slope：1 个 500mm Cell 跨 1000mm 高差，max_step 放行但 slope 拒绝。
@@ -378,12 +444,12 @@ void TestClearanceAndSlope()
     slope_agent.max_step_mm        = 1500;
     slope_agent.max_slope_permille = 500;
     NavigationContext slope_ctx(slope_map);
-    auto slope = GridPathfinder::FindPathStatic(slope_ctx, slope_agent, P(250, 250), P(1250, 250));
+    auto slope = GridPathfinder::findPathStatic(slope_ctx, slope_agent, P(250, 250), P(1250, 250));
     assert(!slope.ok() && slope.error == NavError::kNoPath);
 }
 
 // 锁定 Area Cost 会改变最优路径，且 smoothing 不会切回高成本区域。
-void TestAreaCostChangesRoute()
+void testAreaCostChangesRoute()
 {
     const int            w = 7;
     const int            h = 3;
@@ -403,86 +469,86 @@ void TestAreaCostChangesRoute()
     auto p                  = Small();
     p.area_cost_permille[1] = 5000;
     NavigationContext ctx(map);
-    auto              r = GridPathfinder::FindPathStatic(ctx, p, P(250, 750), P(3250, 750));
+    auto              r = GridPathfinder::findPathStatic(ctx, p, P(250, 750), P(3250, 750));
     assert(r.ok());
     assert(r.value.count() >= 3); // 高成本直线不能被平滑成单条捷径。
 
     bool left_middle_row = false;
     for (std::size_t i = 0; i < r.value.count(); ++i)
     {
-        if (r.value.WorldPoint(i).z_mm != 750)
+        if (r.value.worldPoint(i).z_mm != 750)
         {
             left_middle_row = true;
         }
     }
     assert(left_middle_row);
 
-    assert(GridPathfinder::ValidatePathStatic(ctx, p, r.value).ok());
+    assert(GridPathfinder::validatePathStatic(ctx, p, r.value).ok());
 }
 
 // 锁定平滑只删合法拐点：动态绕行保留，穿过占位格的长 Segment 必须拒绝。
-void TestSmoothedPathSegments()
+void testSmoothedPathSegments()
 {
-    auto                  map = MakeMap(5, 3);
-    NavigationContext     ctx(map);
-    const NavigationProfile    profile = Small();
-    const NavigationAgent self{NavigationAgentHandle{10}, &profile};
-    const NavigationAgent blocker{NavigationAgentHandle{20}, &profile};
-    assert(ctx.occupancy().Move(self.handle, profile, GridPos{0, 1}).ok());
-    assert(ctx.occupancy().Move(blocker.handle, profile, GridPos{2, 1}).ok());
+    auto                    map = MakeMap(5, 3);
+    NavigationContext       ctx(map);
+    const NavigationProfile profile = Small();
+    const NavigationAgent   self{NavigationAgentHandle{10}, &profile};
+    const NavigationAgent   blocker{NavigationAgentHandle{20}, &profile};
+    assert(ctx.occupancy().move(self.handle, profile, GridPos{0, 1}).ok());
+    assert(ctx.occupancy().move(blocker.handle, profile, GridPos{2, 1}).ok());
 
     // 同一静态地图的直线可压成两个点；动态 blocker 只属于当前 Battle Context。
     const auto static_path =
-        GridPathfinder::FindPathStatic(ctx, profile, P(250, 750), P(2250, 750));
+        GridPathfinder::findPathStatic(ctx, profile, P(250, 750), P(2250, 750));
     assert(static_path.ok() && static_path.value.count() == 2);
-    assert(GridPathfinder::ValidatePathStatic(ctx, profile, static_path.value).ok());
+    assert(GridPathfinder::validatePathStatic(ctx, profile, static_path.value).ok());
 
     const auto detour =
-        GridPathfinder::FindPath(ctx, self, P(250, 750), P(2250, 750), ExclusivePolicy());
+        GridPathfinder::findPath(ctx, self, P(250, 750), P(2250, 750), ExclusivePolicy());
     assert(detour.ok() && detour.value.count() >= 3);
-    assert(GridPathfinder::ValidatePath(ctx, self, detour.value, ExclusivePolicy()).ok());
+    assert(GridPathfinder::validatePath(ctx, self, detour.value, ExclusivePolicy()).ok());
 
     // 手工构造“直接穿过 blocker”的长线段；构造 Path 本身不代表通过动态复验。
     const Path invalid(std::vector<WorldPosition>{P(250, 750), P(2250, 750)}, 2000);
-    assert(!GridPathfinder::ValidatePath(ctx, self, invalid, ExclusivePolicy()).ok());
+    assert(!GridPathfinder::validatePath(ctx, self, invalid, ExclusivePolicy()).ok());
 }
 
 // 运行时动态规则只属于设置它的 Battle Context；同地图的其他 Battle 不受影响。
-void TestBattleLocalDynamicEntryRules()
+void testBattleLocalDynamicEntryRules()
 {
-    auto                  map = MakeMap(3, 1);
-    NavigationContext     first(map);
-    NavigationContext     second(map);
-    const NavigationProfile    profile = Small();
-    const NavigationAgent mover{NavigationAgentHandle{100}, &profile};
-    const NavigationAgent blocker{NavigationAgentHandle{200}, &profile};
+    auto                    map = MakeMap(3, 1);
+    NavigationContext       first(map);
+    NavigationContext       second(map);
+    const NavigationProfile profile = Small();
+    const NavigationAgent   mover{NavigationAgentHandle{100}, &profile};
+    const NavigationAgent   blocker{NavigationAgentHandle{200}, &profile};
 
-    assert(first.occupancy().Move(blocker.handle, profile, GridPos{1, 0}).ok());
-    assert(second.occupancy().Move(blocker.handle, profile, GridPos{1, 0}).ok());
-    assert(first.AllowsDynamicEntry(GridPos{1, 0}));
-    assert(second.AllowsDynamicEntry(GridPos{1, 0}));
-    assert(first.SetCellDynamicEntryRule(GridPos{1, 0}, CellDynamicEntryRule::kBlock).ok());
-    assert(!first.AllowsDynamicEntry(GridPos{1, 0}));
-    assert(second.AllowsDynamicEntry(GridPos{1, 0}));
+    assert(first.occupancy().move(blocker.handle, profile, GridPos{1, 0}).ok());
+    assert(second.occupancy().move(blocker.handle, profile, GridPos{1, 0}).ok());
+    assert(first.allowsDynamicEntry(GridPos{1, 0}));
+    assert(second.allowsDynamicEntry(GridPos{1, 0}));
+    assert(first.setCellDynamicEntryRule(GridPos{1, 0}, CellDynamicEntryRule::kBlock).ok());
+    assert(!first.allowsDynamicEntry(GridPos{1, 0}));
+    assert(second.allowsDynamicEntry(GridPos{1, 0}));
 
     const auto allowed =
-        GridPathfinder::FindPath(first, mover, P(250, 250), P(1250, 250), SharedPolicy());
+        GridPathfinder::findPath(first, mover, P(250, 250), P(1250, 250), SharedPolicy());
     const auto blocked =
-        GridPathfinder::FindPath(second, mover, P(250, 250), P(1250, 250), SharedPolicy());
+        GridPathfinder::findPath(second, mover, P(250, 250), P(1250, 250), SharedPolicy());
     assert(!allowed.ok());
     assert(blocked.ok());
 
-    assert(first.SetCellDynamicEntryRule(GridPos{1, 0}, CellDynamicEntryRule::kAllow).ok());
-    assert(first.AllowsDynamicEntry(GridPos{1, 0}));
-    assert(first.SetCellDynamicEntryRule(GridPos{1, 0}, CellDynamicEntryRule::kDefault).ok());
-    assert(first.AllowsDynamicEntry(GridPos{1, 0}));
-    assert(!first.SetCellDynamicEntryRule(GridPos{3, 0}, CellDynamicEntryRule::kAllow).ok());
+    assert(first.setCellDynamicEntryRule(GridPos{1, 0}, CellDynamicEntryRule::kAllow).ok());
+    assert(first.allowsDynamicEntry(GridPos{1, 0}));
+    assert(first.setCellDynamicEntryRule(GridPos{1, 0}, CellDynamicEntryRule::kDefault).ok());
+    assert(first.allowsDynamicEntry(GridPos{1, 0}));
+    assert(!first.setCellDynamicEntryRule(GridPos{3, 0}, CellDynamicEntryRule::kAllow).ok());
     assert(
-        !first.SetCellDynamicEntryRule(GridPos{1, 0}, static_cast<CellDynamicEntryRule>(3)).ok());
+        !first.setCellDynamicEntryRule(GridPos{1, 0}, static_cast<CellDynamicEntryRule>(3)).ok());
 }
 
-// 锁定统一 Move、多个实体事实和冲突时保留旧位置。
-void TestDynamicOccupancyAndAtomicMove()
+// 锁定统一 move、多个实体事实和冲突时保留旧位置。
+void testDynamicOccupancyAndAtomicMove()
 {
     auto                  map = MakeMap(7, 3);
     NavigationContext     ctx(map);
@@ -490,37 +556,37 @@ void TestDynamicOccupancyAndAtomicMove()
     const NavigationAgent a{NavigationAgentHandle{100}, &p};
     const NavigationAgent c{NavigationAgentHandle{200}, &p};
 
-    assert(ctx.occupancy().Move(a.handle, p, GridPos{2, 1}).ok());
-    assert(ctx.occupancy().Move(c.handle, p, GridPos{4, 1}).ok());
-    assert(ctx.occupancy().IsBlocked(GridPos{2, 1}, NavigationAgentHandle{}));
-    assert(!ctx.occupancy().IsBlocked(GridPos{2, 1}, a.handle)); // 只忽略移动者自己。
+    assert(ctx.occupancy().move(a.handle, p, GridPos{2, 1}).ok());
+    assert(ctx.occupancy().move(c.handle, p, GridPos{4, 1}).ok());
+    assert(ctx.occupancy().isBlocked(GridPos{2, 1}, NavigationAgentHandle{}));
+    assert(!ctx.occupancy().isBlocked(GridPos{2, 1}, a.handle)); // 只忽略移动者自己。
 
     // a 先移入空格，再尝试移入 c 的格子。第二次失败后，a 必须仍在旧位置。
     const auto first_move =
-        GridPathfinder::MoveUnit(ctx, a, P(1250, 750), P(1750, 750), ExclusivePolicy());
+        GridPathfinder::moveUnit(ctx, a, P(1250, 750), P(1750, 750), ExclusivePolicy());
     assert(first_move.ok());
     const auto conflict =
-        GridPathfinder::MoveUnit(ctx, a, P(1750, 750), P(2250, 750), ExclusivePolicy());
+        GridPathfinder::moveUnit(ctx, a, P(1750, 750), P(2250, 750), ExclusivePolicy());
     assert(!conflict.ok());
-    assert(ctx.occupancy().FirstOccupantAt(GridPos{3, 1}) == a.handle);
-    assert(ctx.occupancy().FirstOccupantAt(GridPos{4, 1}) == c.handle);
+    assert(ctx.occupancy().firstOccupantAt(GridPos{3, 1}) == a.handle);
+    assert(ctx.occupancy().firstOccupantAt(GridPos{4, 1}) == c.handle);
 }
 
 // 业务允许共存时提交两个真实 owner；较大半径仍须检查整个目标 footprint。
-void TestSharedCellAndRadiusFootprint()
+void testSharedCellAndRadiusFootprint()
 {
-    auto                  map = MakeMap(5, 5);
-    NavigationContext     ctx(map);
-    const NavigationProfile    small = Small();
-    const NavigationAgent first{NavigationAgentHandle{100}, &small};
-    const NavigationAgent second{NavigationAgentHandle{200}, &small};
-    assert(ctx.occupancy().Move(first.handle, small, GridPos{2, 2}).ok());
-    assert(ctx.occupancy().Move(second.handle, small, GridPos{3, 2}).ok());
+    auto                    map = MakeMap(5, 5);
+    NavigationContext       ctx(map);
+    const NavigationProfile small = Small();
+    const NavigationAgent   first{NavigationAgentHandle{100}, &small};
+    const NavigationAgent   second{NavigationAgentHandle{200}, &small};
+    assert(ctx.occupancy().move(first.handle, small, GridPos{2, 2}).ok());
+    assert(ctx.occupancy().move(second.handle, small, GridPos{3, 2}).ok());
     const auto moved =
-        GridPathfinder::MoveUnit(ctx, second, P(1750, 1250), P(1250, 1250), SharedPolicy());
+        GridPathfinder::moveUnit(ctx, second, P(1750, 1250), P(1250, 1250), SharedPolicy());
     assert(moved.ok());
     std::uint32_t count = 0;
-    assert(ctx.occupancy().ForEachOccupant(GridPos{2, 2},
+    assert(ctx.occupancy().forEachOccupant(GridPos{2, 2},
                                            [&](NavigationAgentHandle)
                                            {
                                                ++count;
@@ -530,14 +596,14 @@ void TestSharedCellAndRadiusFootprint()
 
     NavigationProfile large = Small();
     large.unit_id           = 2;
-    large.radius_mm    = 500;
-    assert(ctx.occupancy().IsFootprintBlocked(large, GridPos{3, 2}, second.handle));
-    assert(!ctx.occupancy().ForEachFootprintCell(large, GridPos{4, 4},
+    large.radius_mm         = 500;
+    assert(ctx.occupancy().isFootprintBlocked(large, GridPos{3, 2}, second.handle));
+    assert(!ctx.occupancy().forEachFootprintCell(large, GridPos{4, 4},
                                                  [](const GridPos &) { return true; }));
 }
 
 // 缓存 Path 生成后，两个对角侧格可能被其他单位占据；提交移动时仍必须拒绝切角。
-void TestMoveRevalidatesDynamicCorner()
+void testMoveRevalidatesDynamicCorner()
 {
     auto                  map = MakeMap(3, 3);
     NavigationContext     ctx(map);
@@ -545,105 +611,105 @@ void TestMoveRevalidatesDynamicCorner()
     const NavigationAgent self{NavigationAgentHandle{10}, &p};
     const NavigationAgent side_x{NavigationAgentHandle{20}, &p};
     const NavigationAgent side_z{NavigationAgentHandle{30}, &p};
-    assert(ctx.occupancy().Move(self.handle, p, GridPos{0, 0}).ok());
-    assert(ctx.occupancy().Move(side_x.handle, p, GridPos{1, 0}).ok());
-    assert(ctx.occupancy().Move(side_z.handle, p, GridPos{0, 1}).ok());
+    assert(ctx.occupancy().move(self.handle, p, GridPos{0, 0}).ok());
+    assert(ctx.occupancy().move(side_x.handle, p, GridPos{1, 0}).ok());
+    assert(ctx.occupancy().move(side_z.handle, p, GridPos{0, 1}).ok());
 
     const auto moved =
-        GridPathfinder::MoveUnit(ctx, self, P(250, 250), P(750, 750), ExclusivePolicy());
+        GridPathfinder::moveUnit(ctx, self, P(250, 250), P(750, 750), ExclusivePolicy());
     assert(!moved.ok());
-    assert(ctx.occupancy().FirstOccupantAt(GridPos{0, 0}) == self.handle);
-    assert(!ctx.occupancy().FirstOccupantAt(GridPos{1, 1}).valid());
+    assert(ctx.occupancy().firstOccupantAt(GridPos{0, 0}) == self.handle);
+    assert(!ctx.occupancy().firstOccupantAt(GridPos{1, 1}).valid());
 }
 
 // 目标中心被占用时，范围查询必须停在指定距离内的其他合法 Cell。
-void TestFindPathToOccupiedTargetRange()
+void testFindPathToOccupiedTargetRange()
 {
     auto                  map = MakeMap(7, 3);
     NavigationContext     ctx(map);
     auto                  p = Small();
     const NavigationAgent self{NavigationAgentHandle{10}, &p};
     const NavigationAgent target{NavigationAgentHandle{20}, &p};
-    assert(ctx.occupancy().Move(self.handle, p, GridPos{0, 1}).ok());
-    assert(ctx.occupancy().Move(target.handle, p, GridPos{5, 1}).ok());
+    assert(ctx.occupancy().move(self.handle, p, GridPos{0, 1}).ok());
+    assert(ctx.occupancy().move(target.handle, p, GridPos{5, 1}).ok());
 
-    const auto result = GridPathfinder::FindPathToRange(ctx, self, P(250, 750), P(2750, 750), 750,
+    const auto result = GridPathfinder::findPathToRange(ctx, self, P(250, 750), P(2750, 750), 750,
                                                         ExclusivePolicy());
     assert(result.ok());
-    assert(GridPathfinder::ValidatePath(ctx, self, result.value, ExclusivePolicy()).ok());
+    assert(GridPathfinder::validatePath(ctx, self, result.value, ExclusivePolicy()).ok());
 
-    const WorldPosition &endpoint      = result.value.WorldPoint(result.value.count() - 1);
-    const auto           endpoint_grid = map->WorldToGrid(endpoint);
+    const WorldPosition &endpoint      = result.value.worldPoint(result.value.count() - 1);
+    const auto           endpoint_grid = map->worldToGrid(endpoint);
     assert(endpoint_grid.ok());
     assert(!(endpoint_grid.value.x == 5 && endpoint_grid.value.z == 1));
     const std::int64_t dx = static_cast<std::int64_t>(endpoint.x_mm) - 2750;
     const std::int64_t dz = static_cast<std::int64_t>(endpoint.z_mm) - 750;
     assert(dx * dx + dz * dz <= 750LL * 750LL);
     const auto no_room =
-        GridPathfinder::FindPathToRange(ctx, self, P(250, 750), P(2750, 750), 0, ExclusivePolicy());
+        GridPathfinder::findPathToRange(ctx, self, P(250, 750), P(2750, 750), 0, ExclusivePolicy());
     assert(!no_room.ok());
 }
 
 // 范围 goal 的 Cell Center 合格时，真实起点仍可能位于同 Cell 的查询范围外。
 // 这种情况下必须返回可移动的 Center 终点；真实起点已在范围内则保持单点 Path。
-void TestRangeGoalUsesActualStartPosition()
+void testRangeGoalUsesActualStartPosition()
 {
     auto                  map = MakeMap(3, 1);
     NavigationContext     ctx(map);
     auto                  profile = Small();
     const NavigationAgent self{NavigationAgentHandle{10}, &profile};
-    assert(ctx.occupancy().Move(self.handle, profile, GridPos{0, 0}).ok());
+    assert(ctx.occupancy().move(self.handle, profile, GridPos{0, 0}).ok());
 
-    const auto outside = GridPathfinder::FindPathToRange(ctx, self, P(100, 250), P(400, 250), 200,
+    const auto outside = GridPathfinder::findPathToRange(ctx, self, P(100, 250), P(400, 250), 200,
                                                          ExclusivePolicy());
     assert(outside.ok());
     assert(outside.value.count() == 2);
-    assert(outside.value.WorldPoint(0).x_mm == 100);
-    assert(outside.value.WorldPoint(1).x_mm == 250);
-    assert(GridPathfinder::ValidatePath(ctx, self, outside.value, ExclusivePolicy()).ok());
+    assert(outside.value.worldPoint(0).x_mm == 100);
+    assert(outside.value.worldPoint(1).x_mm == 250);
+    assert(GridPathfinder::validatePath(ctx, self, outside.value, ExclusivePolicy()).ok());
 
-    const auto inside = GridPathfinder::FindPathToRange(ctx, self, P(300, 250), P(400, 250), 200,
+    const auto inside = GridPathfinder::findPathToRange(ctx, self, P(300, 250), P(400, 250), 200,
                                                         ExclusivePolicy());
     assert(inside.ok());
     assert(inside.value.count() == 1);
-    assert(inside.value.WorldPoint(0).x_mm == 300);
+    assert(inside.value.worldPoint(0).x_mm == 300);
 }
 // 锁定负世界坐标使用 floor 归格，负数不等于越界。
-void TestNegativeWorldCoordinates()
+void testNegativeWorldCoordinates()
 {
     auto              map = MakeMap(4, 4, -1000, -1000);
     NavigationContext ctx(map);
-    auto              r = GridPathfinder::FindPathStatic(ctx, Small(), P(-750, -750), P(750, 750));
+    auto              r = GridPathfinder::findPathStatic(ctx, Small(), P(-750, -750), P(750, 750));
     assert(r.ok());
-    assert(r.value.WorldPoint(0).x_mm == -750);
-    assert(r.value.WorldPoint(0).z_mm == -750);
+    assert(r.value.worldPoint(0).x_mm == -750);
+    assert(r.value.worldPoint(0).z_mm == -750);
 }
 
 // 在同一 Context 重复查询，锁定 generation 复用与稳定 tie-break。
-void TestDeterministicRepeatedQuery()
+void testDeterministicRepeatedQuery()
 {
     auto              map = MakeMap(20, 20);
     NavigationContext ctx(map);
-    auto first = GridPathfinder::FindPathStatic(ctx, Small(), P(250, 250), P(9250, 9250));
+    auto first = GridPathfinder::findPathStatic(ctx, Small(), P(250, 250), P(9250, 9250));
     assert(first.ok());
     for (int i = 0; i < 100; ++i)
     {
-        auto next = GridPathfinder::FindPathStatic(ctx, Small(), P(250, 250), P(9250, 9250));
+        auto next = GridPathfinder::findPathStatic(ctx, Small(), P(250, 250), P(9250, 9250));
         assert(next.ok());
         AssertSamePath(first.value, next.value);
     }
 }
 
 // 多线程只共享 immutable map，各线程 Context 独占；结果必须与 baseline 一致。
-void TestIndependentContextsConcurrent()
+void testIndependentContextsConcurrent()
 {
-    auto                map   = MakeMap(64, 64);
-    const NavigationProfile  p     = Small();
-    const WorldPosition start = P(250, 250);
-    const WorldPosition end   = P(31750, 31750);
+    auto                    map   = MakeMap(64, 64);
+    const NavigationProfile p     = Small();
+    const WorldPosition     start = P(250, 250);
+    const WorldPosition     end   = P(31750, 31750);
 
     NavigationContext baseline_ctx(map);
-    auto              baseline = GridPathfinder::FindPathStatic(baseline_ctx, p, start, end);
+    auto              baseline = GridPathfinder::findPathStatic(baseline_ctx, p, start, end);
     assert(baseline.ok());
 
     const int                thread_count = 8;
@@ -660,22 +726,22 @@ void TestIndependentContextsConcurrent()
                 NavigationContext local(map);
                 for (int i = 0; i < iterations; ++i)
                 {
-                    auto r = GridPathfinder::FindPathStatic(local, p, start, end);
+                    auto r = GridPathfinder::findPathStatic(local, p, start, end);
                     if (!r.ok())
                     {
                         ok[t] = 0;
                         return;
                     }
                     if (r.value.count() != baseline.value.count() ||
-                        r.value.length_mm() != baseline.value.length_mm())
+                        r.value.lengthMm() != baseline.value.lengthMm())
                     {
                         ok[t] = 0;
                         return;
                     }
                     for (std::size_t point = 0; point < r.value.count(); ++point)
                     {
-                        const auto &a = baseline.value.WorldPoint(point);
-                        const auto &b = r.value.WorldPoint(point);
+                        const auto &a = baseline.value.worldPoint(point);
+                        const auto &b = r.value.worldPoint(point);
                         if (a.x_mm != b.x_mm || a.y_mm != b.y_mm || a.z_mm != b.z_mm)
                         {
                             ok[t] = 0;
@@ -706,21 +772,21 @@ void testUnitRangeAndPartial()
     const NavigationAgent mover{NavigationAgentHandle{101}, &mover_profile};
     const auto            start  = P(250, 1250);
     const auto            target = P(3250, 1250);
-    assert(ctx.occupancy().Move(mover.handle, mover_profile, GridPos{0, 2}).ok());
-    assert(ctx.occupancy().Move(NavigationAgentHandle{102}, target_profile, GridPos{6, 2}).ok());
+    assert(ctx.occupancy().move(mover.handle, mover_profile, GridPos{0, 2}).ok());
+    assert(ctx.occupancy().move(NavigationAgentHandle{102}, target_profile, GridPos{6, 2}).ok());
     for (auto policy : {DynamicNavigationPolicy{}, ExclusivePolicy()})
     {
-        auto edge = GridPathfinder::findPathToUnitRange(ctx, mover, start, target_profile, target,
-                                                        policy);
+        auto edge =
+            GridPathfinder::findPathToUnitRange(ctx, mover, start, target_profile, target, policy);
         assert(edge.ok());
-        const auto end = edge.value.WorldPoint(edge.value.count() - 1);
+        const auto end = edge.value.worldPoint(edge.value.count() - 1);
         const auto dx  = static_cast<std::int64_t>(end.x_mm) - target.x_mm;
         const auto dz  = static_cast<std::int64_t>(end.z_mm) - target.z_mm;
         assert(dx * dx + dz * dz >= 900LL * 900LL);
         assert(dx * dx + dz * dz <= 1608LL * 1608LL);
-        assert(GridPathfinder::ValidatePath(ctx, mover, edge.value, policy).ok());
-        auto zero = GridPathfinder::findPathToUnitRange(ctx, mover, start, target_profile, target,
-                                                        policy);
+        assert(GridPathfinder::validatePath(ctx, mover, edge.value, policy).ok());
+        auto zero =
+            GridPathfinder::findPathToUnitRange(ctx, mover, start, target_profile, target, policy);
         assert(zero.ok());
         assert(std::string(zero.value.status()) == "reached");
     }
@@ -731,26 +797,26 @@ void testUnitRangeAndPartial()
     for (int z = 0; z < 5; ++z)
     {
         assert(wall.occupancy()
-                   .Move(NavigationAgentHandle{static_cast<std::uint32_t>(300 + z)}, small,
+                   .move(NavigationAgentHandle{static_cast<std::uint32_t>(300 + z)}, small,
                          GridPos{3, z})
                    .ok());
     }
-    auto full = GridPathfinder::FindPathToRange(wall, walker, start, target, 0, ExclusivePolicy());
+    auto full = GridPathfinder::findPathToRange(wall, walker, start, target, 0, ExclusivePolicy());
     assert(!full.ok() && full.error == NavError::kNoPath);
     auto partial =
-        GridPathfinder::FindPathToRange(wall, walker, start, target, 0, ExclusivePolicy(), true);
+        GridPathfinder::findPathToRange(wall, walker, start, target, 0, ExclusivePolicy(), true);
     assert(partial.ok() && std::string(partial.value.status()) == "partial");
-    const auto end = partial.value.WorldPoint(partial.value.count() - 1);
+    const auto end = partial.value.worldPoint(partial.value.count() - 1);
     assert(end.x_mm == 1250 && end.z_mm == 1250);
-    assert(GridPathfinder::ValidatePath(wall, walker, partial.value, ExclusivePolicy()).ok());
+    assert(GridPathfinder::validatePath(wall, walker, partial.value, ExclusivePolicy()).ok());
     auto stalled =
-        GridPathfinder::FindPathToRange(wall, walker, end, target, 0, ExclusivePolicy(), true);
+        GridPathfinder::findPathToRange(wall, walker, end, target, 0, ExclusivePolicy(), true);
     assert(!stalled.ok() && stalled.error == NavError::kNoPath);
     const auto blocked_target = P(1750, 1250);
-    assert(!GridPathfinder::FindPath(wall, walker, start, blocked_target, ExclusivePolicy()).ok());
-    assert(GridPathfinder::FindPath(wall, walker, start, blocked_target, ExclusivePolicy(), true)
+    assert(!GridPathfinder::findPath(wall, walker, start, blocked_target, ExclusivePolicy()).ok());
+    assert(GridPathfinder::findPath(wall, walker, start, blocked_target, ExclusivePolicy(), true)
                .ok());
-    assert(!GridPathfinder::FindPathToRange(wall, walker, P(-1, 250), target, 0, ExclusivePolicy(),
+    assert(!GridPathfinder::findPathToRange(wall, walker, P(-1, 250), target, 0, ExclusivePolicy(),
                                             true)
                 .ok());
 }
@@ -759,22 +825,24 @@ int main()
 {
     // 先验证基本坐标/通行，再验证平滑与动态状态，最后验证重复查询和并发隔离。
     // 每个 case 用 assert 锁定可观察行为；Debug 构建确保断言实际执行。
-    TestNavigationProfileRegistry();
-    TestBoundsAndBlockedEndpoints();
-    TestStraightAndAroundWall();
-    TestSameCellExactEndpoints();
-    TestOffCenterStartAdvancesOnStaticPath();
-    TestOffCenterGoalAdvancesOnStaticPath();
-    TestNoPathAndCornerCutting();
-    TestClearanceAndSlope();
-    TestAreaCostChangesRoute();
-    TestSmoothedPathSegments();
-    TestBattleLocalDynamicEntryRules();
-    TestDynamicOccupancyAndAtomicMove();
-    TestSharedCellAndRadiusFootprint();
-    TestMoveRevalidatesDynamicCorner();
-    TestFindPathToOccupiedTargetRange();
-    TestRangeGoalUsesActualStartPosition();
+    testNavigationProfileRegistry();
+    testProfileReplacementWithActiveContexts();
+    testInvalidNativeProfiles();
+    testBoundsAndBlockedEndpoints();
+    testStraightAndAroundWall();
+    testSameCellExactEndpoints();
+    testOffCenterStartAdvancesOnStaticPath();
+    testOffCenterGoalAdvancesOnStaticPath();
+    testNoPathAndCornerCutting();
+    testClearanceAndSlope();
+    testAreaCostChangesRoute();
+    testSmoothedPathSegments();
+    testBattleLocalDynamicEntryRules();
+    testDynamicOccupancyAndAtomicMove();
+    testSharedCellAndRadiusFootprint();
+    testMoveRevalidatesDynamicCorner();
+    testFindPathToOccupiedTargetRange();
+    testRangeGoalUsesActualStartPosition();
     testUnitRangeAndPartial();
     // 新范围/partial 查询没有共享 scratch；相同请求在独立 Context 可并行执行。
     std::vector<std::thread> range_threads;
@@ -786,9 +854,9 @@ int main()
     {
         thread.join();
     }
-    TestNegativeWorldCoordinates();
-    TestDeterministicRepeatedQuery();
-    TestIndependentContextsConcurrent();
+    testNegativeWorldCoordinates();
+    testDeterministicRepeatedQuery();
+    testIndependentContextsConcurrent();
 
     std::cout << "ALL_TESTS_OK\n";
     return 0;

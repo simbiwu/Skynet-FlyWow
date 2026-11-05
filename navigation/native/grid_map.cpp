@@ -26,7 +26,7 @@ GridMap::GridMap(BMapMetadata metadata, std::vector<NavCell> cells, AirAsset air
     }
 }
 
-std::size_t GridMap::memory_bytes() const noexcept
+std::size_t GridMap::memoryBytes() const noexcept
 {
     // capacity 包含已经预留但未使用的空间，size 只计有效元素；这里估算占用，
     // 不包含分配器开销，也不是进程的实测内存。
@@ -37,7 +37,7 @@ std::size_t GridMap::memory_bytes() const noexcept
 
 // ---- 坐标转换：世界毫米位置与地图内部格下标 ----
 
-NavResult<GridPos> GridMap::WorldToGrid(const WorldPosition &world) const
+NavResult<GridPos> GridMap::worldToGrid(const WorldPosition &world) const
 {
     // BMAP V1 的地图原点仍是 int32；先拒绝其可表达范围之外的坐标，
     // 让后续 int64 相减安全，且不把超大业务坐标误映射进有限 Grid。
@@ -46,7 +46,7 @@ NavResult<GridPos> GridMap::WorldToGrid(const WorldPosition &world) const
         world.z_mm < std::numeric_limits<std::int32_t>::min() ||
         world.z_mm > std::numeric_limits<std::int32_t>::max())
     {
-        return NavResult<GridPos>::Failure(NavError::kOutOfBounds,
+        return NavResult<GridPos>::failure(NavError::kOutOfBounds,
                                            "world position outside BMAP V1 coordinate range");
     }
 
@@ -58,14 +58,14 @@ NavResult<GridPos> GridMap::WorldToGrid(const WorldPosition &world) const
     // 先减地图原点再归格。原点 -500mm、格边 500mm 时，世界 X=-250 属于第 0 格；
     // 世界 X=-501 则在原点外，必须得到 -1，而不能被整数截断误算到第 0 格。
     // Y 不参与二维归格；地图地表高度由对应 Cell 提供。
-    const std::int64_t grid_x = FloorDiv(relative_x, metadata_.cell_size_mm);
-    const std::int64_t grid_z = FloorDiv(relative_z, metadata_.cell_size_mm);
+    const std::int64_t grid_x = floorDiv(relative_x, metadata_.cell_size_mm);
+    const std::int64_t grid_z = floorDiv(relative_z, metadata_.cell_size_mm);
     if (grid_x < std::numeric_limits<std::int32_t>::min() ||
         grid_x > std::numeric_limits<std::int32_t>::max() ||
         grid_z < std::numeric_limits<std::int32_t>::min() ||
         grid_z > std::numeric_limits<std::int32_t>::max())
     {
-        return NavResult<GridPos>::Failure(NavError::kOutOfBounds,
+        return NavResult<GridPos>::failure(NavError::kOutOfBounds,
                                            "world coordinate cannot be represented as GridPos");
     }
 
@@ -73,26 +73,26 @@ NavResult<GridPos> GridMap::WorldToGrid(const WorldPosition &world) const
         static_cast<std::int32_t>(grid_x),
         static_cast<std::int32_t>(grid_z),
     };
-    if (!Contains(grid))
+    if (!contains(grid))
     {
-        return NavResult<GridPos>::Failure(NavError::kOutOfBounds,
+        return NavResult<GridPos>::failure(NavError::kOutOfBounds,
                                            "world position outside map bounds");
     }
 
-    return NavResult<GridPos>::Success(grid);
+    return NavResult<GridPos>::success(grid);
 }
 
-NavResult<WorldPosition> GridMap::GridToWorldCenter(const GridPos &grid) const
+NavResult<WorldPosition> GridMap::gridToWorldCenter(const GridPos &grid) const
 {
-    if (!Contains(grid))
+    if (!contains(grid))
     {
-        return NavResult<WorldPosition>::Failure(NavError::kOutOfBounds,
+        return NavResult<WorldPosition>::failure(NavError::kOutOfBounds,
                                                  "grid position outside map bounds");
     }
 
     // 返回格中心而不是左下角：origin=0、cell_size=500、grid.x=1 时 X=750mm。
     // 奇数边长的半格按整数除法截断；Y 始终来自地图，不从请求坐标复制。
-    const NavCell     &cell = cells_[IndexOf(grid)];
+    const NavCell     &cell = cells_[indexOf(grid)];
     const std::int64_t x    = static_cast<std::int64_t>(metadata_.origin_x_mm) +
                            static_cast<std::int64_t>(grid.x) * metadata_.cell_size_mm +
                            metadata_.cell_size_mm / 2;
@@ -104,10 +104,10 @@ NavResult<WorldPosition> GridMap::GridToWorldCenter(const GridPos &grid) const
         z < std::numeric_limits<std::int32_t>::min() ||
         z > std::numeric_limits<std::int32_t>::max())
     {
-        return NavResult<WorldPosition>::Failure(NavError::kSizeOverflow, "grid center overflow");
+        return NavResult<WorldPosition>::failure(NavError::kSizeOverflow, "grid center overflow");
     }
 
-    return NavResult<WorldPosition>::Success(WorldPosition{
+    return NavResult<WorldPosition>::success(WorldPosition{
         x,
         cell.height_mm,
         z,
@@ -116,29 +116,29 @@ NavResult<WorldPosition> GridMap::GridToWorldCenter(const GridPos &grid) const
 
 // ---- 只读 Cell 查询与不可变进入配置 ----
 
-NavResult<NavCell> GridMap::QueryWorld(const WorldPosition &world) const
+NavResult<NavCell> GridMap::queryWorld(const WorldPosition &world) const
 {
-    NavResult<GridPos> grid = WorldToGrid(world);
+    NavResult<GridPos> grid = worldToGrid(world);
     if (!grid.ok())
     {
-        return NavResult<NavCell>::Failure(grid.error, grid.detail);
+        return NavResult<NavCell>::failure(grid.error, grid.detail);
     }
 
-    return NavResult<NavCell>::Success(cells_[IndexOf(grid.value)]);
+    return NavResult<NavCell>::success(cells_[indexOf(grid.value)]);
 }
 
-const NavCell *GridMap::TryCell(const GridPos &grid) const noexcept
+const NavCell *GridMap::tryCell(const GridPos &grid) const noexcept
 {
-    if (!Contains(grid))
+    if (!contains(grid))
     {
         return nullptr;
     }
-    return &cells_[IndexOf(grid)];
+    return &cells_[indexOf(grid)];
 }
 
 // ---- 内部边界与索引：先确认范围，再读连续数组 ----
 
-bool GridMap::Contains(const GridPos &grid) const noexcept
+bool GridMap::contains(const GridPos &grid) const noexcept
 {
     // 先排除负数再转无符号数比较。右/上边界不包含在地图内，
     // 例如宽 2 格只允许 x=0、1，x=2 已属于地图外。
@@ -146,13 +146,13 @@ bool GridMap::Contains(const GridPos &grid) const noexcept
            static_cast<std::uint32_t>(grid.z) < metadata_.height;
 }
 
-std::size_t GridMap::IndexOf(const GridPos &grid) const noexcept
+std::size_t GridMap::indexOf(const GridPos &grid) const noexcept
 {
     // 每行按 X 排列，再沿 Z 排行；宽 3 时 (2,1) 的下标为 5。
     return static_cast<std::size_t>(grid.z) * metadata_.width + static_cast<std::size_t>(grid.x);
 }
 
-std::int64_t GridMap::FloorDiv(std::int64_t value, std::int64_t divisor)
+std::int64_t GridMap::floorDiv(std::int64_t value, std::int64_t divisor)
 {
     if (divisor <= 0)
     {

@@ -24,23 +24,23 @@ class MapRegistry final
   public:
     /// 返回进程级 Registry；首次初始化由 C++ 保证线程安全。
     /// @return 进程唯一的地图 Registry。
-    static MapRegistry &Instance();
+    static MapRegistry &instance();
 
     /// 读取并校验完整 BMAP，然后按 map_id 替换当前地图。
     /// 文件 I/O 和校验在锁外执行；已有 Context 持有旧 shared_ptr，不受替换影响。
     /// @param path BMAP 资产文件路径。
     /// @return 当前加载的 immutable 地图；文件错误时返回具体 NavError。
-    NavResult<std::shared_ptr<const GridMap>> Load(const std::string &path,
+    NavResult<std::shared_ptr<const GridMap>> load(const std::string &path,
                                                    const std::string &air_path = {});
 
     /// 按 map_id 取得当前地图；map_version 不参与资产选择。
     /// @param map_id BMAP Header 中的业务地图 ID。
     /// @return 共享所有权的 immutable 地图；不存在时返回 kMapNotFound。
-    NavResult<std::shared_ptr<const GridMap>> Find(std::uint32_t map_id) const;
+    NavResult<std::shared_ptr<const GridMap>> find(std::uint32_t map_id) const;
 
     /// 返回 Registry 当前保存的不同 map_id 数量。
     /// @return 当前地图数量。
-    std::size_t map_count() const;
+    std::size_t mapCount() const;
 
   private:
     MapRegistry() = default;

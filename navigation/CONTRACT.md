@@ -14,7 +14,7 @@ Native/Lua 使用整数毫米世界坐标 `{x_mm,y_mm,z_mm}`。X/Z 决定归格�
 | --- | --- | --- |
 | load_map(path[,airnav_path]) | {map_id,map_version,content_sha256} | 校验后按 map_id 替换当前地图；已有 Context 继续持有旧地图 |
 | `query_cell(id,version,worldPosition)` | Cell 查询 record | 只读查询；返回 grid 调试下标、高度、Area、Clearance、walkable |
-| load_navigation_profiles(profiles) | 成功布尔值 | 校验连续 ID 后替换当前导航表；正在执行的同步调用保留其短期快照 |
+| load_navigation_profiles(profiles) | 成功布尔值 | 校验唯一非零 ID（允许空洞）后替换当前表；有活跃 Context 返回 PROFILES_IN_USE |
 | new_context(map_id[,air_limits]) | Context userdata | 固定当前地图；每场 Battle 独占 scratch 与动态占位，Profile 每次操作按 unit_id 查当前 Registry |
 | `context:set_cell_rule(x,z,rule)` | 成功布尔值 | 运行时设置当前 Battle 单格重叠规则；不影响其它 Context |
 | `context:find_path(...)` | Path userdata | 按 Agent 静态规则与当前动态事实规划路径 |
@@ -33,7 +33,7 @@ Native/Lua 使用整数毫米世界坐标 `{x_mm,y_mm,z_mm}`。X/Z 决定归格�
 
 ## 状态归属
 
-MapRegistry 按 map_id 只保存当前只读 GridMap；NavigationProfileRegistry 保存当前导航配置。启动时主动加载配置中的全部地图和完整导航 Profile 表。运行期重新调用 load_map 或 load_navigation_profiles 可替换当前表；地图由 Context 固定持有，Profile 则在每次同步导航操作时短暂持有当前不可变表并按 unit_id 二分查找，替换不会让本次调用失效。UnitProfile 是独立 sharedata 业务配置，Native Navigation 不读取它。每个 Context 只拥有自己的 Node/Heap scratch、occupancy 和稀疏动态规则；单个 Context 必须由一个执行 owner 顺序使用，不同 Battle 不共享这些可变状态。
+MapRegistry 按 map_id 只保存当前只读 GridMap；NavigationProfileRegistry 保存当前导航配置。启动时主动加载配置中的全部地图和完整导航 Profile 表。运行期 load_map 可替换当前地图；已有 Context 继续持有旧地图。load_navigation_profiles 仅在没有活跃 Context 时允许发布：任何尚未 close/析构的 Context（包括纯空中会话）都会返回 PROFILES_IN_USE，旧配置和占位保持不变。发布检查与 Context 登记/注销共用 Registry 锁。Profile 仍在每次同步操作时短暂持有并按 unit_id 二分查找，不为 Context 另存配置快照。UnitProfile 是独立 sharedata 业务配置，Native Navigation 不读取它。每个 Context 只拥有自己的 Node/Heap scratch、occupancy 和稀疏动态规则；单个 Context 必须由一个执行 owner 顺序使用，不同 Battle 不共享这些可变状态。
 
 静态 Clearance 是 Bake 后到障碍和边界的保守格距，动态单位不会重写它。动态 footprint 与可通行规则在规划和移动时另外验证；旧 Path 不能直接授权移动。Clearance、footprint、A*、区域 Dijkstra、smoothing 和逐格移动复验的推导、例子及不变量保留在对应源码注释中。
 
@@ -114,7 +114,7 @@ body 为非负 uint32 `{radius_mm,half_height_mm}`，代表 XZ 对称轴对齐�
 
 A* 固定 1000/1414 直/斜成本、固定邻居顺序；同 f 优先较大 g，再按格号。每条参与松弛的边、起终点连接及平滑都使用完整扫掠，斜走不穿角。查询返回的尺寸、高度和静态快照随 Path 保存，不能混用 ground/air 推进。Path 不借用 scratch，也不管理动态对象。动态变化之后每次移动仍复验，不自动重规划。
 
-推进按整数平方根向下取整的 XZ 段长累计 stride，插值向段起点截断；不是每轴独立走 stride。对象必须匹配 Path 的盒尺寸、固定高度和 cursor 实际位置。已完成段逐段提交，后段 BLOCKED 返回成功的 blocked 结果及合法前缀；预算失败返回明确错误，合法前缀和 cursor 同样保留，Lua error.position 给出实际已提交位置。单次 move 失败旧 AABB/索引不变。set/move 先准备所有关联及分配，再提交；分配/容量失败保留旧状态。
+推进按整数平方根向下取整的 XZ 段长累计 stride，插值向段起点截断；不是每轴独立走 stride。对象必须匹配 Path 的盒尺寸、固定高度和 cursor 实际位置。已完成段逐段提交，后段 BLOCKED 返回成功的 blocked 结果及合法前缀；预算失败返回明确错误，合法前缀和 cursor 同样保留，Lua error.position 给出实际已提交位置。单次 move 失败旧 AABB/索引不变。set/move 先完成参数、范围、碰撞及容量校验，再更新对象和关联；普通失败保留旧状态。OOM 属于系统资源耗尽，不承诺恢复或旧状态完整。
 
 ## 空中资源和失败
 
@@ -130,7 +130,7 @@ Context 单 owner 顺序使用；共享静态图不可变，不共享全局查�
 
 `new_context(map_id,air_limits)` 可调低 expanded/nodes/buckets/tests/path_points/objects/object_links/links，不可调高、不可为零；Native setAirLimits 只允许首次空中操作前调用。预算在超额工作之前检查，覆盖 A*、Sweep、连接、构造、平滑及整次多段推进；嵌套调用不重置。平滑耗尽可保留已验证原路线，不返回未经验证捷径。
 
-稳定错误：INVALID_AIR_ASSET（格式）、ASSET_MISMATCH（配对）、SEARCH_BUDGET_EXCEEDED（展开/节点）、QUERY_BUDGET_EXCEEDED（桶/tests）、CAPACITY_EXCEEDED（资源/分配）、NO_PATH（完整搜索无路）、BLOCKED（移动碰撞），以及现有参数/IO/越界错误。Lua 始终 nil,{code,message}；预算耗尽不能表示 NO_PATH/clear。新增 Binding 和扩展加载入口捕获 C++ 异常，bad_alloc 映射容量失败，其它异常为 INTERNAL_ERROR。
+稳定错误：INVALID_AIR_ASSET（格式）、ASSET_MISMATCH（配对）、SEARCH_BUDGET_EXCEEDED（展开/节点）、QUERY_BUDGET_EXCEEDED（桶/tests）、CAPACITY_EXCEEDED（已配置的资源容量）、NO_PATH（完整搜索无路）、BLOCKED（移动碰撞），以及现有参数/IO/越界错误。Lua 始终 nil,{code,message}；预算耗尽不能表示 NO_PATH/clear。Binding 由统一 nativeCallback 阻止 C++ 异常穿出 Lua 边界；不再将 bad_alloc 映射为容量业务错误，也不为 OOM 增加局部恢复。普通异常沿统一入口返回 INTERNAL_ERROR；OOM 后不承诺继续运行。
 
 单次预算不等于耗时 SLA，也不限制宿主发起的每帧请求数。应用负责帧预算、请求数量、同时移动顺序和重新规划时机。本次不接入 Frame Core、Battle 或弹丸业务。
 

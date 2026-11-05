@@ -1,9 +1,10 @@
 // 职责：实现 Battle-local 规则、动态占位、scratch 分配与 generation 生命周期。
 // 边界：Server Runtime Battle-local Mutable State；不访问 Skynet/Lua，不执行 I/O。
 // 输入/输出：immutable GridMap -> Battle-local 规则/occupancy 与可复用 A* scratch。
-// 内存：构造时按 cell_count 分配 nodes + heap；每次查询不做 per-node allocation。
+// 内存：构造时按 cellCount 分配 nodes + heap；每次查询不做 per-node allocation。
 // 不负责：不计算邻居、不判断 Agent、不生成 Path，也不拥有跨 Battle 的动态状态。
 #include "navigation_context.h"
+#include "navigation_profile_registry.h"
 
 #include <algorithm>
 #include <limits>
@@ -28,25 +29,37 @@ const GridMap &RequireMap(const std::shared_ptr<const GridMap> &map)
 } // namespace
 
 // 为一张非空地图创建 Battle-local Context。
-// map 的共享所有权移入本对象；构造时按 cell_count 分配 scratch 和占位索引。
+// map 的共享所有权移入本对象；构造时按 cellCount 分配 scratch 和占位索引。
 // map 为空或 Cell 数无法用 int32 node_index 表示时抛出 invalid_argument。
 NavigationContext::NavigationContext(std::shared_ptr<const GridMap> map)
     : map_(std::move(map)), occupancy_(RequireMap(map_))
 {
-    if (map_->cell_count() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))
+    if (map_->cellCount() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))
     {
         throw std::invalid_argument("map has too many cells for int32 node index");
     }
 
     // occupancy_ 已在初始化列表中绑定 immutable map；scratch 也在构造阶段一次分配。
-    nodes_.resize(map_->cell_count());
-    heap_.resize(map_->cell_count());
+    nodes_.resize(map_->cellCount());
+    heap_.resize(map_->cellCount());
+
+    // 所有可失败的初始化完成后才登记；构造失败不会泄漏计数。
+    NavigationProfileRegistry::instance().acquireContext();
+}
+
+// moved-from 对象不再拥有地图；只由转移后的有效 owner 注销一次。
+NavigationContext::~NavigationContext()
+{
+    if (map_)
+    {
+        NavigationProfileRegistry::instance().releaseContext();
+    }
 }
 
 // 开始一次新查询：递增 generation 并清空 Heap 逻辑长度。
-// 不清扫全部 Node；只在 uint32 generation 回卷时执行 O(cell_count) 重置。
+// 不清扫全部 Node；只在 uint32 generation 回卷时执行 O(cellCount) 重置。
 // 不执行 I/O、加锁或 yield；调用者必须独占本 Context。
-void NavigationContext::BeginQuery()
+void NavigationContext::beginQuery()
 {
     // 给本次搜索发一个新编号，上一轮的 g/parent/state 即使仍留在数组里，
     // 只要编号不同就视作无效；不必为了短路径清扫整张大地图。
@@ -67,72 +80,60 @@ void NavigationContext::BeginQuery()
 }
 
 // 修改当前 Context 的单格规则；规则列表只保存例外，不按地图大小分配。
-NavResult<bool> NavigationContext::SetCellDynamicEntryRule(const GridPos       &grid,
+NavResult<bool> NavigationContext::setCellDynamicEntryRule(const GridPos       &grid,
                                                            CellDynamicEntryRule rule)
 {
-    if (map_->TryCell(grid) == nullptr)
+    if (map_->tryCell(grid) == nullptr)
     {
-        return NavResult<bool>::Failure(NavError::kOutOfBounds, "dynamic rule cell is outside map");
+        return NavResult<bool>::failure(NavError::kOutOfBounds, "dynamic rule cell is outside map");
     }
     if (rule != CellDynamicEntryRule::kDefault && rule != CellDynamicEntryRule::kAllow &&
         rule != CellDynamicEntryRule::kBlock)
     {
-        return NavResult<bool>::Failure(NavError::kInvalidArgument, "invalid dynamic entry rule");
+        return NavResult<bool>::failure(NavError::kInvalidArgument, "invalid dynamic entry rule");
     }
 
     // 列表按 z、x 排序，lower_bound 同时定位已有覆盖和新覆盖的插入位置。
-    const auto entry =
-        std::lower_bound(dynamic_entry_rules_.begin(), dynamic_entry_rules_.end(), grid,
-                         [](const CellDynamicEntryOverride &candidate, const GridPos &target)
-                         {
-                             return candidate.grid.z < target.z ||
-                                    (candidate.grid.z == target.z && candidate.grid.x < target.x);
-                         });
+    const auto entry = std::lower_bound(
+        blocked_entry_cells_.begin(), blocked_entry_cells_.end(), grid,
+        [](const GridPos &candidate, const GridPos &target)
+        { return candidate.z < target.z || (candidate.z == target.z && candidate.x < target.x); });
     const bool found =
-        entry != dynamic_entry_rules_.end() && entry->grid.x == grid.x && entry->grid.z == grid.z;
-    if (rule == CellDynamicEntryRule::kDefault)
+        entry != blocked_entry_cells_.end() && entry->x == grid.x && entry->z == grid.z;
+    if (rule != CellDynamicEntryRule::kBlock)
     {
         if (found)
         {
-            dynamic_entry_rules_.erase(entry);
+            blocked_entry_cells_.erase(entry);
         }
     }
-    else if (found)
+    else if (!found)
     {
-        entry->rule = rule;
-    }
-    else
-    {
-        dynamic_entry_rules_.insert(entry, CellDynamicEntryOverride{grid, rule});
+        blocked_entry_cells_.insert(entry, grid);
     }
 
-    return NavResult<bool>::Success(true);
+    return NavResult<bool>::success(true);
 }
 
-// 覆盖项只保存 allow/block；无覆盖时使用默认的允许重叠行为。
-bool NavigationContext::AllowsDynamicEntry(const GridPos &grid) const noexcept
+// 集合只保存禁止重叠的格；不存在时即允许，不保存与默认行为相同的 allow。
+bool NavigationContext::allowsDynamicEntry(const GridPos &grid) const noexcept
 {
-    if (map_->TryCell(grid) == nullptr)
+    if (map_->tryCell(grid) == nullptr)
     {
         return false;
     }
 
-    const auto entry =
-        std::lower_bound(dynamic_entry_rules_.begin(), dynamic_entry_rules_.end(), grid,
-                         [](const CellDynamicEntryOverride &candidate, const GridPos &target)
-                         {
-                             return candidate.grid.z < target.z ||
-                                    (candidate.grid.z == target.z && candidate.grid.x < target.x);
-                         });
-    return entry == dynamic_entry_rules_.end() || entry->grid.x != grid.x ||
-           entry->grid.z != grid.z || entry->rule == CellDynamicEntryRule::kDefault ||
-           entry->rule == CellDynamicEntryRule::kAllow;
+    const auto entry = std::lower_bound(
+        blocked_entry_cells_.begin(), blocked_entry_cells_.end(), grid,
+        [](const GridPos &candidate, const GridPos &target)
+        { return candidate.z < target.z || (candidate.z == target.z && candidate.x < target.x); });
+    return entry == blocked_entry_cells_.end() || entry->x != grid.x || entry->z != grid.z;
 }
 
 // 返回 node_index 在当前 generation 的可变 scratch，首次触达时惰性初始化。
-// node_index 必须位于 [0, cell_count)；越界抛出 out_of_range。
+// node_index 必须位于 [0, cellCount)；越界抛出 out_of_range。
 // 返回引用仍归本 Context 所有，不得跨下一次查询保存其语义。
-NavigationContext::NodeScratch &NavigationContext::TouchNode(std::int32_t node_index)
+NavigationContext::NodeScratch &NavigationContext::touchNode(std::int32_t node_index)
 {
     if (node_index < 0 || static_cast<std::size_t>(node_index) >= nodes_.size())
     {
@@ -176,12 +177,12 @@ NavResult<bool> NavigationContext::setAirLimits(const AirLimits &l)
         l.objects > hard.objects || !l.object_links || l.object_links > hard.object_links ||
         !l.links || l.links > hard.links)
     {
-        return NavResult<bool>::Failure(NavError::kInvalidArgument,
+        return NavResult<bool>::failure(NavError::kInvalidArgument,
                                         "air limits invalid or already active");
     }
 
     air_limits_ = l;
-    return NavResult<bool>::Success(true);
+    return NavResult<bool>::success(true);
 }
 std::size_t NavigationContext::airMemoryBytes() const noexcept
 {
@@ -190,8 +191,8 @@ std::size_t NavigationContext::airMemoryBytes() const noexcept
 
     return sizeof(AirState) +
            air_->objects.size() * (sizeof(AirBox) + sizeof(std::uint64_t) + 3 * sizeof(void *)) +
-           air_->links.size() * (sizeof(std::pair<std::uint32_t, std::uint64_t>) + sizeof(bool) +
-                                 3 * sizeof(void *)) +
+           air_->links.size() *
+               (sizeof(std::pair<std::uint32_t, std::uint64_t>) + 3 * sizeof(void *)) +
            air_->empty_cells.capacity() * sizeof(std::uint32_t) +
            air_->nodes.capacity() * sizeof(AirNode) +
            air_->index.capacity() * sizeof(decltype(air_->index)::value_type) +

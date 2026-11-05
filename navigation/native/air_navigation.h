@@ -3,6 +3,7 @@
 #include "navigation_agent.h"
 #include "navigation_path.h"
 #include <map>
+#include <set>
 namespace flywow_navigation
 {
 class NavigationContext;
@@ -58,18 +59,17 @@ struct AirStats
 };
 struct AirNode
 {
-    std::uint32_t cell   = 0;     ///< 稀疏搜索节点格编号。
-    std::uint64_t g      = 0;     ///< 从起点累计整数成本。
-    std::uint64_t f      = 0;     ///< g 加一致 octile 启发式。
-    std::int32_t  parent = -1;    ///< 前驱 scratch 下标；-1 为起点。
-    std::int32_t  heap   = -1;    ///< heap slot；-1 为已取出。
-    bool          closed = false; ///< 本轮已经展开。
+    std::uint32_t cell   = 0;  ///< 稀疏搜索节点格编号。
+    std::uint64_t g      = 0;  ///< 从起点累计整数成本。
+    std::uint64_t f      = 0;  ///< g 加一致 octile 启发式。
+    std::int32_t  parent = -1; ///< 前驱 scratch 下标；-1 为起点。
+    std::int32_t  heap   = -1; ///< 新节点直接入堆；非负为 open slot，-1 表示已展开。
 };
 struct AirState
 {
     using ObjectIndex = std::map<std::uint64_t, AirBox>;
-    using BucketIndex = std::map<std::pair<std::uint32_t, std::uint64_t>, bool>;
-    using NodeIndex   = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+    using BucketIndex = std::set<std::pair<std::uint32_t, std::uint64_t>>;
+    using nodeIndex   = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
 
     AirLimits                  limits;      ///< 首次操作前确定，不超过硬上限。
     AirStats                   stats;       ///< 整次操作共享计数；嵌套扫掠不重置。
@@ -77,21 +77,21 @@ struct AirState
     BucketIndex                links;       ///< 有界排序桶关联，无退化哈希。
     std::vector<std::uint32_t> empty_cells; ///< 单次固定高度空桶证明；每次清空。
     std::vector<AirNode>       nodes;       ///< 有界 reserve 并复用，不按全图分配。
-    NodeIndex                  index;       ///< 格编号到 nodes 下标的排序索引。
+    nodeIndex                  index;       ///< 格编号到 nodes 下标的排序索引。
     std::vector<std::uint32_t> heap;        ///< 唯一 open 节点堆；容量与 nodes 相同。
 };
-/// 动态状态设置，不表示移动已扫掠；准备全部新关联后提交，失败旧状态不变。
+/// 动态状态设置，不表示移动已扫掠；先校验普通失败条件，再更新关联；OOM 不承诺恢复。
 /// @param context 单 owner 的可变导航会话；可能按需分配私有 AirState/桶节点。
 /// @param handle 会话内非零对象身份，不持有业务对象。
 /// @param box 闭整数毫米 AABB；XZ 在地图内，Y 可用完整 int64。
-/// @return 成功 true；非法体积、越界或容量/分配失败返回稳定错误。
+/// @return 成功 true；非法体积、越界或容量超限返回稳定错误。
 /// @note 同步，不 I/O、不 yield、不加全局锁；动态状态不隐式同步 ground。
 NavResult<bool> setAirObstacle(NavigationContext &context, NavigationAgentHandle handle,
                                const AirBox &box);
 /// 不存在也成功；只释放当前 Context 关联。
 /// @param context 单 owner 会话；首次操作可能分配 AirState。
 /// @param handle 非零身份，释放所有桶关联但不管理业务对象。
-/// @return true 或参数/分配失败；同步，不 I/O/yield。
+/// @return true 或参数失败；同步，不 I/O/yield。
 NavResult<bool> removeAirObstacle(NavigationContext &context, NavigationAgentHandle handle);
 /// 只读连续盒体扫掠；查询预算耗尽返回明确错误，不返回 clear。
 /// @param from 段起点中心，整数毫米；to 为终点，允许 Y 不同。
@@ -115,7 +115,7 @@ NavResult<Path> findAirPath(NavigationContext &context, WorldPosition start, Wor
 /// 注册对象按原尺寸移动；全段通过才原子提交，失败旧 AABB 保持不变。
 /// @param handle 当前 Context 已注册的对象；target 为整数毫米新中心。
 /// @return 新中心或稳定错误，原盒的矩形/奇数边长保持。
-/// @note 单 owner，同步无 I/O/yield；新关联可分配，提交前失败不改旧状态。
+/// @note 单 owner，同步无 I/O/yield；新关联可分配，普通失败不改旧状态；OOM 不承诺恢复。
 NavResult<WorldPosition>     moveAir(NavigationContext &context, NavigationAgentHandle handle,
                                      WorldPosition target, AirPolicy policy = {});
 /// 累计真实折线距离；后段阻挡保留已成功提交的部分与 cursor。预算错误也保留已提交进度。

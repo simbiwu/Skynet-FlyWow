@@ -1,4 +1,4 @@
-// 职责：保存一次成功地面导航产生的不可变世界坐标路径。
+// 职责：保存一次成功地面或空中导航产生的不可变世界坐标路径。
 // 边界：Server Runtime Navigation Result；Lua/Battle/Replay 只看 WorldPosition。
 // 输入/输出：有序 WorldPosition 点 -> 只读 Path 和总长度。
 // 生命周期：由调用者或 Lua userdata 持有；构建完成后不再修改。
@@ -26,7 +26,7 @@ enum class PathAdvanceStatus : std::uint8_t
     kBlocked = 2, // 某个子步被最新静态/动态规则拒绝，位置停在最后一次成功提交处。
 };
 
-// 一个 Path userdata 独占一个 cursor；下标使用 C++ 0-based，不进入 Snapshot/Event。
+// 一个 Path userdata 独占一个 cursor；下标使用 C++ 0-based，不进入 snapshot/Event。
 // 例如路线 [A,B,C] 初始 next=1、progress=0，表示沿 A->B 走；到 B 后改为
 // next=2、progress=0，再沿 B->C 走。Path 保存路线，cursor 保存这个单位走到哪。
 // 两个单位即使路线相同也不能共用 cursor，否则一个推进会改变另一个的进度。
@@ -39,10 +39,10 @@ struct PathFollowCursor
 // Native 一次 fixed-tick 推进的结果；position 是已经成功提交的权威位置。
 struct PathAdvanceResult
 {
-    PathAdvanceStatus status = PathAdvanceStatus::kMoving;
-    WorldPosition     position{};
-    std::uint32_t     consumed_mm = 0;     // 本次调用真正消费的距离预算。
-    bool              moved       = false; // X/Z 是否至少发生过一次成功变化。
+    PathAdvanceStatus status = PathAdvanceStatus::kMoving; ///< 决定调用方继续推进、结束或重规划。
+    WorldPosition     position{};                          ///< 本轮最后成功提交的世界毫米位置。
+    std::uint32_t     consumed_mm = 0;                     // 本次调用真正消费的距离预算。
+    bool              moved       = false;                 // X/Z 是否至少发生过一次成功变化。
 };
 
 class GridMap;
@@ -60,7 +60,7 @@ class Path final
     {
     }
 
-    /// 查询结果是否进入目标区域；与 AdvancePath 的执行状态独立。
+    /// 查询结果是否进入目标区域；与 advancePath 的执行状态独立。
     const char *status() const noexcept
     {
         return partial_ ? "partial" : "reached";
@@ -73,7 +73,7 @@ class Path final
     }
 
     // 读取 index 对应的世界坐标点；越界抛 out_of_range，仅供已验证调用者使用。
-    const WorldPosition &WorldPoint(std::size_t index) const
+    const WorldPosition &worldPoint(std::size_t index) const
     {
         if (index >= points_.size())
         {
@@ -83,7 +83,7 @@ class Path final
     }
 
     // 返回整条路径在 XZ 平面的整数毫米长度；不包含动画或墙钟时间。
-    std::uint64_t length_mm() const noexcept
+    std::uint64_t lengthMm() const noexcept
     {
         return length_mm_;
     }
