@@ -4,4 +4,4 @@
 
 从 FlyWow 根目录执行：bash word_filter/sample/run_word_filter_sample.sh ../skynet
 
-缺少 Native 模块时脚本调用现有构建入口；skynet_config.lua 提供 Skynet 搜索路径，word_filter_sample.lua 展示从创建到查询的完整主流程。
+脚本按传入的 Skynet 路径增量构建 Native 模块；skynet_config.lua 提供 Skynet 搜索路径，word_filter_sample.lua 展示从创建到查询的完整主流程。

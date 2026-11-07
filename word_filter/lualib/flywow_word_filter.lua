@@ -4,7 +4,6 @@
 --- package.path 加载本文件，package.cpath 加载 build/native/flywow_word_filter_native.so。
 local word_filter_native = require "flywow_word_filter_native"
 
-local MAX_KEYWORDS              = 16384
 local MAX_REPLACEMENT_BYTES     = 256
 local MAX_DICTIONARY_FILE_BYTES = 2097152
 local M = {}
@@ -19,9 +18,7 @@ local M = {}
 ---| '"dictionary_limit"' # 词数、词长度、总字节、节点或后缀输出超限
 ---| '"text_limit"' # 输入文本超过固定字节上限
 ---| '"match_limit"' # 命中项数超过固定上限，未返回部分结果
----| '"out_of_memory"' # Native 分配失败；Lua 自身的内存失败仍抛 Lua 异常
 ---| '"internal_error"' # Native 遇到未识别异常
----| '"closed"' # Native userdata 已释放，仅直接操作 Native 时可能出现
 
 ---@class flywow_word_filter_match
 ---@field keyword_id integer 宿主词库的 1-based 数组索引，重复词保留独立 ID
@@ -29,7 +26,7 @@ local M = {}
 ---@field length integer 原文字节跨度；compact 时包含中间被忽略的分隔符
 
 ---@class flywow_word_filter_config
----@field keywords string[] 宿主提供的连续数组，创建时复制；空词库合法
+---@field keywords string[] 宿主提供的连续数组，创建时构建词库；空词库合法
 ---@field file? string UTF-8 外部词库路径；每行一个词，空行忽略；与 keywords 二选一
 ---@field compact? boolean 默认 false；true 时忽略固定类别分隔符，可能增加误报
 
@@ -38,9 +35,16 @@ local M = {}
 local Filter = {}
 Filter.__index = Filter
 
+--- 将 Native 查询或构建失败转换成 WordFilter 对外返回的错误码。
+---@param error_value table|string Native 返回的诊断表或错误码。
+---@return string error_code 调用方可直接判断的错误码。
 local function native_error_code(error_value)
     if type(error_value) == "table" then
-        return error_value.code or "internal_error"
+        local code = error_value.code
+        if code == "INTERNAL_ERROR" then
+            return "internal_error"
+        end
+        return code or "internal_error"
     end
     return error_value
 end
@@ -56,38 +60,39 @@ function M.create_filter(word_filter_config)
     if type(word_filter_config) ~= "table" then
         return nil, "invalid_options"
     end
-    if word_filter_config.keywords ~= nil and type(word_filter_config.keywords) ~= "table"
-        or word_filter_config.file ~= nil and type(word_filter_config.file) ~= "string"
-        or (word_filter_config.compact ~= nil and type(word_filter_config.compact) ~= "boolean") then
-        return nil, "invalid_options"
-    end
 
-    -- 只接受这三个配置项；拼写错误不能被静默忽略后使用默认值。
-    for key in pairs(word_filter_config) do
+    -- 用原始键检查选项，避免 __pairs 隐藏未支持的字段。
+    for key in next, word_filter_config do
         if key ~= "keywords" and key ~= "file" and key ~= "compact" then
             return nil, "invalid_options"
         end
     end
 
-    if word_filter_config.keywords ~= nil and word_filter_config.file ~= nil then
-        return nil, "invalid_options"
-    end
-    if word_filter_config.keywords == nil and word_filter_config.file == nil then
+    -- 保留配置字段的 Lua 索引语义，只读取一次，使校验值和实际使用值相同。
+    local keywords = word_filter_config.keywords -- 内存词库；若配置文件则在读取后填充。
+    local dictionary_path = word_filter_config.file -- 词库文件路径，与内存词库二选一。
+    local compact = word_filter_config.compact -- 是否启用查询时的分隔码点过滤。
+    if (keywords ~= nil and type(keywords) ~= "table")
+        or (dictionary_path ~= nil and (type(dictionary_path) ~= "string" or dictionary_path:find("\0", 1, true)))
+        or (compact ~= nil and type(compact) ~= "boolean")
+        or (keywords == nil) == (dictionary_path == nil) then
         return nil, "invalid_options"
     end
 
-    -- 内存词库借用输入数组；文件词库读取为独立数组，两者共用后续 Native 构建。
-    local keywords = word_filter_config.keywords
-    if word_filter_config.file ~= nil then
-        local file = io.open(word_filter_config.file, "rb")
+    -- 文件词库转换为内存数组，与直接传入的数组共用 Native 构建。
+    if dictionary_path ~= nil then
+        local file = io.open(dictionary_path, "rb") -- 当前函数负责读取并关闭的文件。
         if not file then
             return nil, "dictionary_io"
         end
-        local content = file:read(MAX_DICTIONARY_FILE_BYTES + 1)
-        local close_ok = file:close()
-        if not content or not close_ok then
+        -- 定长读取在正常 EOF 返回 nil，在 I/O 失败时另外返回诊断。
+        local content, read_error = file:read(MAX_DICTIONARY_FILE_BYTES + 1)
+        local close_ok = file:close() -- 关闭失败仍按词库 I/O 故障处理。
+        if read_error or not close_ok then
             return nil, "dictionary_io"
         end
+        -- 零字节文件和仅含空行的文件都生成空词库。
+        content = content or ""
         if #content > MAX_DICTIONARY_FILE_BYTES then
             return nil, "dictionary_limit"
         end
@@ -102,22 +107,8 @@ function M.create_filter(word_filter_config)
         end
     end
 
-    -- 统一取得最终词库数组后再检查总词数和每项类型，内存输入与文件输入走同一规则。
-    local keyword_count = #keywords
-    if keyword_count > MAX_KEYWORDS then
-        return nil, "dictionary_limit"
-    end
-
-    --- 此处检查键和类型；Native 逐项 rawgeti，继续检查数组中间的空洞。
-    for key, keyword in pairs(keywords) do
-        if type(key) ~= "number" or math.type(key) ~= "integer"
-            or key < 1 or key > keyword_count or type(keyword) ~= "string" then
-            return nil, "invalid_keyword"
-        end
-    end
-
-    -- Native 成功后由 Filter 持有词库，输入数组不再参与后续查询。
-    local native_handle, error_value = word_filter_native.create_filter(keywords, word_filter_config.compact == true)
+    -- Native 校验词库原始键和每项字符串。构建成功后，输入数组不再参与查询。
+    local native_handle, error_value = word_filter_native.create_filter(keywords, compact == true)
     if not native_handle then
         return nil, native_error_code(error_value)
     end
@@ -150,17 +141,17 @@ function Filter:find(text)
 end
 
 --- 检测是否命中；false 只表示未命中，nil,error 表示失败，业务必须区分。
---- 复用完整 find，容量与分配行为相同，不是找到首项便提前退出的接口。
+--- 校验完整文本并统计有效命中，不构造或排序命中数组。
 ---@param text string 待检查的 UTF-8 原文；允许内嵌 NUL，长度和编码限制与 find 相同。
 ---@return boolean? 成功时 true 表示至少命中一项，false 是正常的未命中结果。
 ---@return flywow_word_filter_error? 输入或命中数量超限时返回稳定错误码，不能把 nil 当作未命中。
 function Filter:contains(text)
-    -- 复用 find 的完整查询结果；只有查找成功后才能判断是否存在命中。
-    local matches, error_code = self:find(text)
-    if not matches then
-        return nil, error_code
+    -- Native 成功时返回布尔值，nil 才表示输入或查询失败。
+    local matched, error_value = word_filter_native.contains(self.native_handle, text)
+    if matched == nil then
+        return nil, native_error_code(error_value)
     end
-    return #matches > 0
+    return matched
 end
 
 --- 合并重叠命中后，每个合并区间替换一次；原文保持不变，新文本归调用者所有。

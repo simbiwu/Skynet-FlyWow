@@ -1,139 +1,92 @@
 // 职责：从 FCLib FCKeywordFilter 移植的 UTF-8 归一化、AC 匹配与原文 byte 映射。
 // Runtime 核心不依赖 Skynet 或业务词库；构建后只读，查询临时数据由调用者独占。
 #include "word_filter.h"
+#include <algorithm>
 #include <queue>
-#include <stdexcept>
 
 namespace flywow_word_filter
 {
-    // 非法 byte 的内部标记基址，不属于可输出的 Unicode 标量值。
-    constexpr std::uint32_t flywow_invalid_byte_base = 0x110000;
-
-    flywow_normalize_options::flywow_normalize_options()
-        : lower_ascii(true), fullwidth_to_ascii(true), drop_utf8_bom(true), keep_invalid_bytes(false)
-    {
-    }
-
-    flywow_compact_options::flywow_compact_options()
-        : ignore_space(true), ignore_control(true), ignore_ascii_punctuation(true), ignore_zero_width(true),
-          max_source_span_bytes(0)
-    {
-    }
-
-    void flywow_normalized_text::clear()
-    {
-        text.clear();
-        source_byte_offsets.clear();
-        source_byte_lengths.clear();
-        code_points.clear();
-    }
-
-    flywow_match::flywow_match()
-        : keyword_id(0), normalized_code_point_offset(0), normalized_code_point_length(0), source_byte_offset(0),
-          source_byte_length(0)
-    {
-    }
-
-    flywow_filter::flywow_filter() : built_(false)
+    Filter::Filter()
     {
         // 索引 0 永远为根节点；即使词库为空也允许查询。
-        nodes_.push_back(flywow_node());
+        nodes_.emplace_back();
     }
 
-    flywow_filter::~flywow_filter()
-    {
-    }
-
-    void flywow_filter::clear()
-    {
-        keywords_.clear();
-        nodes_.clear();
-        nodes_.push_back(flywow_node());
-        built_                 = false;
-        dictionary_byte_count_ = 0;
-    }
-
-    bool flywow_filter::add_keyword(const std::string &keyword, std::int32_t keyword_id,
-                                    const flywow_normalize_options &normalization_options)
+    BuildError Filter::addKeyword(std::string_view keyword, std::int32_t keyword_id)
     {
         if (built_)
         {
-            throw std::runtime_error("already_built");
+            return BuildError::kAlreadyBuilt;
         }
 
-        if (keywords_.size() >= flywow_max_keywords || keyword.size() > flywow_max_keyword_bytes ||
-            keyword.size() > flywow_max_dictionary_bytes - dictionary_byte_count_)
+        if (keywords_.size() >= kMaxKeywords || keyword.size() > kMaxKeywordBytes ||
+            keyword.size() > kMaxDictionaryBytes - dictionary_byte_count_)
         {
-            throw std::runtime_error("dictionary_limit");
+            return BuildError::kDictionaryLimit;
         }
 
-        flywow_normalized_text normalized;
-        if (!normalize_utf8(keyword, normalized, normalization_options))
+        std::vector<SourcePoint> points; // 词条归一化后的码点，用于建立 trie 路径。
+        if (!normalizeUtf8(keyword, points, false))
         {
-            return false;
+            return BuildError::kInvalidKeyword;
         }
 
-        if (normalized.code_points.empty())
+        if (points.empty())
         {
-            return false;
+            return BuildError::kInvalidKeyword;
         }
 
-        flywow_keyword keyword_info;
-        keyword_info.keyword_id     = keyword_id >= 0 ? keyword_id : static_cast<std::int32_t>(keywords_.size());
-        keyword_info.source_keyword = keyword;
-        keyword_info.code_points    = normalized.code_points;
-
-        std::int32_t keyword_index = static_cast<std::int32_t>(keywords_.size());
-        keywords_.push_back(keyword_info);
+        // 终止节点用词条索引引用 ID 和码点长度，重复词仍有独立索引。
+        const auto keyword_index = static_cast<std::int32_t>(keywords_.size());
+        keywords_.push_back({keyword_id, points.size()});
         dictionary_byte_count_ += keyword.size();
 
         // trie 的边使用完整码点；例如“外”是一个节点，而不是三个 UTF-8 字节节点。
         std::int32_t node_index = 0;
-        for (std::size_t index = 0; index < normalized.code_points.size(); ++index)
+        for (std::size_t index = 0; index < points.size(); ++index)
         {
-            std::int32_t next_node_index = find_child_node(nodes_[node_index], normalized.code_points[index]);
-            if (next_node_index < 0)
+            const auto code_point = points[index].code_point; // 词条当前码点，用于查找或新增出边。
+            auto &children = nodes_[node_index].children;
+            const auto edge = lowerBoundEdge(children, code_point);
+            if (edge != children.end() && edge->first == code_point)
             {
-                next_node_index = static_cast<std::int32_t>(nodes_.size());
-                if (nodes_.size() >= flywow_max_nodes)
-                {
-                    throw std::runtime_error("dictionary_limit");
-                }
-                nodes_.push_back(flywow_node());
-                set_child_node(nodes_[node_index], normalized.code_points[index], next_node_index);
+                node_index = edge->second;
+                continue;
             }
+
+            if (nodes_.size() >= kMaxNodes)
+            {
+                return BuildError::kDictionaryLimit;
+            }
+
+            // 先插入出边，再追加节点；追加可能使 nodes_ 中的引用失效。
+            const auto next_node_index = static_cast<std::int32_t>(nodes_.size());
+            children.emplace(edge, code_point, next_node_index);
+            nodes_.emplace_back();
             node_index = next_node_index;
         }
-        nodes_[node_index].outputs.push_back(keyword_index);
-        built_ = false;
-        return true;
+        nodes_[node_index].output_keyword_indices.push_back(keyword_index);
+        return BuildError::kNone;
     }
 
-    bool flywow_filter::build()
+    BuildError Filter::build()
     {
-        // 阶段一：确认是否已构建，并准备根节点。
+        // 已构建的词库不能再次继承后缀输出。
         if (built_)
         {
-            return true;
-        }
-        if (nodes_.empty())
-        {
-            nodes_.push_back(flywow_node());
+            return BuildError::kNone;
         }
 
-        // 阶段二：初始化根节点的直接子节点。
-        // 后缀输出会复制到节点；限制总项数，避免密集后缀词库在 build 时耗尽内存。
-        std::size_t              output_count = keywords_.size();
+        // 总输出从词条自身的命中开始计数，之后累加复制的后缀命中。
+        std::size_t output_count = keywords_.size();
+        // 根的子节点默认回退到根；先入队，之后按 BFS 顺序补全更深节点。
         std::queue<std::int32_t> pending_nodes;
         for (std::size_t index = 0; index < nodes_[0].children.size(); ++index)
         {
-            std::int32_t child_node_index            = nodes_[0].children[index].second;
-            nodes_[child_node_index].fail_node_index = 0;
-            pending_nodes.push(child_node_index);
+            pending_nodes.push(nodes_[0].children[index].second);
         }
 
-        // 阶段三：BFS 保证父节点和较短后缀已经构建；“she”的尾节点继承“he”的命中。
-        // built_ 为 true 后直接返回，避免重复继承后缀输出。
+        // BFS 保证父节点和较短后缀已经构建；“she”的尾节点继承“he”的命中。
         while (!pending_nodes.empty())
         {
             std::int32_t node_index = pending_nodes.front();
@@ -143,182 +96,121 @@ namespace flywow_word_filter
             {
                 std::uint32_t code_point          = nodes_[node_index].children[index].first;
                 std::int32_t  child_node_index    = nodes_[node_index].children[index].second;
-                std::int32_t  fallback_node_index = nodes_[node_index].fail_node_index;
+                // 从父节点的后缀开始查找子节点的最长可用后缀。
+                nodes_[child_node_index].fail_node_index =
+                    followEdge(nodes_[node_index].fail_node_index, code_point);
 
-                while (fallback_node_index != 0 && find_child_node(nodes_[fallback_node_index], code_point) < 0)
+                const std::vector<std::int32_t> &suffix_keyword_indices =
+                    nodes_[nodes_[child_node_index].fail_node_index].output_keyword_indices;
+                if (suffix_keyword_indices.size() > kMaxOutputs - output_count)
                 {
-                    fallback_node_index = nodes_[fallback_node_index].fail_node_index;
+                    return BuildError::kDictionaryLimit;
                 }
-
-                std::int32_t fallback_child_index        = find_child_node(nodes_[fallback_node_index], code_point);
-                nodes_[child_node_index].fail_node_index = fallback_child_index >= 0 ? fallback_child_index : 0;
-
-                const std::vector<std::int32_t> &fallback_outputs =
-                    nodes_[nodes_[child_node_index].fail_node_index].outputs;
-                if (fallback_outputs.size() > flywow_max_outputs - output_count)
-                {
-                    throw std::runtime_error("dictionary_limit");
-                }
-                output_count += fallback_outputs.size();
-                nodes_[child_node_index].outputs.insert(nodes_[child_node_index].outputs.end(),
-                                                        fallback_outputs.begin(), fallback_outputs.end());
+                // 本节点词条最长，后缀节点的输出已经有序；追加后仍按码点数递减。
+                output_count += suffix_keyword_indices.size();
+                nodes_[child_node_index].output_keyword_indices.insert(nodes_[child_node_index].output_keyword_indices.end(),
+                                                        suffix_keyword_indices.begin(), suffix_keyword_indices.end());
                 pending_nodes.push(child_node_index);
             }
         }
 
-        // 阶段四：全部节点成功处理后才发布只读状态。
+        // 全部节点成功处理后才允许只读查询。
         built_ = true;
-        return true;
+        return BuildError::kNone;
     }
 
-    bool flywow_filter::find(const std::string &source_text, std::vector<flywow_match> &results,
-                             const flywow_normalize_options &normalization_options) const
+    QueryResult Filter::query(std::string_view source_text, bool compact, std::vector<Match> *matches) const
     {
-        flywow_normalized_text normalized;
-        bool                   normalized_ok = normalize_utf8(source_text, normalized, normalization_options);
-        if (!normalized_ok)
+        if (matches)
         {
-            results.clear();
-            return false;
+            matches->clear();
         }
-
-        if (!find_normalized(normalized, results))
-        {
-            return false;
-        }
-        return normalized_ok;
-    }
-
-    bool flywow_filter::find_normalized(const flywow_normalized_text &normalized,
-                                        std::vector<flywow_match>    &results) const
-    {
-        results.clear();
         if (!built_)
         {
-            return false;
+            return {QueryError::kNotBuilt, 0};
         }
-
-        const std::vector<std::uint32_t> &code_points = normalized.code_points;
-        if (code_points.size() != normalized.source_byte_offsets.size() ||
-            code_points.size() != normalized.source_byte_lengths.size())
+        if (source_text.size() > kMaxTextBytes)
         {
-            return false;
+            return {QueryError::kTextLimit, 0};
         }
 
+        // 先校验完整 UTF-8，保证文本尾部的编码错误优先于命中数量超限。
+        std::vector<SourcePoint> points; // 保存匹配码点和其原文 byte 区间。
+        if (!normalizeUtf8(source_text, points, compact))
+        {
+            return {QueryError::kInvalidUtf8, 0};
+        }
+
+        std::size_t match_count = 0; // 只统计通过 compact 原文跨度校验的命中。
         std::int32_t node_index = 0;
-        for (std::size_t index = 0; index < code_points.size(); ++index)
+        for (std::size_t index = 0; index < points.size(); ++index)
         {
-            // 不回退输入位置，只沿 fail 链寻找仍能接上当前码点的最长后缀。
-            // 出边为有序 vector，查找使用二分；扫描成本另加每次出边查找和命中输出。
-            while (node_index != 0 && find_child_node(nodes_[node_index], code_points[index]) < 0)
-            {
-                node_index = nodes_[node_index].fail_node_index;
-            }
+            // 不回退输入位置；当前码点沿 fail 链找可用出边。
+            node_index = followEdge(node_index, points[index].code_point);
 
-            std::int32_t next_node_index = find_child_node(nodes_[node_index], code_points[index]);
-            node_index                   = next_node_index >= 0 ? next_node_index : 0;
-
-            const std::vector<std::int32_t> &outputs = nodes_[node_index].outputs;
-            for (std::size_t output_index = 0; output_index < outputs.size(); ++output_index)
+            // 同一结束位置下，词条越长，原文起点越靠前。超跨度候选构成有序前缀。
+            const auto &output_keyword_indices = nodes_[node_index].output_keyword_indices;
+            const auto source_byte_end = points[index].source_byte_end;
+            const auto source_byte_begin_for = [&](std::int32_t keyword_index)
             {
-                const flywow_keyword &keyword                  = keywords_[outputs[output_index]];
-                std::uint32_t         keyword_code_point_count = static_cast<std::uint32_t>(keyword.code_points.size());
-                if (keyword_code_point_count == 0 || index + 1 < keyword_code_point_count)
+                return points[index + 1 - keywords_[keyword_index].code_point_count].source_byte_begin;
+            };
+
+            auto first_valid_output = output_keyword_indices.begin();
+            if (compact && first_valid_output != output_keyword_indices.end())
+            {
+                const auto exceeds_span = [&](std::int32_t keyword_index)
                 {
-                    continue;
+                    return source_byte_end - source_byte_begin_for(keyword_index) > kMaxCompactSpan;
+                };
+                if (exceeds_span(output_keyword_indices.back()))
+                {
+                    continue; // 最短词条也超跨度，整组候选都无效。
                 }
-
-                // 先取得命中的码点区间，再取首字符起点和末字符末尾，恢复原文字节区间。
-                // “外-挂”压缩成两个码点，但原文区间仍覆盖 3+1+3=7 bytes。
-                std::uint32_t normalized_begin_index = static_cast<std::uint32_t>(index + 1 - keyword_code_point_count);
-                std::uint32_t normalized_end_index   = static_cast<std::uint32_t>(index);
-                std::uint32_t source_begin_byte      = normalized.source_byte_offsets[normalized_begin_index];
-                std::uint32_t source_end_byte        = normalized.source_byte_offsets[normalized_end_index] +
-                                                normalized.source_byte_lengths[normalized_end_index];
-
-                flywow_match result;
-                result.keyword_id                   = keyword.keyword_id;
-                result.source_keyword               = keyword.source_keyword;
-                result.normalized_code_point_offset = normalized_begin_index;
-                result.normalized_code_point_length = keyword_code_point_count;
-                result.source_byte_offset           = source_begin_byte;
-                result.source_byte_length =
-                    source_end_byte >= source_begin_byte ? source_end_byte - source_begin_byte : 0;
-                if (results.size() >= flywow_max_matches)
+                if (exceeds_span(*first_valid_output))
                 {
-                    throw std::runtime_error("match_limit");
-                }
-                results.push_back(result);
-            }
-        }
-        return true;
-    }
-
-    bool flywow_filter::find_compact(const std::string &source_text, std::vector<flywow_match> &results,
-                                     const flywow_normalize_options &normalization_options,
-                                     const flywow_compact_options   &compact_options) const
-    {
-        flywow_normalized_text normalized;
-        bool                   normalized_ok = normalize_utf8(source_text, normalized, normalization_options);
-        if (!normalized_ok)
-        {
-            results.clear();
-            return false;
-        }
-        if (!find_compact_normalized(normalized, results, compact_options))
-        {
-            return false;
-        }
-        return normalized_ok;
-    }
-
-    bool flywow_filter::find_compact_normalized(const flywow_normalized_text &normalized,
-                                                std::vector<flywow_match>    &results,
-                                                const flywow_compact_options &compact_options) const
-    {
-        flywow_normalized_text compacted;
-        if (!compact_normalized_text(normalized, compacted, compact_options))
-        {
-            results.clear();
-            return false;
-        }
-        if (!find_normalized(compacted, results))
-        {
-            return false;
-        }
-        // span 衡量原文 bytes，包含被删除的分隔符；它不是 compact 后码点数。
-        if (compact_options.max_source_span_bytes > 0)
-        {
-            std::vector<flywow_match> filtered;
-            for (std::size_t index = 0; index < results.size(); ++index)
-            {
-                if (results[index].source_byte_length <= compact_options.max_source_span_bytes)
-                {
-                    filtered.push_back(results[index]);
+                    first_valid_output = std::partition_point(first_valid_output, output_keyword_indices.end(), exceeds_span);
                 }
             }
-            results.swap(filtered);
+
+            // 有效后缀数量可直接取得；重复词仍分别占用额度。
+            const auto valid_output_count =
+                static_cast<std::size_t>(output_keyword_indices.end() - first_valid_output);
+            if (valid_output_count > kMaxMatches - match_count)
+            {
+                if (matches)
+                {
+                    matches->clear();
+                }
+                return {QueryError::kMatchLimit, 0};
+            }
+            match_count += valid_output_count;
+            if (!matches)
+            {
+                continue;
+            }
+
+            // find 才需要逐项还原区间并写入缓冲。
+            for (auto match_it = first_valid_output; match_it != output_keyword_indices.end(); ++match_it)
+            {
+                const auto source_byte_begin = source_byte_begin_for(*match_it);
+                matches->push_back({keywords_[*match_it].keyword_id, source_byte_begin,
+                                    source_byte_end - source_byte_begin});
+            }
         }
-        return true;
+        return {QueryError::kNone, match_count};
     }
 
-    bool flywow_filter::normalize_utf8(const std::string &source_text, flywow_normalized_text &result,
-                                       const flywow_normalize_options &normalization_options)
+    // 校验原文并保存参与匹配的码点，compact 只跳过已经验证合法的分隔字符。
+    bool Filter::normalizeUtf8(std::string_view source_text, std::vector<SourcePoint> &points,
+                                       bool compact)
     {
-        if (source_text.size() > flywow_max_text_bytes)
-        {
-            throw std::runtime_error("text_limit");
-        }
-
-        result.clear();
-
         const std::uint8_t *bytes       = reinterpret_cast<const std::uint8_t *>(source_text.data());
         std::uint32_t       byte_count  = static_cast<std::uint32_t>(source_text.size());
         std::uint32_t       byte_offset = 0;
-        bool                valid_utf8  = true;
 
         // BOM 只在输入开头跳过；后续位置仍记录原文偏移，不从零重新编号。
-        if (normalization_options.drop_utf8_bom && byte_count >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB &&
+        if (byte_count >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB &&
             bytes[2] == 0xBF)
         {
             byte_offset = 3;
@@ -329,63 +221,23 @@ namespace flywow_word_filter
         {
             std::uint32_t source_byte_offset   = byte_offset;
             std::uint32_t code_point           = 0;
-            std::uint32_t character_byte_count = 0;
-            if (!decode_utf8_char(bytes, byte_count, byte_offset, code_point, character_byte_count))
+            if (!decodeUtf8Char(bytes, byte_count, byte_offset, code_point))
             {
-                valid_utf8 = false;
-                if (normalization_options.keep_invalid_bytes)
-                {
-                    result.text.push_back(static_cast<char>(bytes[source_byte_offset]));
-                    result.source_byte_offsets.push_back(source_byte_offset);
-                    result.source_byte_lengths.push_back(1);
-                    // 此保留模式仅供核心使用；Lua 入口固定拒绝非法 UTF-8。
-                    // 0x110000 超出 Unicode 标量范围，避免非法 byte 与真实字符相等。
-                    result.code_points.push_back(flywow_invalid_byte_base + bytes[source_byte_offset]);
-                }
-                byte_offset = source_byte_offset + 1;
-                continue;
+                return false;
             }
 
-            code_point = normalize_code_point(code_point, normalization_options);
-            append_utf8_char(code_point, result.text);
-            result.source_byte_offsets.push_back(source_byte_offset);
-            result.source_byte_lengths.push_back(character_byte_count);
-            result.code_points.push_back(code_point);
-        }
-
-        return valid_utf8 || normalization_options.keep_invalid_bytes;
-    }
-
-    bool flywow_filter::compact_normalized_text(const flywow_normalized_text &normalized,
-                                                flywow_normalized_text       &result,
-                                                const flywow_compact_options &compact_options)
-    {
-        result.clear();
-        if (normalized.code_points.size() != normalized.source_byte_offsets.size() ||
-            normalized.code_points.size() != normalized.source_byte_lengths.size())
-        {
-            return false;
-        }
-
-        for (std::size_t index = 0; index < normalized.code_points.size(); ++index)
-        {
-            std::uint32_t code_point = normalized.code_points[index];
-            if (is_compact_ignored(code_point, compact_options))
+            code_point = normalizeCodePoint(code_point);
+            if (!compact || !isCompactIgnored(code_point))
             {
-                continue;
+                points.push_back({code_point, source_byte_offset, byte_offset});
             }
-
-            append_normalized_code_point(code_point, result.text);
-            result.source_byte_offsets.push_back(normalized.source_byte_offsets[index]);
-            result.source_byte_lengths.push_back(normalized.source_byte_lengths[index]);
-            result.code_points.push_back(code_point);
         }
+
         return true;
     }
 
-    bool flywow_filter::decode_utf8_char(const std::uint8_t *bytes, std::uint32_t byte_count,
-                                         std::uint32_t &byte_offset, std::uint32_t &code_point,
-                                         std::uint32_t &character_byte_count)
+    bool Filter::decodeUtf8Char(const std::uint8_t *bytes, std::uint32_t byte_count,
+                                         std::uint32_t &byte_offset, std::uint32_t &code_point)
     {
         if (byte_offset >= byte_count)
         {
@@ -396,14 +248,13 @@ namespace flywow_word_filter
         if (leading_byte < 0x80)
         {
             code_point           = leading_byte;
-            character_byte_count = 1;
             ++byte_offset;
             return true;
         }
 
         std::uint32_t required_bytes     = 0;
         std::uint32_t decoded_code_point = 0;
-        std::uint32_t minimum_code_point = 0;
+        std::uint32_t minimum_code_point = 0; // 当前 UTF-8 序列长度允许的最小码点，用于拒绝过长编码。
         if ((leading_byte & 0xE0) == 0xC0)
         {
             required_bytes     = 2;
@@ -450,54 +301,23 @@ namespace flywow_word_filter
         }
 
         code_point           = decoded_code_point;
-        character_byte_count = required_bytes;
         byte_offset += required_bytes;
         return true;
     }
 
-    void flywow_filter::append_utf8_char(std::uint32_t code_point, std::string &text)
+    // 将全角 ASCII 和大写 ASCII 折叠为词库与查询共用的码点。
+    std::uint32_t Filter::normalizeCodePoint(std::uint32_t code_point)
     {
-        if (code_point < 0x80)
+        if (code_point == 0x3000)
         {
-            text.push_back(static_cast<char>(code_point));
+            code_point = ' ';
         }
-        else if (code_point < 0x800)
+        else if (code_point >= 0xFF01 && code_point <= 0xFF5E)
         {
-            text.push_back(static_cast<char>(0xC0 | (code_point >> 6)));
-            text.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
-        }
-        else if (code_point < 0x10000)
-        {
-            text.push_back(static_cast<char>(0xE0 | (code_point >> 12)));
-            text.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
-            text.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
-        }
-        else
-        {
-            text.push_back(static_cast<char>(0xF0 | (code_point >> 18)));
-            text.push_back(static_cast<char>(0x80 | ((code_point >> 12) & 0x3F)));
-            text.push_back(static_cast<char>(0x80 | ((code_point >> 6) & 0x3F)));
-            text.push_back(static_cast<char>(0x80 | (code_point & 0x3F)));
-        }
-    }
-
-    std::uint32_t flywow_filter::normalize_code_point(std::uint32_t                   code_point,
-                                                      const flywow_normalize_options &normalization_options)
-    {
-        if (normalization_options.fullwidth_to_ascii)
-        {
-            if (code_point == 0x3000)
-            {
-                code_point = ' ';
-            }
-            else if (code_point >= 0xFF01 && code_point <= 0xFF5E)
-            {
-                // 全角 U+FF01..U+FF5E 与 ASCII 相差 0xFEE0；例如 U+FF21“Ａ” -> U+0041“A”。
-                code_point -= 0xFEE0;
-            }
+            code_point -= 0xFEE0;
         }
 
-        if (normalization_options.lower_ascii && code_point >= 'A' && code_point <= 'Z')
+        if (code_point >= 'A' && code_point <= 'Z')
         {
             code_point += 'a' - 'A';
         }
@@ -505,32 +325,23 @@ namespace flywow_word_filter
         return code_point;
     }
 
-    bool flywow_filter::is_compact_ignored(std::uint32_t code_point, const flywow_compact_options &compact_options)
+    bool Filter::isCompactIgnored(std::uint32_t code_point)
     {
         // compact 保留字母、数字和中日韩文字，只忽略下面列出的分隔字符。
         // 这些固定 Unicode 范围沿用 FCLib，不表示完整 Unicode 标点或空白分类。
-        if (compact_options.ignore_space &&
-            (code_point == ' ' || code_point == '\t' || code_point == '\r' || code_point == '\n'))
+        // ASCII 控制字符和空格是相邻范围，DEL 单独位于 0x7F。
+        if (code_point <= 0x20 || code_point == 0x7F)
         {
             return true;
         }
 
-        if (compact_options.ignore_control &&
-            ((code_point < 0x20 && code_point != '\t' && code_point != '\r' && code_point != '\n') ||
-             code_point == 0x7F))
-        {
-            return true;
-        }
-
-        if (compact_options.ignore_ascii_punctuation &&
-            ((code_point >= 0x21 && code_point <= 0x2F) || (code_point >= 0x3A && code_point <= 0x40) ||
+        if (((code_point >= 0x21 && code_point <= 0x2F) || (code_point >= 0x3A && code_point <= 0x40) ||
              (code_point >= 0x5B && code_point <= 0x60) || (code_point >= 0x7B && code_point <= 0x7E)))
         {
             return true;
         }
 
-        if (compact_options.ignore_zero_width &&
-            ((code_point >= 0x200B && code_point <= 0x200F) || code_point == 0x2028 || code_point == 0x2029 ||
+        if (((code_point >= 0x200B && code_point <= 0x200F) || code_point == 0x2028 || code_point == 0x2029 ||
              code_point == 0x2060 || code_point == 0xFEFF))
         {
             return true;
@@ -538,62 +349,32 @@ namespace flywow_word_filter
         return false;
     }
 
-    void flywow_filter::append_normalized_code_point(std::uint32_t code_point, std::string &text)
+    // 有序出边按码点定位；不存在时返回应插入的位置。
+    Filter::Edges::const_iterator Filter::lowerBoundEdge(const Edges &children, std::uint32_t code_point)
     {
-        if (code_point >= flywow_invalid_byte_base && code_point <= flywow_invalid_byte_base + 0xFF)
-        {
-            text.push_back(static_cast<char>(code_point - flywow_invalid_byte_base));
-            return;
-        }
-
-        append_utf8_char(code_point, text);
+        return std::lower_bound(children.begin(), children.end(), code_point,
+                                [](const auto &edge, std::uint32_t target)
+                                {
+                                    return edge.first < target;
+                                });
     }
 
-    std::int32_t flywow_filter::find_child_edge(const flywow_node &node, std::uint32_t code_point)
+    // 从指定节点尝试接上当前码点，必要时沿 fail 链回退，根也无边时返回根。
+    std::int32_t Filter::followEdge(std::int32_t node_index, std::uint32_t code_point) const
     {
-        // 搜索区间为 [left,right)，返回边在 children 中的位置，不是目标节点编号。
-        std::size_t left  = 0;
-        std::size_t right = node.children.size();
-        while (left < right)
+        while (true)
         {
-            std::size_t middle = left + (right - left) / 2;
-            if (node.children[middle].first == code_point)
+            const Node &node = nodes_[node_index]; // 当前可用前缀，缺边时改查其后缀。
+            const auto edge = lowerBoundEdge(node.children, code_point);
+            if (edge != node.children.end() && edge->first == code_point)
             {
-                return static_cast<std::int32_t>(middle);
+                return edge->second;
             }
-            if (node.children[middle].first < code_point)
+            if (node_index == 0)
             {
-                left = middle + 1;
+                return 0;
             }
-            else
-            {
-                right = middle;
-            }
-        }
-        return -1;
-    }
-
-    std::int32_t flywow_filter::find_child_node(const flywow_node &node, std::uint32_t code_point)
-    {
-        std::int32_t edge_index = find_child_edge(node, code_point);
-        return edge_index >= 0 ? node.children[edge_index].second : -1;
-    }
-
-    void flywow_filter::set_child_node(flywow_node &node, std::uint32_t code_point, std::int32_t next_node_index)
-    {
-        std::int32_t edge_index = find_child_edge(node, code_point);
-        if (edge_index >= 0)
-        {
-            node.children[edge_index].second = next_node_index;
-        }
-        else
-        {
-            std::vector<std::pair<std::uint32_t, std::int32_t>>::iterator edge = node.children.begin();
-            while (edge != node.children.end() && edge->first < code_point)
-            {
-                ++edge;
-            }
-            node.children.insert(edge, std::make_pair(code_point, next_node_index));
+            node_index = node.fail_node_index;
         }
     }
 } // namespace flywow_word_filter

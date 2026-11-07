@@ -46,15 +46,15 @@ target_link_libraries(flywow_word_filter_test PRIVATE flywow_word_filter_core Th
 add_test(NAME flywow_word_filter_core COMMAND flywow_word_filter_test)
 
 
-# 当前真实集成宿主为主仓库 server/；测试配置的相对路径以此目录为基准。
-# Skynet 会正常 ABORT 退出，成功/失败标记与超时共同判断结果。
-# 找到宿主 Skynet 才注册集成测试；配置中的相对路径以 Server 根目录为工作目录。
-get_filename_component(FLYWOW_SERVER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
+# 从 FlyWow 根目录运行集成测试。Skynet 启动配置展开这两个环境变量，
+# 因此 loader、C 服务及 WordFilter 动态库都来自本次构建选择的路径。
+get_filename_component(FLYWOW_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 if(EXISTS "${SKYNET_ROOT}/skynet")
     add_test(NAME flywow_word_filter_skynet
-        COMMAND "${SKYNET_ROOT}/skynet" "./third_party/skynet-flywow/word_filter/tests/skynet_config.lua")
+        COMMAND "${SKYNET_ROOT}/skynet" "./word_filter/tests/skynet_config.lua")
     set_tests_properties(flywow_word_filter_skynet PROPERTIES
-        WORKING_DIRECTORY "${FLYWOW_SERVER_DIR}"
+        WORKING_DIRECTORY "${FLYWOW_ROOT}"
+        ENVIRONMENT "FLYWOW_WORD_FILTER_SKYNET_ROOT=${SKYNET_ROOT};FLYWOW_WORD_FILTER_NATIVE_DIR=$<TARGET_FILE_DIR:flywow_word_filter_native>"
         PASS_REGULAR_EXPRESSION "FLYWOW_WORD_FILTER_SKYNET_OK"
         FAIL_REGULAR_EXPRESSION "FLYWOW_WORD_FILTER_SKYNET_FAIL"
         TIMEOUT 20)

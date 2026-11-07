@@ -1,13 +1,25 @@
 --- 职责：通过公开 API 验证 Lua/Native 加载、UTF-8、替换、边界和 GC。
---- CTest 传入 Wrapper 目录与 Native 产物目录，不依赖开发机绝对路径。
-package.path = arg[1] .. "/?.lua;" .. package.path
-package.cpath = arg[2] .. "/?.so;" .. package.cpath
+--- 由 Skynet 集成测试加载，复用测试配置提供的 Lua 和 Native 搜索路径。
 local word_filter = require "flywow_word_filter"
 local dictionary_path = os.tmpname()
 local dictionary_file = assert(io.open(dictionary_path, "wb"))
+assert(dictionary_file:close())
+local empty_filter = assert(word_filter.create_filter({file = dictionary_path}))
+assert(empty_filter:contains("SHE") == false)
+
+dictionary_file = assert(io.open(dictionary_path, "wb"))
+assert(dictionary_file:write("\n\r\n"))
+local blank_close_ok = dictionary_file:close()
+assert(blank_close_ok)
+local blank_filter = assert(word_filter.create_filter({file = dictionary_path}))
+assert(blank_filter:contains("SHE") == false)
+
+dictionary_file = assert(io.open(dictionary_path, "wb"))
 dictionary_file:write("外挂\r\nhe\n\nshe\n")
 assert(dictionary_file:close())
 local file_filter, file_error = word_filter.create_filter({file = dictionary_path})
+local truncated_filter, truncated_error = word_filter.create_filter({file = dictionary_path .. "\0ignored"})
+assert(truncated_filter == nil and truncated_error == "invalid_options")
 os.remove(dictionary_path)
 assert(file_filter and not file_error)
 assert(file_filter:contains("SHE"))
@@ -66,6 +78,51 @@ local compact_filter = assert(word_filter.create_filter(
 assert(compact_filter:replace("外-挂") == "*")
 assert(compact_filter:contains("外" .. string.rep(" ", 256) .. "挂") == false)
 
+--- 全长文本与大量重复长词都在公开上限内；所有候选跨度均为 257 bytes。
+local long_keyword = string.rep("a", 257)
+local long_keywords = {}
+for index = 1, 4080 do
+    long_keywords[index] = long_keyword
+end
+local long_filter = assert(word_filter.create_filter({keywords = long_keywords, compact = true}))
+local max_text = string.rep("a", 65536)
+assert(long_filter:contains(max_text) == false)
+assert(#assert(long_filter:find(max_text)) == 0)
+
+--- 同一节点的长候选被跳过，较短后缀仍然按原文位置返回。
+local suffix_filter = assert(word_filter.create_filter({keywords = {long_keyword, "a"}, compact = true}))
+local suffix_matches = assert(suffix_filter:find(long_keyword))
+assert(#suffix_matches == 257 and suffix_matches[257].keyword_id == 2 and suffix_matches[257].offset == 257)
+
+--- GC 回调在同一个过滤器上重入 find。外层使用大量命中确保建表期间有分配。
+local outer_text = string.rep("bad", 4096)
+local nested_matches
+local nested_error
+local in_outer_find = false
+local reentered = false
+collectgarbage("collect")
+collectgarbage("stop")
+local finalizer_meta =
+{
+    -- 记录回调实际发生的阶段及查询结果；断言留在外层，避免 GC 吞掉错误。
+    __gc = function() -- 外层 find 期间，在同一词库上发起内层查询。
+        if in_outer_find and not reentered then
+            reentered = true
+            nested_matches, nested_error = filter:find("she") -- 保存内层命中或错误，供外层断言。
+        end
+    end,
+}
+for _ = 1, 64 do
+    setmetatable({}, finalizer_meta)
+end
+in_outer_find = true
+collectgarbage("restart")
+local outer_matches = assert(filter:find(outer_text))
+in_outer_find = false
+assert(reentered and nested_matches and not nested_error)
+assert(#nested_matches == 2 and nested_matches[1].keyword_id == 3 and nested_matches[2].keyword_id == 2)
+assert(#outer_matches == 4096 and outer_matches[4096].keyword_id == 4 and outer_matches[4096].offset == 12286)
+
 --- 临时创建的过滤对象在失去引用后由 GC 清理。
 for _ = 1, 100 do
     assert(word_filter.create_filter({keywords = {"bad"}}):contains("BAD"))
@@ -79,6 +136,7 @@ for index = 1, 16385 do
 end
 value, error_code = word_filter.create_filter({keywords = too_many_keywords})
 assert(value == nil and error_code == "dictionary_limit")
+assert(word_filter.create_filter({keywords = {string.rep("a", 4096)}}))
 value, error_code = word_filter.create_filter({keywords = {string.rep("a", 4097)}})
 assert(value == nil and error_code == "dictionary_limit")
 

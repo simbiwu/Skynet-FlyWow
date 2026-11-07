@@ -61,14 +61,14 @@ assert(output == "这里有*")
 词库可以由宿主传入连续字符串数组，也可以由模块读取 `file` 指定的 UTF-8 文本文件；
 文件每行一个词，空行忽略，CRLF 的 `CR` 会被去除。对象由当前 Lua State 独占、GC 释放；
 词库创建后只读，更新时创建新对象，再由业务替换引用。
-查询调用同步、无 I/O、无 yield，会分配内存；创建外部词库时会同步读取指定文件。
+查询调用同步、无 I/O、无 yield，会分配内存。contains 只统计有效命中；创建外部词库时会同步读取指定文件。
 
 ## API 与参数
 
-- new({keywords=连续字符串数组, compact=false})：返回 filter 或 nil,error。
-  也可使用 `new({file="词库路径", compact=false})`；`keywords` 与 `file` 不能同时提供。
-  关键词 ID 为词库数组的 1-based 索引。空词库合法；空关键词非法；
-  重复词保留各自 ID；未知选项拒绝。
+- create_filter({keywords=连续字符串数组, compact=false})：返回 filter 或 nil,error。
+  也可使用 `create_filter({file="词库路径", compact=false})`；路径含 NUL 时返回 `invalid_options`。`keywords` 与 `file` 不能同时提供。
+  关键词 ID 为词库数组的 1-based 索引。空词库（含零字节文件）合法；空关键词非法；
+  重复词保留各自 ID。未知原始键会被拒绝，已知字段按 Lua 索引语义各读取一次。
 - filter:find(text)：返回命中数组或 nil,error。每项 keyword_id、offset、length；
   offset 为原文 1-based byte 索引，length 为原文字节数。返回全部重叠项，
   按 offset、keyword_id 排序。
@@ -82,7 +82,7 @@ assert(output == "这里有*")
 text 允许内嵌 NUL；非法 UTF-8 拒绝，不返回部分结果。
 
 compact=true 复用旧算法，删除空白/控制字符、ASCII 标点及常见零宽字符，
-原文映射包含中间被忽略部分；单次命中最多跨原文 256 bytes。
+原文映射包含中间被忽略部分。超过原文 256 bytes 的候选会被淘汰，不计入命中上限。
 可能将正常分隔内容连成关键词，因此默认关闭；不是完整防绕过能力。
 词库按普通归一化构建，compact 用于输入文本；词库应提供连续关键词，
 包含分隔符的词仍建议使用普通模式。
@@ -93,36 +93,37 @@ compact=true 复用旧算法，删除空白/控制字符、ASCII 标点及常见
 每次文本最多 65536 bytes、命中最多 4096 项；超限失败，不截断。
 错误码：invalid_options、invalid_keyword、invalid_text、invalid_utf8、
 invalid_replacement、dictionary_io、dictionary_limit、text_limit、match_limit、
-out_of_memory、internal_error。Native 对已释放对象返回 closed。
+internal_error。直接调用 Native 时，无效或已释放的 userdata 由 LuaBinding 返回 INVALID_ARGUMENT。
 业务不得把 nil,error 当作“无命中”。
 
 ## 源码阅读与算法边界
 
 先读 word_filter/lualib/flywow_word_filter.lua 的公开合同，再读
 word_filter/native/word_filter.h 的内部字段与单位，最后按 word_filter.cpp 的
-add_keyword → build → find 顺序查看核心。lua_word_filter.cpp 负责 userdata、GC、
+addKeyword → build → query 顺序查看核心。lua_word_filter.cpp 负责 userdata、GC、
 异常转换和 C++/Lua 的索引转换；业务不需要直接调用 Native 入口。
 
 AC 自动机按完整 Unicode 码点建立 trie，build 用 BFS 建立 fail 链并继承后缀输出。
 例如词库同时含 she/he，输入 she 会返回两项；Lua replace 合并两项的重叠区间，
 输出一次替换文本。出边使用有序 vector 和二分查找，沿用 FCLib 算法，不新增搜索策略。
 
-归一化位置与原文位置使用不同单位：normalized_code_point_offset/length 是码点，
-source_byte_offset/length 是原文 bytes。核心偏移从 0 开始，Lua offset 从 1 开始。
+核心用归一化码点匹配，只输出原文 byte 区间。核心偏移从 0 开始，Lua offset 从 1 开始。
 例如“前外-挂后”的 compact 命中起点为 C++ byte 3 / Lua byte 4，跨度为
 3+1+3=7 bytes；替换只覆盖“外-挂”，其余原文保持不变。
 
-词库只读不代表查询容器可以共用。C++ 并发查询须各自持有 results；
-Lua 每个对象持有自己的查询容器，调用不 yield。导出 Lua table 时，
-查询容器保留在 userdata owner 内，避免 Lua 分配失败的 longjmp 跳过栈上
-C++ 容器析构。C++ 异常转换为 nil,error；Lua 自身分配失败仍由 Lua 抛异常。
+词库构建完成后只读。每次 find 使用独立的 Lua userdata 持有 Native 命中缓冲，
+避免建表触发的 GC 回调重入时覆盖外层结果，也避免 Lua longjmp 越过栈上 C++ 容器的析构。
+contains 只计数。Lua 原文和词条仅在同步扫描或建库时借用，核心不保存字符串视图。
+公开 Lua 入口沿用 Lua 调用习惯，返回结果或 nil,error。Native 查询不 yield；
+create_filter 的配置字段可通过 __index 提供，元方法行为由宿主决定。
 
 ## 验证与兼容
 
 C++ 测试覆盖后缀/重叠命中、重复 build、中文原文偏移、NUL、非法 UTF-8、
 compact 和同一只读核心的多线程查询。
 Lua 测试覆盖公开接口、排序/替换、全角、词库失败、容量边界及 GC。
-Skynet 测试从宿主 server/ 启动两个 worker Service，验证独立 Lua State 的真实调用。
+Skynet 测试从 FlyWow 根目录启动两个 worker Service，验证独立 Lua State 的真实调用。
+loader 和 Skynet C 模块来自 SKYNET_ROOT，WordFilter 动态库来自当前 CMake target。
 已有 Skynet 可执行文件时 CTest 自动运行此项；没有时该集成边界未验证。
 模块不承诺现有 FCLib C++ API 兼容；宿主通过 FlyWow Lua 入口接入。
 尚未验证正式聊天流量、真实大词库容量及 Windows Native 构建。
