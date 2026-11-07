@@ -740,7 +740,7 @@ local function run_test_group()
         wait_for_batch_phase(controller, begin_update_batch(controller, "extra"), "COMPLETED")
         assert(read_worker_state(worker_service_handle).extra_value == 2)
         assert(skynet.call(worker_service_handle, "hotupgrade", "update",
-            {batch_id = "foreign", sequence = 999}).code == "HU_UNAUTHORIZED")
+            {batch_id = "foreign"}).code == "HU_UNAUTHORIZED")
         print("HOTUPGRADE_SKYNET_DECLARATION_OK")
     elseif group == "bad_functions" or group == "stage_failure" then
         controller = create_controller()

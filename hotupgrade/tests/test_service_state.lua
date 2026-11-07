@@ -222,10 +222,9 @@ assert(hotupgrade.register_service({
     end,
 }).ok)
 local request = { -- Prepare/Update/Abort 共用的完整控制请求。
-    batch_id = "state_merge_" .. scenario_name,
-    sequence = 1,
-    modules = {{name = "state_merge_logic", source = "return {version = 2}"}},
-    service_patch_source = scenario.service_patch_source,
+    batch_id             = "state_merge_" .. scenario_name,                                 -- 关联本场景的控制命令。
+    modules              = {{name = "state_merge_logic", source = "return {version = 2}"}}, -- 与私有状态一起提交的模块候选。
+    service_patch_source = scenario.service_patch_source,                                   -- 当前场景要验证的状态迁移。
 }
 --- 向当前测试 Service 注入一条 HotUpgrade 控制命令并返回协议结果。
 ---@param name string prepare、update、abort 或 finish；本函数将它与共享 request 一起交给接收器。
@@ -260,7 +259,6 @@ assert(scenario.state == state_identity and not hotupgrade.patching)
 assert(functions.load == old_function)
 scenario.check(scenario.state)
 if scenario.retry then
-    request.sequence = 2
     request.batch_id = request.batch_id .. "_retry"
     assert(command("prepare").ok)
     local retried = command("update") -- 恢复失败后第二次 Update 的结果。

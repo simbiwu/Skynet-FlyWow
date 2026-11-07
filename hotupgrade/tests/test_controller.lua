@@ -542,6 +542,12 @@ scenarios['unique'] = function()
     assert(coroutine.resume(first_co))
     assert(first_unique.value.service_handle == 90 and second_unique.value.service_handle == 90 and lifecycle_status(unique).pending_service_count == 1)
     assert(unique:handle_command("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 1).value.service_handle == 90)
+    -- 普通创建可使用同一个入口名，取消该实例时不能释放另一个 handle 的唯一名。
+    module_state.launch_service_handle = 94
+    local ordinary = unique:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 1) -- 同名普通实例。
+    assert(ordinary.ok and ordinary.value.service_handle == 94)
+    assert(unique:handle_command("cancel_service_creation", {service_handle = 94}, 1).ok)
+    assert(unique:handle_command("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 1).value.service_handle == 90)
     assert(unique:handle_command("cancel_service_creation", {service_handle = 90}, 2).code == "HU_UNAUTHORIZED")
     assert(unique:handle_command("cancel_service_creation", {service_handle = 90}, 1).ok and not unique.unique_service_entries.fixture)
 
@@ -706,6 +712,21 @@ scenarios['drain_abort_rejected'] = function()
     assert(c:handle_command("cancel_service_creation", {service_handle = 30}, 10).ok)
     assert(c.last_batch.phase == "COMPLETED" and lifecycle_status(c).pending_service_count == 0)
     assert(table.concat(module_state.operations, ",") == "10:prepare,file:lualib/test_worker_logic.lua,cache,10:update,10:finish")
+
+    -- 等待无关创建登记时，一个已 Prepare 的目标退出，其余目标必须先解除业务门禁。
+    assert(managed_register(c, metadata, 20).ok)
+    module_state.operations = {}
+    local failed_batch_id = begin_deployment(c, "module") -- 用于查询目标退出后的失败终态。
+    module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+    assert(c.active_batch.phase == "PREPARE" and c.active_batch.waiter and lifecycle_status(c).pending_service_count == 1)
+
+    -- 模拟原生退出通知；目标退出后无须等新建的 Service 30 登记才执行 Abort。
+    c:on_service_exit(20)
+    local failed_batch = c:handle_command("status", {batch_id = failed_batch_id}, 1).value.record -- 退出后应立即可查的终态。
+    assert(failed_batch.phase == "ABORTED" and failed_batch.error.code == "HU_SERVICE_EXITED")
+    assert(table.concat(module_state.operations, ",") == "10:prepare,20:prepare,10:abort")
+    assert(lifecycle_status(c).pending_service_count == 1)
+    assert(c:handle_command("cancel_service_creation", {service_handle = 30}, 10).ok)
 end
 
 scenarios['drain_unsupported'] = function()

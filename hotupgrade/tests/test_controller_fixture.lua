@@ -52,7 +52,7 @@ package.loaded.skynet =
         end
     end,
     call = function(service_handle, protocol, command, request)
-        assert(protocol == "hotupgrade" and request.sequence > 0)
+        assert(protocol == "hotupgrade" and type(request.batch_id) == "string")
         module_state.operations[#module_state.operations + 1] = service_handle .. ":" .. command
         module_state.last_control_command_by_service_handle[service_handle] = command
         if module_state.control_hook then

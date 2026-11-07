@@ -13,29 +13,25 @@ local M =
 -- 模块级私有状态表保存本 Lua State 共用的登记、当前批次和模块加载记录。
 local module_state =
 {
-    hotupgrade_handle    = nil,                              -- 首次跨 Service RPC 时取得；宿主必须先完成控制面初始化。
-    registration_config  = nil,                              -- 本 Lua State 的回调配置；登记结果单独保存在 registration_result。
-    registration_result  = nil,                              -- registration_config 设置后，nil 表示登记 RPC 在途；true/false 表示 Controller 接受/拒绝登记。
-    registration_waiters = {},                              -- register_service 的 RPC 等待期间暂停的 require 协程；收到答复后唤醒并清空。
-    active_batch         = nil,                              -- 当前批次的恢复数据保留至 finish/abort 确认完成。
-    completed_sequence   = 0,                                -- 已结束的 Controller 递增序号，拒绝迟到控制消息。
-    last_batch_id        = nil,                              -- 最近完成的批次，用于 finish/abort 幂等响应。
-    declared_modules     = {},                               -- 本 State 已登记模块的映射；例如 lualib/a.lua 以 a 为 require 名时记录 a。
-    module_loads         = {},                               -- 正在首次加载的模块；同名并发 require 等它完成后再检查模块结果。
-    module_sources       = setmetatable({}, {__mode = "k"}), -- 已确认模块导出表到真实文件路径的弱映射，不延长模块表生命周期。
+    hotupgrade_handle     = nil,                              -- 首次跨 Service RPC 时取得；宿主必须先完成控制面初始化。
+    registration_config   = nil,                              -- 本 Lua State 的回调配置；登记结果单独保存在 registration_accepted。
+    registration_accepted = nil,                              -- registration_config 设置后，nil 表示登记 RPC 在途；true 表示登记已确认，false 表示登记失败或未获确认。
+    registration_waiters  = {},                               -- register_service 的 RPC 等待期间暂停的 require 协程；收到答复后唤醒并清空。
+    active_batch          = nil,                              -- 当前批次的恢复数据保留至 finish/abort 确认完成。
+    declared_modules      = {},                               -- 本 State 已登记模块的映射；例如 lualib/a.lua 以 a 为 require 名时记录 a。
+    module_loads          = {},                               -- 正在首次加载的模块；同名并发 require 等它完成后再检查模块结果。
+    module_sources        = setmetatable({}, {__mode = "k"}), -- 已确认模块导出表到真实文件路径的弱映射，不延长模块表生命周期。
 }
 
 ---@class FlyWowHotUpgradeNewModuleContext
 ---@field owner thread 当前 Update 协程；只允许此协程执行声明清单内的新模块加载。
----@field batch_id string 当前 Controller 批次身份；写入 register_new_module 请求。
 ---@field names table<string, boolean> 已核验的新模块统一名称集合；例如 a/b.lua 对应 a.b；阻止候选加载未声明依赖。
 
 ---@class FlyWowHotUpgradeServiceBatch
 ---@field batch_id string Controller 为本次发布生成的身份；用于拒绝其他批次的控制命令。
----@field sequence integer Controller 单调递增的本地序号；finish/abort 后写入 completed_sequence。
 ---@field new_module_context? FlyWowHotUpgradeNewModuleContext 本批 Service Patch 允许首次加载的模块名及执行 Update 的协程；hotupgrade.require 用它拒绝其他新依赖，候选检查结束后清除。
 ---@field module_stage? FlyWowHotUpgradeModuleStage 候选模块的旧/新导出记录；保留至 Finish 或 Abort。
----@field service_patch? FlyWowHotUpgradeServicePatchState Service 私有状态与函数的提交/恢复记录。
+---@field service_patch? FlyWowHotUpgradeServicePatchState 开始写入 Service 状态或函数前保存的恢复记录。
 
 local require_module -- 公共 require 和 new_modules 复用已验证身份的同一加载流程。
 
@@ -51,7 +47,7 @@ local function get_hotupgrade_handle()
 end
 
 ---@class FlyWowHotUpgradeModuleIdentity
----@field name string 调用方使用的原始 require 名。
+---@field require_name string 调用方使用的原始 require 名。
 ---@field source_path string package.path 首次搜索到的 Lua 文件路径。
 ---@field resolved_path string Native 解析后的真实绝对路径，用于核验缓存来源。
 ---@field canonical_name string 相对 root_path 的文件身份，去掉 .lua 并将 / 转为点。
@@ -102,7 +98,7 @@ local function resolve_module_identity(name)
     end
 
     return flywow_result.success(
-        {name = name, source_path = source_path, resolved_path = resolved_path, canonical_name = canonical_name})
+        {require_name = name, source_path = source_path, resolved_path = resolved_path, canonical_name = canonical_name})
 end
 
 -- 与 Controller Service 使用同一原生消息协议；不建立独立协议/RPC 模块。
@@ -165,19 +161,20 @@ end
 ---@return FlyWowResult<nil> 恢复成功；回调拒绝或抛错时返回 HU_RECOVERY_REQUIRED。
 local function restore_service(batch)
     -- 尚未触及线上 Service 状态时无需恢复；否则先恢复状态，再恢复业务函数引用。
-    if not batch.service_patch or not batch.service_patch.touched then
+    local service_patch = batch.service_patch
+    if not service_patch then
         return flywow_result.success()
     end
 
-    -- 本批没有 Service Patch 时无需恢复；存在时从快照恢复 Service 私有状态。
+    -- 恢复使用登记时确定的回调和原业务函数表。
     local service_update = module_state.registration_config.service_update
     local restore_result = flywow_result.success()
 
     -- 自定义或默认状态恢复失败时保留结果，但仍继续装回所有旧函数。
-    if batch.service_patch.has_old_state then
+    if service_patch.update_state then
         if service_update.restore then
             local called, accepted = pcall(service_update.restore,
-                service_update.state, batch.service_patch.old_state)
+                service_update.state, service_patch.old_state)
             if not called then
                 restore_result = flywow_result.failure("HU_RECOVERY_REQUIRED", tostring(accepted))
             elseif type(accepted) ~= "table" or type(accepted.ok) ~= "boolean" then
@@ -188,25 +185,20 @@ local function restore_service(batch)
             end
         else
             restore_result = hotupgrade_module_patch.restore_state(
-                batch.service_patch.old_state, service_update.state)
+                service_patch.old_state, service_update.state)
         end
     end
 
     -- 旧状态恢复完成后，再恢复原函数引用并保留 functions 表身份。
-    for name, fn in pairs(batch.service_patch.old_functions) do
+    for name, fn in pairs(service_patch.old_functions) do
         rawset(service_update.functions, name, fn)
     end
     return restore_result
 end
 
---- 结束当前 Service 的本地批次，记录已完成序号并清除活动记录。
---- 清理完成后将 patching 设为 false，重新允许业务入口执行。
----@param batch FlyWowHotUpgradeServiceBatch 已经完成 Finish 或 Abort 的本地批次；本函数读取其 sequence 和 batch_id 保存终态身份。
+--- 释放当前 Service 的批次、模块 Stage 和恢复快照，并重新开放业务入口。
 ---@return nil
-local function close_batch(batch)
-    -- 本地完成序号和批次身份用于识别迟到或重复控制消息；释放 active_batch 后才重新接纳业务。
-    module_state.completed_sequence = batch.sequence
-    module_state.last_batch_id = batch.batch_id
+local function close_batch()
     module_state.active_batch = nil
     M.patching = false
 end
@@ -215,7 +207,7 @@ end
 --- 恢复完成或失败都会关闭本地批次；恢复失败通过 HU_RECOVERY_REQUIRED 报告。
 ---@param batch FlyWowHotUpgradeServiceBatch Controller 要求回退的本地批次；本函数读取其模块 Stage 和 Service 恢复记录。
 ---@return FlyWowResult<nil> 成功表示本地恢复完成；失败以 HU_RECOVERY_REQUIRED 报告全部恢复错误。
-local function abort(batch)
+local function abort_batch(batch)
     -- 先尝试恢复 Service 私有状态，再恢复模块导出；一个失败也继续另一项。
     -- 汇总 Service 状态和模块导出的恢复错误；一项失败也继续尝试另一项。
     local errors = {}
@@ -236,7 +228,7 @@ local function abort(batch)
 
     -- 恢复尝试结束后清除本地批次并重新开放业务入口；即使部分恢复失败也要结束本次 Abort。
     -- 每项恢复失败都保留在结果 details.errors 中，供 Controller 和宿主定位未恢复对象。
-    close_batch(batch)
+    close_batch()
     if #errors > 0 then
         return flywow_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
     end
@@ -250,9 +242,7 @@ end
 
 ---@class FlyWowHotUpgradeServicePatchState: FlyWowHotUpgradeServicePatchDefinition
 ---@field old_functions table<string, function> 本次替换前的函数；Abort 时逐项装回原业务函数表。
----@field has_old_state boolean 是否存在本次快照；用于保留 nil/false 等合法快照载荷。
----@field old_state any 自定义或默认 snapshot 返回的旧状态载荷；只在 has_old_state 为 true 时读取。
----@field touched boolean 提交开始写入业务状态或函数前置 true，失败时据此恢复。
+---@field old_state any 自定义或默认 snapshot 返回的旧状态载荷；仅当 update_state 存在时使用，允许 nil 或 false。
 
 --- 执行 Service .patch 构建回调，校验更新定义并保存恢复快照。
 ---@param service_patch_source string Controller 固定读取并发送的 Service .patch 源码。
@@ -330,8 +320,6 @@ local function stage_service_patch(service_patch_source)
         replace_functions = patch_definition.replace_functions,  -- 来自 .patch 返回表的 replace_functions 表；Update 安装这些函数，old_functions 保存旧函数供 Abort 恢复。
         new_modules       = patch_definition.new_modules,        -- 来自 .patch 返回表的 new_modules 数组；本批加载并登记后，从下一批起参与候选匹配。
         old_functions     = {},                                  -- 保存将被替换的原函数引用，Abort 时逐项装回原 functions 表。
-        has_old_state     = false,                               -- 标记旧状态快照是否存在；快照值为 nil 或 false 时仍能正确区分。
-        touched           = false,                               -- Activate 开始应用 Service Patch 前为 false；Abort 据此判断是否要恢复。
     }
     for name, replacement_function in pairs(patch_definition.replace_functions or {}) do
         if type(name) ~= "string" or type(replacement_function) ~= "function"
@@ -341,7 +329,7 @@ local function stage_service_patch(service_patch_source)
         service_patch.old_functions[name] = rawget(service_update.functions, name)
     end
 
-    -- 只在 Patch 会改状态时保存旧快照；has_old_state 另行标记 nil/false 合法载荷。
+    -- 只在 Patch 会改状态时保存旧快照；恢复根据 update_state 判断是否使用它。
     if patch_definition.update_state then
         if service_update.snapshot then
             local snapshot_called, snapshot_result = pcall(service_update.snapshot, service_update.state)
@@ -364,7 +352,6 @@ local function stage_service_patch(service_patch_source)
             end
             service_patch.old_state = snapshot_result.value
         end
-        service_patch.has_old_state = true
     end
     return flywow_result.success(service_patch)
 end
@@ -374,12 +361,11 @@ end
 ---@param service_patch_source? string 当前目标的 Service .patch 源码；nil 表示本批不更新 Service 状态或函数。
 ---@return FlyWowResult<FlyWowHotUpgradeServicePatchState|nil> 没有 Service Patch 时成功载荷为 nil；否则返回恢复记录，失败时保留具体错误码。
 local function stage_service_patch_and_new_modules(batch, service_patch_source)
-    -- 保存本批允许首次加载的新模块；hotupgrade.require 用这三项限制当前协程和模块清单。
+    -- 保存本批允许首次加载的新模块；hotupgrade.require 据此校验调用协程和模块名。
     local new_module_context =
     {
-        owner    = coroutine.running(), -- 只有当前 Update 协程可以使用这份新模块清单。
-        batch_id = batch.batch_id,      -- Controller 的本批身份；新模块登记 RPC 必须携带它。
-        names    = {},                  -- Service Patch 声明并核验过的模块名；仅这些名字可首次加载。
+        owner = coroutine.running(), -- 只有当前 Update 协程可以使用这份新模块清单。
+        names = {},                  -- Service Patch 声明并核验过的模块名；仅这些名字可首次加载。
     }
     batch.new_module_context = new_module_context
     if not service_patch_source then
@@ -414,7 +400,7 @@ local function stage_service_patch_and_new_modules(batch, service_patch_source)
 
     -- 确认所有声明名都指向不同文件后才开始加载；这样重复声明不会留下已加载一部分的结果。
     for _, identity in ipairs(identities) do
-        local load_result = require_module(identity.name, identity)
+        local load_result = require_module(identity)
         if not load_result.ok then
             batch.new_module_context = nil
             return flywow_result.failure("HU_NEW_MODULE_FAILED", load_result.message,
@@ -432,7 +418,7 @@ end
 
 --- 在本 Service 建立本批记录并设置 patching，阻止新的业务请求进入。
 --- 随后调用 before_upgrade 等业务 queue 安全点；该回调可能 yield，失败留给 Controller Abort。
----@param request FlyWowHotUpgradeControlRequest Controller 发来的 Prepare 请求；本函数读取 batch_id 和 sequence 创建本地批次记录。
+---@param request FlyWowHotUpgradeControlRequest Controller 发来的 Prepare 请求；本函数读取 batch_id 创建本地批次记录。
 ---@return FlyWowResult<nil> 回调失败或未确认安全点时保留批次记录，交由现有 Abort 收尾
 local function prepare_batch(request)
     -- active_batch 是当前 Service 的本地记录；request 的身份来自 Controller，回调与业务对象仍只留在此 Lua State。
@@ -440,11 +426,10 @@ local function prepare_batch(request)
         return flywow_result.failure("HU_UPGRADE_BUSY", "当前批次已在处理中")
     end
 
-    -- 批次身份和阶段均已校验；现在记录活动批次以拒绝并行更新。
+    -- 活动批次持有本次更新的恢复数据；先建立记录，再等待业务安全点。
     module_state.active_batch =
     {
         batch_id = request.batch_id, -- Controller 为本次发布生成的身份，后续控制命令必须一致。
-        sequence = request.sequence, -- Controller 单调递增的批次序号，用于拒绝迟到命令。
         new_module_context = nil, -- 仅 Update 期间临时保存新模块清单；Prepare 与收尾阶段没有加载权限。
     }
     M.patching = true
@@ -490,9 +475,8 @@ local function update_batch(batch, request)
         return module_result
     end
 
-    -- 保存普通模块 Stage 和 Service Patch；后续 Commit 使用它们，Abort 用它们恢复。
-    batch.module_stage = module_result.value.stage
-    batch.service_patch = service_patch
+    -- 保存普通模块 Stage；Commit 写入导出，Abort 据此恢复。
+    batch.module_stage = module_result.value
 
     -- 先把候选模块字段安装到现有导出表；任一目标失败时 Controller 会对本批已参与目标执行 Abort。
     local commit_result = hotupgrade_module_patch.commit(batch.module_stage)
@@ -505,7 +489,7 @@ local function update_batch(batch, request)
         if service_patch then
             -- Service Patch 只改 state/functions 的字段，保留业务代码已持有的两张根表。
             local service_update = module_state.registration_config.service_update
-            service_patch.touched = true
+            batch.service_patch = service_patch -- 业务写入开始前交给批次持有，供 Abort 恢复。
             if service_patch.update_state then
                 service_patch.update_state()
             end
@@ -534,21 +518,10 @@ local function update_batch(batch, request)
     return flywow_result.success()
 end
 
---- 确认本 Service 的 Update 成功，释放普通模块 Stage 和 Service 恢复记录。
---- Finish 不执行回滚；完成后重新开放业务入口。
----@param batch FlyWowHotUpgradeServiceBatch Prepare 建立且 Update 已成功的本地批次；本函数释放其中保存的候选和恢复快照。
----@return FlyWowResult<nil> 释放模块 Stage 快照的结果；完成后关闭本地批次并重新开放业务入口
-local function finish_batch(batch)
-    -- Controller 仅在全部目标 Update 成功后发送 Finish；这里释放旧/新导出引用并开放业务入口。
-    local finished = hotupgrade_module_patch.finish(batch.module_stage)
-    close_batch(batch)
-    return finished
-end
-
 --- 核对消息来源和批次身份后，将 prepare、update、abort、finish 分派到本地对应步骤。
 --- 本函数不实现阶段细节；阶段结果和可能的 yield 原样返回给 RPC 分发器。
 ---@param command FlyWowHotUpgradeServiceCommand Controller 发来的阶段名，只接受 prepare、update、abort 或 finish。
----@param request FlyWowHotUpgradeControlRequest Controller 发来的批次号、序号及 Update 候选；本函数将其交给对应阶段处理。
+---@param request FlyWowHotUpgradeControlRequest Controller 发来的批次 ID 及 Update 候选；本函数将其交给对应阶段处理。
 ---@param source integer Skynet 消息头提供的调用方 handle；本函数用它确认请求来自宿主 Controller。
 ---@return FlyWowResult<nil> Prepare/Update/Abort 可能 yield；阶段错误原样返回，异常交由 dispatch_upgrade_command 转换。
 local function handle_upgrade(command, request, source)
@@ -561,36 +534,33 @@ local function handle_upgrade(command, request, source)
         return flywow_result.failure("HU_UNKNOWN_COMMAND", tostring(command))
     end
 
-    if module_state.last_batch_id == request.batch_id and (command == "abort" or command == "finish") then
+    -- Controller 可能在目标自行清理控制异常后发送 Abort；没有活动批次就无需再次恢复。
+    local batch = module_state.active_batch
+    if command == "abort" and not batch then
         return flywow_result.success()
     end
 
-    if request.sequence <= module_state.completed_sequence or (module_state.active_batch and module_state.active_batch.batch_id ~= request.batch_id) then
-        return flywow_result.failure("HU_STALE_BATCH", "过期或冲突批次命令")
+    if batch and batch.batch_id ~= request.batch_id then
+        return flywow_result.failure("HU_STALE_BATCH", "控制命令与活动批次不匹配")
     end
-
     if command == "prepare" then
         return prepare_batch(request)
     end
-
-    -- 当前 Service 正在处理的本地批次；用它核对 Controller 命令的序号和身份。
-    local batch = module_state.active_batch
-    if not batch or batch.sequence ~= request.sequence then
+    if not batch then
         return flywow_result.failure("HU_STALE_BATCH", "未取得本批次安全点")
     end
 
     if command == "abort" then
-        return abort(batch)
+        return abort_batch(batch)
     end
 
     if command == "update" then
         return update_batch(batch, request)
     end
-    if command == "finish" then
-        return finish_batch(batch)
-    end
 
-    return flywow_result.failure("HU_PHASE_INVALID", "当前阶段不能执行 " .. tostring(command))
+    -- 全部目标 Update 成功后，Finish 只释放本批恢复材料并开放业务入口。
+    close_batch()
+    return flywow_result.success()
 end
 
 --- 接收原生 hotupgrade 协议消息，调用 handle_upgrade 并把 FlyWowResult 回给 RPC 调用方。
@@ -610,7 +580,7 @@ local function dispatch_upgrade_command(session, source, command, request)
         -- 当前仍未结束的本地批次；Finish 异常只能释放记录，不能回滚已发布更新。
         local batch = module_state.active_batch
         if batch and command ~= "finish" then
-            control_result = abort(batch)
+            control_result = abort_batch(batch)
             if control_result.ok then
                 control_result = original
             else
@@ -621,10 +591,7 @@ local function dispatch_upgrade_command(session, source, command, request)
             end
         else
             if batch then
-                if batch.module_stage then
-                    hotupgrade_module_patch.finish(batch.module_stage)
-                end
-                close_batch(batch)
+                close_batch()
             end
             control_result = original
         end
@@ -718,10 +685,10 @@ function M.register_service(registration)
     -- 先保存 Controller 的最终答复；等待中的 require 恢复后会据此决定是否继续加载。
     local response_is_result = type(registration_response) == "table"
         and type(registration_response.ok) == "boolean"
-    module_state.registration_result = registration_call_succeeded and response_is_result
+    module_state.registration_accepted = registration_call_succeeded and response_is_result
         and registration_response.ok == true
     -- Controller 答复已固定；唤醒所有因本次登记尚未完成而暂停的 require 协程。
-    -- 每个等待者会读取同一个 registration_result，再决定继续加载还是报告登记失败。
+    -- 每个等待者会读取同一个 registration_accepted，再决定继续加载还是报告登记失败。
     for _, waiting_require_thread in ipairs(module_state.registration_waiters) do
         skynet.wakeup(waiting_require_thread)
     end
@@ -736,12 +703,12 @@ function M.register_service(registration)
 end
 
 --- 调用原生 require 并验证模块表确实来自已解析的 Lua 文件。
----@param name string 业务调用方传入的 require 名；用于访问原名缓存。
 ---@param module_identity FlyWowHotUpgradeModuleIdentity 已核实的文件身份；用于核对加载来源。
 ---@param module_load_attempt table 本次加载记录；本函数写入模块表、路径及新增来源映射标记。
 ---@return FlyWowResult<nil> 验证成功；Native 来源或导出不符时返回对应 HU 错误。
-local function load_module_exports(name, module_identity, module_load_attempt)
+local function load_module_exports(module_identity, module_load_attempt)
     -- 读取本次确认的文件身份与缓存快照，先拒绝来源不明或别名占用。
+    local require_name = module_identity.require_name
     local source_path = module_identity.source_path
     local resolved_path = module_identity.resolved_path
     local canonical_name = module_identity.canonical_name
@@ -750,9 +717,9 @@ local function load_module_exports(name, module_identity, module_load_attempt)
         and (type(module_load_attempt.cache_snapshot.module) ~= "table"
             or module_state.module_sources[module_load_attempt.cache_snapshot.module] ~= resolved_path) then
         return flywow_result.failure("HU_INVALID_PATH",
-            "无法确认缓存模块来源，须先通过 hotupgrade.require 加载: " .. name)
+            "无法确认缓存模块来源，须先通过 hotupgrade.require 加载: " .. require_name)
     end
-    if package.preload[canonical_name] ~= nil or package.preload[name] ~= nil then
+    if package.preload[canonical_name] ~= nil or package.preload[require_name] ~= nil then
         return flywow_result.failure("HU_DUPLICATE_MODULE",
             "模块名称已被 package.preload 占用: " .. canonical_name)
     end
@@ -767,7 +734,7 @@ local function load_module_exports(name, module_identity, module_load_attempt)
 
     -- package.loaded 没有该模块时才调用原生 require；随后检查返回值是 table，且真实文件位于 root_path。
     if module_load_attempt.module_exports == nil then
-        local require_succeeded, module_exports, loader_path = pcall(require, name)
+        local require_succeeded, module_exports, loader_path = pcall(require, require_name)
         if not require_succeeded then
             local failure_text = tostring(module_exports)
             local cause_code, cause_message = failure_text:match("(HU_[A-Z0-9_]+):%s*(.*)$")
@@ -775,33 +742,32 @@ local function load_module_exports(name, module_identity, module_load_attempt)
                 cause_code and {cause_code = cause_code} or nil)
         end
         module_load_attempt.module_exports = module_exports
-        module_load_attempt.loader_path = loader_path
         if type(module_exports) ~= "table" then
             return flywow_result.failure("HU_MODULE_EXPORTS_INVALID", "可更新模块必须返回 table")
         end
         if loader_path ~= nil then
             if type(loader_path) ~= "string" then
-                return flywow_result.failure("HU_INVALID_PATH", "原生 require 返回了无效模块路径: " .. name)
+                return flywow_result.failure("HU_INVALID_PATH", "原生 require 返回了无效模块路径: " .. require_name)
             end
             local actual_path, path_failure = hotupgrade_native.resolve(loader_path)
             if actual_path ~= resolved_path then
                 local message = type(path_failure) == "table" and path_failure.message or tostring(path_failure)
                 return flywow_result.failure("HU_INVALID_PATH",
-                    "模块加载来源与 package.path 不一致: " .. name .. ": " .. message)
+                    "模块加载来源与 package.path 不一致: " .. require_name .. ": " .. message)
             end
         else
             local loadfile_succeeded, loader_chunk = pcall(loadfile, source_path, "t")
             if require ~= skynet_require.require or not loadfile_succeeded or not loader_chunk then
                 return flywow_result.failure("HU_INVALID_PATH",
-                    "加载器未提供可确认的模块来源: " .. name)
+                    "加载器未提供可确认的模块来源: " .. require_name)
             end
         end
         -- 只有来源和缓存别名全部匹配后才记录新模块表的来源。
         local previous_source = module_state.module_sources[module_exports]
         if previous_source ~= nil and previous_source ~= resolved_path then
-            return flywow_result.failure("HU_DUPLICATE_MODULE", "同一模块表已对应其他文件: " .. name)
+            return flywow_result.failure("HU_DUPLICATE_MODULE", "同一模块表已对应其他文件: " .. require_name)
         end
-        if package.preload[name] ~= nil or package.preload[canonical_name] ~= nil then
+        if package.preload[require_name] ~= nil or package.preload[canonical_name] ~= nil then
             return flywow_result.failure("HU_DUPLICATE_MODULE",
                 "模块名称已被 package.preload 占用: " .. canonical_name)
         end
@@ -810,7 +776,7 @@ local function load_module_exports(name, module_identity, module_load_attempt)
             return flywow_result.failure("HU_DUPLICATE_MODULE",
                 "模块路径登记名已被其他模块占用: " .. canonical_name)
         end
-        module_load_attempt.loader_path = loader_path or source_path
+        module_load_attempt.loader_path = loader_path
         if previous_source == nil then
             module_state.module_sources[module_exports] = resolved_path
             module_load_attempt.source_mapping_added = true
@@ -820,28 +786,27 @@ local function load_module_exports(name, module_identity, module_load_attempt)
 end
 
 --- 完成模块首次加载、许可和登记，并在失败时回退本次缓存变更。
----@param name string 当前调用使用的 require 名；用于读写原名缓存并加载文件。
 ---@param module_identity FlyWowHotUpgradeModuleIdentity 已确认的模块文件身份；用于统一登记名和来源检查。
----@param new_module_context? FlyWowHotUpgradeNewModuleContext 当前 Update 的声明清单；存在时绑定新模块登记。
----@param register_new_module? boolean 是否走本批新模块登记通道。
+---@param authorized_batch_id? string 当前协程获准登记该新模块的批次 ID；nil 走普通加载路径。
 ---@return FlyWowResult<table> 成功载荷为模块表；许可、加载或登记失败返回稳定 HU 错误。
-local function load_and_register_module(name, module_identity, new_module_context, register_new_module)
-    -- 本次加载的统一身份；许可、缓存别名、登记和失败回退都使用它。
+local function load_and_register_module(module_identity, authorized_batch_id)
+    -- 许可使用规范名，原名用于 require 缓存和候选加载参数。
+    local require_name = module_identity.require_name
     local canonical_name = module_identity.canonical_name
-    local attempt =
+    local module_load_attempt =
     {
-        loader_path              = module_identity.source_path, -- 本次 require 命中的文件路径；成功时更新为实际加载路径。
-        permit_id                = nil,                         -- Controller 发放的首次加载许可；失败或完成后会消费/取消。
-        cache_snapshot           = nil,                         -- require 前两个 package.loaded 槽的值；失败时原样恢复。
-        module_exports           = nil,                         -- 本次加载得到的模块表；登记失败时用于撤销来源映射。
-        source_mapping_added     = false,                       -- 本次是否新增模块表到路径映射；仅撤销本次新增项。
-        module_declaration_added = false,                       -- 本次是否新增模块登记；失败时仅删除本次登记。
+        loader_path              = nil,   -- 加载器提供且已校验的路径；缺失时使用身份记录中的搜索路径。
+        permit_id                = nil,   -- Controller 发放的首次加载许可；失败或完成后会消费/取消。
+        cache_snapshot           = nil,   -- require 前两个 package.loaded 槽的值；失败时原样恢复。
+        module_exports           = nil,   -- 本次加载得到的模块表；登记失败时用于撤销来源映射。
+        source_mapping_added     = false, -- 本次是否新增模块表到路径映射；仅撤销本次新增项。
+        module_declaration_added = false, -- 本次是否新增模块登记；失败时仅删除本次登记。
     }
     local result = flywow_result.success()
 
     -- 已登记 Service 的普通首次加载先申请许可；本批清单新模块走专用登记通道。
     if module_state.registration_config and not module_state.declared_modules[canonical_name]
-        and not register_new_module then
+        and not authorized_batch_id then
         local called, answer = pcall(skynet.call, get_hotupgrade_handle(), "hotupgrade",
             "begin_module_load", {name = canonical_name})
         if not called then
@@ -853,45 +818,45 @@ local function load_and_register_module(name, module_identity, new_module_contex
         elseif type(answer.value) ~= "table" or type(answer.value.permit_id) ~= "string" then
             result = flywow_result.failure("HU_RPC_FAILED", "begin_module_load 未返回许可 ID")
         else
-            attempt.permit_id = answer.value.permit_id
+            module_load_attempt.permit_id = answer.value.permit_id
         end
     end
 
     -- 许可成功后保存两个缓存槽，再验证并加载模块；后续失败据此原样回退。
     if result.ok then
-        attempt.cache_snapshot =
+        module_load_attempt.cache_snapshot =
         {
-            module           = package.loaded[name],           -- 调用方原始 require 名对应的缓存值。
+            module          = package.loaded[require_name],   -- 调用方原始 require 名对应的缓存值。
             canonical_alias = package.loaded[canonical_name], -- FlyWow 统一模块名对应的缓存值。
         }
-        result = load_module_exports(name, module_identity, attempt)
+        result = load_module_exports(module_identity, module_load_attempt)
     end
 
     -- 先写好本地缓存和模块声明，再向 Controller 登记，避免远端先看到尚未完成的加载。
     if result.ok then
-        package.loaded[canonical_name] = attempt.module_exports
+        package.loaded[canonical_name] = module_load_attempt.module_exports
         if not module_state.declared_modules[canonical_name] then
             module_state.declared_modules[canonical_name] =
-                {name = name, path = attempt.loader_path}
-            attempt.module_declaration_added = true
+                {name = require_name, path = module_load_attempt.loader_path or module_identity.source_path}
+            module_load_attempt.module_declaration_added = true
         end
 
         local command
         local request
-        -- 本地缓存、来源路径和模块声明已回退；若普通加载许可仍未使用，再通知 Controller 撤销它。
-        if attempt.permit_id then
+        -- 按本次取得的普通许可或 Update 授权选择登记命令。
+        if module_load_attempt.permit_id then
             command = "register_module"
             request =
             {
                 name      = canonical_name, -- Controller 登记的统一模块名。
-                permit_id = attempt.permit_id, -- 本次普通首次加载对应的许可 ID。
+                permit_id = module_load_attempt.permit_id, -- 本次普通首次加载对应的许可 ID。
             }
-        elseif register_new_module and attempt.module_declaration_added then
+        elseif authorized_batch_id and module_load_attempt.module_declaration_added then
             command = "register_new_module"
             request =
             {
-                batch_id = new_module_context.batch_id, -- 限定新模块登记属于当前 Update 批次。
-                name     = canonical_name,              -- Service Patch 清单中的统一模块名。
+                batch_id = authorized_batch_id, -- 限定新模块登记属于当前 Update 批次。
+                name     = canonical_name,      -- Service Patch 清单中的统一模块名。
             }
         end
         if command then
@@ -903,66 +868,64 @@ local function load_and_register_module(name, module_identity, new_module_contex
             else
                 result = answer
             end
-        else
-            result = flywow_result.success(attempt.module_exports)
         end
     end
 
     if result.ok then
-        return flywow_result.success(attempt.module_exports)
+        return flywow_result.success(module_load_attempt.module_exports)
     end
 
     -- 登记失败时回退缓存、来源映射和本地声明，并尽力取消仍在途的许可。
-    if attempt.cache_snapshot then
-        package.loaded[name] = attempt.cache_snapshot.module
-        package.loaded[canonical_name] = attempt.cache_snapshot.canonical_alias
+    if module_load_attempt.cache_snapshot then
+        package.loaded[require_name] = module_load_attempt.cache_snapshot.module
+        package.loaded[canonical_name] = module_load_attempt.cache_snapshot.canonical_alias
     end
 
     -- 缓存恢复后，逐项撤销本次加载新增的来源映射与模块声明。
-    if attempt.source_mapping_added then
-        module_state.module_sources[attempt.module_exports] = nil
+    if module_load_attempt.source_mapping_added then
+        module_state.module_sources[module_load_attempt.module_exports] = nil
     end
 
     -- 来源映射恢复后，再移除本次添加的本地模块声明。
-    if attempt.module_declaration_added then
+    if module_load_attempt.module_declaration_added then
         module_state.declared_modules[canonical_name] = nil
     end
 
     -- package.loaded、来源映射和模块声明已回退；若许可尚未消费，再请求 Controller 删除它。
-    if attempt.permit_id then
+    if module_load_attempt.permit_id then
         pcall(skynet.call, get_hotupgrade_handle(), "hotupgrade",
-            "cancel_module_load", {name = canonical_name, permit_id = attempt.permit_id})
+            "cancel_module_load", {name = canonical_name, permit_id = module_load_attempt.permit_id})
     end
     return result
 end
 
 --- 已验证身份的首次加载与登记；等待许可或同模块加载时可能 yield。
----@param name string 业务代码原本传给 require 的模块名；用于读写原名缓存。
 ---@param module_identity FlyWowHotUpgradeModuleIdentity 已找到并校验的文件身份；用于登记统一模块名。
 ---@return FlyWowResult<table> 成功载荷为稳定模块表；加载或许可失败以 HU 错误结果返回。
-require_module = function(name, module_identity)
+require_module = function(module_identity)
     local canonical_name = module_identity.canonical_name
-    local new_module_context = module_state.active_batch
-        and module_state.active_batch.new_module_context
-    local in_new_module_context = new_module_context
-        and new_module_context.owner == coroutine.running()
-    local register_new_module = in_new_module_context
-        and new_module_context.names[canonical_name] == true
-    if in_new_module_context and not module_state.declared_modules[canonical_name]
-        and not register_new_module then
-        return flywow_result.failure("HU_NEW_MODULE_NOT_DECLARED",
-            "新模块依赖未列入 new_modules: " .. canonical_name)
+    -- 仅本批 Update 协程可为清单中的模块走批次登记通道。
+    local batch = module_state.active_batch
+    local new_module_context = batch and batch.new_module_context
+    local authorized_batch_id
+    if new_module_context and new_module_context.owner == coroutine.running() then
+        if new_module_context.names[canonical_name] then
+            authorized_batch_id = batch.batch_id
+        elseif not module_state.declared_modules[canonical_name] then
+            return flywow_result.failure("HU_NEW_MODULE_NOT_DECLARED",
+                "新模块依赖未列入 new_modules: " .. canonical_name)
+        end
     end
 
     if module_state.registration_config then
-        if module_state.registration_result == nil then
+        if module_state.registration_accepted == nil then
             -- register_service 的 skynet.call 尚未返回，登记成败仍未知。
             -- 暂停当前 require，避免在 Controller 确认登记前加载并暴露模块。
             local waiting_require_thread = coroutine.running()
             module_state.registration_waiters[#module_state.registration_waiters + 1] = waiting_require_thread
             skynet.wait(waiting_require_thread)
         end
-        if module_state.registration_result ~= true then
+        if module_state.registration_accepted ~= true then
             return flywow_result.failure("HU_SERVICE_NOT_REGISTERED", "首次登记失败，须终止本次启动")
         end
     end
@@ -970,7 +933,7 @@ require_module = function(name, module_identity)
     local module_load = module_state.module_loads[canonical_name]
     if module_load then
         local thread = coroutine.running()
-        if register_new_module and module_load.owner ~= thread then
+        if authorized_batch_id and module_load.owner ~= thread then
             return flywow_result.failure("HU_MODULE_LOADING", "新模块正由其他协程加载: " .. canonical_name)
         end
         if module_load.owner == thread then
@@ -978,7 +941,7 @@ require_module = function(name, module_identity)
         end
         module_load.waiters[#module_load.waiters + 1] = thread
         skynet.wait(thread)
-        return require_module(name, module_identity)
+        return require_module(module_identity)
     end
 
     module_load =
@@ -987,7 +950,7 @@ require_module = function(name, module_identity)
         waiters  = {},                  -- 等待该模块加载结果的其他协程；加载完成后逐个唤醒。
     }
     module_state.module_loads[canonical_name] = module_load
-    local result = load_and_register_module(name, module_identity, new_module_context, register_new_module)
+    local result = load_and_register_module(module_identity, authorized_batch_id)
     module_state.module_loads[canonical_name] = nil
     for _, thread in ipairs(module_load.waiters) do
         skynet.wakeup(thread)
@@ -1012,7 +975,7 @@ function M.require(name)
     end
 
     -- 身份校验通过后才加载并登记模块；失败仍按原生 require 抛错。
-    local require_result = require_module(name, identity_result.value)
+    local require_result = require_module(identity_result.value)
     if not require_result.ok then
         error(tostring(require_result.code or "HU_MODULE_LOAD_FAILED") .. ": " .. tostring(require_result.message), 2)
     end

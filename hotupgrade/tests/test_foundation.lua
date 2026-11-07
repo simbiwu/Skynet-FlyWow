@@ -26,6 +26,11 @@ snapshot.nested.count = 8
 assert(graph.nested.count == 7)
 assert(patch.restore_state(snapshot, graph).ok)
 assert(graph.self == graph and graph.nested.count == 8 and graph.shared == graph.nested)
+-- 状态图验证失败时，现有根表和已引用的子表都保留原值。
+local previous_nested = graph.nested -- 恢复前已被线上状态引用的子表。
+assert(patch.restore_state({nested = {count = 9}, resource = io.stdout}, graph).code == "HU_STATE_COPY_FAILED")
+assert(graph.nested == previous_nested and graph.shared == previous_nested and graph.self == graph)
+assert(previous_nested.count == 8 and graph.resource == nil)
 assert(patch.snapshot_state({resource = io.stdout}).code == "HU_STATE_COPY_FAILED")
 assert(patch.snapshot_state(setmetatable({}, {})).code == "HU_STATE_COPY_FAILED")
 
@@ -56,10 +61,10 @@ return {
 local staged = patch.stage({{name = "logic", source = source}}) -- logic 模块的候选暂存结果，后续依次提交并完成。
 assert(staged.ok, staged.message)
 assert(live.value() == 7 and old_state.count == 7)
-assert(patch.commit(staged.value.stage).ok)
+assert(patch.commit(staged.value).ok)
 assert(package.loaded.logic == live and live.value() == 8 and cached() == 7)
 assert(live.added == 42 and live.removed == nil)
-assert(patch.abort(staged.value.stage).ok)
+assert(patch.abort(staged.value).ok)
 assert(live.value == cached and live.removed and live.added == nil)
 
 local dependency_name = "hotupgrade_stage_dependency_fixture" -- 普通候选源码通过原生 require 引用的依赖名。
@@ -82,11 +87,10 @@ assert(not failed.ok and live.value() == 7)
 failed = patch.stage({{name = "logic", source = "return {value=function() return 3 end, export_state=function() return {} end}"}})
 assert(not failed.ok and live.value() == 7)
 staged = patch.stage({{name = "logic", source = source}})
-assert(staged.ok and patch.commit(staged.value.stage).ok)
+assert(staged.ok and patch.commit(staged.value).ok)
 package.loaded.logic = {}
-assert(patch.abort(staged.value.stage).code == "HU_RECOVERY_REQUIRED")
+assert(patch.abort(staged.value).code == "HU_RECOVERY_REQUIRED")
 package.loaded.logic = live
-assert(patch.abort(staged.value.stage).code == "HU_PHASE_INVALID")
 -- 无状态模块不需要钩子；多模块中一个 Stage 失败不能提前安装其他模块。
 local simple = {value = function() return 1 end}
 package.loaded.a = simple
@@ -104,14 +108,14 @@ local combined = patch.stage({ -- 同时暂存多个模块的候选结果，用�
     {name = "b", source = "return {value = function() return 20 end, added = true}"},
     {name = "a", source = "return {value = function() return 10 end}"},
 })
-assert(combined.ok and patch.commit(combined.value.stage).ok)
+assert(combined.ok and patch.commit(combined.value).ok)
 assert(package.loaded.a == simple and package.loaded.b == second)
 assert(simple.value() == 10 and second.value() == 20 and second.added)
-assert(patch.abort(combined.value.stage).ok)
+assert(patch.abort(combined.value).ok)
 assert(simple.value == old_first_value and second.value == old_second_value and second.added == nil)
 package.loaded.a = {export_state = function() return {old = true} end, import_state = function() return require("flywow_result").success() end}
 local reset_state = patch.stage({{name = "a", source = "return {}"}}) -- 不提供可迁移状态钩子的候选 Stage 结果。
-assert(reset_state.ok and patch.abort(reset_state.value.stage).ok)
+assert(reset_state.ok and patch.abort(reset_state.value).ok)
 package.loaded.a = {
     value = function() return 1 end,
     export_state = function() return {} end,
@@ -139,7 +143,7 @@ local retried = patch.stage({{name = "a", source = [[return {
     export_state = function() return {} end,
     import_state = function() return require("flywow_result").success() end,
 }]]}})
-assert(retried.ok and patch.abort(retried.value.stage).ok)
+assert(retried.ok and patch.abort(retried.value).ok)
 -- 嵌套配置、辅助函数、共享与循环图均按完整新版本安装；回滚必须找回原引用。
 local old_config = {max_level = 50, items = {sword = {attack = 10}}}
 local old_helper = {calculate = function(value) return value end} -- 线上状态中保存的辅助函数对象，默认数据快照不支持时应显式处理。
@@ -159,14 +163,14 @@ return M
 local nested_stage = patch.stage({{name = nested_name, source = nested_source}}) -- 嵌套配置候选的 Stage 结果。
 assert(nested_stage.ok, nested_stage.message)
 assert(nested_live.config == old_config and old_config.max_level == 50)
-assert(patch.commit(nested_stage.value.stage).ok)
+assert(patch.commit(nested_stage.value).ok)
 assert(package.loaded[nested_name] == nested_live and nested_live.config ~= old_config)
 assert(nested_live.config.max_level == 100 and nested_live.config.items.sword.attack == 20)
 assert(nested_live.config.self == nested_live.config and nested_live.alias == nested_live.config.items)
 assert(nested_live.config[1] == "index" and nested_live.config[false] == true)
 assert(nested_live.helper.calculate(3) == 6 and nested_live.get_max_level() == 100)
 assert(nested_live.removed == nil and old_config.max_level == 50)
-assert(patch.abort(nested_stage.value.stage).ok)
+assert(patch.abort(nested_stage.value).ok)
 assert(package.loaded[nested_name] == nested_live and nested_live.config == old_config)
 assert(nested_live.helper == old_helper and nested_live.removed and nested_live.alias == nil)
 assert(nested_live.get_max_level == nil)
@@ -187,20 +191,19 @@ for _, invalid_source in ipairs({
     assert(nested_live.helper == old_helper and nested_live.removed)
 end
 local scalar_stage = patch.stage({{name = nested_name, source = "return {config = 100}"}}) -- 导出字段类型不匹配时的候选 Stage 结果。
-assert(scalar_stage.ok and patch.commit(scalar_stage.value.stage).ok and nested_live.config == 100)
-assert(patch.abort(scalar_stage.value.stage).ok and nested_live.config == old_config)
+assert(scalar_stage.ok and patch.commit(scalar_stage.value).ok and nested_live.config == 100)
+assert(patch.abort(scalar_stage.value).ok and nested_live.config == old_config)
 local root_reference = patch.stage({{name = nested_name, -- 候选对模块根表身份的直接引用，用于验证候选隔离规则。
     source = "local M = {}; M.config = {root = M}; return M"}})
 assert(not root_reference.ok and root_reference.message:find("根导出表", 1, true))
 -- 成功 finish 后，下一次 Stage 也能够校验并回滚已经在线的嵌套循环图。
 nested_stage = patch.stage({{name = nested_name, source = nested_source}})
-assert(nested_stage.ok and patch.commit(nested_stage.value.stage).ok)
-assert(patch.finish(nested_stage.value.stage).ok)
+assert(nested_stage.ok and patch.commit(nested_stage.value).ok)
 local installed_config = nested_live.config -- Commit 后安装到 live 上的配置字段引用。
 nested_stage = patch.stage({{name = nested_name, source = "return {config = {max_level = 200}}"}})
-assert(nested_stage.ok and patch.commit(nested_stage.value.stage).ok)
+assert(nested_stage.ok and patch.commit(nested_stage.value).ok)
 assert(nested_live.helper == nil and nested_live.config.max_level == 200)
-assert(patch.abort(nested_stage.value.stage).ok)
+assert(patch.abort(nested_stage.value).ok)
 assert(nested_live.config == installed_config and nested_live.config.self == installed_config)
 assert(nested_live.helper.calculate(3) == 6)
 package.loaded[nested_name] = nil
@@ -358,13 +361,16 @@ package.loaded.hotupgrade_registration_waiter = nil
 package.loaded["lualib.hotupgrade_registration_waiter"] = nil
 --- 通过 register_service 安装的协议回调发送控制请求，并返回 retpack 捕获的结果。
 ---@param command string prepare、update、abort 或 finish；本函数把它发送给测试 Service 接收器。
----@param sequence integer 本批控制序号；接收器用它校验批次进度。
+---@param batch_number integer 用于构造不同批次 ID 的编号。
 ---@param extra? table 本场景附加的控制内容；本函数合并到基础请求后发送。
-local function target_control(command, sequence, extra)
-    local request = {batch_id = "fixture:" .. sequence, sequence = sequence, modules = {}} -- 发送给模拟 Controller 的控制请求，带批次身份、序号和模块列表。
+---@return table 控制消息处理器回复的阶段结果。
+local function target_control(command, batch_number, extra)
+    local request = {batch_id = "fixture:" .. batch_number, modules = {}} -- 发送给模拟 Controller 的控制请求，带批次身份和模块列表。
     for name, value in pairs(extra or {}) do
         request[name] = value
     end
+
+    -- 通过已登记的控制回调发送请求，捕获阶段结果供场景断言。
     control_dispatch(1, 99, command, request)
     return control_answer
 end
@@ -404,14 +410,14 @@ patch.commit = original_commit
 registration.after_upgrade = nil
 assert(table.concat(update_steps, ",") == "stage,commit,after_upgrade")
 assert(target_control("finish", 3).ok and not hotupgrade.patching)
-assert(target_control("abort", 3).ok and not hotupgrade.patching)
+assert(target_control("update", 3).code == "HU_STALE_BATCH")
 registration.before_upgrade = function() return true end
-assert(target_control("prepare", 5).ok and target_control("update", 5).ok)
-local original_finish = patch.finish -- 替换前的模块 Finish 函数，测试后恢复。
-patch.finish = function(stage) original_finish(stage); return {ok = false, code = "HU_FIXTURE_FINISH_FAILED"} end
-assert(target_control("finish", 5).code == "HU_FIXTURE_FINISH_FAILED" and not hotupgrade.patching)
-assert(target_control("update", 5).code == "HU_STALE_BATCH")
-patch.finish = original_finish
+assert(target_control("prepare", 5).ok)
+assert(target_control("abort", 3).code == "HU_STALE_BATCH" and hotupgrade.patching)
+-- 模拟 Update 发生未被阶段内部捕获的异常，验证目标自行收尾后 Controller 仍可确认 Abort。
+patch.stage = function() error("injected stage exception") end
+assert(target_control("update", 5).code == "HU_CONTROL_FAILED" and not hotupgrade.patching)
+patch.stage = original_stage
 assert(target_control("abort", 5).ok and not hotupgrade.patching)
 assert(target_control("stage", 6).code == "HU_UNKNOWN_COMMAND")
 assert(target_control("activate", 6).code == "HU_UNKNOWN_COMMAND")
@@ -456,14 +462,22 @@ assert(hotupgrade.require("hotupgrade_extra") == extra and begin_count == declar
 assert(package.loaded["lualib.hotupgrade_extra"] == extra)
 local original_value = extra.value -- extra 模块加载前保存的业务字段值。
 assert(target_control("prepare", 7).ok)
+-- 候选代码验证首次 require 的参数，然后安装不同的业务函数。
+local extra_module_source = [[
+    local name, path = ...
+    assert(name == "hotupgrade_extra")
+    assert(path == "build/hotupgrade-tests/host/lualib/hotupgrade_extra.lua")
+    return {value = function() return 2 end}
+]]
 control_dispatch(1, 99, "update", {
-    batch_id = "fixture:7", sequence = 7,
-    modules = {{name = "lualib.hotupgrade_extra", source = [[
-        local name, path = ...
-        assert(name == "hotupgrade_extra")
-        assert(path == "build/hotupgrade-tests/host/lualib/hotupgrade_extra.lua")
-        return {value = function() return 2 end}
-    ]]}},
+    batch_id = "fixture:7", -- 与前一条 Prepare 对应的活动批次。
+    modules  =              -- 本次替换的候选模块，用于验证原始加载参数和缓存身份。
+    {
+        {
+            name   = "lualib.hotupgrade_extra", -- Controller 用来定位已声明模块的规范名称。
+            source = extra_module_source,      -- Update 在目标 State 执行的候选源码。
+        },
+    },
 })
 assert(control_answer.ok, control_answer.message)
 assert(extra.value() == 2 and package.loaded.hotupgrade_extra == extra)

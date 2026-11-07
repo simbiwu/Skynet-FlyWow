@@ -72,15 +72,15 @@ elseif scenario == "module" then
     local live = {value = 1} -- package.loaded 中代表当前线上导出表的对象。
     package.loaded.continuation_logic = live
     local staged = patch.stage({{name = "continuation_logic", source = "return {value = 2}"}}) -- 提交后故意破坏缓存以触发恢复失败。
-    assert(staged.ok and patch.commit(staged.value.stage).ok)
+    assert(staged.ok and patch.commit(staged.value).ok)
     package.loaded.continuation_logic = {}
-    assert(patch.abort(staged.value.stage).code == "HU_RECOVERY_REQUIRED")
+    assert(patch.abort(staged.value).code == "HU_RECOVERY_REQUIRED")
     -- 宿主修正缓存后，下一批不能仍被上一批 Stage 阻塞。
     package.loaded.continuation_logic = live
     local next_stage = patch.stage({{name = "continuation_logic", source = "return {value = 3}"}}) -- 下一次热更按当前 live 内容创建新候选。
     assert(next_stage.ok, next_stage.code)
-    assert(patch.commit(next_stage.value.stage).ok and live.value == 3)
-    assert(patch.abort(next_stage.value.stage).ok and live.value == 2)
+    assert(patch.commit(next_stage.value).ok and live.value == 3)
+    assert(patch.abort(next_stage.value).ok and live.value == 2)
 elseif scenario == "service" then
     local receiver -- register_service 安装的控制消息回调，由 command 驱动。
     local answer -- retpack 替身捕获的最近一次命令返回值。
@@ -112,14 +112,15 @@ elseif scenario == "service" then
     }).ok)
     --- 向模拟 Service 发送指定批次命令；Update Patch 将 state.count 改为 count，供后续恢复场景断言。
     ---@param name string 要发送的控制命令
-    ---@param sequence integer 本批控制序号
+    ---@param batch_number integer 用于构造不同批次 ID 的编号
     ---@param count integer Patch 写入 Service 私有状态的值
     ---@return table 模拟 Controller 返回的命令结果
-    local function command(name, sequence, count)
+    local function command(name, batch_number, count)
         -- receiver 是登记时安装的控制消息回调，answer 由 retpack 替身捕获；使用 99 模拟已确认的 Controller 来源。
         receiver(1, 99, name, {
-            batch_id = "continuation:" .. sequence, sequence = sequence, modules = {},
-            service_patch_source = "return function(state) return {update_state = function() state.count = " .. count .. " end} end",
+            batch_id             = "continuation:" .. batch_number,                                                                   -- 关联本场景中同一批次的各条命令。
+            modules              = {},                                                                                                -- 本场景只更新 Service 状态。
+            service_patch_source = "return function(state) return {update_state = function() state.count = " .. count .. " end} end", -- 用 count 区分本批状态与恢复结果。
         })
         return answer
     end

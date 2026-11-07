@@ -33,14 +33,14 @@ local hotupgrade_common = require "flywow_hotupgrade_common"
 ---@field wake_registration fun(self: FlyWowHotUpgradeController) 唤醒等待登记映射的协程。
 ---@field wait_lifecycle fun(self: FlyWowHotUpgradeController) 等待当前生命周期门禁开放。
 ---@field uniqueservice fun(self: FlyWowHotUpgradeController, request: table, source: integer): FlyWowResult<any> 获取或创建唯一 Service。
----@field newservice fun(self: FlyWowHotUpgradeController, request: table, source: integer, unique_name?: string): FlyWowResult<any> 创建并登记受管理 Service。
+---@field newservice fun(self: FlyWowHotUpgradeController, request: table, source: integer): FlyWowResult<any> 创建并登记受管理 Service。
 ---@field cancel_service_creation fun(self: FlyWowHotUpgradeController, request: table, source: integer): FlyWowResult<nil> 取消受管理 Service 创建。
 ---@field begin_module_load fun(self: FlyWowHotUpgradeController, request: table, source: integer): FlyWowResult<any> 核发普通模块首次加载许可。
 ---@field complete_module_load fun(self: FlyWowHotUpgradeController, request: table, source: integer, cancel: boolean): FlyWowResult<nil> 完成或取消模块加载许可。
 ---@field register_new_module fun(self: FlyWowHotUpgradeController, request: table, source: integer): FlyWowResult<nil> 登记当前 Update 声明的新模块。
 ---@field register fun(self: FlyWowHotUpgradeController, request: table, service_handle: integer): FlyWowResult<nil> 登记受管理 Service。
 ---@field load_patch fun(self: FlyWowHotUpgradeController, batch: FlyWowHotUpgradeBatch): FlyWowResult<{needs_prepare:boolean}> 读取并分类 Patch 后返回是否仍有目标需要 Prepare。
----@field step fun(self: FlyWowHotUpgradeController, batch: FlyWowHotUpgradeBatch, service_target: FlyWowHotUpgradeServiceTarget, command: string): FlyWowResult<nil> 向单个目标发送热更控制命令。
+---@field call_target_control fun(self: FlyWowHotUpgradeController, batch: FlyWowHotUpgradeBatch, service_target: FlyWowHotUpgradeServiceTarget, command: string): FlyWowResult<nil> 向单个目标发送热更控制命令。
 ---@field run_batch fun(self: FlyWowHotUpgradeController, batch: FlyWowHotUpgradeBatch) 推进本批发布并保存终态。
 ---@field wake_batch fun(self: FlyWowHotUpgradeController) 唤醒等待批次进度的协程。
 ---@field wake_lifecycle fun(self: FlyWowHotUpgradeController) 唤醒等待生命周期门禁的协程。
@@ -59,7 +59,7 @@ local M =
     service_registration_waiters   = nil,                 -- 等待原生 Service handle 建立映射的登记协程；映射完成后唤醒。
     module_load_permits            = nil,                 -- 许可 ID 到来源 Service/模块名的映射；登记或取消时移除。
     module_permit_sequence         = nil,                 -- 本 Controller 内递增的许可序号，用于生成不重复的许可 ID。
-    batch_sequence                 = nil,                 -- 本 Controller 生命周期内递增的批次序号，用来拒绝迟到控制消息。
+    batch_sequence                 = nil,                 -- 本 Controller 生命周期内递增的批次序号，用来生成唯一批次 ID。
     lifecycle_gate_waiters         = nil,                 -- Update 起等待创建或首次模块加载的协程，终态时统一唤醒。
     unique_service_entries         = nil,                 -- 逻辑唯一 Service 名到在途结果/Service handle 的映射，仅限本 Controller。
     active_batch                   = nil,                 -- 当前唯一活动批次；批次结束后移入 last_batch。
@@ -77,12 +77,12 @@ local function lifecycle_closed(controller)
 end
 
 --- 检查 Controller 是否仍有 skynet.newservice 尚未返回 handle。
---- 只把 native_create_returned 为 false 的记录算作在途创建，不把已返回 handle、等待业务登记的 Service 算入。
+--- 只把尚未取得 service_handle 的记录算作在途创建，不把已返回 handle、等待业务登记的 Service 算入。
 ---@param controller FlyWowHotUpgradeController 保存受管理创建记录的 Controller；本函数遍历 pending_creations 检查原生创建是否返回。
 ---@return boolean 是否仍可能收到尚未返回创建的真实 handle
 local function has_unreturned_native_creation(controller)
     for _, creation in pairs(controller.pending_creations) do
-        if creation.native_create_returned == false then
+        if creation.service_handle == nil then
             return true
         end
     end
@@ -136,7 +136,6 @@ end
 ---@field has_service_update boolean 是否在本 State 提供私有状态及函数更新入口
 
 ---@class FlyWowHotUpgradeRegisteredService
----@field service_handle integer register 消息头中的真实 source；作为登记索引和热更 RPC 接收者
 ---@field service_name string Skynet Service 入口名，用于匹配 Service Patch
 ---@field modules table<string, boolean> 当前 Lua State 声明的完整模块名集合
 ---@field loading_modules table<string, string> 规范模块名到在途 permit_id 的索引；提供同一 Service/模块的 O(1) 重复许可检查
@@ -180,7 +179,6 @@ end
 
 ---@class FlyWowHotUpgradeBatch
 ---@field batch_id string 本批唯一身份
----@field sequence integer Controller 生命周期内递增的本批序号
 ---@field patch_dir string begin 接受时固定的发布包目录；相对 Controller 的 patch_root，开始处理批次时从此目录读取源码
 ---@field modules FlyWowHotUpgradeModulePatch[] 本批读取并固定的普通模块源码；不携带文件恢复快照
 ---@field service_patches table<string, FlyWowHotUpgradeServicePatchSource> 本批读取并固定的 Service Patch，重匹配直接复用
@@ -195,7 +193,6 @@ end
 
 ---@class FlyWowHotUpgradeControlRequest
 ---@field batch_id string Controller Service handle 与本进程递增序号组成；仅在该 Controller 生命周期有效
----@field sequence integer 当前批次严格递增的序号，目标用来拒绝迟到消息
 ---@field modules? table[] Controller 按目标登记集合筛选、按模块名排序的 name/source 模块数组；不含业务对象
 ---@field service_patch_source? string Update 请求携带的 Service .patch 源码；没有匹配的 Service Patch 时为 nil
 
@@ -268,7 +265,7 @@ function M.initialize(controller_config)
         service_registration_waiters  = {},                                             -- 保存等待 register 来源与原生 handle 匹配的协程；映射变化时唤醒重查。
         module_load_permits           = {},                                             -- 按许可 ID 保存 Service handle 与模块名；登记、取消或 Service 退出时消费。
         module_permit_sequence        = 0,                                              -- 本 Controller 内递增的许可序号；生成不复用的首次加载许可 ID。
-        batch_sequence                = 0,                                              -- 本 Controller 内递增的批次序号；生成批次身份并拒绝迟到控制消息。
+        batch_sequence                = 0,                                              -- 本 Controller 内递增的批次序号；用于生成唯一批次 ID。
         lifecycle_gate_waiters        = {},                                             -- 保存因 Update 门禁暂停的创建/首次加载协程；批次终态后统一唤醒。
         unique_service_entries        = {},                                             -- 按逻辑 Service 名保存唯一创建记录、等待者及已创建 handle。
         active_batch                  = nil,                                            -- 当前唯一活动批次；终态后原记录移入 last_batch。
@@ -299,12 +296,11 @@ function M:finish_creation(creation)
         if creation.service_handle then
             self.service_creations[creation.service_handle] = nil
         end
-        self:wake_batch()
-        self:wake_registration()
-
         if not has_unreturned_native_creation(self) then
             self.early_exit_handles = {}
         end
+        self:wake_batch()
+        self:wake_registration()
     end
 end
 
@@ -336,18 +332,10 @@ function M:on_service_exit(service_handle)
         end
     end
 
-    -- 唯一 Service 索引清理完成后，再结束该 handle 对应的创建记录。
-    if creation then
-        self:finish_creation(creation)
-    end
-
     -- 撤销此 Service 尚未完成的首次加载许可，避免退出的进程继续阻塞批次。
     for permit_id, permit in pairs(self.module_load_permits) do
         if permit.service_handle == service_handle then
             self.module_load_permits[permit_id] = nil
-            if service_registration then
-                service_registration.loading_modules[permit.module_name] = nil
-            end
             tracked = true
         end
     end
@@ -378,9 +366,13 @@ function M:on_service_exit(service_handle)
         end
     end
 
-    -- 登记、创建与许可记录更新完成后，唤醒等待这些变化的批次和协程。
-    self:wake_batch()
-    self:wake_registration()
+    -- 所有退出事实就绪后只发一次通知；存在待创建记录时由它的收尾路径唤醒。
+    if creation then
+        self:finish_creation(creation)
+    else
+        self:wake_batch()
+        self:wake_registration()
+    end
 end
 
 --- 唤醒等待 register 消息来源与原生创建 handle 匹配的协程。
@@ -411,8 +403,6 @@ end
 ---@field creator_service_handle integer 首次调用者身份；仅该来源可取消尚未登记的创建。
 ---@field service_name string 原生 Service 入口名；后续用于 Patch 匹配。
 ---@field service_handle? integer 原生 newservice 返回后建立的目标 handle；早到登记以此核对 source。
----@field unique_name? string 本 Controller 内唯一入口的逻辑预留名；普通创建时为空。
----@field native_create_returned boolean 区分原生启动尚未返回与 handle 已建立的阶段，处理早到 register/退出。
 
 --- Update 门禁关闭时暂停新的 Service 创建或模块首次加载请求。
 --- 门禁重新开放后返回；调用方醒来后仍须重新检查唯一名、许可或批次条件。
@@ -446,17 +436,14 @@ end
 ---@param self FlyWowHotUpgradeController 当前 Controller 单例；本函数在其中建立创建记录并保存原生返回 handle。
 ---@param request FlyWowHotUpgradeServiceCreationRequest 已通过校验的创建请求；本函数把 service_name 和 arguments 原样传给 Skynet。
 ---@param source integer 创建 RPC 消息头中的真实调用者 handle；写入创建记录供之后权限核对。
----@param unique_name? string uniqueservice 传入的本地唯一名称；本函数用它暂存和查找同名创建，普通 newservice 不传。
 ---@return FlyWowResult<{service_handle:integer}> 成功载荷包含 service_handle
-local function start_service(self, request, source, unique_name)
+local function start_service(self, request, source)
     -- 创建记录先进入 pending_creations，覆盖原生启动与业务登记两个阶段；返回 handle 并不代表登记完成。
     local creation =
     {
         creator_service_handle = source,               -- 原创建者拥有返回后未登记 Service 的取消权。
         service_name           = request.service_name, -- Patch 匹配使用的原生 Service 入口名。
         service_handle         = nil,                  -- 仅由原生返回值建立真实来源索引。
-        unique_name            = unique_name,          -- 本地唯一预留名，不改变其既有语义。
-        native_create_returned = false,                -- 原生 newservice 返回后置 true；与业务登记完成分开。
     }
     self.pending_creations[creation] = creation
 
@@ -475,7 +462,6 @@ local function start_service(self, request, source, unique_name)
     local service_handle = service_handle_or_failure
     creation.service_handle = service_handle
     self.service_creations[service_handle] = creation
-    creation.native_create_returned = true
     -- 检查退出通知是否先于 newservice 返回到达，避免把已退出实例当成可登记对象。
     local exited_before_return = self.early_exit_handles[service_handle]
     self.early_exit_handles[service_handle] = nil
@@ -544,7 +530,7 @@ function M:uniqueservice(request, source)
     }
     self.unique_service_entries[request.service_name] = unique_service_entry
     -- 把创建结果写进共享记录；同名等待者醒来后从这条记录读取 handle 或错误。
-    local creation_result = start_service(self, request, source, request.service_name)
+    local creation_result = start_service(self, request, source)
     if creation_result.ok then
         unique_service_entry.service_handle = creation_result.value.service_handle
     else
@@ -564,9 +550,8 @@ end
 --- 接收管理端的受管理 Service 创建命令，校验请求后进入共同创建流程。
 ---@param request FlyWowHotUpgradeServiceCreationRequest hotupgrade.newservice 转来的入口名和启动参数；本函数校验后交给 start_service 调用原生 Skynet 创建。
 ---@param source integer Skynet 消息头中的创建者 handle；用于限制谁能取消尚未登记的实例。
----@param unique_name? string uniqueservice 传入的本地唯一名称；本函数用它暂存和查找同名创建，普通 newservice 不传。
 ---@return FlyWowResult<{service_handle:integer}> 成功载荷包含 service_handle
-function M:newservice(request, source, unique_name)
+function M:newservice(request, source)
     if not valid_service_creation_request(request, source) then
         return flywow_result.failure("HU_INVALID_REQUEST", "需要创建者、Service 名和启动参数")
     end
@@ -576,7 +561,7 @@ function M:newservice(request, source, unique_name)
 
     -- 请求检查通过后，等当前热更批次结束，再创建并登记新 Service。
     self:wait_lifecycle()
-    return start_service(self, request, source, unique_name)
+    return start_service(self, request, source)
 end
 
 --- 由创建者取消已创建但尚未登记的 Service，并在终止成功后释放创建记录。
@@ -595,7 +580,7 @@ function M:cancel_service_creation(request, source)
     if self.service_registrations[request.service_handle] then
         return flywow_result.failure("HU_SERVICE_ALREADY_REGISTERED", "已登记 Service 不能取消创建")
     end
-    if not creation or not creation.native_create_returned then
+    if not creation then
         return flywow_result.failure("HU_CREATION_MISSING", "没有可取消的待登记 Service")
     end
     if creation.creator_service_handle ~= source then
@@ -608,13 +593,10 @@ function M:cancel_service_creation(request, source)
         return flywow_result.failure("HU_SERVICE_CANCEL_FAILED", tostring(kill_failure))
     end
 
-    -- 原生 kill 接受取消后，清除仍指向被取消 handle 的唯一名映射。
-    if creation.unique_name then
-        -- 被取消实例对应的唯一名记录；只清除仍指向该 handle 的记录。
-        local unique_service_entry = self.unique_service_entries[creation.unique_name]
-        if unique_service_entry and unique_service_entry.service_handle == request.service_handle then
-            self.unique_service_entries[creation.unique_name] = nil
-        end
+    -- 只有映射指向被取消的实例才释放唯一名；普通创建允许使用同一个入口名。
+    local unique_service_entry = self.unique_service_entries[creation.service_name]
+    if unique_service_entry and unique_service_entry.service_handle == request.service_handle then
+        self.unique_service_entries[creation.service_name] = nil
     end
 
     -- 取消和原生终止处理完成后，统一移除创建记录并唤醒等待者。
@@ -792,7 +774,6 @@ function M:register(request, service_handle)
     ---@type FlyWowHotUpgradeRegisteredService
     local registered_service =
     {
-        service_handle     = service_handle,             -- register 消息头中的真实来源，也是后续热更 RPC 目标。
         service_name       = creation.service_name,      -- 来自该 handle 对应的受管理创建记录。
         modules            = modules,                    -- 该 State 明确声明的可更新模块集合。
         loading_modules    = {},                         -- 同一 Service/模块同时只允许一项首次加载操作。
@@ -806,7 +787,7 @@ end
 --- 按每个已登记 Service 的模块清单和入口名筛选本批候选。
 --- 创建或复用 service_targets 记录，并返回是否存在尚未 Prepare 的目标。
 ---@param batch FlyWowHotUpgradeBatch 已读取候选模块和 Service .patch 的本批记录；本函数根据当前登记信息重建目标列表 service_targets。
----@param registered_services table<integer, FlyWowHotUpgradeServiceRegistration> Controller 按 Service handle 保存的登记信息；本函数读取每个 Service 的模块名和入口名来挑选本批候选。
+---@param registered_services table<integer, FlyWowHotUpgradeRegisteredService> Controller 按 Service handle 保存的登记信息；本函数读取每个 Service 的模块名和入口名来挑选本批候选。
 ---@return FlyWowResult<{needs_prepare:boolean}> 成功时替换目标列表并返回是否有未 Prepare 目标；失败时保留旧列表。
 local function match_service_targets(batch, registered_services)
     -- 先按真实 handle 建旧目标索引；匹配回来的 Service 必须保留其 Prepare 和恢复进度。
@@ -821,7 +802,7 @@ local function match_service_targets(batch, registered_services)
     local matched_services = {} -- 记录每个 .patch 是否匹配到支持更新的已登记 Service。
     local needs_prepare = false -- 有新目标尚未 Prepare 时置 true，run_batch 会再匹配一轮。
     -- 以最新登记表重建目标清单，并在生成目标时同时计算是否需要再做一轮 Prepare。
-    for _, service_registration in pairs(registered_services) do
+    for service_handle, service_registration in pairs(registered_services) do
         -- 登记记录的 modules 是名称集合；本地 modules 则保存本目标真正要收到的候选源码项。
         local modules = {}
         for _, module_patch in ipairs(batch.modules) do
@@ -834,7 +815,7 @@ local function match_service_targets(batch, registered_services)
         local service_patch = batch.service_patches[service_registration.service_name]
         if service_patch and not service_registration.has_service_update then
             return flywow_result.failure("HU_SERVICE_PATCH_UNSUPPORTED", batch.patch_dir .. "/" .. service_patch.patch_relative_path
-                .. ": 目标 " .. service_registration.service_handle .. " 未提供 Service 内部更新入口")
+                .. ": 目标 " .. service_handle .. " 未提供 Service 内部更新入口")
         end
         if service_patch then
             matched_services[service_patch.patch_relative_path] = true
@@ -842,11 +823,11 @@ local function match_service_targets(batch, registered_services)
 
         if #modules > 0 or service_patch then
             -- 本 Service 在上一轮目标列表中的记录；复用它才能保留 Prepare 和退出结果。
-            local service_target = service_targets_by_handle[service_registration.service_handle]
+            local service_target = service_targets_by_handle[service_handle]
             if not service_target then
                 service_target =
                 {
-                    service_handle = service_registration.service_handle, -- register 消息来源；后续 Prepare/Update/Abort/Finish 都发给它。
+                    service_handle = service_handle, -- register 消息来源；后续 Prepare/Update/Abort/Finish 都发给它。
                 }
             end
             -- 当前 Service 要执行的 Service Patch；nil 表示本批只更新普通模块。
@@ -992,13 +973,12 @@ end
 ---@param service_target FlyWowHotUpgradeServiceTarget 本次要更新的 Service 及其匹配结果；本函数读取 handle、普通模块源码和可选 Service .patch。
 ---@param command string 本次要发给 Service 的 prepare、update、abort 或 finish 命令；目标 Service 按它选择对应处理步骤。
 ---@return FlyWowResult<nil> 目标返回的热更结果，或本地 RPC 失败结果；调用可能 yield。
-function M:step(batch, service_target, command)
+function M:call_target_control(batch, service_target, command)
     -- service_target 是本批复用的目标记录；modules 是筛选后的候选，service_patch 保存匹配到的 .patch 源码。
     ---@type FlyWowHotUpgradeControlRequest
     local request =
     {
         batch_id = batch.batch_id, -- Controller 生成的本批身份，Service 用它拒绝其他批次命令。
-        sequence = batch.sequence, -- 同一 Controller 内递增的序号，用来拒绝迟到的旧命令。
     }
 
     if command == "update" then
@@ -1027,14 +1007,14 @@ function M:step(batch, service_target, command)
     return service_result
 end
 
---- 等待已受理的 Service 创建和普通模块首次加载全部结束。
---- 等待通过 waiter 回调唤醒，不轮询；恢复后由调用方重新判断批次错误。
+--- 正常发布等待已受理的 Service 创建和普通模块首次加载排空。
+--- 批次一旦失败就结束等待，由调用方进入现有恢复流程。
 ---@param controller FlyWowHotUpgradeController 保存待创建和许可记录的 Controller；本函数等相应集合清空。
 ---@param batch FlyWowHotUpgradeBatch 当前等待的活动批次；本函数在其中保存 waiter 协程。
----@return nil 可能 yield；创建和模块许可记录全部清空后返回。
+---@return nil 可能 yield；在途记录清空或批次失败后返回。
 local function wait_for_batch_work(controller, batch)
-    -- 两张事实表分别记录尚未登记的创建与尚未消费的模块许可；batch.waiter 只保存本批等待协程。
-    while next(controller.pending_creations) ~= nil or next(controller.module_load_permits) ~= nil do
+    -- 两张事实表分别记录待登记创建和待消费许可；退出通知写入 batch.error 后无需继续排空。
+    while not batch.error and (next(controller.pending_creations) ~= nil or next(controller.module_load_permits) ~= nil) do
         batch.waiter = coroutine.running()
         skynet.wait(batch.waiter)
         batch.waiter = nil
@@ -1076,7 +1056,7 @@ local function prepare_batch_targets(controller, batch)
             if not service_target.participated then
                 batch.current_service_handle = service_target.service_handle
                 service_target.participated = true
-                local service_result = controller:step(batch, service_target, "prepare")
+                local service_result = controller:call_target_control(batch, service_target, "prepare")
                 if batch.error then
                     return batch.error
                 end
@@ -1137,7 +1117,7 @@ end
 local function update_batch_targets(controller, batch)
     for _, service_target in ipairs(batch.service_targets) do
         batch.current_service_handle = service_target.service_handle
-        local service_result = controller:step(batch, service_target, "update")
+        local service_result = controller:call_target_control(batch, service_target, "update")
         if batch.error then
             return batch.error
         end
@@ -1221,7 +1201,7 @@ local function recover_batch(controller, batch)
         local service_target = batch.service_targets[index]
         if service_target.participated and not service_target.exited then
             -- 当前目标的 Abort 结果；单个目标恢复失败不跳过剩余目标。
-            local restored = controller:step(batch, service_target, "abort")
+            local restored = controller:call_target_control(batch, service_target, "abort")
             if not restored.ok and not service_target.exited then
                 recovery_failure = recovery_failure or restored
                 recovery_errors[#recovery_errors + 1] = service_target.service_handle .. ": "
@@ -1240,10 +1220,6 @@ local function recover_batch(controller, batch)
     -- 恢复和 Abort 均已尝试后，根据汇总错误确定批次终态。
     batch.phase = (#recovery_errors > 0 or batch.error.code == "HU_RECOVERY_REQUIRED")
         and "RECOVERY_REQUIRED" or "ABORTED"
-    if #recovery_errors > 0 then
-        return batch.error
-    end
-    return flywow_result.success()
 end
 
 --- 发布决定后向所有参与目标发送 Finish，并汇总收尾错误。
@@ -1257,7 +1233,7 @@ local function finish_batch(controller, batch)
     for _, service_target in ipairs(batch.service_targets) do
         batch.current_service_handle = service_target.service_handle
         if not service_target.exited then
-            service_target.hotupgrade_result = controller:step(batch, service_target, "finish")
+            service_target.hotupgrade_result = controller:call_target_control(batch, service_target, "finish")
         end
         if not service_target.hotupgrade_result.ok then
             batch.error = flywow_result.failure("HU_RECOVERY_REQUIRED",
@@ -1267,10 +1243,6 @@ local function finish_batch(controller, batch)
 
     -- 所有 Finish 结果汇总后才确定批次终态；发布决定已作出，不回滚。
     batch.phase = batch.error and "RECOVERY_REQUIRED" or "COMPLETED"
-    if batch.error then
-        return batch.error
-    end
-    return flywow_result.success()
 end
 
 --- 生成批次最终查询结果，释放批次源码和恢复快照，并重新开放等待入口。
@@ -1324,21 +1296,17 @@ function M:run_batch(batch)
 
     -- Prepare/Update 已得出批次结果；失败进入恢复，成功进入发布完成阶段。
     if batch.error then
-        local recovered, recovery_result = pcall(recover_batch, self, batch)
-        if not recovered then
-            batch.error = flywow_result.failure("HU_RECOVERY_REQUIRED", tostring(recovery_result),
+        local recovery_completed, recovery_exception = pcall(recover_batch, self, batch)
+        if not recovery_completed then
+            batch.error = flywow_result.failure("HU_RECOVERY_REQUIRED", tostring(recovery_exception),
                 {original_error = batch.error})
             batch.phase = "RECOVERY_REQUIRED"
-        elseif not recovery_result.ok then
-            batch.error = recovery_result
         end
     else
-        local finished, finish_result = pcall(finish_batch, self, batch)
-        if not finished then
-            batch.error = flywow_result.failure("HU_RECOVERY_REQUIRED", tostring(finish_result), {step = "finish"})
+        local finish_completed, finish_exception = pcall(finish_batch, self, batch)
+        if not finish_completed then
+            batch.error = flywow_result.failure("HU_RECOVERY_REQUIRED", tostring(finish_exception), {step = "finish"})
             batch.phase = "RECOVERY_REQUIRED"
-        elseif not finish_result.ok then
-            batch.error = finish_result
         end
     end
 
@@ -1346,12 +1314,13 @@ function M:run_batch(batch)
     complete_batch(self, batch)
 end
 
---- 创建和模块许可记录全部清空后唤醒批次；最终关闭入口由 run_batch 在 Prepare 收口后执行。
+--- 在途记录清空或批次失败时唤醒发布协程；协程恢复后重新检查结束条件。
 ---@return nil
 function M:wake_batch()
-    -- active_batch.waiter 只等待已受理工作排空；两张事实表都清空后才能继续 Prepare 或读取发布包源码。
+    -- 目标退出使批次失败时，即使无关操作尚未完成，也要唤醒协程执行恢复。
     local batch = self.active_batch
-    if batch and batch.waiter and next(self.pending_creations) == nil and next(self.module_load_permits) == nil then
+    if batch and batch.waiter
+        and (batch.error or (next(self.pending_creations) == nil and next(self.module_load_permits) == nil)) then
         skynet.wakeup(batch.waiter)
     end
 end
@@ -1379,7 +1348,6 @@ function M:begin(request)
     local batch =
     {
         batch_id             = tostring(skynet.self()) .. ":" .. self.batch_sequence, -- 管理端用它查询这次发布；迟到命令也用它确认批次身份。
-        sequence             = self.batch_sequence,                                   -- 本 Controller 内递增；控制 RPC 用它拒绝迟到的旧批消息。
         patch_dir            = request.path,                                          -- 相对 patch_root 的发布目录；begin 接受时固定并从此冻结源码。
         phase                = "WAITING_CREATIONS",                                   -- run_batch 推进；生命周期门禁和 status 视图据此生成。
         service_results      = {},                                                    -- 保存每个目标 Service 的最终结果，供 status 返回成功/失败明细。
