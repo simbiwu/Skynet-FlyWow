@@ -217,7 +217,7 @@ local function abort_batch(batch)
         errors[#errors + 1] = service_restore_result.message
     end
 
-    -- Service 私有状态恢复后，再恢复本批可能已提交的普通模块导出。
+    -- Service 私有状态恢复后，再恢复本批已提交的普通模块导出。
     if batch.module_stage then
         -- 模块导出恢复结果；失败时记录错误并继续结束本地批次。
         local restored = hotupgrade_module_patch.abort(batch.module_stage)
@@ -227,7 +227,7 @@ local function abort_batch(batch)
     end
 
     -- 恢复尝试结束后清除本地批次并重新开放业务入口；即使部分恢复失败也要结束本次 Abort。
-    -- 每项恢复失败都保留在结果 details.errors 中，供 Controller 和宿主定位未恢复对象。
+    -- 恢复失败原因合并到结果的 message，供 Controller 和宿主定位未恢复对象。
     close_batch()
     if #errors > 0 then
         return flywow_result.failure("HU_RECOVERY_REQUIRED", table.concat(errors, "; "))
@@ -357,17 +357,10 @@ local function stage_service_patch(service_patch_source)
 end
 
 --- 构建 Service Patch、校验 new_modules 清单并执行对应首次加载登记。
----@param batch FlyWowHotUpgradeServiceBatch Controller 为本次 Update 建立的本地记录；本函数把 batch_id 绑定到新模块登记。
+---@param new_module_names table<string, boolean> Update 建立的空清单；本函数把已核验的模块身份填入其中，供首次加载检查。
 ---@param service_patch_source? string 当前目标的 Service .patch 源码；nil 表示本批不更新 Service 状态或函数。
 ---@return FlyWowResult<FlyWowHotUpgradeServicePatchState|nil> 没有 Service Patch 时成功载荷为 nil；否则返回恢复记录，失败时保留具体错误码。
-local function stage_service_patch_and_new_modules(batch, service_patch_source)
-    -- 保存本批允许首次加载的新模块；hotupgrade.require 据此校验调用协程和模块名。
-    local new_module_context =
-    {
-        owner = coroutine.running(), -- 只有当前 Update 协程可以使用这份新模块清单。
-        names = {},                  -- Service Patch 声明并核验过的模块名；仅这些名字可首次加载。
-    }
-    batch.new_module_context = new_module_context
+local function stage_service_patch_and_new_modules(new_module_names, service_patch_source)
     if not service_patch_source then
         return flywow_result.success()
     end
@@ -375,7 +368,6 @@ local function stage_service_patch_and_new_modules(batch, service_patch_source)
     -- 先完整构建并验证清单，再解析所有模块身份，避免边加载边发现重复项。
     local service_patch_result = stage_service_patch(service_patch_source)
     if not service_patch_result.ok then
-        batch.new_module_context = nil
         return service_patch_result
     end
 
@@ -385,16 +377,14 @@ local function stage_service_patch_and_new_modules(batch, service_patch_source)
     for _, name in ipairs(service_patch.new_modules or {}) do
         local identity_result = resolve_module_identity(name)
         if not identity_result.ok then
-            batch.new_module_context = nil
             return identity_result
         end
         local identity = identity_result.value
-        if new_module_context.names[identity.canonical_name] then
-            batch.new_module_context = nil
+        if new_module_names[identity.canonical_name] then
             return flywow_result.failure("HU_DUPLICATE_MODULE",
                 "new_modules 重复指向同一文件: " .. identity.canonical_name)
         end
-        new_module_context.names[identity.canonical_name] = true
+        new_module_names[identity.canonical_name] = true
         identities[#identities + 1] = identity
     end
 
@@ -402,7 +392,6 @@ local function stage_service_patch_and_new_modules(batch, service_patch_source)
     for _, identity in ipairs(identities) do
         local load_result = require_module(identity)
         if not load_result.ok then
-            batch.new_module_context = nil
             return flywow_result.failure("HU_NEW_MODULE_FAILED", load_result.message,
                 {cause_code = load_result.details and load_result.details.cause_code or load_result.code})
         end
@@ -457,9 +446,18 @@ end
 local function update_batch(batch, request)
     -- request.modules 和 service_patch_source 是 Controller 为本批固定读取的候选输入。
     -- Controller 在 Prepare 收口时已固定普通候选；new_modules 在这里才首次加载并登记，从下一批 Stage 起才会匹配。
-    -- Service Patch 构建和 new_modules 登记结果；成功后才能执行普通候选 Stage。
-    local service_patch_result = stage_service_patch_and_new_modules(batch, request.service_patch_source)
+    -- 清单从构建 Service Patch 前生效，供本协程检查新依赖；普通候选 Stage 结束后撤销。
+    local new_module_context =
+    {
+        owner = coroutine.running(), -- 只有当前 Update 协程可以使用这份新模块清单。
+        names = {},                  -- Service Patch 声明并核验过的模块名；仅这些名字可首次加载。
+    }
+    batch.new_module_context = new_module_context
+
+    -- Service Patch 构建和 new_modules 登记结果；失败时直接撤销本协程的首次加载权限。
+    local service_patch_result = stage_service_patch_and_new_modules(new_module_context.names, request.service_patch_source)
     if not service_patch_result.ok then
+        batch.new_module_context = nil
         return service_patch_result
     end
 
@@ -475,14 +473,15 @@ local function update_batch(batch, request)
         return module_result
     end
 
-    -- 保存普通模块 Stage；Commit 写入导出，Abort 据此恢复。
-    batch.module_stage = module_result.value
-
-    -- 先把候选模块字段安装到现有导出表；任一目标失败时 Controller 会对本批已参与目标执行 Abort。
-    local commit_result = hotupgrade_module_patch.commit(batch.module_stage)
+    -- 先核对根表并提交候选字段，成功后才把旧字段的恢复记录交给批次。
+    local module_stage = module_result.value
+    local commit_result = hotupgrade_module_patch.commit(module_stage)
     if not commit_result.ok then
         return flywow_result.failure("HU_ACTIVATE_FAILED", commit_result.message)
     end
+
+    -- 普通模块已经更新；后续业务迁移失败时，Abort 用这份记录恢复旧字段。
+    batch.module_stage = module_stage
 
     -- update_state、函数安装或 after_upgrade 可能抛错；捕获后返回 HU_ACTIVATE_FAILED，由 Controller 执行 Abort。
     local activation_succeeded, after_upgrade_result = pcall(function()

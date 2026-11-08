@@ -108,14 +108,20 @@ local combined = patch.stage({ -- 同时暂存多个模块的候选结果，用�
     {name = "b", source = "return {value = function() return 20 end, added = true}"},
     {name = "a", source = "return {value = function() return 10 end}"},
 })
-assert(combined.ok and patch.commit(combined.value).ok)
+assert(combined.ok)
+-- 后一个目标的缓存身份变化时，Commit 必须在安装第一个目标前拒绝整批。
+package.loaded.a = {}
+assert(patch.commit(combined.value).code == "HU_MODULE_COMMIT_FAILED")
+assert(second.value == old_second_value and second.added == nil)
+package.loaded.a = simple
+assert(patch.commit(combined.value).ok)
 assert(package.loaded.a == simple and package.loaded.b == second)
 assert(simple.value() == 10 and second.value() == 20 and second.added)
 assert(patch.abort(combined.value).ok)
 assert(simple.value == old_first_value and second.value == old_second_value and second.added == nil)
 package.loaded.a = {export_state = function() return {old = true} end, import_state = function() return require("flywow_result").success() end}
 local reset_state = patch.stage({{name = "a", source = "return {}"}}) -- 不提供可迁移状态钩子的候选 Stage 结果。
-assert(reset_state.ok and patch.abort(reset_state.value).ok)
+assert(reset_state.ok and type(package.loaded.a.export_state) == "function")
 package.loaded.a = {
     value = function() return 1 end,
     export_state = function() return {} end,
@@ -143,7 +149,7 @@ local retried = patch.stage({{name = "a", source = [[return {
     export_state = function() return {} end,
     import_state = function() return require("flywow_result").success() end,
 }]]}})
-assert(retried.ok and patch.abort(retried.value).ok)
+assert(retried.ok and package.loaded.a == before_corrupt_import and package.loaded.a.value() == 1)
 -- 嵌套配置、辅助函数、共享与循环图均按完整新版本安装；回滚必须找回原引用。
 local old_config = {max_level = 50, items = {sword = {attack = 10}}}
 local old_helper = {calculate = function(value) return value end} -- 线上状态中保存的辅助函数对象，默认数据快照不支持时应显式处理。

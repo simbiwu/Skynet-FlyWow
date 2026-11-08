@@ -117,7 +117,7 @@ hotupgrade.require(name) 仍用宿主原有 name 加载模块，通过 package.s
 
 登记前声明随初始元数据提交，由待创建记录保护。register_service 会拒绝本 State 尚在执行的首次声明（HU_LIFECYCLE_PENDING），调用方须待声明完成后登记；登记 RPC 期间的新声明等待登记结果，避免落在初始模块快照之外。
 
-已登记 Service 首次声明普通模块时，先向 Controller 请求 begin_module_load 许可，再执行实际 require、校验来源并建立缓存、别名、来源映射和本地声明，最后携许可 ID 调用 register_module。许可绑定真实来源及规范模块名，不能转用或重复消费；失败时回退本地新增状态，并通过 cancel_module_load 释放尚未完成的许可。begin 接受后等待已有许可完成，覆盖模块执行及登记的整个关键区间。同一 State 内并发首次声明同一规范模块会等待前一项成功或完整回退；已声明模块不重复请求许可。Controller 只更新目标已声明的模块。begin 后的 WAITING_CREATIONS 和 PREPARE 窗口继续接纳创建与首次声明，覆盖父子创建、嵌套 require 和 queue 内已有业务的正常依赖。进入 UPDATE 后，普通新请求挂起到批次终态，不申请许可、不执行模块代码，也不增加本批排空计数。
+已登记 Service 首次声明普通模块时，`hotupgrade.require` 先按 `package.path` 定位文件并解析模块身份，再向 Controller 申请 `begin_module_load` 许可。取得许可后才执行实际 require、核对加载来源并建立缓存、别名、来源映射和本地声明，最后携许可 ID 调用 `register_module`。许可绑定真实来源及规范模块名，不能转用或重复消费；失败时回退本地新增状态，并通过 cancel_module_load 释放尚未完成的许可。begin 接受后等待已有许可完成，覆盖模块执行及登记的整个关键区间。同一 State 内并发首次声明同一规范模块会等待前一项成功或完整回退；已声明模块不重复请求许可。Controller 只更新目标已声明的模块。begin 后的 WAITING_CREATIONS 和 PREPARE 窗口继续接纳创建与首次声明，覆盖父子创建、嵌套 require 和 queue 内已有业务的正常依赖。进入 UPDATE 后，普通首次加载的许可请求在 Controller 等待批次终态；等待期间尚未发放许可，也不执行模块代码或增加本批排空计数。若本地查找时文件尚未部署，`hotupgrade.require` 直接抛出 `HU_INVALID_PATH`，该调用未进入门禁。
 
 Service Patch 可通过 `new_modules` 声明本 Service 在本批首次使用的模块，例如 `{new_modules = {"combat_rules", "skill_rules"}}`。Controller 先部署本批完整 `.lua` 并清理缓存，再把 `.patch` 交给目标。目标先构建 Service Patch、读取该列表，再用内部登记命令加载清单内模块；这个命令只接受当前批次 UPDATE 阶段正在处理的目标。它不走普通首次加载许可，因此目标等待 Controller 登记时不会与批次互等。清单内模块在该 State 尚未登记的依赖也必须列入；已登记依赖可直接复用。清单以外的未登记依赖会立即失败，不进入生命周期等待。Service Patch 构建函数需要先返回清单，不能在构建函数内首次 require 这批新模块。
 
@@ -155,7 +155,7 @@ Prepare 期间，Controller 逐个通过 RPC 等待目标 Service 返回 Prepare
 
 Controller 完成一轮 Prepare 发送后等待两类在途工作结束：尚未完成登记的受管理 Service 创建，以及尚未完成的普通模块首次加载。创建记录在 Service 登记完成或创建失败、取消、退出收尾前一直保留；模块许可在模块成功登记、加载取消或 Service 退出清理前一直保留。随后 Controller 用本批已固定的 Patch 内容，根据最新登记表重建目标清单和每个目标的模块清单。新匹配到的 Service 会补做 Prepare；已 Prepare 的目标如果此时新增了受影响模块，只刷新模块清单，不重复执行 Prepare。若这一轮又 Prepare 了新目标，就继续等待和重匹配，直到没有未 Prepare 的匹配目标。
 
-最终重匹配成功后，Controller 到把批次阶段设为 UPDATE 之间没有 yield。阶段变为 UPDATE 时，普通 Service 创建和普通模块首次加载入口关闭；此后到达的请求在生命周期门禁处等待，不会在最终清单确定后插入本批。Controller 先部署已固定的文件并清理缓存，再对最终清单中的目标发送 Update。
+最终重匹配成功后，Controller 到把批次阶段设为 UPDATE 之间没有 yield。阶段变为 UPDATE 时，Controller 关闭普通 Service 创建与普通首次加载许可的受理入口。此后到达 Controller 的创建请求和加载许可请求在门禁处等待。Controller 先部署已固定的文件并清理缓存，再对最终清单中的目标发送 Update。
 
 成功路径的顺序是：
 
@@ -164,7 +164,7 @@ Controller 完成一轮 Prepare 发送后等待两类在途工作结束：尚未
 3. 对最终目标执行 Update，成功后逐个 Finish。
 4. 批次终态保存、释放门禁；等待中的普通创建和模块首次加载继续执行。
 
-因此，新 Service 或普通模块的首次加载不会读到“文件已是新版、但旧目标尚未完成 Update”的中间状态：成功 Finish 后它们才继续，读取到已部署的新文件；本批目标已完成 Update。Service Patch 的 `new_modules` 是例外的专用当前批次流程：它在文件部署后由正在 Update 的目标加载并登记，不走普通首次加载门禁，也不加入本批冻结的普通模块清单，从下一批开始参加普通模块匹配。
+成功 Finish 后，等待中的创建与加载许可请求才继续，随后启动 Service 或执行模块代码时使用已部署文件。Service Patch 的 `new_modules` 是例外的专用当前批次流程：它在文件部署后由正在 Update 的目标加载并登记，不走普通首次加载门禁，也不加入本批冻结的普通模块清单，从下一批开始参加普通模块匹配。
 
 该版本一致性结论只针对成功完成 Update 和 Finish 的路径。失败时框架会尝试恢复已替换文件并 Abort 存活目标，等待请求在恢复或最终保留的文件上继续；但它不构成所有运行态都回到旧版本的保证：已成功加载登记的 Service Patch `new_modules` 按现有合同不会因后续失败而撤销。若文件恢复或 Abort 失败，批次进入 `RECOVERY_REQUIRED`，此时更不能保证所有存活 Service 和正式文件处于同一版本，需依据 status 诊断并处理。
 
@@ -345,7 +345,7 @@ begin 建立批次后立即返回 batch_id，由 Controller 的原有协程继�
 8. 所有目标 Update 成功后记录 PUBLISH_DECIDED，逐个目标 Finish，清理快照并开放业务。
 9. 保存 COMPLETED 或具体失败记录，唤醒门禁等待者；之后的创建和首次加载使用已部署文件，恢复成功时则使用恢复后的文件。
 
-正常门禁等待由框架内部完成，业务调用方无需为发布窗口捕获错误或重试。排空期间的新增依赖可能延长 Prepare；最终关门的依据是操作完成和目标准备完成，而不是等待固定时长。
+到达 Controller 门禁的请求由框架负责等待。普通业务若要首次使用本批新增文件，应在发布状态为 `COMPLETED` 后再调用 `hotupgrade.require`。排空期间的新增依赖可能延长 Prepare；最终关门的依据是操作完成和目标准备完成，而不是等待固定时长。
 
 prepare/update/finish 是正常目标控制 RPC，abort 用于失败恢复。没有运行时目标时不发目标 RPC，照常部署完整文件。新目录按需建立；文件恢复删除本批新增文件，可能留下空目录。不部署非 Lua 资源，不提供文件删除清单。
 

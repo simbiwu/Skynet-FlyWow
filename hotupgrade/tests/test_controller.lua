@@ -106,20 +106,33 @@ scenarios['lifecycle'] = function()
     -- 退出通知和许可清理场景共用的 Controller。
     local lifecycle = initialize_controller() -- 当前创建/加载门禁视图。
     -- 原生退出通知移除登记与加载许可；重复通知不会重复清理记录。
-    assert(managed_register(lifecycle, metadata, 61).ok)
+    assert(managed_register(lifecycle, metadata, 61, "fixture").ok)
     -- Service 61 的在途模块许可；随后模拟 Service 退出消费它。
     local permit = lifecycle:handle_command("begin_module_load", {name = "lualib.exit_pending"}, 61) -- Controller 发给首次模块加载方的许可结果；后续登记必须携带其中的 permit_id。
     assert(permit.ok and lifecycle_status(lifecycle).pending_module_count == 1)
     assert(lifecycle.service_registrations[61].loading_modules["lualib.exit_pending"] == permit.value.permit_id)
+    module_state.launch_service_handle = 63
+    assert(lifecycle:handle_command("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 1).ok)
+    assert(lifecycle:handle_command("register", metadata, 63).ok)
+    -- 另一个 Service 同名模块的许可，验证退出只清除原 Service 的记录。
+    local surviving_permit = lifecycle:handle_command("begin_module_load", {name = "lualib.exit_pending"}, 63)
+    assert(surviving_permit.ok and lifecycle_status(lifecycle).pending_module_count == 2)
+    -- 普通实例 61 与唯一实例 63 共用入口名；退出普通实例不能删掉唯一映射。
     lifecycle:on_service_exit(61)
     assert(lifecycle.service_registrations[61] == nil)
-    assert(lifecycle_status(lifecycle).pending_module_count == 0 and next(lifecycle.module_load_permits) == nil)
+    assert(lifecycle.unique_service_entries.fixture.service_handle == 63)
+    assert(lifecycle_status(lifecycle).pending_module_count == 1)
+    assert(lifecycle:handle_command("register_module",
+        {name = "lualib.exit_pending", permit_id = surviving_permit.value.permit_id}, 63).ok)
+    assert(next(lifecycle.module_load_permits) == nil)
+    lifecycle:on_service_exit(63)
+    assert(lifecycle.unique_service_entries.fixture == nil)
     lifecycle:on_service_exit(61)
     lifecycle:on_service_exit(999)
     assert(lifecycle_status(lifecycle).pending_module_count == 0 and lifecycle_status(lifecycle).pending_service_count == 0)
 
     -- 退出只删除匹配 handle 的唯一实例；保留批次快照并记录失败。
-    assert(managed_register(lifecycle, metadata, 62).ok)
+    assert(managed_register(lifecycle, metadata, 62, "fixture").ok)
     lifecycle.unique_service_entries.fixture = {service_handle = 62}
     lifecycle.unique_service_entries.other = {service_handle = 63}
     -- 本批 Prepare 中的 Service 目标记录，用于观察退出后仍保留目标诊断。
@@ -652,7 +665,7 @@ scenarios['draining'] = function()
             assert(c.active_batch.service_targets[1] == prepared_service_target)
             assert(#request.modules == 2 and lifecycle_status(c).pending_service_count == 0 and lifecycle_status(c).pending_module_count == 0)
             for _, module_patch in ipairs(request.modules) do
-                assert(module_patch.old_source == nil and module_patch.touched == nil)
+                assert(module_patch.old_source == nil)
             end
             launches_at_update = #module_state.launches
             for index = 1, 2 do
@@ -817,12 +830,18 @@ scenarios['resources'] = function()
     assert(managed_register(deployment, metadata, 104).ok)
     module_state.file_contents = {["lualib/test_worker_logic.lua"] = "old"}
     module_state.injected_file_failure = "service/z_blocked.lua"
+    module_state.operations = {}
     assert(publish(deployment, {path = "deploy_failure"}).ok)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(lifecycle_status(deployment).phase == "IDLE" and deployment.last_batch.phase == "ABORTED")
     assert(module_state.file_contents["lualib/test_worker_logic.lua"] == "old")
     assert(module_state.file_contents["lualib/a_added.lua"] == nil)
     assert(module_state.last_control_command_by_service_handle[104] == "abort")
+    -- 只恢复前两个成功替换的文件，逆序执行；失败项仅尝试写入一次。
+    assert(table.concat(module_state.operations, ",") ==
+        "101:prepare,102:prepare,103:prepare,104:prepare,file:lualib/a_added.lua,file:lualib/test_worker_logic.lua,"
+        .. "file:service/z_blocked.lua,file:lualib/test_worker_logic.lua,file:lualib/a_added.lua,cache,"
+        .. "104:abort,103:abort,102:abort,101:abort")
     module_state.injected_file_failure = nil
     -- 文件准备和缓存清理失败均保留具体诊断；恢复失败只报告错误，不阻止后续发布。
     module_state.injected_read_failure = "lualib/test_worker_logic.lua"

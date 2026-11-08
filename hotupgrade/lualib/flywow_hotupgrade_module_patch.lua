@@ -7,7 +7,6 @@ local M = {}
 
 ---@class FlyWowHotUpgradeModuleStage
 ---@field entries table[] 本 State 每个候选模块的旧字段与新字段记录；Commit/Abort 处理，Finish 释放。
----@field exports_write_started boolean 是否已开始安装线上导出；部分提交失败时也必须恢复。
 
 --- 复制普通 Lua 状态图；数据限制失败时返回结构化错误。
 ---@param source_graph any 业务状态根值；只接受 nil、string、boolean、number 和普通 table。
@@ -114,12 +113,12 @@ end
 ---@return nil
 local function replace_exports(module_exports, export_fields)
     -- 先移除旧版本全部字段，再安装完整候选；两个阶段都保持根导出表身份。
-    for key in pairs(module_exports) do
+    for key in next, module_exports do
         rawset(module_exports, key, nil)
     end
 
     -- key/value 是新版本导出的字段和值，直接写入原模块根表以保留其身份。
-    for key, value in pairs(export_fields) do
+    for key, value in next, export_fields do
         rawset(module_exports, key, value)
     end
 end
@@ -194,7 +193,6 @@ function M.stage(module_patches, module_loaders)
     local module_stage =
     {
         entries               = {},    -- 每个模块的线上表、旧字段和候选导出；Commit 安装，Abort 恢复，Finish 释放。
-        exports_write_started = false, -- 只要开始替换线上导出就置 true；即使部分模块失败，Abort 也会恢复。
     }
     -- 导出检查与快照复制的失败归入 Stage 错误，编译与导入失败保留各自阶段的错误码。
     --- 将导出检查或状态快照的失败转换为 Stage 合同，同时保留原始错误码。
@@ -293,9 +291,9 @@ function M.stage(module_patches, module_loaders)
     return flywow_result.success(module_stage)
 end
 
---- 把 Stage 中候选模块的字段写入线上导出表；部分提交失败时保留记录供 Abort 恢复。
----@param module_stage FlyWowHotUpgradeModuleStage 当前 State 的候选 Stage；本函数按 entries 安装新字段并记录提交进度。
----@return FlyWowResult<nil> 同步提交结果；导出表身份变化或安装失败时返回 HU_MODULE_COMMIT_FAILED。
+--- 把 Stage 中候选模块的字段写入线上导出表；先核对全部线上根表，再同步安装字段。
+---@param module_stage FlyWowHotUpgradeModuleStage 当前 State 的候选 Stage；本函数按 entries 核对线上根表并安装候选字段。
+---@return FlyWowResult<nil> 同步提交结果；导出表身份或元表变化时返回 HU_MODULE_COMMIT_FAILED。
 function M.commit(module_stage)
     -- 检查线上缓存是否仍指向 Stage 保存的根表；失败直接返回，尚未修改线上导出。
     for _, entry in ipairs(module_stage.entries) do
@@ -304,24 +302,18 @@ function M.commit(module_stage)
         end
     end
 
-    -- 捕获替换导出字段时的意外异常；Controller 收到失败结果后会调用 Abort。
-    local commit_succeeded, commit_failure = pcall(function()
-        -- 所有候选已在 Stage 完成检查，现在原地替换每个模块的完整导出字段。
-        module_stage.exports_write_started = true
-        -- 逐个安装候选字段；某项异常时仍保留整个 Stage 供 Abort 恢复。
-        for _, entry in ipairs(module_stage.entries) do
-            replace_exports(entry.live, entry.candidate)
-        end
-    end)
-    return commit_succeeded and flywow_result.success()
-        or flywow_result.failure("HU_MODULE_COMMIT_FAILED", tostring(commit_failure))
+    -- 根表和候选字段均已核验，直接写入原表，期间不会调用业务代码或 yield。
+    for _, entry in ipairs(module_stage.entries) do
+        replace_exports(entry.live, entry.candidate)
+    end
+    return flywow_result.success()
 end
 
 --- 按 Stage 记录恢复已提交模块的旧字段；继续尝试其余模块并汇总恢复失败。
----@param module_stage FlyWowHotUpgradeModuleStage 需要恢复的当前 State Stage；entries 保存各模块旧字段和是否已提交。
+---@param module_stage FlyWowHotUpgradeModuleStage 当前 State 已成功提交的 Stage；entries 保存线上根表和提交前的字段。
 ---@return FlyWowResult<nil> 恢复结果；恢复失败返回 HU_RECOVERY_REQUIRED。
 function M.abort(module_stage)
-    -- entries.old 保存 Stage 时的字段引用；exports_write_started 表示已开始改线上表，包含只提交了部分模块的失败情况。
+    -- 本函数只接收已提交的 Stage；entries.old 保存需要恢复的旧字段引用。
     -- 逐个尝试恢复线上表；单个模块失败不能阻止后面的模块恢复。
     -- 每个失败原因都暂存到 errors，循环结束后合并到 HU_RECOVERY_REQUIRED。
     local errors = {}
@@ -330,12 +322,8 @@ function M.abort(module_stage)
         -- package.loaded 若已指向别的表，就不能覆盖它；记录失败后继续恢复下一模块。
         if package.loaded[entry.name] ~= entry.live or getmetatable(entry.live) ~= nil then
             errors[#errors + 1] = "模块缓存身份或元表变化: " .. entry.name
-        elseif module_stage.exports_write_started then
-            -- 字段恢复中的意外 Lua 错误不应阻止其他模块恢复。
-            local restore_succeeded, restore_failure = pcall(replace_exports, entry.live, entry.old)
-            if not restore_succeeded then
-                errors[#errors + 1] = tostring(restore_failure)
-            end
+        else
+            replace_exports(entry.live, entry.old)
         end
     end
 

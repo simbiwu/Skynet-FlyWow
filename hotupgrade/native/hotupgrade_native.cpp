@@ -18,7 +18,6 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <utility>
 #include <vector>
 
 namespace
@@ -47,13 +46,6 @@ int mapNativeFailure(LuaBinding &binding, int results)
     return results;
 }
 
-struct FileList
-{
-    // 接收整个发布目录扫描出的相对文件路径。
-    std::vector<std::string>
-        paths; ///< 发布包中的相对 .lua/.patch 路径，供 Controller 分类并冻结源码。
-};
-
 // realpath 要求目标已存在；输出规范化绝对路径，供后续根目录包含关系校验。
 // path 含空字节、超出 PATH_MAX 或无法解析时返回 false，不写入有效 output。
 bool resolvePath(const std::string &path, std::string &output)
@@ -73,7 +65,7 @@ bool resolvePath(const std::string &path, std::string &output)
 
 // 递归枚举受信任根目录内的普通 Lua 文件；拒绝符号链接和特殊文件。
 // 返回 0 成功，-1 路径或文件结构无效。
-int scanDirectory(const std::string &directory, const std::string &relative, FileList &files)
+int scanDirectory(const std::string &directory, const std::string &relative, std::vector<std::string> &paths)
 {
     // DIR 归当前递归层所有；字符串/vector 分配异常也必须关闭，不泄漏祖先层的目录 fd。
     const std::unique_ptr<DIR, int (*)(DIR *)> directory_handle(opendir(directory.c_str()),
@@ -122,7 +114,7 @@ int scanDirectory(const std::string &directory, const std::string &relative, Fil
         }
         if (S_ISDIR(attributes.st_mode))
         {
-            status = scanDirectory(absolute, child_relative, files);
+            status = scanDirectory(absolute, child_relative, paths);
             if (status != 0)
             {
                 break;
@@ -146,7 +138,7 @@ int scanDirectory(const std::string &directory, const std::string &relative, Fil
         }
         // 只登记 .lua/.patch；相对路径交由 Controller 检查和分类。
         // files 由所有递归层共用；保存相对发布目录的路径，不能把本机绝对路径交给 Controller。
-        files.paths.push_back(child_relative);
+        paths.push_back(child_relative);
     }
     return status;
 }
@@ -219,19 +211,16 @@ int listLuaFiles(const std::string &patch_root, const std::string &relative_patc
         return -1;
     }
 
-    // 收集递归扫描发现的 Lua/Patch 相对路径。
-    FileList  files;
-    // 递归扫描结果；-1 表示无效路径或文件结构，1 表示目录没有发布文件。
-    const int status = scanDirectory(directory, "", files);
+    // 直接收集发布目录的 Lua/Patch 相对路径；扫描失败时调用方丢弃结果。
+    const int status = scanDirectory(directory, "", output);
     if (status != 0)
     {
         return -1;
     }
-    if (files.paths.empty())
+    if (output.empty())
     {
         return 1;
     }
-    output = std::move(files.paths);
     return 0;
 }
 
