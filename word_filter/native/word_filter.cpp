@@ -12,14 +12,10 @@ namespace flywow_word_filter
         nodes_.emplace_back();
     }
 
-    BuildError Filter::addKeyword(std::string_view keyword, std::int32_t keyword_id)
+    BuildError Filter::addKeyword(std::string_view keyword)
     {
-        if (built_)
-        {
-            return BuildError::kAlreadyBuilt;
-        }
-
-        if (keywords_.size() >= kMaxKeywords || keyword.size() > kMaxKeywordBytes ||
+        // Binding 已校验词数；这里累计原始字节数，并在建 trie 前限制单条词长。
+        if (keyword.size() > kMaxKeywordBytes ||
             keyword.size() > kMaxDictionaryBytes - dictionary_byte_count_)
         {
             return BuildError::kDictionaryLimit;
@@ -36,9 +32,9 @@ namespace flywow_word_filter
             return BuildError::kInvalidKeyword;
         }
 
-        // 终止节点用词条索引引用 ID 和码点长度，重复词仍有独立索引。
-        const auto keyword_index = static_cast<std::int32_t>(keywords_.size());
-        keywords_.push_back({keyword_id, points.size()});
+        // 终止节点保存词条索引，用它取回码点数和派生 ID；重复词保留各自的索引。
+        const auto keyword_index = static_cast<std::int32_t>(keyword_code_point_counts_.size());
+        keyword_code_point_counts_.push_back(points.size());
         dictionary_byte_count_ += keyword.size();
 
         // trie 的边使用完整码点；例如“外”是一个节点，而不是三个 UTF-8 字节节点。
@@ -71,14 +67,8 @@ namespace flywow_word_filter
 
     BuildError Filter::build()
     {
-        // 已构建的词库不能再次继承后缀输出。
-        if (built_)
-        {
-            return BuildError::kNone;
-        }
-
         // 总输出从词条自身的命中开始计数，之后累加复制的后缀命中。
-        std::size_t output_count = keywords_.size();
+        std::size_t output_count = keyword_code_point_counts_.size();
         // 根的子节点默认回退到根；先入队，之后按 BFS 顺序补全更深节点。
         std::queue<std::int32_t> pending_nodes;
         for (std::size_t index = 0; index < nodes_[0].children.size(); ++index)
@@ -114,8 +104,6 @@ namespace flywow_word_filter
             }
         }
 
-        // 全部节点成功处理后才允许只读查询。
-        built_ = true;
         return BuildError::kNone;
     }
 
@@ -124,14 +112,6 @@ namespace flywow_word_filter
         if (matches)
         {
             matches->clear();
-        }
-        if (!built_)
-        {
-            return {QueryError::kNotBuilt, 0};
-        }
-        if (source_text.size() > kMaxTextBytes)
-        {
-            return {QueryError::kTextLimit, 0};
         }
 
         // 先校验完整 UTF-8，保证文本尾部的编码错误优先于命中数量超限。
@@ -151,9 +131,10 @@ namespace flywow_word_filter
             // 同一结束位置下，词条越长，原文起点越靠前。超跨度候选构成有序前缀。
             const auto &output_keyword_indices = nodes_[node_index].output_keyword_indices;
             const auto source_byte_end = points[index].source_byte_end;
+            // 用命中词条的码点数，从当前结束码点向前定位原文起点。
             const auto source_byte_begin_for = [&](std::int32_t keyword_index)
             {
-                return points[index + 1 - keywords_[keyword_index].code_point_count].source_byte_begin;
+                return points[index + 1 - keyword_code_point_counts_[keyword_index]].source_byte_begin;
             };
 
             auto first_valid_output = output_keyword_indices.begin();
@@ -194,8 +175,7 @@ namespace flywow_word_filter
             for (auto match_it = first_valid_output; match_it != output_keyword_indices.end(); ++match_it)
             {
                 const auto source_byte_begin = source_byte_begin_for(*match_it);
-                matches->push_back({keywords_[*match_it].keyword_id, source_byte_begin,
-                                    source_byte_end - source_byte_begin});
+                matches->push_back({*match_it + 1, source_byte_begin, source_byte_end - source_byte_begin});
             }
         }
         return {QueryError::kNone, match_count};

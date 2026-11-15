@@ -1,4 +1,4 @@
-// 职责：验证移植 AC 算法、原文映射、重复构建和只读并发；失败非零退出。
+// 职责：验证移植 AC 算法、原文映射、建库后的词条 ID 和只读并发；失败非零退出。
 #include "word_filter.h"
 #include <future>
 #include <iostream>
@@ -18,16 +18,16 @@ int main()
 {
     try
     {
-        // “she”同时命中“he”，覆盖 fail 输出继承和重复构建的回归。
+        // 单次构建后，“she”同时命中“he”，两个 ID 对应原始词库中的加入顺序。
         Filter filter;
-        flywow_check(filter.addKeyword("he", 1) == BuildError::kNone, "添加后缀词 he");
-        flywow_check(filter.addKeyword("she", 2) == BuildError::kNone, "添加前缀词 she");
-        flywow_check(filter.addKeyword("外挂", 3) == BuildError::kNone, "添加中文词库");
+        flywow_check(filter.addKeyword("he") == BuildError::kNone, "添加后缀词 he");
+        flywow_check(filter.addKeyword("she") == BuildError::kNone, "添加前缀词 she");
+        flywow_check(filter.addKeyword("外挂") == BuildError::kNone, "添加中文词库");
         flywow_check(filter.build() == BuildError::kNone, "构建词库");
-        flywow_check(filter.build() == BuildError::kNone, "重复构建"); // 后缀词仍只命中一次。
         std::vector<Match> matches;
         flywow_check(filter.query("SHE", false, &matches).error == QueryError::kNone, "ASCII 大小写折叠");
-        flywow_check(matches.size() == 2, "she 必须同时返回 she 和 he");
+        flywow_check(matches.size() == 2 && matches[0].keyword_id == 2 && matches[1].keyword_id == 1,
+                     "she 必须同时返回自身和 he，两个 ID 对应加入顺序");
         flywow_check(filter.query("前外挂后", false, &matches).error == QueryError::kNone, "中文原文查询");
         flywow_check(matches.size() == 1 && matches[0].source_byte_offset == 3 && matches[0].source_byte_length == 6,
                      "中文命中 byte 区间映射");

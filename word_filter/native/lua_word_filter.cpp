@@ -57,56 +57,48 @@ int create_filter(lua_State *state)
         return lua_binding.pushError();
     }
 
-    // 先保留稠密数组超过词数上限时的诊断优先级。稀疏数组的 rawlen 不是实际词数。
-    if (lua_rawlen(state, 1) > flywow_word_filter::kMaxKeywords)
-    {
-        setFilterError(lua_binding, "dictionary_limit");
-        return lua_binding.pushError();
-    }
-
-    // 从第 1 个参数槽遍历原始键。正整数键唯一，最大下标等于键数才表示没有空洞。
-    std::size_t keyword_count = 0;
-    lua_Integer max_keyword_index = 0;
-    lua_pushnil(state); // 参数栈后追加首轮遍历的 nil key。
-    while (lua_next(state, 1) != 0)
-    {
-        // 栈顶依次为 key、value；每轮弹出 value，让 lua_next 继续消费 key。
-        if (!lua_isinteger(state, -2) || lua_tointeger(state, -2) < 1)
-        {
-            lua_pop(state, 2); // 提前返回时恢复原参数栈。
-            setFilterError(lua_binding, "invalid_keyword");
-            return lua_binding.pushError();
-        }
-        const lua_Integer keyword_index = lua_tointeger(state, -2);
-        if (keyword_index > max_keyword_index)
-        {
-            max_keyword_index = keyword_index;
-        }
-        ++keyword_count;
-        lua_pop(state, 1);
-    }
-
-    // 正常结束时 lua_next 已弹出最后一个 key，原参数仍位于原槽。
-    if (static_cast<std::uintmax_t>(max_keyword_index) != keyword_count)
-    {
-        setFilterError(lua_binding, "invalid_keyword");
-        return lua_binding.pushError();
-    }
-    if (keyword_count > flywow_word_filter::kMaxKeywords)
-    {
-        setFilterError(lua_binding, "dictionary_limit");
-        return lua_binding.pushError();
-    }
-
-    // 创建后由 userdata 持有候选词库，只有构建成功才交给 Lua Wrapper。
-    LuaFilter *lua_filter = nullptr;
+    // 创建候选 userdata 可能触发 Lua __gc。先完成分配，再读取并校验同一份词库。
+    LuaFilter *lua_filter = nullptr; // 校验和构建成功后才作为返回值交给宿主。
     if (!lua_binding.newUserdata(kFilterMeta, lua_filter))
     {
         return lua_binding.pushError();
     }
     lua_filter->compact_enabled = compact_enabled;
 
-    // 下标是公开词条 ID；每轮读取的字符串在退出循环体时销毁。
+    // 把 rawlen 当作连续数组的候选长度，先保留词数超限的错误优先级。
+    const auto keyword_count = lua_rawlen(state, 1);
+    if (keyword_count > flywow_word_filter::kMaxKeywords)
+    {
+        setFilterError(lua_binding, "dictionary_limit");
+        return lua_binding.pushError();
+    }
+
+    // 核对原始键是否正好覆盖 1..keyword_count。直到读取词条结束都不调用可能推进 Lua GC 的 API。
+    std::size_t seen_keyword_count = 0; // 进入范围的原始键数，用于判断数组是否有空洞。
+    lua_pushnil(state); // 参数栈后追加首轮遍历的 nil key。
+    while (lua_next(state, 1) != 0)
+    {
+        // 栈顶依次为 key、value；每轮弹出 value，让 lua_next 继续消费 key。
+        const lua_Integer keyword_index = lua_tointeger(state, -2); // 原始键对应的词条下标。
+        if (!lua_isinteger(state, -2) || keyword_index < 1 ||
+            static_cast<std::uintmax_t>(keyword_index) > keyword_count)
+        {
+            lua_pop(state, 2); // 提前返回时恢复原参数栈。
+            setFilterError(lua_binding, "invalid_keyword");
+            return lua_binding.pushError();
+        }
+        ++seen_keyword_count;
+        lua_pop(state, 1);
+    }
+
+    // 正常结束时 lua_next 已弹出最后一个 key，原参数仍位于原槽。
+    if (seen_keyword_count != keyword_count)
+    {
+        setFilterError(lua_binding, "invalid_keyword");
+        return lua_binding.pushError();
+    }
+
+    // 按数组顺序建库，让核心的词条下标与公开 ID 对应。
     BuildError build_error = BuildError::kNone;
     for (std::size_t index = 1; index <= keyword_count; ++index)
     {
@@ -116,8 +108,7 @@ int create_filter(lua_State *state)
         {
             std::size_t keyword_size = 0; // Lua 原始字符串长度，包含内嵌 NUL。
             const char *keyword_bytes = lua_tolstring(state, -1, &keyword_size);
-            build_error = lua_filter->filter.addKeyword({keyword_bytes, keyword_size},
-                                                        static_cast<std::int32_t>(index));
+            build_error = lua_filter->filter.addKeyword({keyword_bytes, keyword_size});
         }
         else
         {
@@ -193,9 +184,7 @@ int queryFilter(lua_State *state, bool collect_matches)
     switch (query_result.error)
     {
     case QueryError::kNone: break;
-    case QueryError::kNotBuilt: error_code = "internal_error"; break;
     case QueryError::kInvalidUtf8: error_code = "invalid_utf8"; break;
-    case QueryError::kTextLimit: error_code = "text_limit"; break;
     case QueryError::kMatchLimit: error_code = "match_limit"; break;
     }
 

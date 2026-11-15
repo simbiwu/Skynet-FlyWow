@@ -100,8 +100,9 @@ internal_error。直接调用 Native 时，无效或已释放的 userdata 由 Lu
 
 先读 word_filter/lualib/flywow_word_filter.lua 的公开合同，再读
 word_filter/native/word_filter.h 的内部字段与单位，最后按 word_filter.cpp 的
-addKeyword → build → query 顺序查看核心。lua_word_filter.cpp 负责 userdata、GC、
-异常转换和 C++/Lua 的索引转换；业务不需要直接调用 Native 入口。
+addKeyword → build → query 顺序查看核心。Binding 先分配候选 userdata，再连续校验词库原始键
+并读取词条，避免 GC 回调改动已校验的数组。词条按数组顺序加入，ID 由该顺序得出。
+Binding 调用一次 build 并仅在成功后发布 userdata，后续只读。
 
 AC 自动机按完整 Unicode 码点建立 trie，build 用 BFS 建立 fail 链并继承后缀输出。
 例如词库同时含 she/he，输入 she 会返回两项；Lua replace 合并两项的重叠区间，
@@ -119,9 +120,9 @@ create_filter 的配置字段可通过 __index 提供，元方法行为由宿主
 
 ## 验证与兼容
 
-C++ 测试覆盖后缀/重叠命中、重复 build、中文原文偏移、NUL、非法 UTF-8、
-compact 和同一只读核心的多线程查询。
-Lua 测试覆盖公开接口、排序/替换、全角、词库失败、容量边界及 GC。
+C++ 测试覆盖建库后的后缀命中及 ID、中文原文偏移、NUL、非法 UTF-8、compact 和同一只读核心的多线程查询。
+Lua 测试覆盖公开接口、排序与替换、全角、文件词库与容量边界，以及建库分配期间的词库变更和
+find 建表期间的 GC 重入。
 Skynet 测试从 FlyWow 根目录启动两个 worker Service，验证独立 Lua State 的真实调用。
 loader 和 Skynet C 模块来自 SKYNET_ROOT，WordFilter 动态库来自当前 CMake target。
 已有 Skynet 可执行文件时 CTest 自动运行此项；没有时该集成边界未验证。

@@ -24,7 +24,7 @@ namespace flywow_word_filter
 
     struct Match
     {
-        std::int32_t keyword_id;         // 调用方指定的 ID，Lua 使用 1-based 数组下标。
+        std::int32_t keyword_id;         // 从 1 开始的原始词库下标。
         std::uint32_t source_byte_offset; // 原文 0-based byte 起点。
         std::uint32_t source_byte_length; // 原文跨度，包含 compact 跳过的中间字符。
     };
@@ -32,7 +32,6 @@ namespace flywow_word_filter
     enum class BuildError
     {
         kNone,
-        kAlreadyBuilt,
         kInvalidKeyword,
         kDictionaryLimit,
     };
@@ -40,9 +39,7 @@ namespace flywow_word_filter
     enum class QueryError
     {
         kNone,
-        kNotBuilt,
         kInvalidUtf8,
-        kTextLimit,
         kMatchLimit,
     };
 
@@ -52,27 +49,26 @@ namespace flywow_word_filter
         std::size_t match_count; // 成功时统计有效命中，失败时为零。
     };
 
-    // 对象独占词库和自动机。addKeyword/build 不得与查询并发；
-    // build 成功后可只读并发查询，各调用必须独占自己的临时数据及 results。
+    // Binding 按词库顺序调用 addKeyword，最后调用一次 build；任一步失败都丢弃候选对象。
+    // build 成功后才发布，只读查询可并发，各调用必须独占自己的临时数据及 matches。
     // 所有核心操作无 I/O、无锁、无 yield；分配失败由运行时处理。
     class Filter
     {
       public:
         Filter();
-        /// 构建词库时加入一个词，只保存其 ID 和归一化后的码点数。
+        /// Binding 校验数组总词数后按下标添加词条，保存其归一化码点数。词条 ID 从加入顺序得出。
         /// @param keyword 宿主词库中的原始 UTF-8 词条。
-        /// @param keyword_id 调用方为该词条分配的 ID，Lua 使用数组下标。
-        /// @return 成功返回 kNone；已构建、非法词条和超限分别返回对应原因。
+        /// @return 成功返回 kNone；词条非法或超过词长、词库字节数或节点上限时返回对应原因。
         /// @note 添加失败后销毁候选词库，部分 trie 不可继续使用。
-        BuildError addKeyword(std::string_view keyword, std::int32_t keyword_id);
+        BuildError addKeyword(std::string_view keyword);
 
-        /// 添加完词条后建立 fail 链和后缀输出；成功后重复调用不修改词库。
+        /// 添加完全部词条后调用一次，建立 fail 链和后缀输出。
         /// @return 成功返回 kNone；后缀输出超限返回 kDictionaryLimit。
         /// @note 构建失败后销毁候选词库，部分后缀输出不可重用。
         BuildError build();
 
         /// 校验完整原文后扫描已构建词库，检查跨度与命中上限。
-        /// @param source_text 宿主传入的 UTF-8 原文。
+        /// @param source_text Binding 已验证长度不超过 kMaxTextBytes 的原始 UTF-8 字节。
         /// @param compact 是否忽略指定分隔码点并检查原文跨度。
         /// @param matches 接收命中的容器；传 nullptr 时只计数。返回预期错误时清空容器。
         /// @return 有效命中数，或本次查询的失败原因。
@@ -84,12 +80,6 @@ namespace flywow_word_filter
             std::uint32_t code_point; // 归一化后用于查找 trie 出边。
             std::uint32_t source_byte_begin;      // 原文 byte 起点。
             std::uint32_t source_byte_end;        // 原文 byte 结束位置，不包含该位置。
-        };
-
-        struct Keyword
-        {
-            std::int32_t keyword_id;      // 调用方指定的 ID，Lua 使用 1-based 数组下标。
-            std::size_t code_point_count; // 通过结束位置反推命中起点。
         };
 
         using Edges = std::vector<std::pair<std::uint32_t, std::int32_t>>;
@@ -117,10 +107,9 @@ namespace flywow_word_filter
         // 构建和扫描共用 fail 链查找。没有可用后缀时返回根节点。
         std::int32_t followEdge(std::int32_t node_index, std::uint32_t code_point) const;
 
-        std::vector<Keyword> keywords_;
-        std::vector<Node>    nodes_; // 索引 0 永远为根节点。
-        bool built_ = false; // build 完整建立后缀输出后置为 true，随后只读。
-        std::size_t                 dictionary_byte_count_ = 0; // 原始词库总字节数。
+        std::vector<std::size_t> keyword_code_point_counts_;     // 按加入顺序保存码点数，供查询反推命中起点。
+        std::vector<Node>        nodes_;                         // 索引 0 永远为根节点。
+        std::size_t             dictionary_byte_count_ = 0;     // 原始词库总字节数。
     };
 } // namespace flywow_word_filter
 

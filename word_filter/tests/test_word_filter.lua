@@ -1,4 +1,4 @@
---- 职责：通过公开 API 验证 Lua/Native 加载、UTF-8、替换、边界和 GC。
+--- 职责：验证 WordFilter 的公开 Lua API，并通过 Native 入口定位建库分配时的 GC 回调。
 --- 由 Skynet 集成测试加载，复用测试配置提供的 Lua 和 Native 搜索路径。
 local word_filter = require "flywow_word_filter"
 local dictionary_path = os.tmpname()
@@ -15,7 +15,7 @@ local blank_filter = assert(word_filter.create_filter({file = dictionary_path}))
 assert(blank_filter:contains("SHE") == false)
 
 dictionary_file = assert(io.open(dictionary_path, "wb"))
-dictionary_file:write("外挂\r\nhe\n\nshe\n")
+assert(dictionary_file:write("外挂\r\nhe\n\nshe"))
 assert(dictionary_file:close())
 local file_filter, file_error = word_filter.create_filter({file = dictionary_path})
 local truncated_filter, truncated_error = word_filter.create_filter({file = dictionary_path .. "\0ignored"})
@@ -23,6 +23,8 @@ assert(truncated_filter == nil and truncated_error == "invalid_options")
 os.remove(dictionary_path)
 assert(file_filter and not file_error)
 assert(file_filter:contains("SHE"))
+local file_matches = assert(file_filter:find("SHE")) -- 末行无换行，she 仍是第三个词条。
+assert(#file_matches == 2 and file_matches[1].keyword_id == 3 and file_matches[2].keyword_id == 2)
 local missing_filter, missing_error = word_filter.create_filter({file = dictionary_path})
 assert(missing_filter == nil and missing_error == "dictionary_io")
 
@@ -41,6 +43,14 @@ assert(filter:replace("前外挂后") == "前*后")
 assert(filter:replace("she", "[屏蔽]") == "[屏蔽]")
 assert(filter:replace("badshe") == "**")
 assert(filter:contains("x\0bad"))
+
+--- 三个不同命中连成一个区间；尾部相邻命中单独替换，重复词仍返回各自的 ID。
+local overlap_filter = assert(word_filter.create_filter({keywords = {"ab", "bc", "cd", "ab"}}))
+local overlap_matches = assert(overlap_filter:find("zabcdabz")) -- 首个区间包含两个同起点同词的匹配。
+assert(#overlap_matches == 6 and overlap_matches[1].keyword_id == 1 and overlap_matches[2].keyword_id == 4)
+assert(overlap_filter:replace("zabcdabz") == "z**z")
+assert(overlap_filter:replace("zabcdabz", "") == "zz")
+assert(overlap_filter:replace("zz") == "zz")
 
 --- 输入和命中数量的合法边界；NUL 由显式长度传入 Native，不当作结束符。
 assert(filter:contains(string.rep("a", 65536)) == false)
@@ -122,6 +132,26 @@ in_outer_find = false
 assert(reentered and nested_matches and not nested_error)
 assert(#nested_matches == 2 and nested_matches[1].keyword_id == 3 and nested_matches[2].keyword_id == 2)
 assert(#outer_matches == 4096 and outer_matches[4096].keyword_id == 4 and outer_matches[4096].offset == 12286)
+
+--- 分代 GC 在重启后的首次分配中回收新一代对象，并运行词库修改回调。
+--- 直接调用 Native，使回调落在候选 userdata 分配时，避开 Lua Wrapper 创建返回对象的分配。
+local word_filter_native = require "flywow_word_filter_native"
+local gc_keywords = {"bad"} -- 调用开始时只有一个合法词条，回调会插入未支持的原始键。
+local dictionary_finalizer =
+{
+    -- 回调执行时把词库改成带有额外键的数组，建库必须按更新后的实际键校验。
+    __gc = function()
+        gc_keywords.unexpected = true
+    end,
+}
+local previous_gc_mode = collectgarbage("generational") -- 保存外层测试使用的 GC 模式，建库后恢复。
+collectgarbage("stop")
+setmetatable({}, dictionary_finalizer)
+collectgarbage("restart")
+local gc_filter, gc_error = word_filter_native.create_filter(gc_keywords, false)
+collectgarbage(previous_gc_mode)
+assert(gc_keywords.unexpected == true, "建库分配期间应触发 GC 回调")
+assert(gc_filter == nil and gc_error and gc_error.code == "invalid_keyword", "建库必须拒绝 GC 回调插入的额外键")
 
 --- 临时创建的过滤对象在失去引用后由 GC 清理。
 for _ = 1, 100 do

@@ -36,17 +36,14 @@ local Filter = {}
 Filter.__index = Filter
 
 --- 将 Native 查询或构建失败转换成 WordFilter 对外返回的错误码。
----@param error_value table|string Native 返回的诊断表或错误码。
+---@param error_value table Native 返回的诊断表；code 由 LuaBinding 或 WordFilter 写入。
 ---@return string error_code 调用方可直接判断的错误码。
 local function native_error_code(error_value)
-    if type(error_value) == "table" then
-        local code = error_value.code
-        if code == "INTERNAL_ERROR" then
-            return "internal_error"
-        end
-        return code or "internal_error"
+    local code = error_value.code -- Native 的机器错误码，供 Lua API 调用者判断失败原因。
+    if code == "INTERNAL_ERROR" then
+        return "internal_error"
     end
-    return error_value
+    return code
 end
 
 --- 从内存数组或 UTF-8 外部文本文件创建只读词库；文件每行一个词，空行忽略。
@@ -97,12 +94,13 @@ function M.create_filter(word_filter_config)
             return nil, "dictionary_limit"
         end
         keywords = {}
-        for line in (content .. "\n"):gmatch("(.-)\n") do
-            if line:sub(-1) == "\r" then
-                line = line:sub(1, -2)
+        -- 直接匹配非空行，既能读取无换行的末行，也无需复制整份文件补换行。
+        for keyword in content:gmatch("[^\n]+") do -- 逐行取原始词条，接下来去掉行尾 CR。
+            if keyword:sub(-1) == "\r" then
+                keyword = keyword:sub(1, -2)
             end
-            if #line > 0 then
-                keywords[#keywords + 1] = line
+            if #keyword > 0 then
+                keywords[#keywords + 1] = keyword
             end
         end
     end
@@ -175,37 +173,21 @@ function Filter:replace(text, replacement)
         return nil, error_code
     end
 
-    -- 查询成功后按原文 byte 区间拼新字符串；原文及命中表均不修改。
-    local parts = {}           -- 按原文顺序积累保留片段和替换文本，最后一次拼接。
-    local next_source_byte = 1 -- 尚未输出的原文字节起点，区间写出后前移。
-    local span_start_byte      -- 当前合并命中区间起点；nil 表示尚无待输出区间。
-    local span_end_byte        -- 当前合并区间的闭区间终点，与起点一起更新。
-
-    --- find 已按起点排序。合并区间使用闭区间 [start,end]，所有位置都是原文 bytes。
-    --- 例如 she 同时命中 she/he：两个区间合并为 [1,3]，只输出一次替换文本。
+    -- find 已按起点排序。首次遇到一个区间就写出前面的原文和替换文本，之后只扩展覆盖终点。
+    local parts = {}            -- 按原文顺序积累保留片段和替换文本，最后一次拼接。
+    local covered_end_byte = 0  -- 已处理命中覆盖的最远原文 byte，0 表示尚无命中。
     for _, match in ipairs(matches) do
-        local match_end_byte = match.offset + match.length - 1
-        if span_start_byte and match.offset <= span_end_byte then
-            span_end_byte = math.max(span_end_byte, match_end_byte)
-        else
-            if span_start_byte then
-                parts[#parts + 1] = text:sub(next_source_byte, span_start_byte - 1)
-                parts[#parts + 1] = replacement
-                next_source_byte = span_end_byte + 1
-            end
-            span_start_byte, span_end_byte = match.offset, match_end_byte
+        local match_start_byte = match.offset -- find 返回的 1-based 原文起点。
+        local match_end_byte = match_start_byte + match.length - 1 -- length 是原文跨度，换算成闭区间终点。
+        if match_start_byte > covered_end_byte then
+            parts[#parts + 1] = text:sub(covered_end_byte + 1, match_start_byte - 1)
+            parts[#parts + 1] = replacement
         end
+        covered_end_byte = math.max(covered_end_byte, match_end_byte)
     end
 
-    --- 循环只在遇到下一个区间时写出上一个；最后一个区间和余下原文在此收尾。
-    if span_start_byte then
-        parts[#parts + 1] = text:sub(next_source_byte, span_start_byte - 1)
-        parts[#parts + 1] = replacement
-        next_source_byte = span_end_byte + 1
-    end
-
-    -- 已输出全部合并命中；保留最后一个命中之后的原文后再拼接结果。
-    parts[#parts + 1] = text:sub(next_source_byte)
+    -- 最后一个命中之后的原文仍需输出；无命中时从第 1 byte 保留整个原文。
+    parts[#parts + 1] = text:sub(covered_end_byte + 1)
     return table.concat(parts)
 end
 
