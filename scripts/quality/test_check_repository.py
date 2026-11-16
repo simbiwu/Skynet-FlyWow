@@ -141,7 +141,7 @@ class CheckWorkflowTests(unittest.TestCase):
 class HotUpgradeControllerTypeGateTests(unittest.TestCase):
     """防止 Controller 模块类型与 controller 参数的方法声明脱节。"""
 
-    def test_requires_load_patch_on_the_controller_module_type(self) -> None:
+    def test_requires_call_target_control_on_the_controller_module_type(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             source_path = root / "hotupgrade/lualib/flywow_hotupgrade_controller.lua"
@@ -155,7 +155,7 @@ class HotUpgradeControllerTypeGateTests(unittest.TestCase):
 
             errors = CHECKER.check_hotupgrade_controller_type_contract(root)
 
-            self.assertTrue(any("未声明 load_patch" in error for error in errors))
+            self.assertTrue(any("未声明 call_target_control" in error for error in errors))
 
 
 class CommentClarityGateTests(unittest.TestCase):
@@ -219,7 +219,7 @@ class CommentClarityGateTests(unittest.TestCase):
             controller_path.parent.mkdir(parents=True)
             controller_path.write_text(
                 "---@class FlyWowHotUpgradeController\n"
-                "---@field load_patch fun(self: FlyWowHotUpgradeController, batch: any)\n"
+                "---@field call_target_control fun(self: FlyWowHotUpgradeController, batch: any)\n"
                 "local M = {}\n",
                 encoding="utf-8",
             )

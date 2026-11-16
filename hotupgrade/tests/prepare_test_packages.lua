@@ -243,6 +243,9 @@ for name, directories in pairs(cases) do
         end
     end
 end
+-- 同一个缓存别名可以来自根目录的点号文件，单独发布它应只部署文件。
+assert(os.execute("mkdir -p " .. root .. "module_other_path"))
+write(root .. "module_other_path/lualib.test_worker_logic.lua", "return {value = function() return 99 end}")
 -- 生成大量文件的 Patch 夹具，验证扫描和源码读取不会因文件数量或总字节数被拒绝。
 assert(os.execute("mkdir -p " .. root .. "count_unlimited/config " .. root .. "count_unlimited/lualib "
     .. root .. "total_unlimited/config " .. root .. "total_unlimited/lualib " .. root .. "file_unlimited"))

@@ -18,44 +18,17 @@ local early_ok, early_error = pcall(hotupgrade.require, "test_worker_logic") -- 
 assert(not early_ok and tostring(early_error):find("HU_NOT_INITIALIZED", 1, true))
 assert(not controller.initialize({}).ok)
 assert(controller.initialize(controller_config).ok)
-local c = controller -- 后续场景共用的已初始化 Controller 单例。
---- 用可控的虚拟 handle 创建并登记一个测试 Service，供文件扫描场景匹配目标。
----@param instance table 已初始化的测试 Controller；本函数向它发送 newservice 和 register。
----@param service_handle integer 测试替身指定的 Service handle；用于模拟原生创建返回值和登记消息来源。
----@param metadata table 测试 Service 登记的模块名及更新能力；本函数原样提交给 register。
----@param service_name string 测试 Service 入口名；本函数把它放进 newservice 请求。
-local function register_fixture(instance, service_handle, metadata, service_name)
-    local skynet = require "skynet" -- 替换 newservice，让 Controller 获得可控的虚拟 handle。
-    local original_newservice = skynet.newservice -- 保存原生创建函数，避免影响后续测试。
-    skynet.newservice = function() return service_handle end
-    local created = instance:handle_command("newservice", -- 创建登记窗口；随后用 service_handle 模拟真实来源。
-        {service_name = service_name, arguments = {n = 0}}, 1)
-    skynet.newservice = original_newservice
-    assert(created.ok and instance.service_creations[service_handle].service_name == service_name)
-    local registered = instance:handle_command("register", metadata, service_handle) -- 目标携带创建时获得的真实 handle 登记。
-    assert(registered.ok and instance.service_registrations[service_handle].service_name == service_name)
-    return registered
-end
-assert(register_fixture(c, 10, {modules = {"lualib.test_worker_logic"},
-    has_service_update = true}, "battle/worker").ok)
-assert(c:load_patch({patch_dir = "module"}).ok)
-assert(not c:load_patch({patch_dir = "invalid"}).ok)
 for _, path in ipairs({"../module", "/module", "module/../module", "module//lualib",
     "module/", "module/./lualib", "module\\lualib", "module" .. string.char(0)}) do
     assert(not hotupgrade_native.list_lua(root, path), path)
 end
 
-for _, path in ipairs({"duplicate_module"}) do
-    assert(c:load_patch({patch_dir = path}).code == "HU_INVALID_PATCH")
-end
 local many_files = assert(hotupgrade_native.list_lua(root, "count_unlimited")) -- 用于确认扫描不因文件数量达到 1024 而截断。
 assert(#many_files == 1025)
 assert(#assert(hotupgrade_native.list_lua(root, "file_unlimited")) == 1)
 assert(#assert(hotupgrade_native.list_lua(root, "total_unlimited")) == 9)
--- Lua Controller 也必须读取完整源码；未登记普通 .lua 现在可直接进入部署集合。
-for _, path in ipairs({"count_unlimited", "file_unlimited", "total_unlimited"}) do
-    assert(c:load_patch({patch_dir = path}).ok)
-end
+-- 大文件应被完整读取；夹具比此前 2 MiB 的单文件限制多一个字节。
+assert(#assert(hotupgrade_native.read_file(root, "file_unlimited/large.lua")) == 2 * 1024 * 1024 + 1)
 local other_root = config.root_path .. "/another" -- 与已解析宿主根不同的目录，用来验证配置不一致会被拒绝。
 assert(os.execute("mkdir -p " .. other_root .. "/service"))
 local conflicting = controller.initialize({patch_path = root, root_path = other_root, service_path = "service"}) -- 错误根目录配置的校验结果。
@@ -94,9 +67,6 @@ assert(os.execute("ln -s service " .. service_link))
 local rejected = controller.initialize({patch_path = root, root_path = config.root_path, service_path = "service_link"}) -- 指向符号链接目录时必须拒绝初始化。
 assert(os.remove(service_link))
 assert(not rejected.ok and rejected.code == "HU_INVALID_PATH")
-assert(register_fixture(c, 20,
-    {modules = {}, has_service_update = true}, "skynet_hotupgrade_worker").ok)
-assert(c:load_patch({patch_dir = "custom_service_files"}).ok)
 local file_path = "native_files/nested/value.lua" -- Native 测试用的宿主相对文件路径，依次覆盖创建、覆盖和删除。
 assert(hotupgrade_native.read_file(config.root_path, file_path) == false)
 assert(hotupgrade_native.replace_file(config.root_path, file_path, "old"))

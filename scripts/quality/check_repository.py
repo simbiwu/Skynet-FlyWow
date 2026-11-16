@@ -692,10 +692,10 @@ def check_hotupgrade_controller_type_contract(root: Path) -> list[str]:
     if not class_match:
         return [f"{path.relative_to(root)}: Controller 类型没有绑定到模块表 M"]
     if not re.search(
-        r"---@field load_patch fun\(self: FlyWowHotUpgradeController,",
+        r"---@field call_target_control fun\(self: FlyWowHotUpgradeController,",
         class_match.group("fields"),
     ):
-        return [f"{path.relative_to(root)}: Controller 类型未声明 load_patch，helper 无法获得 IDE 成员提示"]
+        return [f"{path.relative_to(root)}: Controller 类型未声明 call_target_control，发布流程无法获得 IDE 成员提示"]
     return []
 
 

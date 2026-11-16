@@ -39,7 +39,6 @@ skynet.start(function()
                 if answer.ok then
                     skynet_core.command("MONITOR", skynet.address(skynet.self()))
                     controller_initialized = true
-                    answer = flywow_result.success()
                 end
             end
         end

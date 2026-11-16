@@ -336,13 +336,13 @@ skynet.start(function()
             end)
             skynet.call = function(target, protocol, operation, request)
                 if protocol == "hotupgrade" and operation == "register_new_module"
-                    and request.name == "lualib.hotupgrade_new_dependency" then
+                    and request.host_relative_path == "lualib/hotupgrade_new_dependency.lua" then
                     dependency_registration_started = true
                     while not ordinary_load_waiting do
                         skynet.sleep(1)
                     end
                 elseif protocol == "hotupgrade" and operation == "begin_module_load"
-                    and request.name == "lualib.hotupgrade_new_rules" then
+                    and request.host_relative_path == "lualib/hotupgrade_new_rules.lua" then
                     ordinary_load_waiting = true
                 end
                 return original_call(target, protocol, operation, request)

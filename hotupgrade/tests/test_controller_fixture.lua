@@ -120,6 +120,7 @@ package.loaded.flywow_hotupgrade_native =
             custom_named_service = {"actors/zone/player.patch"},
             duplicate_module = {"lualib/battle.worker.lua", "lualib/battle/worker.lua"},
             duplicate_service = {"service/battle/worker.patch", "service/battle/worker.patch"},
+            module_other_path = {"lualib.test_worker_logic.lua"}, -- 与常规 Worker 模块缓存别名碰撞的点号文件。
         }
         return files[path], {code = "HU_PATCH_EMPTY"}
     end,
@@ -158,7 +159,7 @@ end
 
 --- 模拟受管理创建后由目标来源登记；沿用生产消息入口建立测试目标。
 ---@param instance table initialize_controller 创建的测试 Controller；本函数通过它完成受管理创建和目标登记。
----@param metadata table 测试目标提交的登记内容；包含 modules 模块名数组和 has_service_update 更新能力标记。
+---@param metadata table 测试目标提交的登记内容；包含 module_paths 宿主相对文件路径数组和 has_service_update 更新能力标记。
 ---@param service_handle integer 测试替身分配给目标 Service 的 handle；本函数用它作为 register 的消息来源。
 ---@param service_name? string 测试 Service 的入口名；省略时按 worker 入口登记目标。
 ---@return table Controller 的创建失败或登记结果
@@ -171,6 +172,8 @@ local function managed_register(instance, metadata, service_handle, service_name
     if not created.ok then
         return created
     end
+
+    -- 创建已返回真实 handle，登记请求必须使用同一个来源。
     assert(instance.service_creations[service_handle].service_name == service_name)
     -- 目标登记结果；成功后断言 Controller 已按该 handle 保存实例。
     local registered = instance:handle_command("register", metadata, service_handle)
@@ -182,20 +185,20 @@ end
 
 --- 为已登记测试目标完成一次模块许可申请与登记，返回实际协议结果。
 ---@param instance table initialize_controller 创建的测试 Controller；本函数通过它完成受管理创建和目标登记。
----@param name string 测试模块的统一名；本函数为它申请加载许可并登记到指定目标。
+---@param host_relative_path string 测试模块的宿主相对文件路径；本函数为它申请加载许可并登记到指定目标。
 ---@param service_handle integer managed_register 已登记目标的 handle；本函数以它作为模块登记 RPC 来源。
 ---@return table 许可失败结果或登记结果
-local function register_module(instance, name, service_handle)
+local function register_module(instance, host_relative_path, service_handle)
     -- 同一 Service 先取得 permit_id，再携带该 ID 登记；夹具沿用生产许可协议，避免直接改登记集合。
-    local allowed = instance:handle_command("begin_module_load", {name = name}, service_handle)
+    local allowed = instance:handle_command("begin_module_load", {host_relative_path = host_relative_path}, service_handle)
     if not allowed.ok then
         return allowed
     end
-    return instance:handle_command("register_module", {name = name, permit_id = allowed.value.permit_id}, service_handle)
+    return instance:handle_command("register_module", {host_relative_path = host_relative_path, permit_id = allowed.value.permit_id}, service_handle)
 end
 
 -- 模拟目标 State 发送给 Controller 的初始模块声明和 Service 更新能力。
-local metadata = {modules = {"lualib.test_worker_logic"}, has_service_update = false}
+local metadata = {module_paths = {"lualib/test_worker_logic.lua"}, has_service_update = false}
 
 return
 {

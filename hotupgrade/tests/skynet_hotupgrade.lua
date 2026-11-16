@@ -491,12 +491,24 @@ local function run_test_group()
         local worker = create_worker_service() -- 本场景创建的业务 worker Service。
         local native = require "flywow_hotupgrade_native" -- 真实 HotUpgrade Native 扩展，用于验证部署前后正式文件内容。
         local config = require "hotupgrade_test_options" -- 传给目标 worker 的故障开关；指定 Prepare/Update 或恢复中的注入点。
+        -- 此文件与线上 lualib/test_worker_logic.lua 生成同一个缓存别名，但没有目标登记它。
+        local other_path = "lualib.test_worker_logic.lua"
+        local original_source = assert(native.read_file(config.root_path, "lualib/test_worker_logic.lua"))
+        local file_only = wait_for_batch_phase(controller,
+            begin_update_batch(controller, "module_other_path"), "COMPLETED")
+        assert(file_only.target_service_count == 0 and type(native.read_file(config.root_path, other_path)) == "string")
+        assert(native.read_file(config.root_path, "lualib/test_worker_logic.lua") == original_source)
+        assert(read_worker_state(worker).module_value == 1)
+        local fresh_worker = create_worker_service() -- 文件单独部署后新启动的实例，应仍加载原路径的 V1。
+        assert(read_worker_state(fresh_worker).module_value == 1)
+
         for index = 1, 4 do
             local path = "source_headers_" .. index -- 当前循环选择的发布目录名。
             local record = wait_for_batch_phase(controller, begin_update_batch(controller, path), "COMPLETED") -- 等待到的本批终态记录。
-            assert(record.target_service_count == 1)
+            assert(record.target_service_count == 2)
             local state = read_worker_state(worker) -- worker 当前的模块和 Service 状态快照。
             assert(state.module_value == 2 and state.level == 51 and not state.paused)
+            assert(read_worker_state(fresh_worker).module_value == 2)
             for _, file in ipairs({"lualib/test_worker_logic.lua", "config/headers.lua"}) do
                 assert(native.read_file(config.root_path, file) == native.read_file(config.patch_path, path .. "/" .. file))
             end
@@ -579,6 +591,12 @@ local function run_test_group()
         assert(read_worker_state(create_worker_service()).module_value == 2)
         assert(require("new.dependency").version == 2)
         assert(native.read_file(root, "service/skynet_hotupgrade_worker.patch") == false)
+
+        -- 走真实发布入口，验证原有数量与字节阈值以上的发布包可全部部署。
+        for _, patch_dir in ipairs({"count_unlimited", "file_unlimited", "total_unlimited"}) do
+            local record = wait_for_batch_phase(controller, begin_update_batch(controller, patch_dir), "COMPLETED")
+            assert(record.target_service_count == 0)
+        end
         print("HOTUPGRADE_SKYNET_DEPLOYMENT_OK")
     elseif group == "deploy_failure" then
         controller = create_controller()

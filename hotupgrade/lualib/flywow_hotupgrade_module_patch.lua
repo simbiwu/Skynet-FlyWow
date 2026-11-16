@@ -184,7 +184,7 @@ end
 --- 编译并运行本批普通模块候选，保存旧字段和新字段，返回可提交的 Stage。
 --- 所有候选准备成功后才返回 Stage；此时线上模块导出表还没有被替换。
 ---@param module_patches table[] Controller 按模块名排序的候选数组；每项含 name 和 source，本函数逐项编译并准备。
----@param module_loaders? table<string, {name:string, path:string}> 本 State 首次声明时使用的加载名和路径；独立调用省略时使用统一模块名，路径为 nil。
+---@param module_loaders? table<string, {name:string, path:string}> 按宿主相对路径索引的首次加载名和路径；独立调用省略时使用统一模块名，路径为 nil。
 --- 候选 chunk、export_state 和 import_state 在本调用中同步执行，不得 yield。
 ---@return FlyWowResult<FlyWowHotUpgradeModuleStage> 成功载荷是暂存记录；失败保留编译、候选校验或迁移阶段错误，且不安装线上导出。
 function M.stage(module_patches, module_loaders)
@@ -221,7 +221,7 @@ function M.stage(module_patches, module_loaders)
             return flywow_result.failure("HU_MODULE_COMPILE_FAILED",
                 module_patch.name .. ": " .. tostring(compile_failure))
         end
-        local loader = module_loaders and module_loaders[module_patch.name]
+        local loader = module_loaders and module_loaders[module_patch.host_relative_path]
         module_stage.entries[#module_stage.entries + 1] =
         {
             name        = module_patch.name, -- package.loaded 中当前线上模块的名称。
@@ -237,6 +237,9 @@ function M.stage(module_patches, module_loaders)
     -- 运行更新包里的模块代码；如果文件顶层代码抛错，就转换成 HU_MODULE_STAGE_FAILED 返回。
     for _, entry in ipairs(module_stage.entries) do
         local candidate_succeeded, candidate = pcall(entry.chunk, entry.loader_name, entry.loader_path)
+        entry.chunk = nil
+        entry.loader_name = nil
+        entry.loader_path = nil
         if not candidate_succeeded then
             local failure_text = tostring(candidate)
             local cause_code, cause_message = failure_text:match("(HU_[A-Z0-9_]+):%s*(.*)$")
@@ -284,7 +287,6 @@ function M.stage(module_patches, module_loaders)
             end
         end
         entry.candidate = candidate
-        entry.chunk = nil
     end
 
     -- 候选编译、执行和导出校验成功后，发布暂存记录供 Commit 或 Abort 使用。
@@ -305,6 +307,7 @@ function M.commit(module_stage)
     -- 根表和候选字段均已核验，直接写入原表，期间不会调用业务代码或 yield。
     for _, entry in ipairs(module_stage.entries) do
         replace_exports(entry.live, entry.candidate)
+        entry.candidate = nil -- 后续 Abort 只需要线上表与旧字段。
     end
     return flywow_result.success()
 end

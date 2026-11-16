@@ -10,8 +10,23 @@ local managed_register = fixture.managed_register -- 通过受管理创建和真
 local register_module = fixture.register_module -- 通过许可协议向 Controller 登记普通模块。
 local scenario = assert(arg[1], "需要测试场景名") -- 命令行选择本次独立运行的 Controller 场景。
 
+--- 查询测试 Controller 的生命周期概览。
+---@param controller FlyWowHotUpgradeController 本场景初始化的控制面；通过 status 观察发布和待登记进度。
+---@return FlyWowHotUpgradeLifecycleStatus 管理端看到的排空计数和活动阶段。
 local function lifecycle_status(controller)
     return controller:handle_command("status", {}, 1).value.lifecycle
+end
+
+--- 通过公开管理命令运行同步夹具发布，并返回可供断言的终态。
+---@param controller table 已初始化的测试 Controller；本函数通过它提交并查询发布。
+---@param path string 测试发布目录；原样交给 begin。
+---@return FlyWowHotUpgradeBatchStatus 指定批次的终态记录。
+local function publish_and_read_record(controller, path)
+    local batch_id = begin_deployment(controller, path) -- begin 返回的批次身份，用于推进和查询同一发布。
+    module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
+    local status = controller:handle_command("status", {batch_id = batch_id}, 1) -- 管理端看到的批次结果。
+    assert(status.ok, status.message)
+    return status.value.record
 end
 
 local scenarios = {} -- 场景名到测试函数的映射，文件末尾只运行指定的一项。
@@ -108,14 +123,14 @@ scenarios['lifecycle'] = function()
     -- 原生退出通知移除登记与加载许可；重复通知不会重复清理记录。
     assert(managed_register(lifecycle, metadata, 61, "fixture").ok)
     -- Service 61 的在途模块许可；随后模拟 Service 退出消费它。
-    local permit = lifecycle:handle_command("begin_module_load", {name = "lualib.exit_pending"}, 61) -- Controller 发给首次模块加载方的许可结果；后续登记必须携带其中的 permit_id。
+    local permit = lifecycle:handle_command("begin_module_load", {host_relative_path = "lualib/exit_pending.lua"}, 61) -- Controller 发给首次模块加载方的许可结果；后续登记必须携带其中的 permit_id。
     assert(permit.ok and lifecycle_status(lifecycle).pending_module_count == 1)
-    assert(lifecycle.service_registrations[61].loading_modules["lualib.exit_pending"] == permit.value.permit_id)
+    assert(lifecycle.service_registrations[61].loading_modules["lualib/exit_pending.lua"] == permit.value.permit_id)
     module_state.launch_service_handle = 63
     assert(lifecycle:handle_command("uniqueservice", {service_name = "fixture", arguments = {n = 0}}, 1).ok)
     assert(lifecycle:handle_command("register", metadata, 63).ok)
     -- 另一个 Service 同名模块的许可，验证退出只清除原 Service 的记录。
-    local surviving_permit = lifecycle:handle_command("begin_module_load", {name = "lualib.exit_pending"}, 63)
+    local surviving_permit = lifecycle:handle_command("begin_module_load", {host_relative_path = "lualib/exit_pending.lua"}, 63)
     assert(surviving_permit.ok and lifecycle_status(lifecycle).pending_module_count == 2)
     -- 普通实例 61 与唯一实例 63 共用入口名；退出普通实例不能删掉唯一映射。
     lifecycle:on_service_exit(61)
@@ -123,7 +138,7 @@ scenarios['lifecycle'] = function()
     assert(lifecycle.unique_service_entries.fixture.service_handle == 63)
     assert(lifecycle_status(lifecycle).pending_module_count == 1)
     assert(lifecycle:handle_command("register_module",
-        {name = "lualib.exit_pending", permit_id = surviving_permit.value.permit_id}, 63).ok)
+        {host_relative_path = "lualib/exit_pending.lua", permit_id = surviving_permit.value.permit_id}, 63).ok)
     assert(next(lifecycle.module_load_permits) == nil)
     lifecycle:on_service_exit(63)
     assert(lifecycle.unique_service_entries.fixture == nil)
@@ -235,9 +250,9 @@ local function blocked(instance)
         or (duplicate_registered.ok and early_registered.code == "HU_DUPLICATE_SERVICE"))
     assert(unknown_registered.code == "HU_CREATION_MISSING")
     assert(lifecycle_status(lifecycle).pending_service_count == 0 and lifecycle.service_registrations[70] and next(lifecycle.service_registration_waiters) == nil)
-    -- 直接调用 load_patch 所需的测试批次输入；返回匹配后的目标列表。
-    local batch = {patch_dir = "module"} -- 仅用于直接测试 load_patch 的批次输入，路径对应待测发布包。
-    assert(lifecycle:load_patch(batch).ok and #batch.service_targets == 1)
+    -- 用真实登记来源形成发布目标；未知来源不能进入目标列表。
+    local record = publish_and_read_record(lifecycle, "module")
+    assert(record.phase == "COMPLETED" and record.target_service_count == 1)
     assert(lifecycle:handle_command("unknown_command", {path = "module"}, 1).code == "HU_UNKNOWN_COMMAND")
     assert(lifecycle:handle_command("cancel_service_creation", {service_handle = 70}, 1).code == "HU_SERVICE_ALREADY_REGISTERED")
 
@@ -271,25 +286,25 @@ local function blocked(instance)
     assert(module_state.killed[82] and lifecycle_status(lifecycle).pending_service_count == 0)
     assert(lifecycle:handle_command("cancel_service_creation", {service_handle = 82}, 2).code == "HU_CREATION_MISSING")
 
-    local permit = lifecycle:handle_command("begin_module_load", {name = "extra"}, 70) -- Controller 发给首次模块加载方的许可结果；后续登记必须携带其中的 permit_id。
+    local permit = lifecycle:handle_command("begin_module_load", {host_relative_path = "lualib/extra.lua"}, 70) -- Controller 发给首次模块加载方的许可结果；后续登记必须携带其中的 permit_id。
     assert(permit.ok)
-    assert(lifecycle.service_registrations[70].loading_modules.extra == permit.value.permit_id)
-    assert(lifecycle:handle_command("begin_module_load", {name = "extra"}, 70).code == "HU_MODULE_LOADING")
+    assert(lifecycle.service_registrations[70].loading_modules["lualib/extra.lua"] == permit.value.permit_id)
+    assert(lifecycle:handle_command("begin_module_load", {host_relative_path = "lualib/extra.lua"}, 70).code == "HU_MODULE_LOADING")
     blocked(lifecycle)
-    local request = {name = "extra", permit_id = permit.value.permit_id} -- 提交给注册命令的模块名和许可编号；本测试用它验证登记通过后队列被唤醒。
+    local request = {host_relative_path = "lualib/extra.lua", permit_id = permit.value.permit_id} -- 提交给注册命令的文件路径和许可编号；本测试用它验证登记通过后队列被唤醒。
     assert(lifecycle:handle_command("register_module", request, 80).code == "HU_UNAUTHORIZED")
-    assert(lifecycle:handle_command("register_module", {name = "wrong", permit_id = permit.value.permit_id}, 70).code == "HU_MODULE_PERMIT_MISMATCH")
+    assert(lifecycle:handle_command("register_module", {host_relative_path = "lualib/wrong.lua", permit_id = permit.value.permit_id}, 70).code == "HU_MODULE_PERMIT_MISMATCH")
     assert(lifecycle_status(lifecycle).pending_module_count == 1)
     assert(lifecycle:handle_command("register_module", request, 70).ok and lifecycle_status(lifecycle).pending_module_count == 0)
-    assert(lifecycle.service_registrations[70].loading_modules.extra == nil)
+    assert(lifecycle.service_registrations[70].loading_modules["lualib/extra.lua"] == nil)
     assert(lifecycle.module_load_permits[permit.value.permit_id] == nil)
     assert(lifecycle:handle_command("register_module", request, 70).code == "HU_MODULE_PERMIT_MISSING")
-    permit = lifecycle:handle_command("begin_module_load", {name = "cancelled"}, 70)
-    assert(lifecycle:handle_command("cancel_module_load", {name = "cancelled", permit_id = permit.value.permit_id}, 70).ok)
-    assert(lifecycle_status(lifecycle).pending_module_count == 0 and not lifecycle.service_registrations[70].modules.cancelled)
-    assert(lifecycle.service_registrations[70].loading_modules.cancelled == nil)
+    permit = lifecycle:handle_command("begin_module_load", {host_relative_path = "lualib/cancelled.lua"}, 70)
+    assert(lifecycle:handle_command("cancel_module_load", {host_relative_path = "lualib/cancelled.lua", permit_id = permit.value.permit_id}, 70).ok)
+    assert(lifecycle_status(lifecycle).pending_module_count == 0 and not lifecycle.service_registrations[70].module_paths["lualib/cancelled.lua"])
+    assert(lifecycle.service_registrations[70].loading_modules["lualib/cancelled.lua"] == nil)
     assert(lifecycle.module_load_permits[permit.value.permit_id] == nil)
-    assert(lifecycle:handle_command("begin_module_load", {name = "extra"}, 90).code == "HU_SERVICE_NOT_REGISTERED")
+    assert(lifecycle:handle_command("begin_module_load", {host_relative_path = "lualib/extra.lua"}, 90).code == "HU_SERVICE_NOT_REGISTERED")
     local started_lifecycle = publish(lifecycle, {path = "module"}) -- 本批 begin 的受理结果；其 batch_id 用于构造本批新模块登记请求。
     assert(started_lifecycle.ok)
     -- 只有 Update 起关闭门禁；在真实 Update 调用中挂起，验证后来的请求等待且不计数。
@@ -298,13 +313,13 @@ local function blocked(instance)
     end
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(lifecycle.active_batch.phase == "UPDATE")
-    local new_module_request = {batch_id = started_lifecycle.value.batch_id, name = "lualib.new_rules"} -- 本批新增模块的登记请求；包含批次身份和模块名。
+    local new_module_request = {batch_id = started_lifecycle.value.batch_id, host_relative_path = "lualib/new_rules.lua"} -- 本批新增模块的登记请求；包含批次身份和文件路径。
     assert(lifecycle:handle_command("register_new_module", new_module_request, 71).code == "HU_NEW_MODULE_NOT_ALLOWED")
-    assert(lifecycle:handle_command("register_new_module", {batch_id = "stale", name = new_module_request.name}, 70).code
+    assert(lifecycle:handle_command("register_new_module", {batch_id = "stale", host_relative_path = new_module_request.host_relative_path}, 70).code
         == "HU_NEW_MODULE_NOT_ALLOWED")
     assert(lifecycle:handle_command("register_new_module", new_module_request, 70).ok)
     assert(lifecycle:handle_command("register_new_module", new_module_request, 70).ok)
-    assert(lifecycle.service_registrations[70].modules[new_module_request.name])
+    assert(lifecycle.service_registrations[70].module_paths[new_module_request.host_relative_path])
     local queued_result -- 协程被唤醒后保存的许可/登记结果，供主测试断言。
     local queued = coroutine.create(function() -- 模拟并发调用许可接口的协程，测试批次开始后是否按合同等待。
         queued_result = lifecycle:handle_command("newservice", {service_name = "fixture", arguments = {n = 0}}, 1)
@@ -315,7 +330,7 @@ local function blocked(instance)
     assert(lifecycle:handle_command("register", metadata, 90).code == "HU_CREATION_MISSING")
     local queued_module -- 模块加载许可等待协程恢复后的结果。
     local module_waiter = coroutine.create(function() -- 等待模块许可的第二个协程，用于验证同名加载不会错误放行。
-        queued_module = lifecycle:handle_command("begin_module_load", {name = "late"}, 70)
+        queued_module = lifecycle:handle_command("begin_module_load", {host_relative_path = "lualib/late.lua"}, 70)
     end)
     assert(coroutine.resume(module_waiter) and queued_module == nil)
     local view = lifecycle:handle_command("status", {}, 1).value.lifecycle -- status 返回的生命周期视图，检查等待中的创建和加载数量。
@@ -323,7 +338,7 @@ local function blocked(instance)
     module_state.control_hook = nil
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(queued_module.ok and lifecycle_status(lifecycle).pending_module_count == 1)
-    assert(lifecycle:handle_command("register_module", {name = "late", permit_id = queued_module.value.permit_id}, 70).ok)
+    assert(lifecycle:handle_command("register_module", {host_relative_path = "lualib/late.lua", permit_id = queued_module.value.permit_id}, 70).ok)
     assert(queued_result.ok and queued_result.value.service_handle == 83)
     assert(lifecycle:handle_command("cancel_service_creation", {service_handle = 83}, 1).ok)
     assert(lifecycle:handle_command("register_new_module", new_module_request, 70).code == "HU_NEW_MODULE_NOT_ALLOWED")
@@ -340,19 +355,23 @@ scenarios['matching'] = function()
     assert(named_creation.ok and c.service_creations[9].service_name == "player_service")
     assert(c:handle_command("cancel_service_creation", {service_handle = 9}, 1).ok)
     for _, service_handle in ipairs({10, 20}) do
-        assert(managed_register(c, {modules = {"lualib.test_worker_logic"},
-            has_service_update = false}, service_handle).ok)
+        assert(managed_register(c, metadata, service_handle).ok)
     end
-    assert(c:handle_command("register", {modules = {}, has_service_update = false}, 10).code == "HU_DUPLICATE_SERVICE")
-    assert(c:handle_command("register", {modules = {}, has_service_update = 1}, 30).code == "HU_INVALID_OPTIONS")
-    assert(register_module(c, "extra", 10).ok)
-    assert(not register_module(c, "extra", 30).ok)
-    local batch = {patch_dir = "module"} -- 仅用于直接测试 load_patch 的批次输入，路径对应待测发布包。
-    assert(c:load_patch(batch).ok and #batch.service_targets == 2)
-    -- 未登记模块只部署；一次性 Service .patch 仍须匹配。
-    local unmatched = {patch_dir = "unmatched_module"}
-    assert(c:load_patch(unmatched).ok and #unmatched.service_targets == 2 and #unmatched.files == 2)
+    assert(c:handle_command("register", {module_paths = {}, has_service_update = false}, 10).code == "HU_DUPLICATE_SERVICE")
+    assert(c:handle_command("register", {module_paths = {}, has_service_update = 1}, 30).code == "HU_INVALID_OPTIONS")
+    assert(register_module(c, "lualib/extra.lua", 10).ok)
+    assert(not register_module(c, "lualib/extra.lua", 30).ok)
+    -- 未登记模块只部署，目标清单仍只包含登记了同一路径的两个 Service。
+    local unmatched = publish_and_read_record(c, "unmatched_module")
+    assert(unmatched.phase == "COMPLETED" and unmatched.target_service_count == 2)
+    assert(module_state.file_contents["lualib/missing_logic.lua"] ~= nil)
+
+    -- 只有别名相同的另一份文件能部署，已登记目标不能因此进入控制流程。
     module_state.last_control_command_by_service_handle = {}
+    local file_only = publish_and_read_record(c, "module_other_path")
+    assert(file_only.phase == "COMPLETED" and file_only.target_service_count == 0)
+    assert(module_state.file_contents["lualib.test_worker_logic.lua"] ~= nil)
+    assert(next(module_state.last_control_command_by_service_handle) == nil)
     local accepted = publish(c, {path = "unmatched_service"}) -- begin 接受发布后的结果，包含后续查询所需的 batch_id。
     assert(accepted.ok and accepted.value.batch_id)
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
@@ -362,7 +381,7 @@ scenarios['matching'] = function()
     assert(c.last_batch.phase == "ABORTED")
     -- 同一模块仍可匹配多个 Service，组合包中的 Service 脚本也必须覆盖所有目标。
 
-    local unsupported = c:load_patch({patch_dir = "combined"}) -- 直接调用 load_patch 得到的协议拒绝结果。
+    local unsupported = publish_and_read_record(c, "combined").error -- 查询组合包在 Prepare 前被拒绝的错误。
     assert(unsupported.code == "HU_SERVICE_PATCH_UNSUPPORTED")
     assert(unsupported.message:find("combined/service/skynet_hotupgrade_worker.patch", 1, true))
 
@@ -415,9 +434,9 @@ scenarios['matching'] = function()
     assert(c:handle_command("status", {batch_id = "99:1"}, 1).code == "HU_BATCH_MISSING")
     -- 恢复失败仅报告，不再阻止创建、声明和下一批发布。
     assert(lifecycle_status(c).phase == "IDLE")
-    local allowed_after_failure = c:handle_command("begin_module_load", {name = "late"}, 10) -- 恢复失败后申请下一次模块加载许可的结果；应仍可获准。
+    local allowed_after_failure = c:handle_command("begin_module_load", {host_relative_path = "lualib/late.lua"}, 10) -- 恢复失败后申请下一次模块加载许可的结果；应仍可获准。
     assert(allowed_after_failure.ok)
-    assert(c:handle_command("cancel_module_load", {name = "late", permit_id = allowed_after_failure.value.permit_id}, 10).ok)
+    assert(c:handle_command("cancel_module_load", {host_relative_path = "lualib/late.lua", permit_id = allowed_after_failure.value.permit_id}, 10).ok)
     module_state.injected_control_failure = nil
 
     local waiting = c -- 正在等待 Service 创建或模块加载完成的 Controller，用于测试入口门禁。
@@ -448,13 +467,13 @@ scenarios['matching'] = function()
     assert(waiting:handle_command("cancel_service_creation", {service_handle = 86}, 1).ok)
     assert(waiting.last_batch.phase == "COMPLETED" and lifecycle_status(waiting).pending_service_count == 0)
 
-    local allowed = waiting:handle_command("begin_module_load", {name = "later"}, 84) -- 生命周期窗口开放时模块首次加载许可的结果。
+    local allowed = waiting:handle_command("begin_module_load", {host_relative_path = "lualib/later.lua"}, 84) -- 生命周期窗口开放时模块首次加载许可的结果。
     assert(allowed.ok)
     local module_batch = waiting:handle_command("begin", {path = "module"}, 1) -- 等待许可后启动的批次，用于确认排队工作已继续。
     assert(module_batch.ok and lifecycle_status(waiting).phase == "WAITING_CREATIONS")
     module_state.pending_control_coroutines[#module_state.pending_control_coroutines]()
     assert(waiting.active_batch.waiter and lifecycle_status(waiting).phase == "WAITING_CREATIONS")
-    assert(waiting:handle_command("register_module", {name = "later", permit_id = allowed.value.permit_id}, 84).ok)
+    assert(waiting:handle_command("register_module", {host_relative_path = "lualib/later.lua", permit_id = allowed.value.permit_id}, 84).ok)
     assert(lifecycle_status(waiting).phase == "COMPLETED")
 
     -- begin 后仍接纳创建；完成登记后才能进行整包检查，失败前没有目标控制命令。
@@ -486,8 +505,11 @@ end
 scenarios['combined'] = function()
     local combined = initialize_controller() -- 包含模块与 Service 更新的 Controller 实例。
     for _, service_handle in ipairs({30, 40}) do
-        assert(managed_register(combined, {modules = {"lualib.test_worker_logic"},
-            has_service_update = true}, service_handle).ok)
+        assert(managed_register(combined,
+        {
+            module_paths       = metadata.module_paths, -- 两个目标均声明普通 Worker 模块。
+            has_service_update = true,                  -- 两个目标也应接收 Service Patch。
+        }, service_handle).ok)
     end
     local answer = publish(combined, {path = "combined"}) -- begin 请求的受理结果；测试继续推进对应后台批次。
     assert(answer.ok and answer.value.batch_id)
@@ -499,24 +521,35 @@ end
 scenarios['paths'] = function()
     local paths = initialize_controller() -- 以特殊 service_path 初始化的 Controller，用于验证路径映射。
     assert(managed_register(paths,
-        {modules = {"config.settings", "lualib.battle.state_sync.runtime", "lualib.packages.demo.init"},
-            has_service_update = true}, 50, "battle/worker").ok)
-    local batch = {patch_dir = "host_paths"} -- 仅用于直接测试 load_patch 的批次输入，路径对应待测发布包。
-    assert(paths:load_patch(batch).ok and #batch.modules == 3)
-    assert(batch.files[1].host_relative_path == "config/settings.lua")
-    assert(batch.modules[1].name == "config.settings")
-    for _, module_patch in ipairs(batch.modules) do
-        for key in pairs(module_patch) do
-            assert(key == "name" or key == "source")
+    {
+        module_paths       = {"config/settings.lua", "lualib/battle/state_sync/runtime.lua", "lualib/packages/demo/init.lua"}, -- 分别覆盖配置、嵌套模块和 init.lua 路径。
+        has_service_update = true, -- 允许同一目标接收嵌套 Service 入口的 Patch。
+    }, 50, "battle/worker").ok)
+    -- 从真实 Update 请求检查文件路径与缓存别名，并确认文件回滚内容没有随请求发送。
+    module_state.control_hook = function(service_handle, command, request)
+        if command == "update" then
+            assert(service_handle == 50)
+            if request.service_patch_source then
+                assert(#request.modules == 0)
+                return
+            end
+            local modules = request.modules -- 被发送给已登记 worker 的三个候选模块。
+            assert(#modules == 3)
+            assert(modules[1].name == "config.settings" and modules[1].host_relative_path == "config/settings.lua")
+            assert(modules[2].name == "lualib.battle.state_sync.runtime")
+            assert(modules[2].host_relative_path == "lualib/battle/state_sync/runtime.lua")
+            for _, module_patch in ipairs(modules) do
+                assert(module_patch.old_source == nil)
+            end
         end
     end
-    assert(batch.modules[2].name == "lualib.battle.state_sync.runtime")
-    local nested_batch = {patch_dir = "nested_named_service"} -- 含 service/battle/worker.patch 的本批目标记录。
-    assert(paths:load_patch(nested_batch).ok)
-    assert(nested_batch.service_patches["battle/worker"].patch_relative_path == "service/battle/worker.patch")
+    assert(publish_and_read_record(paths, "host_paths").succeeded_service_count == 1)
+    assert(module_state.file_contents["config/settings.lua"] ~= nil)
+    assert(publish_and_read_record(paths, "nested_named_service").succeeded_service_count == 1)
+    module_state.control_hook = nil
 
     for _, path in ipairs({"duplicate_module", "duplicate_service"}) do
-        assert(paths:load_patch({patch_dir = path}).code == "HU_INVALID_PATCH")
+        assert(publish_and_read_record(paths, path).error.code == "HU_INVALID_PATCH")
     end
     local zero = paths:handle_command("begin", {path = "module"}, 1) -- 空目标批次的 begin 返回值，确认无目标时直接完成。
     assert(paths:handle_command("status", {batch_id = zero.value.batch_id}, 1).value.record.target_service_count == 0)
@@ -529,8 +562,8 @@ end
 scenarios['custom_paths'] = function()
     local changed = initialize_controller("actors") -- service_path 为 actors 的 Controller，用于核对自定义 Service 目录。
     assert(managed_register(changed,
-        {modules = {}, has_service_update = true}, 60, "zone/player").ok)
-    assert(changed:load_patch({patch_dir = "custom_named_service"}).ok)
+        {module_paths = {}, has_service_update = true}, 60, "zone/player").ok)
+    assert(publish_and_read_record(changed, "custom_named_service").succeeded_service_count == 1)
 end
 
 scenarios['unique'] = function()
@@ -633,7 +666,7 @@ end
 scenarios['draining'] = function()
     local c = initialize_controller() -- 本段测试使用的 Controller 单例，后续所有命令都发给它。
     assert(managed_register(c, metadata, 10).ok)
-    assert(managed_register(c, {modules = {}, has_service_update = false}, 20).ok)
+    assert(managed_register(c, {module_paths = {}, has_service_update = false}, 20).ok)
     local native = require "flywow_hotupgrade_native" -- 替换文件扫描函数的 Native 测试模块。
     local original_list = native.list_lua -- 保存的真实扫描函数，测试结束后恢复。
     local scans = 0 -- 文件扫描调用次数，用于确认批次只读取一次文件列表。
@@ -652,9 +685,9 @@ scenarios['draining'] = function()
             assert(c:handle_command("status", {batch_id = c.active_batch.batch_id}, 1).value.record.target_service_count == #c.active_batch.service_targets)
             prepared_service_target = c.active_batch.service_targets[1]
             assert(managed_register(c, metadata, 30).ok)
-            assert(managed_register(c, {modules = {}, has_service_update = false}, 31, "unaffected").ok)
-            assert(register_module(c, "lualib.hotupgrade_extra", 10).ok)
-            assert(register_module(c, "lualib.hotupgrade_extra", 20).ok)
+            assert(managed_register(c, {module_paths = {}, has_service_update = false}, 31, "unaffected").ok)
+            assert(register_module(c, "lualib/hotupgrade_extra.lua", 10).ok)
+            assert(register_module(c, "lualib/hotupgrade_extra.lua", 20).ok)
         elseif command == "prepare" and service_handle == 30 then
             assert(c:handle_command("status", {batch_id = c.active_batch.batch_id}, 1).value.record.target_service_count == 3)
             module_state.launch_service_handle = 40
@@ -676,7 +709,7 @@ scenarios['draining'] = function()
                 assert(coroutine.resume(waiter) and not queued_unique[index])
             end
             local waiter = coroutine.create(function() -- 等待批次或许可结束的协程。
-                queued_permit = c:handle_command("begin_module_load", {name = "late"}, 10)
+                queued_permit = c:handle_command("begin_module_load", {host_relative_path = "lualib/late.lua"}, 10)
             end)
             assert(coroutine.resume(waiter) and queued_permit == nil)
             assert(c.unique_service_entries.late == nil and #module_state.launches == launches_at_update)
@@ -701,7 +734,7 @@ scenarios['draining'] = function()
         and queued_unique[2].value.service_handle == 50)
     assert(#module_state.launches == launches_at_update + 1 and queued_permit.ok)
     assert(c:handle_command("register_module",
-        {name = "late", permit_id = queued_permit.value.permit_id}, 10).ok)
+        {host_relative_path = "lualib/late.lua", permit_id = queued_permit.value.permit_id}, 10).ok)
     assert(c:handle_command("cancel_service_creation", {service_handle = 50}, 10).ok)
     assert(lifecycle_status(c).pending_service_count == 0 and lifecycle_status(c).pending_module_count == 0 and next(c.lifecycle_gate_waiters) == nil)
 end
@@ -744,7 +777,7 @@ end
 
 scenarios['drain_unsupported'] = function()
     local c = initialize_controller() -- 本段测试使用的 Controller 单例，后续所有命令都发给它。
-    assert(managed_register(c, {modules = metadata.modules, has_service_update = true}, 10).ok)
+    assert(managed_register(c, {module_paths = metadata.module_paths, has_service_update = true}, 10).ok)
     module_state.control_hook = function(service_handle, command)
         if service_handle == 10 and command == "prepare" then
             assert(managed_register(c, metadata, 30).ok)
@@ -880,16 +913,16 @@ scenarios['resources'] = function()
     assert(files_only.last_batch.phase == "COMPLETED" and files_only.last_batch.target_service_count == 0 and module_state.file_contents["service/new_service.lua"])
 
     -- 保留移除固定容量上限前的边界验证；各目标仍属于同一模块级 Controller。
-    local module_names = {}
+    local module_paths = {}
     for index = 1, 1025 do
-        module_names[index] = "logic_" .. index
+        module_paths[index] = "lualib/logic_" .. index .. ".lua"
     end
     assert(managed_register(deployment,
-        {modules = module_names, has_service_update = false}, 20000).ok)
-    assert(register_module(deployment, "beyond_previous_limit", 20000).ok)
+        {module_paths = module_paths, has_service_update = false}, 20000).ok)
+    assert(register_module(deployment, "lualib/beyond_previous_limit.lua", 20000).ok)
     for service_handle = 10000, 11024 do
         assert(managed_register(deployment,
-            {modules = {}, has_service_update = false}, service_handle).ok)
+            {module_paths = {}, has_service_update = false}, service_handle).ok)
     end
     print("HOTUPGRADE_CONTROLLER_RESOURCE_OK")
 end

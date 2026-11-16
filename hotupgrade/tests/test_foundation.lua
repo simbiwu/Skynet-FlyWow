@@ -279,13 +279,15 @@ package.loaded.skynet =
             begin_count = begin_count + 1
             permit_sequence = permit_sequence + 1
             local id = tostring(permit_sequence) -- 模拟许可 RPC 生成的唯一 permit_id。
-            permits[id] = request.name
+            permits[id] = request.host_relative_path
             return {ok = true, value = {permit_id = id}}
         elseif command == "register_module" then
-            assert(permits[request.permit_id] == request.name)
-            assert(package.loaded[request.name] ~= nil)
-            if request.name == "lualib.hotupgrade_extra" then
-                assert(package.loaded.hotupgrade_extra == package.loaded[request.name])
+            assert(permits[request.permit_id] == request.host_relative_path)
+            -- 从登记文件路径计算本地别名，验证发 RPC 前已发布同一个模块表。
+            local cache_alias = request.host_relative_path:sub(1, -5):gsub("/", ".")
+            assert(package.loaded[cache_alias] ~= nil)
+            if request.host_relative_path == "lualib/hotupgrade_extra.lua" then
+                assert(package.loaded.hotupgrade_extra == package.loaded[cache_alias])
                 last_loaded_value = package.loaded.hotupgrade_extra
             end
             if fail_registration == "rpc" then
@@ -296,17 +298,17 @@ package.loaded.skynet =
             permits[request.permit_id] = nil
             return {ok = true}
         elseif command == "register_new_module" then
-            if pause_new_module_registration and request.name == "lualib.hotupgrade_new_rules" then
+            if pause_new_module_registration and request.host_relative_path == "lualib/hotupgrade_new_rules.lua" then
                 coroutine.yield()
             end
             assert(request.batch_id == active_new_module_batch)
             if fail_new_module_registration then
                 return {ok = false, message = "injected new module registration failure"}
             end
-            new_module_registrations[#new_module_registrations + 1] = request.name
+            new_module_registrations[#new_module_registrations + 1] = request.host_relative_path
             return {ok = true}
         elseif command == "cancel_module_load" then
-            assert(permits[request.permit_id] == request.name)
+            assert(permits[request.permit_id] == request.host_relative_path)
             permits[request.permit_id] = nil
             return {ok = true}
         end
@@ -410,7 +412,15 @@ registration.after_upgrade = function()
     update_steps[#update_steps + 1] = "after_upgrade"
     return true
 end
-assert(target_control("update", 3).ok and hotupgrade.patching)
+-- 提供一个真实候选，验证有普通模块时仍先 Stage 与 Commit，再执行检查回调。
+local ordinary_update =
+{
+    modules = -- 提供一个已在线的普通模块，让 Update 真正进入 Stage。
+    {
+        {name = "logic", host_relative_path = "logic.lua", source = source}, -- 已有线上模块和本轮候选源码。
+    },
+}
+assert(target_control("update", 3, ordinary_update).ok and hotupgrade.patching)
 patch.stage = original_stage
 patch.commit = original_commit
 registration.after_upgrade = nil
@@ -422,7 +432,7 @@ assert(target_control("prepare", 5).ok)
 assert(target_control("abort", 3).code == "HU_STALE_BATCH" and hotupgrade.patching)
 -- 模拟 Update 发生未被阶段内部捕获的异常，验证目标自行收尾后 Controller 仍可确认 Abort。
 patch.stage = function() error("injected stage exception") end
-assert(target_control("update", 5).code == "HU_CONTROL_FAILED" and not hotupgrade.patching)
+assert(target_control("update", 5, ordinary_update).code == "HU_CONTROL_FAILED" and not hotupgrade.patching)
 patch.stage = original_stage
 assert(target_control("abort", 5).ok and not hotupgrade.patching)
 assert(target_control("stage", 6).code == "HU_UNKNOWN_COMMAND")
@@ -480,8 +490,9 @@ control_dispatch(1, 99, "update", {
     modules  =              -- 本次替换的候选模块，用于验证原始加载参数和缓存身份。
     {
         {
-            name   = "lualib.hotupgrade_extra", -- Controller 用来定位已声明模块的规范名称。
-            source = extra_module_source,      -- Update 在目标 State 执行的候选源码。
+            name               = "lualib.hotupgrade_extra",     -- 目标 State 中的缓存别名。
+            host_relative_path = "lualib/hotupgrade_extra.lua", -- 目标根据这个文件路径读取首次加载参数。
+            source             = extra_module_source,         -- Update 在目标 State 执行的候选源码。
         },
     },
 })
@@ -531,7 +542,11 @@ patch.stage = function(...)
 end
 pause_new_module_registration = true
 local updating = coroutine.create(function() -- 执行 Update 协程；新模块登记 yield 期间确认普通模块 Stage 尚未开始。
-    new_module_update = target_control("update", 8, {service_patch_source = new_module_service_patch_source})
+    new_module_update = target_control("update", 8,
+    {
+        modules              = ordinary_update.modules,           -- 需要等新模块登记完成的普通候选。
+        service_patch_source = new_module_service_patch_source,    -- 声明本批要首次加载的新依赖。
+    })
 end)
 local update_resumed -- 首次 Update 协程是否正常执行到暂停点。
 local update_failure -- 协程恢复失败时的诊断，供断言报告。
@@ -544,7 +559,7 @@ assert(staged_calls == 1)
 patch.stage = original_stage
 assert(new_module_update.ok, tostring(new_module_update.code) .. ": " .. tostring(new_module_update.message))
 assert(begin_count == declarations_before_new_modules)
-assert(table.concat(new_module_registrations, ",") == "lualib.hotupgrade_new_dependency,lualib.hotupgrade_new_rules")
+assert(table.concat(new_module_registrations, ",") == "lualib/hotupgrade_new_dependency.lua,lualib/hotupgrade_new_rules.lua")
 assert(hotupgrade.require("hotupgrade_new_rules").value() == 42)
 assert(target_control("finish", 8).ok)
 active_new_module_batch = "fixture:9"

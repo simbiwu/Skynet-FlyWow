@@ -57,9 +57,9 @@ end
 
 hotupgrade.newservice 会 yield，成功返回原生 handle，失败抛出含 HU_SERVICE_CREATE_FAILED（或入口拒绝码）的异常。原生创建失败自动释放记录；创建成功后的业务 init 由调用方负责。业务 init 应在所有可能失败的初始化工作完成后，最后调用 register_service，并把登记结果作为 init 的结果；成功后再宣布 READY。业务初始化在登记前失败时，原创建者必须显式调用 cancel_service_creation，不能仅丢弃 handle。取消返回统一结果，非创建者返回 HU_UNAUTHORIZED，未知/已取消的 handle 返回 HU_CREATION_MISSING，已登记 Service 返回 HU_SERVICE_ALREADY_REGISTERED 且不会被终止。若登记 RPC 结果不明或登记后又失败，取消可能被拒绝，须由宿主核对真实登记状态并处理受控终止/重启，不能把它当成仍未登记。
 
-Controller 在调用原生 skynet.newservice(service_name, ...) 前建立创建记录，原样转发目标名称和全部启动参数。原生返回后立即保存真实 handle 索引并返回调用方，不等待业务登记。目标由原生 loader 在自己的 Lua State 中启动；SERVICE_NAME、SERVICE_PATH、preload 和参数语义均由 Skynet 原生处理，Controller 不改写启动环境或重新执行 loader。
+Controller 在调用原生 skynet.newservice(service_name, ...) 前增加原生创建在途计数，原样转发目标名称和全部启动参数。原生调用返回后退出计数，成功拿到仍存活的真实 handle 时建立待登记记录并返回调用方。目标由原生 loader 在自己的 Lua State 中启动；SERVICE_NAME、SERVICE_PATH、preload 和参数语义均由 Skynet 原生处理，Controller 不改写启动环境或重新执行 loader。
 
-register_service 只发送原有元数据，Controller 仅按消息头真实 source 与原生返回 handle 精确关联。登记先到时，登记协程让出执行权，等待在途原生创建返回后重新查询索引；其他消息和创建返回仍能继续处理。所有原生调用均返回后仍无匹配时返回 HU_CREATION_MISSING，重复登记返回 HU_DUPLICATE_SERVICE。内部创建序号仅作 Controller 表索引，不传入业务 Service。登记成功、原生失败或创建者合法取消后释放对应记录；记录不会自动超时清除。
+register_service 只发送原有元数据，Controller 仅按消息头真实 source 与原生返回 handle 精确关联。登记先到时，登记协程让出执行权，等待在途原生创建返回后重新查询索引；其他消息和创建返回仍能继续处理。所有原生调用均返回后仍无匹配时返回 HU_CREATION_MISSING，重复登记返回 HU_DUPLICATE_SERVICE。登记成功、创建者合法取消或目标退出后释放待登记记录。原生创建失败时只结束在途计数，未完成的记录不会自动超时清除。
 
 **登记不能阻止原生启动完成。** Skynet 的 newservice 等待 skynet.start 回调返回后才交付 handle，因此不能在该回调中同步等待 register_service；这会与早到登记的 handle 等待形成循环。推荐按上述例子在创建返回后调用业务 init，或在独立协程执行登记并让 start 回调先结束。独立协程仍可能先发出登记，Controller 会按真实 handle 关联；业务 READY 必须等待登记成功。
 
@@ -111,13 +111,13 @@ end)
 
 Controller 使用 newservice()/uniqueservice() 创建记录中的 service_name 匹配 service_path 下的一次性 .patch。service_path 为 service 时，service/player_service.patch 对应 player_service，service/battle/worker.patch 对应 battle/worker；嵌套目录以斜杠保留为 Skynet Service 名称，因为 loader 会将该名称原样替换进 LUA_SERVICE 路径模板；因此 battle/worker 对应嵌套文件，battle.worker 则对应名为 battle.worker 的平铺文件。登记请求不重复携带 Service 名称。service_update 可省略，此时该 Service 只参与普通模块更新。Controller 使用注册消息真实 source 作为目标 handle；私有状态、函数和回调留在业务 State，不经消息传给 Controller。登记成功前宿主不得宣布 Service READY；登记 RPC 失败可能有不确定结果，应终止该次启动，由宿主管理，而不是继续接收业务。
 
-hotupgrade.require(name) 仍用宿主原有 name 加载模块，通过 package.searchpath(name, package.path) 定位 Lua 文件，再复用 Native resolve 得到规范化路径。Controller 登记名由该文件相对 root_path 的路径去掉 .lua、将 / 转为 . 得到。例如原调用 hotupgrade.require("battle.state_sync.runtime") 加载 lualib/battle/state_sync/runtime.lua，登记名为 lualib.battle.state_sync.runtime；不是给原 name 固定增加目录前缀。?/init.lua 解析出的文件也按真实路径登记，例如 lualib/battle/init.lua 对应 lualib.battle.init。
+hotupgrade.require(name) 仍用宿主原有 name 加载模块，通过 package.searchpath(name, package.path) 定位 Lua 文件，再复用 Native resolve 得到规范化路径。Controller 以该文件相对 root_path 的真实路径登记及匹配发布包。例如 hotupgrade.require("battle.state_sync.runtime") 加载 lualib/battle/state_sync/runtime.lua，登记该相对路径。本地 package.loaded 别名由该路径去掉 .lua 并把 / 换成点，得到 lualib.battle.state_sync.runtime。?/init.lua 也按实际文件登记，例如 lualib/battle/init.lua 对应的本地别名是 lualib.battle.init。
 
-原 require 名和文件登记名在 package.loaded 中指向同一个模块根表，热更和恢复都通过同一根表对两种名称生效。只有首次通过 hotupgrade.require 确认加载来源的模块表才允许复用；先经普通 require 加载而没有来源记录的缓存模块会被明确拒绝，即使原名恰好等于文件登记名。须从首次加载时就使用 hotupgrade.require，不要清空已有业务缓存来绕过检查。建立别名前同时检查原名来源、文件登记名缓存和 package.preload；冲突时明确拒绝，不覆盖已有缓存或预加载器。加载、来源验证或动态登记失败会恢复本次涉及的原名缓存和规范别名，撤销本次新增的来源映射及声明计数，保留操作前已有的合法缓存，允许重试。对于 new_modules 批次中新部署的文件，失败恢复会删除该文件；重试前须由后续批次重新部署。仅支持通过标准 package.path 搜索的 Lua 文件；package.preload、自定义加载器来源不一致、无法定位文件或文件位于 root_path 外时明确拒绝。宿主应保持受控模块的搜索路径稳定，不在已加载后改写其加载来源。
+原 require 名和本地缓存别名在 package.loaded 中指向同一个模块根表，热更和恢复都通过同一根表对两种名称生效。只有首次通过 hotupgrade.require 确认加载来源的模块表才允许复用；先经普通 require 加载而没有来源记录的缓存模块会被明确拒绝，即使原名恰好等于本地缓存别名。须从首次加载时就使用 hotupgrade.require，不要清空已有业务缓存来绕过检查。建立别名前同时检查原名来源、本地别名缓存和 package.preload；冲突时明确拒绝，不覆盖已有缓存或预加载器。加载、来源验证或动态登记失败会恢复本次涉及的原名缓存和规范别名，撤销本次新增的来源映射及声明计数，保留操作前已有的合法缓存，允许重试。对于 new_modules 批次中新部署的文件，失败恢复会删除该文件；重试前须由后续批次重新部署。仅支持通过标准 package.path 搜索的 Lua 文件；package.preload、自定义加载器来源不一致、无法定位文件或文件位于 root_path 外时明确拒绝。宿主应保持受控模块的搜索路径稳定，不在已加载后改写其加载来源。
 
 登记前声明随初始元数据提交，由待创建记录保护。register_service 会拒绝本 State 尚在执行的首次声明（HU_LIFECYCLE_PENDING），调用方须待声明完成后登记；登记 RPC 期间的新声明等待登记结果，避免落在初始模块快照之外。
 
-已登记 Service 首次声明普通模块时，`hotupgrade.require` 先按 `package.path` 定位文件并解析模块身份，再向 Controller 申请 `begin_module_load` 许可。取得许可后才执行实际 require、核对加载来源并建立缓存、别名、来源映射和本地声明，最后携许可 ID 调用 `register_module`。许可绑定真实来源及规范模块名，不能转用或重复消费；失败时回退本地新增状态，并通过 cancel_module_load 释放尚未完成的许可。begin 接受后等待已有许可完成，覆盖模块执行及登记的整个关键区间。同一 State 内并发首次声明同一规范模块会等待前一项成功或完整回退；已声明模块不重复请求许可。Controller 只更新目标已声明的模块。begin 后的 WAITING_CREATIONS 和 PREPARE 窗口继续接纳创建与首次声明，覆盖父子创建、嵌套 require 和 queue 内已有业务的正常依赖。进入 UPDATE 后，普通首次加载的许可请求在 Controller 等待批次终态；等待期间尚未发放许可，也不执行模块代码或增加本批排空计数。若本地查找时文件尚未部署，`hotupgrade.require` 直接抛出 `HU_INVALID_PATH`，该调用未进入门禁。
+已登记 Service 首次声明普通模块时，`hotupgrade.require` 先按 `package.path` 定位文件并解析模块身份，再向 Controller 申请 `begin_module_load` 许可。取得许可后才执行实际 require、核对加载来源并建立缓存、别名、来源映射和本地声明，最后携许可 ID 调用 `register_module`。许可绑定真实来源及宿主相对文件路径，不能转用或重复消费；失败时回退本地新增状态，并通过 cancel_module_load 释放尚未完成的许可。begin 接受后等待已有许可完成，覆盖模块执行及登记的整个关键区间。同一 State 内并发首次声明同一缓存别名会等待前一项成功或完整回退；已声明模块不重复请求许可。Controller 只更新目标已声明的模块。begin 后的 WAITING_CREATIONS 和 PREPARE 窗口继续接纳创建与首次声明，覆盖父子创建、嵌套 require 和 queue 内已有业务的正常依赖。进入 UPDATE 后，普通首次加载的许可请求在 Controller 等待批次终态；等待期间尚未发放许可，也不执行模块代码或增加本批排空计数。若本地查找时文件尚未部署，`hotupgrade.require` 直接抛出 `HU_INVALID_PATH`，该调用未进入门禁。
 
 Service Patch 可通过 `new_modules` 声明本 Service 在本批首次使用的模块，例如 `{new_modules = {"combat_rules", "skill_rules"}}`。Controller 先部署本批完整 `.lua` 并清理缓存，再把 `.patch` 交给目标。目标先构建 Service Patch、读取该列表，再用内部登记命令加载清单内模块；这个命令只接受当前批次 UPDATE 阶段正在处理的目标。它不走普通首次加载许可，因此目标等待 Controller 登记时不会与批次互等。清单内模块在该 State 尚未登记的依赖也必须列入；已登记依赖可直接复用。清单以外的未登记依赖会立即失败，不进入生命周期等待。Service Patch 构建函数需要先返回清单，不能在构建函数内首次 require 这批新模块。
 
@@ -190,7 +190,7 @@ Finish 释放旧快照并清除本地批次后将 hot.patching 设为 false。Ab
 
 发布包内部路径对应宿主 root_path 下的实际路径。批次 files 中的 `host_relative_path` 是相对 `root_path` 的宿主 Lua 路径，例如 `lualib/player_logic.lua`；快照、部署和恢复都用它定位同一正式文件。Service Patch 记录中的 `patch_relative_path` 则相对于本批 `patch_dir`，例如 `service/player_service.patch`；它用于目标匹配和错误诊断，不是宿主部署路径。递归扫描全部 .lua 和 .patch，并先冻结内容、检查语法。配置 service_path 中的 .lua 是完整新版 Service，只部署；该目录中的 .patch 是一次性 Service 更新脚本，只更新现存实例、不部署。其他目录中的 .lua 是完整普通模块：已登记时同时更新运行时和部署文件，未登记时仅部署。.patch 不能出现在 service_path 之外。
 
-.lua 与 .patch 无须成对出现；允许仅 Service 源码、仅 Service Patch、仅普通模块，以及没有任何运行时目标的纯文件发布。Service .patch 必须匹配至少一个已登记且支持内部更新的目标；未匹配返回 HU_TARGET_MISSING，不支持则返回 HU_SERVICE_PATCH_UNSUPPORTED。普通模块名称仍按实际路径登记，例如 config.settings、lualib.player_logic。不同路径映射到同一普通模块名或同一 Service Patch 名时拒绝整包；其他普通文件忽略，符号链接和特殊文件拒绝。
+.lua 与 .patch 无须成对出现；允许仅 Service 源码、仅 Service Patch、仅普通模块，以及没有任何运行时目标的纯文件发布。Service .patch 必须匹配至少一个已登记且支持内部更新的目标；未匹配返回 HU_TARGET_MISSING，不支持则返回 HU_SERVICE_PATCH_UNSUPPORTED。普通模块按文件路径匹配，例如 config/settings.lua、lualib/player_logic.lua。同一包中两个路径产生相同普通模块缓存别名，或出现重复 Service Patch 名时拒绝整包。若包只包含 lualib/a.b.lua，它不会匹配已登记的 lualib/a/b.lua；其他普通文件忽略，符号链接和特殊文件拒绝。
 
 Service Patch 返回表中的 `new_modules` 是普通 require 名称数组。框架按实际路径解析模块身份、拒绝重复文件项，并在目标 Update 内通过 `hotupgrade.require` 加载。清单中的模块可以递归依赖清单内的其他新模块；已经登记的模块可直接复用，循环声明沿用现有拒绝行为。清单外首次依赖若未被业务捕获，会使当前阶段失败：外层 `code` 保留阶段错误（如 `HU_MODULE_STAGE_FAILED`），`details.cause_code` 随实际传播的错误记录（如 `HU_NEW_MODULE_NOT_DECLARED`）；调用方不需要解析 `message`。业务捕获该错误后，它不会污染后续失败的 `details.cause_code`。Patch 构建函数只能声明清单，不能在返回前首次加载清单内模块。仅声明非空 `new_modules` 的 Patch 不需要伪造 `update_state` 或 `replace_functions`。
 
@@ -198,7 +198,7 @@ Service Patch 返回表中的 `new_modules` 是普通 require 名称数组。框
 
 两类均可单独存在。每份普通模块文件必须是完整模块新版本。只改一个函数也必须保留新版仍需要的全部导出字段。提交会更新所有新字段，并删除新版已去掉的字段，原导出表和两种 package.loaded 名称的身份保持不变。
 
-模块根导出必须是无元表 table，且候选必须是新根表。顶层导出字段名必须是字符串；导出值可为函数、数字、字符串、布尔值或普通嵌套表。嵌套表不得带元表，键只能是字符串、数字或布尔值，值可使用上述类型并继续嵌套；共享引用和循环引用允许，但数据图不得直接或间接引用模块根表，否则提交后会指向候选根表。引擎不限制新旧版本同名字段的类型。提交按候选根表完整替换字段，嵌套对象不递归合并、不保证身份；缓存的旧嵌套引用仍指向旧对象，回滚恢复旧字段及其原引用。可变私有状态放在模块闭包或由 Service 持有。候选源码接收首次 hotupgrade.require 使用的原始模块名和加载路径作为两个可变参数；该记录留在本 Lua State，不使用 Controller 的规范登记名替代。候选源码中的 require 使用 Lua 原生实现，可以按普通 Lua 规则加载当前 State 尚未加载的依赖。成功加载的依赖会留在 package.loaded；即使 Stage 或后续发布步骤失败，模块更新引擎也不清理这些新依赖、不回滚它们的模块初始化状态。本批次只回滚明确纳入更新的模块导出和状态。候选模块顶层及状态钩子仍须受信、同步，不得 yield、I/O、写全局、修改线上状态或启动任务。
+模块根导出必须是无元表 table，且候选必须是新根表。顶层导出字段名必须是字符串；导出值可为函数、数字、字符串、布尔值或普通嵌套表。嵌套表不得带元表，键只能是字符串、数字或布尔值，值可使用上述类型并继续嵌套；共享引用和循环引用允许，但数据图不得直接或间接引用模块根表，否则提交后会指向候选根表。引擎不限制新旧版本同名字段的类型。提交按候选根表完整替换字段，嵌套对象不递归合并、不保证身份；缓存的旧嵌套引用仍指向旧对象，回滚恢复旧字段及其原引用。可变私有状态放在模块闭包或由 Service 持有。候选源码接收首次 hotupgrade.require 使用的原始模块名和加载路径作为两个可变参数；该记录留在本 Lua State，不使用缓存别名替代。候选源码中的 require 使用 Lua 原生实现，可以按普通 Lua 规则加载当前 State 尚未加载的依赖。成功加载的依赖会留在 package.loaded；即使 Stage 或后续发布步骤失败，模块更新引擎也不清理这些新依赖、不回滚它们的模块初始化状态。本批次只回滚明确纳入更新的模块导出和状态。候选模块顶层及状态钩子仍须受信、同步，不得 yield、I/O、写全局、修改线上状态或启动任务。
 
 ### 函数引用与候选根表
 
@@ -327,9 +327,9 @@ while true do
 end
 ~~~
 
-Controller 从 begin 到终态复用同一个 batch。load_patch(batch) 将冻结源码和初次匹配目标直接写入该记录，Prepare 重匹配复用原目标对象。Controller 的 batch.phase 是唯一保存的发布进度，生命周期门禁直接读取活动批次；Update 按唯一 Service handle 顺序各派发一次，且只有全部 Update 成功后才派发 Finish。Service 本地批次只保留提交与恢复所需的快照，不另存 Controller 已保证的 Update/Finish 阶段状态。status 的 lifecycle.pending_service_count 和 pending_module_count 分别表示尚未完成创建或登记的受管理 Service 数、尚未完成首次加载或登记的普通模块数；phase 和 recovery_required 仍由当前及最近终态批次生成，新批次进行中保留最近终态的恢复诊断。
+Controller 从 begin 到终态复用同一个 batch。读取发布包时将冻结源码和初次匹配目标写入该记录，Prepare 重匹配复用原目标对象。Controller 的 batch.phase 是唯一保存的发布进度，生命周期门禁直接读取活动批次；Update 按唯一 Service handle 顺序各派发一次，且只有全部 Update 成功后才派发 Finish。Service 本地批次只保留提交与恢复所需的快照，不另存 Controller 已保证的 Update/Finish 阶段状态。status 的 lifecycle.pending_service_count 和 pending_module_count 分别表示尚未完成创建或登记的受管理 Service 数、尚未完成首次加载或登记的普通模块数；phase 和 recovery_required 仍由当前及最近终态批次生成，新批次进行中保留最近终态的恢复诊断。
 
-每个目标 Lua State 都保存本批次的 Service Patch 提交内容、恢复快照和 module_stage；本地 batch 独占模块 Stage。Abort、Finish 和控制异常通过同一个收尾操作释放批次引用。控制命令先校验真实来源，有活动批次时再核对 batch_id。若控制异常已在目标本地收尾，Controller 随后发送 Abort 时，目标直接确认无需再次恢复。输入在首次可信边界检查，内部不重复校验没有变化的数据；Service Patch 返回值、自定义快照和候选导出在产生处检查，执行 import_state 后才再次检查候选图。跨 yield 后的来源、许可、缓存身份和模块代码可能改变的状态仍在使用处核对。
+每个目标 Lua State 在 Update 中准备提交内容。写入开始前将 Service 旧状态和旧函数交给本地批次，普通模块提交后也只保留 Abort 所需的线上表和旧导出字段。Abort、Finish 和控制异常通过同一个收尾操作释放批次引用。控制命令先校验真实来源，有活动批次时再核对 batch_id。若控制异常已在目标本地收尾，Controller 随后发送 Abort 时，目标直接确认无需再次恢复。输入在首次可信边界检查，内部不重复校验没有变化的数据；Service Patch 返回值、自定义快照和候选导出在产生处检查，执行 import_state 后才再次检查候选图。跨 yield 后的来源、许可、缓存身份和模块代码可能改变的状态仍在使用处核对。
 
 begin 建立批次后立即返回 batch_id，由 Controller 的原有协程继续发布。排空和 PREPARE 窗口继续接纳依赖，创建、登记和首次加载完成或取消后，由原有完成回调唤醒发布协程；完成通知只唤醒，不自动关闭门禁。协程恢复后重新检查在途计数，并重新匹配新增目标，没有定时扫描或轮询排空。正常发布期间，遗漏登记或取消会持续等待，不自动清理记录。若 Prepare 排空等待中目标退出并导致本批失败，发布协程立即转入 Abort；尚未完成的创建或首次加载仍由其原流程收尾。重复 begin 返回 HU_UPGRADE_BUSY。
 
@@ -369,7 +369,7 @@ begin 成功后不提供管理端主动取消。向 Controller 发送 abort 返�
 
 发布包语法检查、普通模块候选和 Service Patch 执行均按 Lua 文件加载规则跳过开头的 UTF-8 BOM 和首行 `#` 注释，保留换行以维持诊断行号。处理只作用于编译输入；冻结、部署和恢复仍保留文件原始字节。
 
-Native 提供 resolve(path[, relative_dir])、list_lua(patch_root, relative_patch_dir) 和 Controller 内部使用的 read_file(root_path, relative_file)、replace_file(root_path, relative_file, source_or_nil)；相对目录检查与递归扫描共用路径安全校验，拒绝越界路径、链接及特殊文件。Controller 不设目标 Service、模块声明、Patch Lua 文件数或源码字节数硬上限；扫描与冻结规模由实际 Patch 和运行时可用资源决定。宿主在扫描/冻结期间保持 Patch 目录不变；扫描和读取不是抵抗并发目录替换的原子安全边界。冻结后更新和部署只使用本次源码，不重新读取发布包。正式目录应由本次 Controller 独占部署，不支持外部并发修改；文件操作沿用逐级路径检查，临时文件替换不提供跨文件磁盘原子性或断电恢复。replace_file 的 nil 内容仅用于删除本批原本不存在的新增文件；已有文件保留原权限，新文件使用 0644。
+Native 提供 resolve(path[, relative_dir])、list_lua(patch_root, relative_patch_dir) 和 Controller 内部使用的 read_file(root_path, relative_file)、replace_file(root_path, relative_file, source_or_nil)；相对目录检查与递归扫描共用路径安全校验，拒绝越界路径、链接及特殊文件。Controller 不设目标 Service、模块声明、Patch Lua 文件数或源码字节数硬上限；扫描与冻结规模由实际 Patch 和运行时可用资源决定。宿主在扫描/冻结期间保持 Patch 目录不变；扫描和读取不是抵抗并发目录替换的原子安全边界。冻结后更新和部署只使用本次源码，不重新读取发布包。Controller 与目标 State 的内部模块登记和许可消息使用宿主相对文件路径，接入此版本时应一起更新并重启整个 Skynet 进程。正式目录应由本次 Controller 独占部署，不支持外部并发修改；文件操作沿用逐级路径检查，临时文件替换不提供跨文件磁盘原子性或断电恢复。replace_file 的 nil 内容仅用于删除本批原本不存在的新增文件；已有文件保留原权限，新文件使用 0644。
 
 待创建记录也占用 Controller 内存。每个目标的同一模块仍同时只保留一项首次加载许可。登记和许可记录由当前 Controller 持有，不建立后台发现、自动超时清理或持久化恢复；宿主负责保持实际 Service 生命周期与控制面一致。Service 或调用方在关键区间异常退出、许可取消 RPC 无法送达时，屏障会保留；须核对实际状态并受控重启，不得假定操作已完成。
 
