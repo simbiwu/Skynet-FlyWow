@@ -64,8 +64,8 @@ bool resolvePath(const std::string &path, std::string &output)
 }
 
 // 递归枚举受信任根目录内的普通 Lua 文件；拒绝符号链接和特殊文件。
-// 返回 0 成功，-1 路径或文件结构无效。
-int scanDirectory(const std::string &directory, const std::string &relative, std::vector<std::string> &paths)
+// 扫描完整目录返回 true；读取失败或发现不允许的项时返回 false。
+bool scanDirectory(const std::string &directory, const std::string &relative, std::vector<std::string> &paths)
 {
     // DIR 归当前递归层所有；字符串/vector 分配异常也必须关闭，不泄漏祖先层的目录 fd。
     const std::unique_ptr<DIR, int (*)(DIR *)> directory_handle(opendir(directory.c_str()),
@@ -73,10 +73,9 @@ int scanDirectory(const std::string &directory, const std::string &relative, std
     DIR                                       *handle = directory_handle.get();
     if (handle == nullptr)
     {
-        return -1;
+        return false;
     }
-    // 当前递归目录扫描结果；发现读取错误或不支持的文件时改为 -1。
-    int status = 0;
+
     while (true)
     {
         errno         = 0;
@@ -84,11 +83,8 @@ int scanDirectory(const std::string &directory, const std::string &relative, std
         dirent *entry = readdir(handle);
         if (entry == nullptr)
         {
-            if (errno != 0)
-            {
-                status = -1;
-            }
-            break;
+            // readdir 返回空指针且未设置 errno，表示本层目录已遍历完。
+            return errno == 0;
         }
         if (std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0)
         {
@@ -101,30 +97,26 @@ int scanDirectory(const std::string &directory, const std::string &relative, std
             relative.empty() ? entry->d_name : relative + "/" + entry->d_name;
         if (absolute.size() >= PATH_MAX || child_relative.size() >= PATH_MAX)
         {
-            status = -1;
-            break;
+            return false;
         }
         // lstat 检查链接本身，不跟随链接目标；递归和源码读取只接受普通目录/文件。
         // lstat 读取的文件属性；用于拒绝符号链接和非普通文件。
         struct stat attributes;
         if (lstat(absolute.c_str(), &attributes) != 0 || S_ISLNK(attributes.st_mode))
         {
-            status = -1;
-            break;
+            return false;
         }
         if (S_ISDIR(attributes.st_mode))
         {
-            status = scanDirectory(absolute, child_relative, paths);
-            if (status != 0)
+            if (!scanDirectory(absolute, child_relative, paths))
             {
-                break;
+                return false;
             }
             continue;
         }
         if (!S_ISREG(attributes.st_mode))
         {
-            status = -1;
-            break;
+            return false;
         }
         // 当前目录项的文件名部分，用于检查 .lua 或 .patch 后缀。
         const std::string name = entry->d_name;
@@ -140,7 +132,6 @@ int scanDirectory(const std::string &directory, const std::string &relative, std
         // files 由所有递归层共用；保存相对发布目录的路径，不能把本机绝对路径交给 Controller。
         paths.push_back(child_relative);
     }
-    return status;
 }
 
 // 与扫描和 Controller 配置共用的相对目录检查；逐级拒绝链接和特殊文件。
@@ -198,29 +189,6 @@ bool resolveDirectory(const std::string &root_argument, const std::string &relat
     }
     directory = canonical;
     return true;
-}
-
-// 一次扫描整个选定 Patch 目录，返回其中全部 .lua 和 .patch 文件。
-int listLuaFiles(const std::string &patch_root, const std::string &relative_patch_dir,
-                 std::vector<std::string> &output)
-{
-    std::string directory; // 本次要递归枚举的绝对目录；返回数组仍使用相对路径。
-    if (!resolveDirectory(patch_root, relative_patch_dir, directory))
-    {
-        return -1;
-    }
-
-    // 直接收集发布目录的 Lua/Patch 相对路径；扫描失败时调用方丢弃结果。
-    const int status = scanDirectory(directory, "", output);
-    if (status != 0)
-    {
-        return -1;
-    }
-    if (output.empty())
-    {
-        return 1;
-    }
-    return 0;
 }
 
 // 文件描述符仅由当前同步调用持有；字符串分配异常时同样关闭。
@@ -546,15 +514,21 @@ int list_lua(lua_State *state)
             return mapNativeFailure(binding, binding.pushError());
         }
 
+        // 解析成功后扫描指定目录，收集相对文件路径；扫描失败时丢弃已收集的部分结果。
+        std::string              directory;
         std::vector<std::string> paths;
-        // 扫描发布目录的结果码；成功为 0，空目录为 1，其他情况为路径错误。
-        const int                status = listLuaFiles(patch_root, relative_patch_dir, paths);
-        if (status != 0)
+        if (!resolveDirectory(patch_root, relative_patch_dir, directory) ||
+            !scanDirectory(directory, "", paths))
         {
             return mapNativeFailure(
-                binding, binding.pushError(status == 1 ? "HU_PATCH_EMPTY" : "HU_INVALID_PATH",
-                                           "patch Lua file list is invalid or empty"));
+                binding, binding.pushError("HU_INVALID_PATH", "patch Lua file list is invalid or empty"));
         }
+        if (paths.empty())
+        {
+            return mapNativeFailure(
+                binding, binding.pushError("HU_PATCH_EMPTY", "patch Lua file list is invalid or empty"));
+        }
+
         LuaTable output;
         if (!binding.newTable(output))
         {

@@ -252,8 +252,7 @@ end
 ---@field old_functions table<string, function> 本次替换前的函数；Abort 时逐项装回原业务函数表。
 ---@field old_state any 自定义或默认 snapshot 返回的旧状态载荷；允许 nil 或 false。
 
----@class FlyWowHotUpgradeStagedServicePatch
----@field definition FlyWowHotUpgradeServicePatchDefinition 已验证的原 Patch 定义；用于本次依赖加载和提交。
+---@class FlyWowHotUpgradeStagedServicePatch: FlyWowHotUpgradeServicePatchDefinition
 ---@field rollback? FlyWowHotUpgradeServiceRollback 改写状态或函数前交给批次；仅声明依赖时没有恢复数据。
 
 --- 执行 Service .patch 构建回调，校验更新定义并保存恢复快照。
@@ -286,22 +285,27 @@ local function stage_service_patch(service_patch_source)
     if type(patch_definition) ~= "table" or getmetatable(patch_definition) ~= nil then
         return flywow_result.failure("HU_SERVICE_STAGE_FAILED", "Service 构建结果必须是普通表")
     end
-    if patch_definition.update_state ~= nil and type(patch_definition.update_state) ~= "function" then
+
+    -- 固定构建函数返回的字段引用；后续回调即使重设原定义字段，也只提交这里校验过的内容。
+    local update_state      = patch_definition.update_state      -- 提交时迁移现存状态的回调。
+    local replace_functions = patch_definition.replace_functions -- 要校验、备份并安装的函数清单。
+    local new_modules       = patch_definition.new_modules       -- 提交前需要首次加载的依赖名。
+    if update_state ~= nil and type(update_state) ~= "function" then
         return flywow_result.failure("HU_SERVICE_STAGE_FAILED", "update_state 必须是函数")
     end
-    if patch_definition.replace_functions ~= nil and (type(patch_definition.replace_functions) ~= "table"
-        or getmetatable(patch_definition.replace_functions) ~= nil) then
+    if replace_functions ~= nil and (type(replace_functions) ~= "table"
+        or getmetatable(replace_functions) ~= nil) then
         return flywow_result.failure("HU_SERVICE_STAGE_FAILED", "replace_functions 必须是普通表")
     end
 
     -- 基础更新回调和替换表通过后，校验可选的新模块声明数组。
-    if patch_definition.new_modules ~= nil then
-        if type(patch_definition.new_modules) ~= "table" or getmetatable(patch_definition.new_modules) ~= nil then
+    if new_modules ~= nil then
+        if type(new_modules) ~= "table" or getmetatable(new_modules) ~= nil then
             return flywow_result.failure("HU_SERVICE_STAGE_FAILED", "new_modules 必须是普通数组")
         end
         local item_count = 0
         local last_index = 0
-        for index, module_name in pairs(patch_definition.new_modules) do
+        for index, module_name in pairs(new_modules) do
             if math.type(index) ~= "integer" or index <= 0 or type(module_name) ~= "string" or module_name == "" then
                 return flywow_result.failure("HU_SERVICE_STAGE_FAILED", "new_modules 必须是非空模块名组成的连续数组")
             end
@@ -315,21 +319,21 @@ local function stage_service_patch(service_patch_source)
 
     -- 各更新字段的结构已通过校验；拒绝没有任何实际更新内容的定义。
     -- 只有写状态或替换函数才需要 Abort 数据；仅声明依赖的 Patch 不分配恢复记录。
-    local replaces_functions = patch_definition.replace_functions and next(patch_definition.replace_functions) ~= nil
-    if not (patch_definition.update_state or replaces_functions
-        or (patch_definition.new_modules and next(patch_definition.new_modules))) then
+    local replaces_functions = replace_functions and next(replace_functions) ~= nil
+    if not (update_state or replaces_functions
+        or (new_modules and next(new_modules))) then
         return flywow_result.failure("HU_SERVICE_STAGE_FAILED", "Service Patch 没有更新内容")
     end
 
     -- 先检查每个替换目标并保存原函数；有状态迁移时再保存可独立恢复的快照。
     local service_rollback
-    if patch_definition.update_state or replaces_functions then
+    if update_state or replaces_functions then
         service_rollback =
         {
-            restore_state = patch_definition.update_state ~= nil, -- 即使合法快照为 nil 或 false，状态迁移也需要恢复。
+            restore_state = update_state ~= nil, -- 即使合法快照为 nil 或 false，状态迁移也需要恢复。
             old_functions = {},                                  -- 仅保存将被替换的原函数，Abort 时原样装回。
         }
-        for name, replacement_function in pairs(patch_definition.replace_functions or {}) do
+        for name, replacement_function in pairs(replace_functions or {}) do
             -- 按 Patch 指定的字段读取线上函数，用于验证替换目标并保存恢复引用。
             local old_function = rawget(service_update.functions, name)
             if type(name) ~= "string" or type(replacement_function) ~= "function"
@@ -341,7 +345,7 @@ local function stage_service_patch(service_patch_source)
     end
 
     -- 只在 Patch 会改状态时保存旧快照；恢复根据 update_state 判断是否使用它。
-    if patch_definition.update_state then
+    if update_state then
         if service_update.snapshot then
             local snapshot_called, snapshot_result = pcall(service_update.snapshot, service_update.state)
             if not snapshot_called then
@@ -365,11 +369,13 @@ local function stage_service_patch(service_patch_source)
         end
     end
 
-    -- 已验证的定义直接用于加载依赖和提交；旧数据只在首次写入前交给本地批次。
+    -- 后续加载和安装复用已校验的字段；旧数据只在首次写入前交给本地批次。
     return flywow_result.success(
     {
-        definition = patch_definition, -- Service Patch 构建函数返回的原表；当前 Update 读取已验证的更新声明。
-        rollback   = service_rollback, -- 即将修改线上状态或函数时的恢复数据；依赖专用 Patch 为 nil。
+        update_state      = update_state,      -- 提交时调用的状态迁移回调。
+        replace_functions = replace_functions, -- 提交时安装的函数，与保存旧函数时使用同一个清单。
+        new_modules       = new_modules,       -- 完整校验过、需要先加载的依赖名。
+        rollback          = service_rollback,  -- Abort 恢复状态和函数的数据；仅声明依赖时为 nil。
     })
 end
 
@@ -391,7 +397,7 @@ local function stage_service_patch_and_new_modules(new_module_names, service_pat
     -- Service Patch 构建成功后，解析并登记它声明的新模块清单。
     local service_patch = service_patch_result.value
     local identities = {}
-    for _, name in ipairs(service_patch.definition.new_modules or {}) do
+    for _, name in ipairs(service_patch.new_modules or {}) do
         local identity_result = resolve_module_identity(name)
         if not identity_result.ok then
             return identity_result
@@ -506,15 +512,14 @@ local function update_batch(batch, request)
         if service_patch then
             -- Service Patch 只改 state/functions 的字段，保留业务代码已持有的两张根表。
             local service_update = module_state.registration_config.service_update
-            -- Patch 定义已核验，先保留可能被修改的旧数据，再执行迁移或替换。
-            local patch_definition = service_patch.definition
+            -- 写入前保留旧数据；迁移和函数安装使用 Stage 固定的引用。
             batch.service_rollback = service_patch.rollback
-            if patch_definition.update_state then
-                patch_definition.update_state()
+            if service_patch.update_state then
+                service_patch.update_state()
             end
 
             -- name 是 Patch 指定的业务函数字段，fn 是准备安装的新实现。
-            for name, fn in pairs(patch_definition.replace_functions or {}) do
+            for name, fn in pairs(service_patch.replace_functions or {}) do
                 rawset(service_update.functions, name, fn)
             end
         end
@@ -742,10 +747,9 @@ local function load_module_exports(module_identity, module_load_attempt)
             "模块名称已被 package.preload 占用: " .. canonical_name)
     end
 
-    -- 排除缓存占用冲突后，核对规范别名是否仍指向已登记文件。
+    -- 若别名已占用，它必须与上面已核对来源的原名缓存指向同一张表。
     local cached_alias = module_load_attempt.cache_snapshot.canonical_alias
-    if cached_alias ~= nil and (not rawequal(cached_alias, module_load_attempt.cache_snapshot.module)
-        or module_state.module_sources[cached_alias] ~= resolved_path) then
+    if cached_alias ~= nil and not rawequal(cached_alias, module_load_attempt.cache_snapshot.module) then
         return flywow_result.failure("HU_DUPLICATE_MODULE",
             "模块路径登记名已被其他模块占用: " .. canonical_name)
     end

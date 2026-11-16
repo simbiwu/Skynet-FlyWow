@@ -349,7 +349,7 @@ function M:wake_registration()
 end
 
 ---@class FlyWowHotUpgradeUniqueServiceEntry
----@field waiters table<thread, boolean> 等待同名首次创建结果的协程；创建完成或失败后逐个唤醒
+---@field waiters? table<thread, boolean> 等待同名首次创建结果的协程；创建协程统一唤醒后释放此表
 ---@field service_handle? integer 首次创建成功后保存的真实 Service handle，供后续调用复用
 ---@field error? FlyWowResult 首次创建失败时供等待者读取；失败项随后从唯一名映射移除
 
@@ -476,7 +476,6 @@ function M:uniqueservice(request, source)
         local waiter = coroutine.running()
         unique_service_entry.waiters[waiter] = true
         skynet.wait(waiter)
-        unique_service_entry.waiters[waiter] = nil
         return unique_service_entry.error or flywow_result.success({service_handle = unique_service_entry.service_handle})
     end
 
@@ -492,16 +491,18 @@ function M:uniqueservice(request, source)
     if creation_result.ok then
         unique_service_entry.service_handle = creation_result.value.service_handle
     else
+        -- 在途记录没有 handle，取消与退出流程无法替换这条预留。
         unique_service_entry.error = creation_result
-        if self.unique_service_entries[request.service_name] == unique_service_entry then
-            self.unique_service_entries[request.service_name] = nil
-        end
+        self.unique_service_entries[request.service_name] = nil
     end
 
-    -- 唯一创建结果已写入共享记录后，唤醒所有同名等待者读取结果。
+    -- 创建结果已保存，通知同名等待者读取结果；唤醒只将协程排入 Skynet 队列。
     for waiter in pairs(unique_service_entry.waiters) do
         skynet.wakeup(waiter)
     end
+
+    -- 等待者仍持有共享结果，Controller 此时可以释放只在创建期间使用的等待表。
+    unique_service_entry.waiters = nil
     return creation_result
 end
 
@@ -1154,11 +1155,11 @@ local function recover_batch(controller, batch)
     -- 文件和目标恢复均已完成；汇总错误供终态和管理查询使用。
     if #recovery_errors > 0 then
         batch.error = flywow_result.failure("HU_RECOVERY_REQUIRED", table.concat(recovery_errors, "; "),
-            {original_error = batch.error or recovery_failure, recovery_error = recovery_failure})
+            {original_error = batch.error, recovery_error = recovery_failure})
     end
 
     -- 恢复和 Abort 均已尝试后，根据汇总错误确定批次终态。
-    batch.phase = (#recovery_errors > 0 or batch.error.code == "HU_RECOVERY_REQUIRED")
+    batch.phase = batch.error.code == "HU_RECOVERY_REQUIRED"
         and "RECOVERY_REQUIRED" or "ABORTED"
 end
 

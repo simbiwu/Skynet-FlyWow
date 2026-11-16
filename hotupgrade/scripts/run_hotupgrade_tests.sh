@@ -36,7 +36,7 @@ for scenario in controller module service management_abort diagnostic; do
 done
 # 每个业务接收器场景拥有独立 Lua State，不为测试向生产模块增加 reset 接口。
 # 每个状态场景在独立 Lua State 中运行，避免测试为生产模块新增 reset API。
-for scenario in shared custom nested_shared cycles old_alias types empty direct_fields expansion depth depth_boundary field_boundary snapshot_size abort recovery recovery_retry custom_recovery partial_throw bad_state_callback; do
+for scenario in shared custom nested_shared cycles old_alias types empty direct_fields expansion depth depth_boundary field_boundary snapshot_size abort recovery recovery_retry custom_recovery partial_throw bad_state_callback fixed_patch_definition; do
     "$SKYNET_ROOT/3rd/lua/lua" hotupgrade/tests/test_service_state.lua "$scenario"
 done
 CONTROLLER_LOG="$FRAMEWORK_DIR/build/hotupgrade-tests/controller.log"

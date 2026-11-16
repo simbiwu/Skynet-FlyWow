@@ -163,6 +163,24 @@ scenarios.partial_throw = function()
     s.check = function(state) check(state); assert(state.extra == nil) end
     return s
 end
+-- 迁移闭包重设自己的 Patch 字段时，本次仍须提交已经校验的原函数清单。
+scenarios.fixed_patch_definition = function()
+    local s = restored() -- 使用现有状态断言检查 Update 写入和 Abort 恢复。
+    s.service_patch_source = [[return function(state)
+        local definition = {
+            replace_functions = {load = function() return 2 end},
+        }
+
+        definition.update_state = function()
+            state.a.changed = 3
+            state.b.changed = 3
+            definition.replace_functions = {load = function() return 3 end}
+        end
+        return definition
+    end]]
+    s.abort = true
+    return s
+end
 scenarios.bad_state_callback = function()
     local s = normal() -- 当前构造的状态测试场景记录。
     s.service_patch_source = "return function() return {update_state = 12} end"
@@ -237,6 +255,10 @@ end
 assert(command("prepare").ok and hotupgrade.patching)
 assert(scenario.state == state_identity and functions.load == old_function)
 local updated = command("update") -- 当前 Update 的成功或失败结果。
+if scenario_name == "fixed_patch_definition" then
+    assert(updated.ok, updated.message)
+    assert(functions.load() == 2, "Update 必须使用 Stage 校验过的函数清单")
+end
 if scenario.expected_failure then
     assert(not updated.ok and updated.code == scenario.expected_failure, updated.message)
     if scenario.error_text then assert(updated.message:find(scenario.error_text, 1, true), updated.message) end
