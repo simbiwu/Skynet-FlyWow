@@ -30,25 +30,22 @@ enum class CellDynamicEntryRule : std::uint8_t
 class NavigationContext final
 {
   public:
-    enum class NodeState : std::uint8_t
-    {
-        kUnseen = 0, // 本轮还没有找到到达它的合法路线。
-        kOpen   = 1, // 已有候选路线，正在堆中等待被展开，成本仍可能改善。
-        kClosed = 2, // 已从堆顶取出；本算法前提下最低到达成本已经确定。
-    };
-
     struct NodeScratch
     {
         std::uint32_t generation = 0; // 只有等于 query_generation_ 时其余字段才属于当前查询。
-        std::uint64_t g_cost     = 0; // 起点到当前 node 的累计整数成本；大图不会发生 uint32 回绕。
+        std::uint64_t g_cost = 0; // 起点到本格的累计整数成本；最大值表示当前查询尚未发现。
         std::int32_t  parent_index = -1; // 最优前驱 node_index；-1 表示起点/未设置。
         std::int32_t  heap_index   = -1; // 当前 node 在 binary heap 中的 slot；不在 heap 时为 -1。
-        NodeState     state        = NodeState::kUnseen; // 本次 query 的 unseen/open/closed 状态。
     };
 
     // 为 map 分配一次 dense scratch；构造阶段会发生 O(cellCount) 内存分配。
     // map 必须非空，cellCount 必须可由 int32 node_index 表示。
     explicit NavigationContext(std::shared_ptr<const GridMap> map);
+
+    /// 创建带指定空中预算的会话。非法预算返回 INVALID_ARGUMENT，此时未分配 scratch 或登记会话。
+    /// map 借用至验证通过；成功后的 Context 持有地图，调用方拥有返回的会话。
+    static NavResult<std::unique_ptr<NavigationContext>>
+    create(std::shared_ptr<const GridMap> map, const AirLimits &limits);
 
     /// 转移已有会话和地图所有权；Registry 仍只登记一个有效 Context。
     NavigationContext(NavigationContext &&) noexcept = default;
@@ -66,7 +63,7 @@ class NavigationContext final
     /// 判断当前 Battle 在该格已有其他单位时是否允许重叠；越界返回 false。
     bool allowsDynamicEntry(const GridPos &grid) const noexcept;
 
-    // 开始一次新查询：递增 generation、清空 heapSize，不扫描清零全部 Node。
+    // 开始一次新查询：递增 generation、清空 OPEN 堆，不扫描清零全部 Node。
     // Generation 回卷时才 O(cellCount) 清零 generation 字段。
     void beginQuery();
 
@@ -90,7 +87,7 @@ class NavigationContext final
         return occupancy_;
     }
 
-    // Binary Heap backing array；元素是 node_index。容量在构造时一次性分配为 cellCount。
+    // OPEN 堆只存有效 node_index；容量在构造时按 cellCount 预留。
     std::vector<std::int32_t> &heapStorage() noexcept
     {
         return heap_;
@@ -98,16 +95,6 @@ class NavigationContext final
     const std::vector<std::int32_t> &heapStorage() const noexcept
     {
         return heap_;
-    }
-
-    // 当前 heap 的有效 slot 数；[0, heap_size_) 才是本次查询数据。
-    std::size_t heapSize() const noexcept
-    {
-        return heap_size_;
-    }
-    void setHeapSize(std::size_t value) noexcept
-    {
-        heap_size_ = value;
     }
 
     // 当前查询 generation；只用于 GridPathfinder，不进入业务数据。
@@ -130,6 +117,9 @@ class NavigationContext final
     std::size_t     airMemoryBytes() const noexcept;
 
   private:
+    // 仅接受默认值或已验证的空中预算；分配全部会话资源成功后再登记。
+    NavigationContext(std::shared_ptr<const GridMap> map, const AirLimits &limits);
+
     std::unique_ptr<AirState>      air_;        // 按需创建；Context 析构统一释放。
     AirLimits                      air_limits_; // 不分配资源；首次空中操作后保持不变。
     std::shared_ptr<const GridMap> map_;        // 与 MapRegistry 共享 immutable GridMap 所有权。
@@ -138,7 +128,6 @@ class NavigationContext final
         blocked_entry_cells_;         // 仅保存禁止重叠的格，按 z、x 排序；allow/default 均移除。
     std::vector<NodeScratch>  nodes_; // 每 Cell 一个 scratch record，本 Context 独占。
     std::vector<std::int32_t> heap_;  // Binary Heap 的 node_index 存储，本 Context 独占。
-    std::size_t               heap_size_        = 0; // 本次 query 的有效 heap slot 数。
     std::uint32_t             query_generation_ = 0; // 0 保留为“从未属于任何查询”。
     std::uint32_t             visited_nodes_    = 0; // 本次查询 Touch 的唯一 Node 计数。
 };

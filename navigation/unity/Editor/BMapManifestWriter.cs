@@ -51,10 +51,21 @@ namespace FlyWow.Navigation.Editor
         public static void Write(NavigationMapSnapshot snapshot, string bmapPath,
                                  string airnavPath = null, string packageHash = null)
         {
-            // bmap 是刚完成回读验证的正式文件字节。
-            byte[] bmap = File.ReadAllBytes(bmapPath);
-            // payloadCrc 从正式 BMAP Header 读取，避免 Manifest 自己重算出另一份来源。
-            uint payloadCrc = BMapLittleEndian.ReadU32(bmap, 48);
+            WriteWithHashes(snapshot, bmapPath, NavigationAssetPublisher.ContentHash(bmapPath),
+                            airnavPath == null ? null : NavigationAssetPublisher.ContentHash(airnavPath),
+                            packageHash);
+        }
+
+        // 摘要由候选发布流程传入；Manifest 只需再读取 Header 中的 Payload CRC。
+        internal static void WriteWithHashes(NavigationMapSnapshot snapshot, string bmapPath,
+                                              string bmapHash, string airnavHash, string packageHash)
+        {
+            byte[] header;
+            using (var reader = new BinaryReader(File.OpenRead(bmapPath)))
+            {
+                header = reader.ReadBytes(BMapFormat.HeaderSize);
+            }
+            uint payloadCrc = BMapLittleEndian.ReadU32(header, 48);
             // walkable 是可走 Cell 数量，blocked 由总数减去它得到。
             int walkable = 0;
             // minHeight 只统计可走表面的最小世界 Y，单位毫米。
@@ -76,7 +87,7 @@ namespace FlyWow.Navigation.Editor
 
             // manifest 是纯观察数据，不参与 Server 决策。
             var manifest = new Manifest {
-                content_sha256 = NavigationAssetPublisher.ContentHash(bmapPath),
+                content_sha256 = bmapHash,
                 format_version = BMapFormat.FormatVersion,
                 map_id         = snapshot.mapId,
                 map_version    = snapshot.mapVersion,
@@ -95,11 +106,11 @@ namespace FlyWow.Navigation.Editor
             string manifestPath = Path.ChangeExtension(bmapPath, ".manifest.json");
             string json         = JsonUtility.ToJson(manifest, true);
             // 旧无空中包保留原 Manifest 字节与目录名，升级后重复导出仍幂等。
-            if (airnavPath != null)
+            if (airnavHash != null)
             {
                 json = json.TrimEnd().Substring(0, json.TrimEnd().Length - 1).TrimEnd() +
                        ",\n  \"airnav_sha256\": \"" +
-                       NavigationAssetPublisher.ContentHash(airnavPath) +
+                       airnavHash +
                        "\",\n  \"capabilities\": [\"air_2_5d\"],\n  \"package_hash\": \"" +
                        packageHash + "\"\n}";
             }

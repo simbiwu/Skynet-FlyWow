@@ -71,7 +71,10 @@ assert(first:unit_radius_mm(1) == 0)
 assert(first:map_version() == 2)
 local start = { x_mm = 750, y_mm = 0, z_mm = 750 }
 local goal = { x_mm = 1750, y_mm = 0, z_mm = 1750 }
-assert(first:place_unit(1, 1, start))
+local placed = assert(first:place_unit(1, 1, { x_mm = 751, y_mm = 91, z_mm = 752 }))
+assert(placed.x_mm == 751 and placed.y_mm == 0 and placed.z_mm == 752)
+local moved = assert(first:move_unit(1, 1, placed, { x_mm = 754, y_mm = -91, z_mm = 755 }))
+assert(moved.x_mm == 754 and moved.y_mm == 0 and moved.z_mm == 755)
 assert(first:set_cell_rule(1, 1, "block"))
 local blocked_start, blocked_start_error = first:place_unit(1, 2, start)
 assert(blocked_start == nil and blocked_start_error.code == "MOVE_BLOCKED")
@@ -181,9 +184,11 @@ gc_context = nil
 collectgarbage("collect")
 assert(navigation.load_navigation_profiles(updated_profiles))
 
--- 创建失败必须立即注销，不等待 GC 才允许换表。
+-- 非法预算不能留下阻止换表的会话。
 local invalid_context, invalid_context_error = navigation.new_context(17, { nodes = 0 })
 assert(invalid_context == nil and invalid_context_error.code == "INVALID_ARGUMENT")
+local oversized_context, oversized_context_error = navigation.new_context(17, { nodes = 8193 })
+assert(oversized_context == nil and oversized_context_error.code == "INVALID_ARGUMENT")
 assert(navigation.load_navigation_profiles(profiles))
 collectgarbage("collect")
 print("FLYWOW_NAVIGATION_BINDING_OK")

@@ -557,7 +557,7 @@ void siftDown(NavigationContext &context, const GridMap &map, std::size_t slot,
               const GoalPolicy &goal)
 {
     auto             &heap = context.heapStorage();
-    const std::size_t size = context.heapSize();
+    const std::size_t size = heap.size();
     for (;;)
     {
         const std::size_t left = slot * 2 + 1;
@@ -585,9 +585,8 @@ void heapPush(NavigationContext &context, const GridMap &map, std::int32_t node_
               const GoalPolicy &goal)
 {
     auto             &heap = context.heapStorage();
-    const std::size_t slot = context.heapSize();
-    heap[slot]             = node_index;
-    context.setHeapSize(slot + 1);
+    const std::size_t slot = heap.size();
+    heap.push_back(node_index);
     context.touchNode(node_index).heap_index = static_cast<std::int32_t>(slot);
     siftUp(context, map, slot, goal);
 }
@@ -598,14 +597,13 @@ std::int32_t heapPop(NavigationContext &context, const GridMap &map, const GoalP
 {
     auto              &heap     = context.heapStorage();
     const std::int32_t result   = heap[0];
-    const std::size_t  new_size = context.heapSize() - 1;
-    context.setHeapSize(new_size);
+    const std::int32_t last = heap.back();
+    heap.pop_back();
     context.touchNode(result).heap_index = -1;
-    if (new_size > 0)
+    if (!heap.empty())
     {
-        // 堆顶移走后不挪动整个数组，只将最后一个有效元素补到根部。
-        // new_size 之外的旧值不再属于 OPEN；随后下沉修复堆的优先级关系。
-        heap[0]                               = heap[new_size];
+        // 将最后一个有效节点补到根部，再下沉修复优先级。
+        heap[0] = last;
         context.touchNode(heap[0]).heap_index = 0;
         siftDown(context, map, 0, goal);
     }
@@ -846,13 +844,12 @@ static NavResult<Path> findPathImpl(NavigationContext &context, const Navigation
     auto              &start_node  = context.touchNode(start_index);
     start_node.g_cost              = 0;
     start_node.parent_index        = -1;
-    start_node.state               = NavigationContext::NodeState::kOpen;
     heapPush(context, map, start_index, goal);
 
     std::int32_t  closest_index = -1;
     DistanceScore closest_distance{};
     std::uint64_t closest_cost = 0;
-    while (context.heapSize() > 0)
+    while (!context.heapStorage().empty())
     {
         // heapPop 取出当前 f 最小的候选；节点改善时用 decrease-key 原地调整，不会留下重复旧条目。
         const std::int32_t current_index = heapPop(context, map, goal);
@@ -860,7 +857,6 @@ static NavResult<Path> findPathImpl(NavigationContext &context, const Navigation
         // 精确目标的估计在每条合法边上都不会比真实成本下降得更快；
         // 范围目标的估计恒为 0。配合固定地图/策略与非负成本，出堆时该节点
         // 的最低到达成本已确定，因此 CLOSED 不必重新加入 OPEN。
-        current_node.state               = NavigationContext::NodeState::kClosed;
         const GridPos current_grid       = gridFromIndex(map, current_index);
         if (allow_partial)
         {
@@ -925,7 +921,9 @@ static NavResult<Path> findPathImpl(NavigationContext &context, const Navigation
             // node_index 是当前 map 内稳定的一维索引；NodeScratch 由 Context 独占。
             const std::int32_t next_index = nodeIndex(map, next);
             auto              &next_node  = context.touchNode(next_index);
-            if (next_node.state == NavigationContext::NodeState::kClosed)
+            // 有有效成本但已不在堆中，说明最低到达成本已经确定。
+            if (next_node.heap_index < 0 &&
+                next_node.g_cost != std::numeric_limits<std::uint64_t>::max())
             {
                 continue;
             }
@@ -936,8 +934,7 @@ static NavResult<Path> findPathImpl(NavigationContext &context, const Navigation
             // candidate 是经当前节点到 next 的真实 g-cost；Area Cost 已在 moveCost 中加入。
             const std::uint32_t step      = moveCost(map, profile, next, direction.base_cost);
             const std::uint64_t candidate = current_node.g_cost + step;
-            if (next_node.state != NavigationContext::NodeState::kUnseen &&
-                candidate >= next_node.g_cost)
+            if (candidate >= next_node.g_cost)
             {
                 continue;
             }
@@ -945,9 +942,8 @@ static NavResult<Path> findPathImpl(NavigationContext &context, const Navigation
             // 只有发现新节点或找到更低 g-cost 时才改 parent；否则保留已有最优候选。
             next_node.g_cost       = candidate;
             next_node.parent_index = current_index;
-            if (next_node.state == NavigationContext::NodeState::kUnseen)
+            if (next_node.heap_index < 0)
             {
-                next_node.state = NavigationContext::NodeState::kOpen;
                 heapPush(context, map, next_index, goal);
             }
             else
@@ -1142,32 +1138,16 @@ NavResult<Path> GridPathfinder::findPathToUnitRange(
                         static_cast<std::uint32_t>(minimum));
 }
 
-// 重新验证并提交一次相邻 Cell 移动；这是缓存 Path 消费时的权威边界。
-NavResult<bool> GridPathfinder::moveUnit(NavigationContext &context, const NavigationAgent &agent,
-                                         const WorldPosition &from, const WorldPosition &to,
-                                         const DynamicNavigationPolicy &dynamic_policy)
+// 复验两格之间的移动并提交。起点和目标已经在同一不可变地图中归格，
+// agent 已校验句柄和 Profile 指针；失败保留旧占位。
+NavResult<bool> detail::commitGridMove(NavigationContext &context, const NavigationAgent &agent,
+                                      const GridPos &from, const GridPos &to,
+                                      const DynamicNavigationPolicy &dynamic_policy)
 {
-    if (agent.profile == nullptr || !agent.handle.valid())
-    {
-        return NavResult<bool>::failure(NavError::kInvalidArgument,
-                                        "NavigationAgent requires a valid handle and profile");
-    }
+    const GridMap &map = *context.map();
     const NavigationProfile &profile = *agent.profile;
-
-    const GridMap &map       = *context.map();
-    const auto     from_grid = map.worldToGrid(from);
-    if (!from_grid.ok())
-    {
-        return NavResult<bool>::failure(from_grid.error, from_grid.detail);
-    }
-    const auto to_grid = map.worldToGrid(to);
-    if (!to_grid.ok())
-    {
-        return NavResult<bool>::failure(to_grid.error, to_grid.detail);
-    }
-
-    const long long dx = static_cast<long long>(to_grid.value.x) - from_grid.value.x;
-    const long long dz = static_cast<long long>(to_grid.value.z) - from_grid.value.z;
+    const long long dx = static_cast<long long>(to.x) - from.x;
+    const long long dz = static_cast<long long>(to.z) - from.z;
     if (std::llabs(dx) > 1 || std::llabs(dz) > 1)
     {
         return NavResult<bool>::failure(NavError::kMoveBlocked,
@@ -1182,7 +1162,7 @@ NavResult<bool> GridPathfinder::moveUnit(NavigationContext &context, const Navig
     if (dx != 0 || dz != 0)
     {
         // 复用 A* 的目标、坡度和 corner-cutting 验证，避免缓存 Path 绕过动态规则。
-        if (!canTraverse(map, profile, from_grid.value, to_grid.value,
+        if (!canTraverse(map, profile, from, to,
                          static_cast<std::int32_t>(dx), static_cast<std::int32_t>(dz), policy,
                          context.occupancy()))
         {
@@ -1190,7 +1170,7 @@ NavResult<bool> GridPathfinder::moveUnit(NavigationContext &context, const Navig
                                             "cached path transition is no longer traversable");
         }
     }
-    else if (!canOccupy(map, profile, from_grid.value, from_grid.value, policy,
+    else if (!canOccupy(map, profile, from, from, policy,
                         context.occupancy()))
     {
         return NavResult<bool>::failure(NavError::kMoveBlocked,
@@ -1198,7 +1178,34 @@ NavResult<bool> GridPathfinder::moveUnit(NavigationContext &context, const Navig
     }
 
     // 所有规则已复验，DynamicOccupancy 再以 validate-before-commit 更新真实 owner。
-    return context.occupancy().move(agent.handle, profile, to_grid.value);
+    return context.occupancy().move(agent.handle, profile, to);
+}
+
+// C++ 单步入口先检查调用者提供的 Agent，再按起点、目标的顺序归格。
+NavResult<bool> GridPathfinder::moveUnit(NavigationContext &context, const NavigationAgent &agent,
+                                       const WorldPosition &from, const WorldPosition &to,
+                                       const DynamicNavigationPolicy &dynamic_policy)
+{
+    if (agent.profile == nullptr || !agent.handle.valid())
+    {
+        return NavResult<bool>::failure(NavError::kInvalidArgument,
+                                        "NavigationAgent requires a valid handle and profile");
+    }
+
+    const GridMap &map = *context.map();
+    const auto from_grid = map.worldToGrid(from);
+    if (!from_grid.ok())
+    {
+        return NavResult<bool>::failure(from_grid.error, from_grid.detail);
+    }
+    const auto to_grid = from.x_mm == to.x_mm && from.z_mm == to.z_mm
+                             ? from_grid
+                             : map.worldToGrid(to);
+    if (!to_grid.ok())
+    {
+        return NavResult<bool>::failure(to_grid.error, to_grid.detail);
+    }
+    return detail::commitGridMove(context, agent, from_grid.value, to_grid.value, dynamic_policy);
 }
 
 // 沿已有 Path 消耗一次 fixed-tick 距离预算；完整合同见头文件声明。
@@ -1251,7 +1258,7 @@ GridPathfinder::advancePath(NavigationContext &context, const NavigationAgent &a
             NavError::kInvalidArgument, "distance budget exceeds bounded substep count");
     }
 
-    // 把本 Tick 的距离预算分成小步；每步复用 moveUnit 重新验证并提交。
+    // 把本 Tick 的距离预算分成小步；每步按已归格的位置复验并提交。
     std::uint64_t budget   = distance_mm;
     std::uint64_t substeps = 0;
     while (budget > 0 && cursor.next_point_index < path.count())
@@ -1329,7 +1336,14 @@ GridPathfinder::advancePath(NavigationContext &context, const NavigationAgent &a
                 return NavResult<PathAdvanceResult>::failure(checked_world.error,
                                                              checked_world.detail);
             }
-            const auto moved = moveUnit(context, agent, output.position, candidate, policy);
+            const auto from_grid = context.map()->worldToGrid(output.position);
+            if (!from_grid.ok())
+            {
+                output.status = PathAdvanceStatus::kBlocked;
+                return NavResult<PathAdvanceResult>::success(output);
+            }
+            const auto moved =
+                detail::commitGridMove(context, agent, from_grid.value, checked_grid.value, policy);
             if (!moved.ok())
             {
                 if (moved.error == NavError::kMoveBlocked ||
@@ -1349,7 +1363,7 @@ GridPathfinder::advancePath(NavigationContext &context, const NavigationAgent &a
                 return NavResult<PathAdvanceResult>::failure(moved.error, moved.detail);
             }
 
-            // moveUnit 已提交目标 footprint；权威 Y 使用提交前验证的目标 Cell 地表高度。
+            // 目标 footprint 已提交；权威 Y 使用提交前验证的目标 Cell 地表高度。
             output.position      = checked_world.value;
             output.position.x_mm = candidate.x_mm;
             output.position.z_mm = candidate.z_mm;

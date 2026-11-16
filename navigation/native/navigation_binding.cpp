@@ -414,14 +414,14 @@ int new_context(lua_State *state)
             return lua_binding.pushError();
     }
 
-    owner->context.reset(new flywow_navigation::NavigationContext(found.value));
-    const auto valid = owner->context->setAirLimits(air);
-    if (!valid.ok())
+    auto created = flywow_navigation::NavigationContext::create(found.value, air);
+    if (!created.ok())
     {
-        owner->context.reset(); // 普通参数失败立即注销，不等待未返回 userdata 的 GC。
-        return lua_binding.pushError(flywow_navigation::navErrorName(valid.error), valid.detail);
+        return lua_binding.pushError(flywow_navigation::navErrorName(created.error),
+                                     created.detail);
     }
 
+    owner->context = std::move(created.value);
     return lua_binding.returnValues(owner);
 }
 
@@ -596,30 +596,39 @@ bool readMoveAgent(LuaBinding &lua_binding, LuaNavigationContext *&owner,
 int commitMove(LuaBinding &lua_binding, LuaNavigationContext &owner, const NavigationAgent &agent,
                const WorldPosition from, const WorldPosition to)
 {
-    // 先准备权威位置；归格失败时尚未写入 Occupancy，不需要回滚原 footprint。
-    const auto grid = owner.context->map()->worldToGrid(to);
-    if (!grid.ok())
+    // 先准备权威位置，目标归格或格中心溢出时不得提交占位。
+    const auto &map = *owner.context->map();
+    const auto to_grid = map.worldToGrid(to);
+    if (!to_grid.ok())
     {
-        return lua_binding.pushError(flywow_navigation::navErrorName(grid.error), grid.detail);
+        return lua_binding.pushError(flywow_navigation::navErrorName(to_grid.error), to_grid.detail);
     }
-    auto normalized = owner.context->map()->gridToWorldCenter(grid.value);
+    auto normalized = map.gridToWorldCenter(to_grid.value);
     if (!normalized.ok())
     {
         return lua_binding.pushError(flywow_navigation::navErrorName(normalized.error),
                                      normalized.detail);
     }
 
-    const DynamicNavigationPolicy policy{};
-    const auto                    moved =
-        flywow_navigation::GridPathfinder::moveUnit(*owner.context, agent, from, to, policy);
+    // Y 不参与归格；出生时起点与目标相同，直接复用目标格。
+    const auto from_grid = from.x_mm == to.x_mm && from.z_mm == to.z_mm
+                               ? to_grid
+                               : map.worldToGrid(from);
+    if (!from_grid.ok())
+    {
+        return lua_binding.pushError(flywow_navigation::navErrorName(from_grid.error),
+                                     from_grid.detail);
+    }
+    const auto moved = flywow_navigation::detail::commitGridMove(
+        *owner.context, agent, from_grid.value, to_grid.value, DynamicNavigationPolicy{});
     if (!moved.ok())
     {
         return lua_binding.pushError(flywow_navigation::navErrorName(moved.error), moved.detail);
     }
-    // Battle 正式位置保留输入 XZ；Y 由 Server BMAP 高度决定，不用折线 Y 插值。
+
     normalized.value.x_mm = to.x_mm;
     normalized.value.z_mm = to.z_mm;
-    auto table            = worldPositionTable(lua_binding, normalized.value);
+    auto table = worldPositionTable(lua_binding, normalized.value);
     return table.valid() ? lua_binding.returnValues(table) : lua_binding.pushError();
 }
 

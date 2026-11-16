@@ -133,6 +133,18 @@ namespace FlyWow.Navigation.Tests
                 string first = NavigationAssetPublisher.WriteCandidate(map, output, air);
 
                 Assert.That(first, Is.Not.EqualTo(old));
+                string bmapPath = Path.Combine(first, "map.bmap");
+                string airPath = Path.Combine(first, "map.airnav");
+                string packageHash = NavigationAssetPublisher.PackageHash(bmapPath, airPath);
+                string manifest = File.ReadAllText(Path.Combine(first, "map.manifest.json"));
+                Assert.That(Path.GetFileName(first), Does.EndWith("-" + packageHash));
+                Assert.That(manifest, Does.Contain("\"content_sha256\": \"" +
+                                                   NavigationAssetPublisher.ContentHash(bmapPath) +
+                                                   "\""));
+                Assert.That(manifest, Does.Contain("\"airnav_sha256\": \"" +
+                                                   NavigationAssetPublisher.ContentHash(airPath) +
+                                                   "\""));
+                Assert.That(manifest, Does.Contain("\"package_hash\": \"" + packageHash + "\""));
                 Assert.That(NavigationAssetPublisher.WriteCandidate(map, output, air),
                             Is.EqualTo(first));
                 air.cells[65][0] = new AirNavInterval { minY = 0, maxY = 11000 };

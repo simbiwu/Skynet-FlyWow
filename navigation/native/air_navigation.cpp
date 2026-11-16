@@ -379,6 +379,35 @@ NavResult<AirSweepResult> sweep(NavigationContext &context, AirState &air_state,
 // set/move 通过此处更新当前会话的动态盒及空间关联；所有普通失败在清旧前返回。
 // context 提供不可变地图，air_state 独占对象与桶；handle 是业务句柄，box 是待登记的闭合世界 AABB。
 // 不 yield、不跨线程共享；成功更新两份索引，参数/越界/容量失败保留旧状态，OOM 不承诺恢复。
+// 已归格 AABB 的闭区间覆盖范围；左/下边贴内部格线时同时覆盖相邻桶。
+struct AirBucketRange
+{
+    GridPos min; // 最左、最下的关联格，包含边界相邻桶。
+    GridPos max; // 最右、最上的关联格，包含端点所在格。
+
+    std::uint64_t count() const
+    {
+        return std::uint64_t(max.x - min.x + 1) * std::uint64_t(max.z - min.z + 1);
+    }
+};
+
+AirBucketRange airBucketRange(const BMapMetadata &map, const WorldPosition &minimum,
+                              GridPos min, GridPos max)
+{
+    if ((minimum.x_mm - map.origin_x_mm) % map.cell_size_mm == 0 && min.x > 0)
+        --min.x;
+    if ((minimum.z_mm - map.origin_z_mm) % map.cell_size_mm == 0 && min.z > 0)
+        --min.z;
+    return {min, max};
+}
+
+// box 已由当前 Context 登记，其坐标始终可以在同一静态地图中归格。
+AirBucketRange airBucketRange(const GridMap &map, const AirBox &box)
+{
+    return airBucketRange(map.metadata(), box.min, map.worldToGrid(box.min).value,
+                          map.worldToGrid(box.max).value);
+}
+
 NavResult<bool> set(NavigationContext &context, AirState &air_state, NavigationAgentHandle handle,
                     const AirBox &box)
 {
@@ -393,14 +422,8 @@ NavResult<bool> set(NavigationContext &context, AirState &air_state, NavigationA
     if (!a.ok() || !b.ok())
         return fail<bool>(NavError::kOutOfBounds, "air AABB outside map");
 
-    // 闭下边界位于格线时必须同时关联左/下格；地图边界外不建立桶。
-    auto x0 = a.value.x, z0 = a.value.z;
-    if ((box.min.x_mm - m.origin_x_mm) % m.cell_size_mm == 0 && x0 > 0)
-        --x0;
-    if ((box.min.z_mm - m.origin_z_mm) % m.cell_size_mm == 0 && z0 > 0)
-        --z0;
-    const std::uint64_t count =
-        std::uint64_t(b.value.x - x0 + 1) * std::uint64_t(b.value.z - z0 + 1);
+    const AirBucketRange target = airBucketRange(m, box.min, a.value, b.value);
+    const std::uint64_t count = target.count();
     auto old = air_state.objects.find(handle.value);
 
     if (count > air_state.limits.object_links ||
@@ -410,19 +433,12 @@ NavResult<bool> set(NavigationContext &context, AirState &air_state, NavigationA
     }
 
     // 旧盒是关联范围的唯一来源；只重算本对象覆盖的格，不保存第二份关联清单。
-    GridPos       old_min{};     // 更新已有对象时，用于删除旧盒在闭边界规则下覆盖的关联。
-    GridPos       old_max{};     // 旧盒覆盖范围的右上格；首次插入时不使用。
-    std::uint64_t old_count = 0; // 本对象即将释放的关联数；容量预检必须扣除这些关联。
+    AirBucketRange previous{};
+    std::uint64_t old_count = 0;
     if (old != air_state.objects.end())
     {
-        old_min = context.map()->worldToGrid(old->second.min).value;
-        old_max = context.map()->worldToGrid(old->second.max).value;
-        if ((old->second.min.x_mm - m.origin_x_mm) % m.cell_size_mm == 0 && old_min.x > 0)
-            --old_min.x;
-        if ((old->second.min.z_mm - m.origin_z_mm) % m.cell_size_mm == 0 && old_min.z > 0)
-            --old_min.z;
-        old_count =
-            std::uint64_t(old_max.x - old_min.x + 1) * std::uint64_t(old_max.z - old_min.z + 1);
+        previous = airBucketRange(*context.map(), old->second);
+        old_count = previous.count();
     }
     if (air_state.links.size() - old_count + count > air_state.limits.links)
     {
@@ -432,16 +448,16 @@ NavResult<bool> set(NavigationContext &context, AirState &air_state, NavigationA
     // 参数、地图范围和容量失败均在修改前返回；OOM 交给运行时，不构建恢复用临时 map。
     if (old != air_state.objects.end())
     {
-        for (int z = old_min.z; z <= old_max.z; ++z)
+        for (int z = previous.min.z; z <= previous.max.z; ++z)
         {
-            for (int x = old_min.x; x <= old_max.x; ++x)
+            for (int x = previous.min.x; x <= previous.max.x; ++x)
                 air_state.links.erase(
                     {std::uint32_t(std::uint64_t(z) * m.width + x), handle.value});
         }
     }
-    for (int z = z0; z <= b.value.z; ++z)
+    for (int z = target.min.z; z <= target.max.z; ++z)
     {
-        for (int x = x0; x <= b.value.x; ++x)
+        for (int x = target.min.x; x <= target.max.x; ++x)
             air_state.links.emplace(std::uint32_t(std::uint64_t(z) * m.width + x), handle.value);
     }
     air_state.objects.insert_or_assign(handle.value, box);
@@ -523,19 +539,14 @@ NavResult<bool> removeAirObstacle(NavigationContext &context, NavigationAgentHan
         return fail<bool>(NavError::kInvalidArgument, "air handle is zero");
     if (it != air_state.objects.end())
     {
-        // 仅遍历本对象不超过 256 个格关联；与 set 相同的闭边界规则。
-        const auto &m = context.map()->metadata();
-        auto        a = context.map()->worldToGrid(it->second.min).value,
-             b        = context.map()->worldToGrid(it->second.max).value;
-        if ((it->second.min.x_mm - m.origin_x_mm) % m.cell_size_mm == 0 && a.x > 0)
-            --a.x;
-        if ((it->second.min.z_mm - m.origin_z_mm) % m.cell_size_mm == 0 && a.z > 0)
-            --a.z;
-        for (int z = a.z; z <= b.z; ++z)
+        const GridMap &map = *context.map();
+        const AirBucketRange previous = airBucketRange(map, it->second);
+        const auto width = map.metadata().width;
+        for (int z = previous.min.z; z <= previous.max.z; ++z)
         {
-            for (int x = a.x; x <= b.x; ++x)
+            for (int x = previous.min.x; x <= previous.max.x; ++x)
                 air_state.links.erase(
-                    {std::uint32_t(std::uint64_t(z) * m.width + x), handle.value});
+                    {std::uint32_t(std::uint64_t(z) * width + x), handle.value});
         }
         air_state.objects.erase(it);
     }

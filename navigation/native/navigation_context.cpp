@@ -26,13 +26,32 @@ const GridMap &RequireMap(const std::shared_ptr<const GridMap> &map)
     return *map;
 }
 
+// 验证可调预算的值域。Native setter 另行检查会话是否已开始空中操作。
+bool validAirLimits(const AirLimits &limits)
+{
+    const AirLimits hard;
+    return limits.expanded != 0 && limits.expanded <= hard.expanded &&
+           limits.nodes != 0 && limits.nodes <= hard.nodes &&
+           limits.buckets != 0 && limits.buckets <= hard.buckets &&
+           limits.tests != 0 && limits.tests <= hard.tests &&
+           limits.path_points != 0 && limits.path_points <= hard.path_points &&
+           limits.objects != 0 && limits.objects <= hard.objects &&
+           limits.object_links != 0 && limits.object_links <= hard.object_links &&
+           limits.links != 0 && limits.links <= hard.links;
+}
+
 } // namespace
 
 // 为一张非空地图创建 Battle-local Context。
 // map 的共享所有权移入本对象；构造时按 cellCount 分配 scratch 和占位索引。
 // map 为空或 Cell 数无法用 int32 node_index 表示时抛出 invalid_argument。
 NavigationContext::NavigationContext(std::shared_ptr<const GridMap> map)
-    : map_(std::move(map)), occupancy_(RequireMap(map_))
+    : NavigationContext(std::move(map), AirLimits{})
+{
+}
+
+NavigationContext::NavigationContext(std::shared_ptr<const GridMap> map, const AirLimits &limits)
+    : air_limits_(limits), map_(std::move(map)), occupancy_(RequireMap(map_))
 {
     if (map_->cellCount() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()))
     {
@@ -41,10 +60,24 @@ NavigationContext::NavigationContext(std::shared_ptr<const GridMap> map)
 
     // occupancy_ 已在初始化列表中绑定 immutable map；scratch 也在构造阶段一次分配。
     nodes_.resize(map_->cellCount());
-    heap_.resize(map_->cellCount());
+    heap_.reserve(map_->cellCount());
 
     // 所有可失败的初始化完成后才登记；构造失败不会泄漏计数。
     NavigationProfileRegistry::instance().acquireContext();
+}
+
+// 在分配整图缓冲和登记活跃会话之前，先拒绝不受支持的预算。
+NavResult<std::unique_ptr<NavigationContext>>
+NavigationContext::create(std::shared_ptr<const GridMap> map, const AirLimits &limits)
+{
+    if (!validAirLimits(limits))
+    {
+        return NavResult<std::unique_ptr<NavigationContext>>::failure(
+            NavError::kInvalidArgument, "air limits invalid or already active");
+    }
+
+    auto context = std::unique_ptr<NavigationContext>(new NavigationContext(std::move(map), limits));
+    return NavResult<std::unique_ptr<NavigationContext>>::success(std::move(context));
 }
 
 // moved-from 对象不再拥有地图；只由转移后的有效 owner 注销一次。
@@ -75,7 +108,7 @@ void NavigationContext::beginQuery()
         query_generation_ = 1;
     }
 
-    heap_size_     = 0;
+    heap_.clear();
     visited_nodes_ = 0;
 }
 
@@ -152,7 +185,6 @@ NavigationContext::NodeScratch &NavigationContext::touchNode(std::int32_t node_i
         node.g_cost       = std::numeric_limits<std::uint64_t>::max();
         node.parent_index = -1;
         node.heap_index   = -1;
-        node.state        = NodeState::kUnseen;
         ++visited_nodes_;
     }
     return node;
@@ -170,12 +202,7 @@ AirState &NavigationContext::airState()
 }
 NavResult<bool> NavigationContext::setAirLimits(const AirLimits &l)
 {
-    const AirLimits hard;
-    if (air_ || !l.expanded || l.expanded > hard.expanded || !l.nodes || l.nodes > hard.nodes ||
-        !l.buckets || l.buckets > hard.buckets || !l.tests || l.tests > hard.tests ||
-        !l.path_points || l.path_points > hard.path_points || !l.objects ||
-        l.objects > hard.objects || !l.object_links || l.object_links > hard.object_links ||
-        !l.links || l.links > hard.links)
+    if (air_ || !validAirLimits(l))
     {
         return NavResult<bool>::failure(NavError::kInvalidArgument,
                                         "air limits invalid or already active");

@@ -121,4 +121,14 @@ class GridPathfinder final
                 const DynamicNavigationPolicy &policy);
 };
 
+namespace detail
+{
+// 供 C++ 移动、路径推进和 Lua Binding 共用的地面提交步骤。
+// from/to 已在 context 的地图中归格，agent 的句柄和 Profile 指针已验证。
+// 成功后更新占位；静态或动态规则拒绝时保留旧占位。
+NavResult<bool> commitGridMove(NavigationContext &context, const NavigationAgent &agent,
+                               const GridPos &from, const GridPos &to,
+                               const DynamicNavigationPolicy &policy);
+} // namespace detail
+
 } // namespace flywow_navigation

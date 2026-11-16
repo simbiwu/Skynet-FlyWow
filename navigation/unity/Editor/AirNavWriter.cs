@@ -152,14 +152,21 @@ namespace FlyWow.Navigation.Editor
             return value;
         }
 
-        private static byte[] Hash(byte[] data)
+        internal static byte[] Hash(byte[] data)
         {
             using (SHA256 sha = SHA256.Create()) return sha.ComputeHash(data);
         }
         /// <summary>显式 Little Endian 编码；输入必须已规范化，禁止直接 dump struct。</summary>
         public static byte[] Encode(NavigationMapSnapshot map, AirNavSnapshot air, byte[] bmap)
         {
-            if (air == null || map == null || bmap == null)
+            return EncodeWithHash(map, air, bmap == null ? null : Hash(bmap));
+        }
+
+        // bmapHash 是同一候选包已校验 BMAP 的原始 32 字节摘要。
+        private static byte[] EncodeWithHash(NavigationMapSnapshot map, AirNavSnapshot air,
+                                             byte[] bmapHash)
+        {
+            if (air == null || map == null || bmapHash == null)
                 throw new ArgumentException("AIRNAV_ARGUMENT");
             long count = air.cells.Values.Sum(list => (long)list.Count);
             long size  = checked(HeaderSize + air.cells.Count * 12L + count * 16);
@@ -181,7 +188,7 @@ namespace FlyWow.Navigation.Editor
                                 unchecked((uint)map.originZMm) };
             for (int i = 0; i < metadata.Length; ++i)
                 Put(bytes, 8 + i * 4, metadata[i], 4);
-            Array.Copy(Hash(bmap), 0, bytes, 40, 32);
+            Array.Copy(bmapHash, 0, bytes, 40, 32);
             Put(bytes, 72, (ulong)air.cells.Count, 4);
             Put(bytes, 76, (ulong)count, 4);
             int row = 0, interval = 0;
@@ -211,6 +218,13 @@ namespace FlyWow.Navigation.Editor
         }
         /// <summary>完整回读并验证精确长度、预留位、配对、记录及区间；不修改输入。</summary>
         public static AirNavSnapshot Decode(byte[] bytes, NavigationMapSnapshot map, byte[] bmap)
+        {
+            return DecodeWithHash(bytes, map, bmap == null ? null : Hash(bmap));
+        }
+
+        // 验证回读 AIRN 的格式、规范编码和已知 BMAP 摘要的配对关系。
+        internal static AirNavSnapshot DecodeWithHash(byte[] bytes, NavigationMapSnapshot map,
+                                                      byte[] bmapHash)
         {
             if (bytes.Length < HeaderSize || bytes.Length > MaxBytes || bytes[0] != 'A' ||
                 bytes[1] != 'I' || bytes[2] != 'R' || bytes[3] != 'N' || Get(bytes, 4, 2) != 1 ||
@@ -242,7 +256,7 @@ namespace FlyWow.Navigation.Editor
                 expected += length;
                 previous = cell;
             }
-            if (expected != count || !bytes.SequenceEqual(Encode(map, air, bmap)))
+            if (expected != count || !bytes.SequenceEqual(EncodeWithHash(map, air, bmapHash)))
                 throw new InvalidOperationException("AIRNAV_PAIR_OR_CANONICAL");
             return air;
         }
@@ -250,9 +264,17 @@ namespace FlyWow.Navigation.Editor
         public static void Write(NavigationMapSnapshot map, AirNavSnapshot air, string bmap,
                                  string output)
         {
-            byte[] ground = File.ReadAllBytes(bmap);
-            File.WriteAllBytes(output, Encode(map, air, ground));
-            Decode(File.ReadAllBytes(output), map, ground);
+            WriteWithHash(map, air, Hash(File.ReadAllBytes(bmap)), output);
+        }
+
+        // 回读并验证写入结果，返回经验证的磁盘字节供候选包计算 AIRN 摘要。
+        internal static byte[] WriteWithHash(NavigationMapSnapshot map, AirNavSnapshot air,
+                                             byte[] bmapHash, string output)
+        {
+            File.WriteAllBytes(output, EncodeWithHash(map, air, bmapHash));
+            byte[] bytes = File.ReadAllBytes(output);
+            DecodeWithHash(bytes, map, bmapHash);
+            return bytes;
         }
     }
 }
