@@ -158,7 +158,7 @@ end
 ---@class FlyWowHotUpgradePatchFile
 ---@field host_relative_path string 相对于 Controller.root_path 的 Lua 文件路径；例如 lualib/player_logic.lua；部署和恢复都使用该路径
 ---@field source string 从本批 Patch 读取并固定的 Lua 文件内容，作为正式部署内容
----@field old_source? string|false 部署前的正式文件内容；false 表示文件原先不存在，nil 表示尚未完成快照
+---@field name? string 普通模块的缓存别名；Service 入口只部署，不设置此字段
 
 ---@class FlyWowHotUpgradeModulePatch
 ---@field name string 目标 Lua State 的缓存别名；如 lualib/player.lua 对应 lualib.player
@@ -177,7 +177,8 @@ end
 ---@field phase string 本批当前阶段及终态
 ---@field service_results FlyWowHotUpgradeServiceResult[] 本批参与控制的 Service 结果；终态汇总并由 status 返回
 ---@field service_targets FlyWowHotUpgradeServiceTarget[] 本批匹配到的目标 Service 记录；Prepare 期间可增长，Update 前固定并保留参与记录
----@field files? FlyWowHotUpgradePatchFile[] 本批读取并固定的宿主文件及部署前快照
+---@field files? FlyWowHotUpgradePatchFile[] 按部署顺序保存本批冻结的宿主文件，普通模块列表引用同一批文件记录
+---@field old_sources? table<string, string|false> 按宿主相对路径保存部署前的源码；false 表示文件原本不存在，仅 Controller 用于恢复
 ---@field deployed_file_count integer 已顺序替换成功的正式文件数；Abort 只恢复 files 中这段前缀。
 ---@field target_service_count? integer 终态释放 service_targets 前保存的最终目标数；活动期间从目标列表计算
 ---@field current_service_handle? integer 当前或最近一次处理的业务 Service handle；status 对外返回此值
@@ -264,13 +265,12 @@ function M.initialize(controller_config)
     return flywow_result.success()
 end
 
---- 登记、取消或退出结束已返回 handle 的创建；删记录后通知排空及登记等待者。
+--- 登记、取消或退出结束已返回 handle 的创建；移除待登记记录后通知发布协程重查排空条件。
 ---@param service_handle integer 已匹配待登记记录的真实 Service handle；本函数据此删除该记录。
 ---@return nil 无返回值。
 function M:finish_creation(service_handle)
     self.service_creations[service_handle] = nil
     self:wake_batch()
-    self:wake_registration()
 end
 
 --- 处理 Skynet MONITOR 报告的 Service 退出，清除它的登记、许可和创建记录。
@@ -335,7 +335,6 @@ function M:on_service_exit(service_handle)
         self:finish_creation(service_handle)
     else
         self:wake_batch()
-        self:wake_registration()
     end
 end
 
@@ -890,12 +889,9 @@ local function freeze_patch_files(controller, batch)
                     return flywow_result.failure("HU_INVALID_PATCH", "Lua 路径映射重复或无效: " .. relative_path)
                 end
                 module_names[name] = true
-                batch.modules[#batch.modules + 1] =
-                {
-                    name               = name,          -- 目标 State 的缓存别名。
-                    host_relative_path = relative_path, -- 用于匹配准确文件，目标据此读取首次加载参数。
-                    source             = source,        -- Controller 冻结的候选源码，Update 时随请求发送。
-                }
+                -- 普通模块与正式文件共用冻结记录；缓存别名用于排序和定位目标 State 的导出表。
+                file.name = name
+                batch.modules[#batch.modules + 1] = file
             end
         end
     end
@@ -979,12 +975,14 @@ local function load_and_snapshot_batch_files(controller, batch)
     end
 
     -- 再为每个正式文件保存部署前内容，供部分部署失败时恢复。
+    -- 旧内容只由 Controller 持有，避免随普通模块文件记录发给目标 Service。
+    batch.old_sources = {}
     for _, file in ipairs(batch.files) do
         local old_source, read_failure = hotupgrade_native.read_file(controller.root_path, file.host_relative_path)
         if old_source == nil then
             return flywow_result.failure(native_code(read_failure), "文件准备失败: " .. file.host_relative_path)
         end
-        file.old_source = old_source
+        batch.old_sources[file.host_relative_path] = old_source
     end
     return flywow_result.success()
 end
@@ -1114,10 +1112,11 @@ local function recover_batch(controller, batch)
 
     -- 从最后一个已替换的文件逆序恢复；首个部署失败的文件及其后续项无需处理。
     for index = batch.deployed_file_count, 1, -1 do
-        -- 当前已替换的正式文件；old_source 保存部署前的内容，false 表示原先不存在。
+        -- 按部署顺序定位已写入的文件，再按路径查找原始内容；false 原样表示旧文件不存在。
         local file = batch.files[index]
+        local old_source = batch.old_sources[file.host_relative_path]
         local restore_called, file_restored, restore_failure = pcall(hotupgrade_native.replace_file,
-            controller.root_path, file.host_relative_path, file.old_source or nil)
+            controller.root_path, file.host_relative_path, old_source or nil)
         if not restore_called or not file_restored then
             recovery_failure = recovery_failure or flywow_result.failure(
                 restore_called and native_code(restore_failure) or "HU_CONTROL_FAILED", file.host_relative_path)
@@ -1211,6 +1210,7 @@ local function complete_batch(controller, batch)
     batch.target_service_count = #batch.service_targets
     batch.service_targets = nil
     batch.files = nil
+    batch.old_sources = nil
     batch.deployed_file_count = nil
     batch.modules = nil
     batch.service_patches = nil

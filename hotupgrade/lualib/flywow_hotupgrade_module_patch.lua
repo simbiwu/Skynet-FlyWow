@@ -241,10 +241,7 @@ function M.stage(module_patches, module_loaders)
         entry.loader_name = nil
         entry.loader_path = nil
         if not candidate_succeeded then
-            local failure_text = tostring(candidate)
-            local cause_code, cause_message = failure_text:match("(HU_[A-Z0-9_]+):%s*(.*)$")
-            return flywow_result.failure("HU_MODULE_STAGE_FAILED", cause_message or failure_text,
-                cause_code and {cause_code = cause_code} or nil)
+            return hotupgrade_common.failure_from_lua_error("HU_MODULE_STAGE_FAILED", candidate)
         end
         local candidate_exports = check_exports(candidate, entry.name)
         if not candidate_exports.ok then

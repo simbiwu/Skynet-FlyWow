@@ -327,9 +327,9 @@ while true do
 end
 ~~~
 
-Controller 从 begin 到终态复用同一个 batch。读取发布包时将冻结源码和初次匹配目标写入该记录，Prepare 重匹配复用原目标对象。Controller 的 batch.phase 是唯一保存的发布进度，生命周期门禁直接读取活动批次；Update 按唯一 Service handle 顺序各派发一次，且只有全部 Update 成功后才派发 Finish。Service 本地批次只保留提交与恢复所需的快照，不另存 Controller 已保证的 Update/Finish 阶段状态。status 的 lifecycle.pending_service_count 和 pending_module_count 分别表示尚未完成创建或登记的受管理 Service 数、尚未完成首次加载或登记的普通模块数；phase 和 recovery_required 仍由当前及最近终态批次生成，新批次进行中保留最近终态的恢复诊断。
+Controller 从 begin 到终态复用同一个 batch。每个普通 Lua 文件只冻结一次，部署清单与候选清单引用同一文件记录。旧源码按宿主相对路径单独保存，只供 Controller 恢复。Prepare 重匹配复用原目标对象。Controller 的 batch.phase 是唯一保存的发布进度，生命周期门禁直接读取活动批次；Update 按唯一 Service handle 顺序各派发一次，且只有全部 Update 成功后才派发 Finish。Service 本地批次只保留提交与恢复所需的快照，不另存 Controller 已保证的 Update/Finish 阶段状态。status 的 lifecycle.pending_service_count 和 pending_module_count 分别表示尚未完成创建或登记的受管理 Service 数、尚未完成首次加载或登记的普通模块数；phase 和 recovery_required 仍由当前及最近终态批次生成，新批次进行中保留最近终态的恢复诊断。
 
-每个目标 Lua State 在 Update 中准备提交内容。写入开始前将 Service 旧状态和旧函数交给本地批次，普通模块提交后也只保留 Abort 所需的线上表和旧导出字段。Abort、Finish 和控制异常通过同一个收尾操作释放批次引用。控制命令先校验真实来源，有活动批次时再核对 batch_id。若控制异常已在目标本地收尾，Controller 随后发送 Abort 时，目标直接确认无需再次恢复。输入在首次可信边界检查，内部不重复校验没有变化的数据；Service Patch 返回值、自定义快照和候选导出在产生处检查，执行 import_state 后才再次检查候选图。跨 yield 后的来源、许可、缓存身份和模块代码可能改变的状态仍在使用处核对。
+每个目标 Lua State 在 Update 中准备提交内容。已验证的 Service Patch 定义直接用于加载依赖和提交。仅在会修改状态或函数时保存旧数据，并在首次写入前交给本地批次。普通模块提交后也只保留 Abort 所需的线上表和旧导出字段。Abort、Finish 和控制异常通过同一个收尾操作释放批次引用。控制命令先校验真实来源，有活动批次时再核对 batch_id。若控制异常已在目标本地收尾，Controller 随后发送 Abort 时，目标直接确认无需再次恢复。输入在首次可信边界检查，内部不重复校验没有变化的数据；Service Patch 返回值、自定义快照和候选导出在产生处检查，执行 import_state 后才再次检查候选图。跨 yield 后的来源、许可、缓存身份和模块代码可能改变的状态仍在使用处核对。
 
 begin 建立批次后立即返回 batch_id，由 Controller 的原有协程继续发布。排空和 PREPARE 窗口继续接纳依赖，创建、登记和首次加载完成或取消后，由原有完成回调唤醒发布协程；完成通知只唤醒，不自动关闭门禁。协程恢复后重新检查在途计数，并重新匹配新增目标，没有定时扫描或轮询排空。正常发布期间，遗漏登记或取消会持续等待，不自动清理记录。若 Prepare 排空等待中目标退出并导致本批失败，发布协程立即转入 Abort；尚未完成的创建或首次加载仍由其原流程收尾。重复 begin 返回 HU_UPGRADE_BUSY。
 

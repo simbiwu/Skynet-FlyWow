@@ -145,8 +145,9 @@ int scanDirectory(const std::string &directory, const std::string &relative, std
 
 // 与扫描和 Controller 配置共用的相对目录检查；逐级拒绝链接和特殊文件。
 bool resolveDirectory(const std::string &root_argument, const std::string &relative,
-                      std::string &root, std::string &directory)
+                      std::string &directory)
 {
+    std::string root; // 校验相对目录时使用的规范化根路径，仅在本函数中使用。
     if (!resolvePath(root_argument, root) || relative.empty() || relative.size() >= PATH_MAX ||
         relative.find('\0') != std::string::npos || relative[0] == '/' ||
         relative.find('\\') != std::string::npos)
@@ -203,10 +204,8 @@ bool resolveDirectory(const std::string &root_argument, const std::string &relat
 int listLuaFiles(const std::string &patch_root, const std::string &relative_patch_dir,
                  std::vector<std::string> &output)
 {
-    // 第二参数模式下解析后的信任根目录。
-    std::string root;      // 解析后的 Patch 根目录，用来核对发布目录仍在根内。
     std::string directory; // 本次要递归枚举的绝对目录；返回数组仍使用相对路径。
-    if (!resolveDirectory(patch_root, relative_patch_dir, root, directory))
+    if (!resolveDirectory(patch_root, relative_patch_dir, directory))
     {
         return -1;
     }
@@ -498,13 +497,12 @@ int resolve(lua_State *state)
         bool        resolved = false;
         if (lua_gettop(state) >= 2)
         {
-            std::string relative;
-            std::string root;
+            std::string relative; // 调用方指定的根目录相对路径，用于逐段校验。
             if (!binding.readValue(2, relative))
             {
                 return mapNativeFailure(binding, binding.pushError());
             }
-            resolved = resolveDirectory(input, relative, root, output);
+            resolved = resolveDirectory(input, relative, output);
         }
         else
         {

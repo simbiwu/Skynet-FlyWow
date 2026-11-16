@@ -1,4 +1,5 @@
--- HotUpgrade Lua 模块共用的协议、配置和 Lua 文件头处理。
+-- HotUpgrade Lua 模块共用的协议、配置、文件头处理和候选代码异常转换。
+local flywow_result = require "flywow_result" -- 构造包含阶段错误码和实际根因的失败结果。
 local M =
 {
     ROOT_PATH_ENV      = "flywow_hotupgrade_root_path", -- Controller 发布的进程内宿主根路径；所有目标 State 共用。
@@ -23,6 +24,18 @@ function M.normalize_source(source)
         source = newline and source:sub(newline) or "\n"
     end
     return source
+end
+
+--- Service Patch、候选模块或受控 require 执行抛错后，保留调用阶段和本次异常携带的 HotUpgrade 根因。
+---@param stage_code string 捕获异常的调用方所属阶段的错误码，作为返回结果的 code。
+---@param thrown any pcall 返回的异常值；从其文本识别实际传播的 HU_ 错误码。
+---@return FlyWowResult<nil> 阶段失败结果；识别到 HU_ 根因时附带 details.cause_code。
+function M.failure_from_lua_error(stage_code, thrown)
+    -- 异常转成文本后，分离内部错误码和消息；普通 Lua 错误保留完整文本。
+    local failure_text = tostring(thrown)
+    local cause_code, cause_message = failure_text:match("(HU_[A-Z0-9_]+):%s*(.*)$")
+    return flywow_result.failure(stage_code, cause_message or failure_text,
+        cause_code and {cause_code = cause_code} or nil)
 end
 
 return M
