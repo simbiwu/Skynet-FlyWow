@@ -4,6 +4,7 @@
 #include <limits>
 #include <set>
 #include <stdexcept>
+#include <vector>
 
 namespace flywow_lua_binding
 {
@@ -14,6 +15,29 @@ LuaNativeData::LuaNativeData() : proxy_state_(std::make_shared<LuaNativeDataProx
 LuaNativeData::~LuaNativeData() noexcept
 {
     proxy_state_->node = nullptr;
+
+    // 把每层子节点的所有权移到本次析构的工作栈。单个节点释放前已移走它的子树。
+    std::vector<std::unique_ptr<LuaNativeData>> pending_nodes;
+    const auto                                  detach_children = [&pending_nodes](FieldMap &fields)
+    {
+        for (auto &entry : fields)
+        {
+            auto *child = std::get_if<std::unique_ptr<LuaNativeData>>(&entry.second);
+            if (child && *child)
+            {
+                pending_nodes.push_back(std::move(*child));
+            }
+        }
+    };
+
+    detach_children(fields_);
+    while (!pending_nodes.empty())
+    {
+        auto node = std::move(pending_nodes.back()); // 此节点由本轮循环释放。
+        pending_nodes.pop_back();
+        detach_children(node->fields_);
+        node->fields_.clear(); // 子节点已独立排队；析构当前节点时只需通知其代理失效。
+    }
 }
 const LuaNativeDataValue *LuaNativeData::get(const LuaNativeDataKey &key) const
 {
@@ -35,23 +59,34 @@ void LuaNativeData::erase(const LuaNativeDataKey &key)
 }
 std::unique_ptr<LuaNativeData> LuaNativeData::clone() const
 {
-    auto copy = std::make_unique<LuaNativeData>(); // 新树在返回前仅归本作用域所有。
-    for (const auto &[key, value] : fields_)
+    auto copy = std::make_unique<LuaNativeData>(); // 新树由本作用域独占，完成后一次性交给调用者。
+    // 每项将尚未复制字段的来源节点与新树中已挂接的副本节点配对。
+    std::vector<std::pair<const LuaNativeData *, LuaNativeData *>> pending_nodes{
+        {this, copy.get()}};
+    while (!pending_nodes.empty())
     {
-        std::visit(
-            [&](const auto &field)
-            {
-                using T = std::decay_t<decltype(field)>;
-                if constexpr (std::is_same_v<T, std::unique_ptr<LuaNativeData>>)
+        const auto [source, target] = pending_nodes.back();
+        pending_nodes.pop_back();
+        for (const auto &[key, value] : source->fields_)
+        {
+            std::visit(
+                [&](const auto &field)
                 {
-                    copy->set(key, field->clone());
-                }
-                else
-                {
-                    copy->set(key, field);
-                }
-            },
-            value);
+                    using T = std::decay_t<decltype(field)>;
+                    if constexpr (std::is_same_v<T, std::unique_ptr<LuaNativeData>>)
+                    {
+                        auto  child        = std::make_unique<LuaNativeData>();
+                        auto *target_child = child.get(); // 挂接后仍由 target 保活。
+                        target->set(key, std::move(child));
+                        pending_nodes.emplace_back(field.get(), target_child);
+                    }
+                    else
+                    {
+                        target->set(key, field);
+                    }
+                },
+                value);
+        }
     }
     return copy;
 }
@@ -210,11 +245,12 @@ void pushValue(lua_State *state, const LuaNativeDataValue &value)
         value);
 }
 
-// 递归链只属于本次赋值；所有子树完整构造后才移动挂接，不保存 Lua 引用。
-// state/index 是来源字段；ancestors 是当前 table 递归链，返回尚未挂接的独立值。
-LuaNativeDataValue readValue(lua_State *state, int index, std::set<const void *> &ancestors)
+// 将标量或已有代理复制为独立字段。调用方负责逐层遍历 Lua table。
+/// @param state 当前 NativeData 赋值使用的 Lua State。
+/// @param index 待复制的字段值槽；代理复制其当前整棵子树。
+/// @return 尚未挂接的字段值；类型不支持或代理失效时抛错。
+LuaNativeDataValue copyFieldValue(lua_State *state, int index)
 {
-    index = lua_absindex(state, index); // 递归压栈后仍指向当前来源值。
     switch (lua_type(state, index))
     {
     case LUA_TBOOLEAN:
@@ -233,36 +269,74 @@ LuaNativeDataValue readValue(lua_State *state, int index, std::set<const void *>
     }
     case LUA_TUSERDATA:
         return readNode(state, index)->clone();
-    case LUA_TTABLE:
+    default:
+        throw "unsupported NativeData value";
+    }
+}
+
+// 遍历原始 table 字段，把完整副本交给赋值入口，失败时由本作用域销毁候选树。
+/// @param state 当前 Lua State；每层保留父表的迭代键和子表值供返回时继续遍历。
+/// @param index 来源 table 的栈位置；源表及其元表保持原样。
+/// @return 独占的新数据树；环、非法字段或 Lua 栈空间不足时抛错。
+std::unique_ptr<LuaNativeData> copyTable(lua_State *state, int index)
+{
+    struct TableFrame
     {
-        // C++ 递归不会建立新的 Lua 调用帧。每层预留 key/value 两槽，
-        // 并留两槽供嵌套 userdata 的精确元表检查；下一层 table 自行继续预留。
-        // lua_checkstack 返回失败时先通过 C++ 展开临时树，再由元方法出口抛错。
+        int            table_index; ///< 来源表的绝对栈位置，子表压栈后仍可供 lua_next 使用。
+        const void    *identity;    ///< 来源表身份，退出本层时用于移出活跃路径。
+        LuaNativeData *target;      ///< 候选树中接收本层字段的节点，由候选树保活。
+    };
+
+    auto                    root = std::make_unique<LuaNativeData>(); // 完整导入后才交给实际字段。
+    std::vector<TableFrame> frames;    // 每层的 Lua 迭代进度，由本次导入持有。
+    std::set<const void *>  ancestors; // 只记录当前路径，同一表可在兄弟字段中独立复制。
+    const auto              enter_table = [&](int table_index, LuaNativeData *target)
+    {
+        // lua_next 最多追加两个槽，嵌套 userdata 元表比较再使用两个槽。
         if (!lua_checkstack(state, 4))
         {
             throw "NativeData table copy exceeds Lua stack capacity";
         }
-        const void *identity = lua_topointer(state, index); // 本次来源 table 的身份，只用于环检测。
+        const void *identity = lua_topointer(state, table_index);
         if (!ancestors.insert(identity).second)
         {
             throw "NativeData cannot copy a cyclic table";
         }
-        auto child = std::make_unique<LuaNativeData>(); // 尚未挂接，普通错误由 unique_ptr 释放。
-        lua_pushnil(state);
-        // [S, key] -> [S, key, value]；递归返回后只弹 value，保留 key 给下一次 lua_next。
-        while (lua_next(state, index))
+        frames.push_back({table_index, identity, target});
+        lua_pushnil(state); // 新一层以 nil 作为 lua_next 的首个控制键。
+    };
+
+    enter_table(lua_absindex(state, index), root.get());
+    while (!frames.empty())
+    {
+        const auto &frame = frames.back(); // 当前最内层；进入下一层后不再使用此引用。
+        if (!lua_next(state, frame.table_index))
         {
-            auto key   = readKey(state, -2);              // 当前来源字段的键，按原始字段读取。
-            auto value = readValue(state, -1, ancestors); // 完整的新字段值，子树只转换一次。
-            child->set(key, std::move(value));
+            ancestors.erase(frame.identity);
+            frames.pop_back();
+            if (!frames.empty())
+            {
+                lua_pop(state, 1); // 子表迭代结束，移除其 value，保留父表的控制键。
+            }
+            continue;
+        }
+
+        // [S, key, value]；进入子表时保留两项，复制非 table 字段后只弹出 value。
+        const auto key = readKey(state, -2);
+        if (lua_istable(state, -1))
+        {
+            auto  child  = std::make_unique<LuaNativeData>();
+            auto *target = child.get(); // 由候选树持有，直到本次导入完成或失败。
+            frame.target->set(key, std::move(child));
+            enter_table(lua_gettop(state), target);
+        }
+        else
+        {
+            frame.target->set(key, copyFieldValue(state, -1));
             lua_pop(state, 1);
         }
-        ancestors.erase(identity); // 退出当前递归链；兄弟位置重复出现同一表仍可独立复制。
-        return child;
     }
-    default:
-        throw "unsupported NativeData value";
-    }
+    return root;
 }
 
 // Lua 字段读取：缺失是 nil；子节点仅返回不拥有子树的代理。
@@ -295,8 +369,9 @@ int __newindex(lua_State *state)
         return 0;
     }
 
-    std::set<const void *> ancestors;            // 本次导入的当前递归路径；操作结束即释放。
-    auto value = readValue(state, 3, ancestors); // 尚未挂接的完整值，失败时旧值保持。
+    // table 与其他字段都在 set 之前完成转换，任何失败都保留旧值。
+    auto value =
+        lua_istable(state, 3) ? LuaNativeDataValue(copyTable(state, 3)) : copyFieldValue(state, 3);
     node->set(key, std::move(value));
     return 0;
 }

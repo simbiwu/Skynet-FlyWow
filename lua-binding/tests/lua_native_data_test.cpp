@@ -78,6 +78,16 @@ int retained_root(lua_State *state)
     return binding.returnValues(*owner);
 }
 
+// 把本 State 首次构造的 NativeData 放在多返回值末尾，覆盖元表初始化的栈峰值。
+int return_many_with_native_data(lua_State *state)
+{
+    LuaBinding binding(state);                           // 本回调的多返回值出口。
+    auto       root = std::make_shared<LuaNativeData>(); // 最后一个值；当前 State 尚未注册其元表。
+    root->set("hp", std::int64_t{23});
+    return binding.returnValues(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                                20, 21, root);
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 3)
@@ -200,6 +210,27 @@ int main(int argc, char **argv)
             cursor.bad = function() end
             assert(not pcall(function() d.source = deep end))
             assert(d.source.hp == 3)
+            -- 深树的导入、克隆与删除不应依赖 C++ 递归栈。
+            local depth = 100000
+            local leaf_value = { hp = 7 }
+            local deep_table = leaf_value
+            for i = 1, depth do deep_table = {child = deep_table} end
+            d.deep = deep_table
+            deep_table = nil
+            d.deep_copy = d.deep
+            local leaf = d.deep
+            local leaf_copy = d.deep_copy
+            for i = 1, depth do
+                leaf = leaf.child
+                leaf_copy = leaf_copy.child
+            end
+            assert(leaf.hp == 7 and leaf_copy.hp == 7 and leaf ~= leaf_copy)
+            d.deep = nil
+            expired(function() return leaf.hp end)
+            assert(leaf_copy.hp == 7)
+            d.deep_copy = nil
+            expired(function() return leaf_copy.hp end)
+
             local cyc = {}; cyc.self = cyc
             local ok = pcall(function() d.source = cyc end)
             assert(not ok and d.source.hp == 3)
@@ -270,6 +301,20 @@ int main(int argc, char **argv)
                    "borrowed_kept.hp end))");
         check(weak.expired(), "child proxy must not retain root");
         check(lua_gettop(state) == 0, "test scenarios leave balanced stack");
+        lua_close(state);
+
+        // 首次注册栈峰值在新的 State 验证，保留 peer .so 在原 State 首次注册的覆盖。
+        state = luaL_newstate();
+        check(state != nullptr, "Lua State allocation for return stack test");
+        luaL_openlibs(state);
+        lua_pushcfunction(state, LuaBinding::nativeCallback<return_many_with_native_data>);
+        lua_setglobal(state, "return_many_with_native_data");
+        run(state, R"lua(
+            local packed = table.pack(return_many_with_native_data())
+            assert(packed.n == 22 and packed[22].hp == 23)
+            for i = 1, 21 do assert(packed[i] == i) end
+        )lua");
+
         lua_close(state);
         state = nullptr;
         std::cout << "FLYWOW_NATIVE_DATA_OK" << std::endl;

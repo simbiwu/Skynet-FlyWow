@@ -195,6 +195,14 @@ int table_operations(lua_State *state)
     std::uint32_t map_id = 0; // 请求或子表中的地图编号，0 也可读取成功。
     require(child.readValue("map_id", map_id) && map_id == 17, "nested field read failed");
     require(!input.readValue("missing", map_id) && map_id == 17, "missing changed output");
+    require(input.readOptionalValue("missing", map_id) && map_id == 17,
+            "missing optional field changed default");
+    require(!input.readOptionalValue("child", map_id) && map_id == 17,
+            "invalid optional scalar changed output");
+    require(input.readOptionalTable("missing", child), "missing optional table failed");
+    require(!input.readOptionalTable("kept", child), "invalid optional table accepted");
+    require(child.readValue("map_id", map_id) && map_id == 17,
+            "missing or invalid optional table replaced output");
 
     auto moved = std::move(input); // 接管 input 引用的句柄，原 input 此后失效。
     require(!input.valid() && moved.valid(), "table move failed");
@@ -218,6 +226,11 @@ int table_operations(lua_State *state)
     bool truth = false; // 按 Lua 真值规则读取的布尔输出。
     require(child.readTruth(-1, truth) && truth, "zero truth changed");
     require(child.readTruth(0, truth) && !truth, "false truth changed");
+    require(child.readOptionalTruth(-1, truth) && truth, "optional truth rejected zero");
+    require(child.readOptionalTruth(2, truth) && truth, "missing truth changed default");
+    require(child.readOptionalTruth(0, truth) && !truth, "explicit false lost in optional truth");
+    require(!child.readOptionalValue(-1, truth) && !truth, "strict boolean accepted zero");
+    require(child.readOptionalValue(0, truth) && !truth, "strict boolean rejected false");
 
     LuaTable parent; // 临时父表，先释放它再检查子表独立引用。
     if (!lua_binding.newTable(parent))

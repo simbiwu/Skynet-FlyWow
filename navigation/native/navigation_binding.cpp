@@ -141,10 +141,7 @@ bool readWorldPosition(LuaBinding &lua_binding, int index, WorldPosition &output
 LuaTable worldPositionTable(LuaBinding &lua_binding, const WorldPosition position)
 {
     LuaTable table;
-    if (!lua_binding.newTable(table))
-    {
-        return {};
-    }
+    lua_binding.newTable(table);
     if (!table.writeValue("x_mm", position.x_mm) || !table.writeValue("y_mm", position.y_mm) ||
         !table.writeValue("z_mm", position.z_mm))
     {
@@ -156,18 +153,18 @@ LuaTable worldPositionTable(LuaBinding &lua_binding, const WorldPosition positio
 // area_cost_permille 使用业务 key=0..255；未配置保持默认 1000，不按 profiles 的 1-based 处理。
 bool readAreaCosts(const LuaTable &table, flywow_navigation::NavigationProfile &profile)
 {
-    if (table.isNil("area_cost_permille"))
-    {
-        return true;
-    }
     LuaTable costs;
-    if (!table.readTable("area_cost_permille", costs))
+    if (!table.readOptionalTable("area_cost_permille", costs))
     {
         return false;
     }
+    if (!costs.valid())
+    {
+        return true;
+    }
     for (int area = 0; area < 256; ++area)
     {
-        if (!costs.isNil(area) && !costs.readValue(area, profile.area_cost_permille[area]))
+        if (!costs.readOptionalValue(area, profile.area_cost_permille[area]))
         {
             return false;
         }
@@ -177,27 +174,24 @@ bool readAreaCosts(const LuaTable &table, flywow_navigation::NavigationProfile &
 
 bool readAreaAllowed(const LuaTable &table, flywow_navigation::NavigationProfile &profile)
 {
-    if (table.isNil("area_allowed"))
-    {
-        return true;
-    }
     LuaTable allowed;
-    if (!table.readTable("area_allowed", allowed))
+    if (!table.readOptionalTable("area_allowed", allowed))
     {
         return false;
     }
+    if (!allowed.valid())
+    {
+        return true;
+    }
     for (int area = 0; area < 256; ++area)
     {
-        if (!allowed.isNil(area))
+        // nil 保留此 Area 的默认通行策略；显式值沿用 Lua 真值，数字 0 也为真。
+        bool is_allowed = profile.area_allowed[area] != 0;
+        if (!allowed.readOptionalTruth(area, is_allowed))
         {
-            // 保留既有 Lua 真值合同：只有 nil/false 为假，数字 0 也为真。
-            bool value = false;
-            if (!allowed.readTruth(area, value))
-            {
-                return false;
-            }
-            profile.area_allowed[area] = value ? 1 : 0;
+            return false;
         }
+        profile.area_allowed[area] = is_allowed ? 1 : 0;
     }
     return true;
 }
@@ -270,10 +264,7 @@ int load_map(lua_State *state)
         content_sha256[i * 2 + 1] = digits[hash[i] & 15];
     }
     LuaTable table;
-    if (!lua_binding.newTable(table))
-    {
-        return lua_binding.pushError();
-    }
+    lua_binding.newTable(table);
     if (!table.writeValue("map_id", metadata.map_id) ||
         !table.writeValue("map_version", metadata.map_version) ||
         !table.writeValue("content_sha256", content_sha256))
@@ -286,10 +277,7 @@ LuaTable cellResultTable(LuaBinding &lua_binding, const flywow_navigation::GridP
                          const flywow_navigation::NavCell &cell)
 {
     LuaTable table;
-    if (!lua_binding.newTable(table))
-    {
-        return {};
-    }
+    lua_binding.newTable(table);
     if (!table.writeValue("grid_x", grid.x) || !table.writeValue("grid_z", grid.z) ||
         !table.writeValue("cell_height_mm", cell.height_mm) ||
         !table.writeValue("area", cell.area_type) ||
@@ -396,22 +384,17 @@ int new_context(lua_State *state)
         LuaTable limits;
         if (!lua_binding.readTable(2, limits))
             return lua_binding.pushError();
-        if (!limits.isNil("expanded") && !limits.readValue("expanded", air.expanded))
+        if (!limits.readOptionalValue("expanded", air.expanded) ||
+            !limits.readOptionalValue("nodes", air.nodes) ||
+            !limits.readOptionalValue("buckets", air.buckets) ||
+            !limits.readOptionalValue("tests", air.tests) ||
+            !limits.readOptionalValue("path_points", air.path_points) ||
+            !limits.readOptionalValue("objects", air.objects) ||
+            !limits.readOptionalValue("object_links", air.object_links) ||
+            !limits.readOptionalValue("links", air.links))
+        {
             return lua_binding.pushError();
-        if (!limits.isNil("nodes") && !limits.readValue("nodes", air.nodes))
-            return lua_binding.pushError();
-        if (!limits.isNil("buckets") && !limits.readValue("buckets", air.buckets))
-            return lua_binding.pushError();
-        if (!limits.isNil("tests") && !limits.readValue("tests", air.tests))
-            return lua_binding.pushError();
-        if (!limits.isNil("path_points") && !limits.readValue("path_points", air.path_points))
-            return lua_binding.pushError();
-        if (!limits.isNil("objects") && !limits.readValue("objects", air.objects))
-            return lua_binding.pushError();
-        if (!limits.isNil("object_links") && !limits.readValue("object_links", air.object_links))
-            return lua_binding.pushError();
-        if (!limits.isNil("links") && !limits.readValue("links", air.links))
-            return lua_binding.pushError();
+        }
     }
 
     auto created = flywow_navigation::NavigationContext::create(found.value, air);
@@ -711,10 +694,7 @@ LuaTable advanceResultTable(LuaBinding                                 &lua_bind
         return {};
     }
     LuaTable table;
-    if (!lua_binding.newTable(table))
-    {
-        return {};
-    }
+    lua_binding.newTable(table);
     auto position = worldPositionTable(lua_binding, advanced.position);
     if (!position.valid() || !table.writeValue("status", status) ||
         !table.writeValue("position", position) ||
@@ -965,10 +945,8 @@ void registerPath(lua_State *state)
 // 空中入口全部使用具名 record；这里只转换合同，不维护第二套 Context/Path 类型。
 bool readAirPolicy(const LuaTable &request, flywow_navigation::AirPolicy &policy)
 {
-    if (!request.isNil("check_terrain") &&
-        !request.readValue("check_terrain", policy.check_terrain))
-        return false;
-    return request.isNil("clearance_mm") || request.readValue("clearance_mm", policy.clearance_mm);
+    return request.readOptionalValue("check_terrain", policy.check_terrain) &&
+           request.readOptionalValue("clearance_mm", policy.clearance_mm);
 }
 bool readAirPosition(const LuaTable &request, const char *name, WorldPosition &position)
 {
@@ -1030,7 +1008,7 @@ int sweep_air(lua_State *state)
     if (!readContext(lua_binding, owner) || !lua_binding.readTable(2, request) ||
         !readAirPosition(request, "from", from) || !readAirPosition(request, "to", to) ||
         !readAirBody(request, body) || !readAirPolicy(request, policy) ||
-        (!request.isNil("exclude_handle") && !request.readValue("exclude_handle", exclude_handle)))
+        !request.readOptionalValue("exclude_handle", exclude_handle))
         return lua_binding.pushError();
 
     const auto result =
@@ -1039,10 +1017,7 @@ int sweep_air(lua_State *state)
         return lua_binding.pushError(flywow_navigation::navErrorName(result.error), result.detail);
 
     LuaTable out;
-    if (!lua_binding.newTable(out))
-    {
-        return lua_binding.pushError();
-    }
+    lua_binding.newTable(out);
     const auto &hit  = result.value;
     const char *kind = hit.kind == flywow_navigation::AirHitKind::kClear    ? "clear"
                        : hit.kind == flywow_navigation::AirHitKind::kStatic ? "static"
@@ -1072,9 +1047,8 @@ int find_air_path(lua_State *state)
         !readAirPosition(request, "start", start) || !readAirPosition(request, "target", target) ||
         !readAirBody(request, body) || !readAirPolicy(request, policy) ||
         !request.readValue("flight_y_mm", flight_y_mm) ||
-        (!request.isNil("exclude_handle") &&
-         !request.readValue("exclude_handle", exclude_handle)) ||
-        (!request.isNil("range_mm") && !request.readValue("range_mm", range_mm)))
+        !request.readOptionalValue("exclude_handle", exclude_handle) ||
+        !request.readOptionalValue("range_mm", range_mm))
         return lua_binding.pushError();
 
     auto result = flywow_navigation::findAirPath(*owner->context, start, target, flight_y_mm, body,
@@ -1129,10 +1103,7 @@ int advance_air_path(lua_State *state)
     {
         // 推进可在后段失败前已有合法提交；错误 record 携带真实位置，Lua owner 不会丢失恢复依据。
         LuaTable error;
-        if (!lua_binding.newTable(error))
-        {
-            return lua_binding.pushError();
-        }
+        lua_binding.newTable(error);
         if (!error.writeValue("code", flywow_navigation::navErrorName(result.error)) ||
             !error.writeValue("message", result.detail))
             return lua_binding.pushError();

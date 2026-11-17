@@ -61,6 +61,29 @@ void LuaTable::push() const
     lua_rawgeti(binding_->state_, LUA_REGISTRYINDEX, reference_);
 }
 
+bool LuaTable::writeField()
+{
+    auto *state = binding_->state_; // 栈顶已是目标表、键和值。
+    // [S, table, key, value] -> [S, rawset, table, key, value]。
+    lua_pushcfunction(state,
+                      [](lua_State *call_state) -> int
+                      {
+                          lua_rawset(call_state,
+                                     1); // 成功时消耗 key/value；共享表在此抛出 Lua 错误。
+                          return 0;
+                      });
+    lua_insert(state, -4);
+    if (lua_pcall(state, 3, 0, 0) != LUA_OK)
+    {
+        // 失败时只剩 Lua 错误对象，外层 StackRestore 会清除它。
+        const char *message =
+            lua_type(state, -1) == LUA_TSTRING ? lua_tostring(state, -1) : "Lua operation failed";
+        binding_->setError("INTERNAL_ERROR", message);
+        return false;
+    }
+    return true;
+}
+
 bool LuaTable::denseArrayLength(std::size_t &output) const
 {
     if (!valid())

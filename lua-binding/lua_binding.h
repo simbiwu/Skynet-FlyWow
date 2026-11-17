@@ -30,6 +30,8 @@ namespace detail
 // upvalue 1 仍为元表身份；这两项均不占用任何业务方法的 upvalue。
 inline constexpr lua_Integer kManagedGcTag = 0x46574743;
 inline constexpr int         kMaxUpvalues  = 255; // Lua 5.4 的业务 upvalue 数量上限。
+// 压入一个值时的峰值。首次注册 NativeData 元表需要同时放置元表、字段值与临时键。
+inline constexpr int         kPushValueStackSlots = 3;
 union UserdataAlignment
 {
     LUAI_MAXALIGN;
@@ -339,8 +341,10 @@ class LuaBinding
         }
 
         const int base = lua_gettop(state_); // 转换失败时丢弃已经压入的部分结果。
-        // C 函数默认栈空间之外的返回值由 Lua API 扩栈；超过 Lua 上限时按 Lua 栈错误处理。
-        luaL_checkstack(state_, static_cast<int>(sizeof...(Values)), "Native results exceed stack capacity");
+        // 为最后一个值的临时项和回调退出时的 unref 留空间。转换失败先回到 base，
+        // 预留的槽也足以构造 [nil, error_table, 临时字段值, 临时键]。
+        luaL_checkstack(state_, static_cast<int>(sizeof...(Values)) + detail::kPushValueStackSlots,
+                        "Native results exceed stack capacity");
         const char *failure = nullptr; // 严格转换失败时的静态诊断。
         if (!(pushRaw(state_, values, &failure) && ...))
         {
@@ -575,12 +579,6 @@ class LuaBinding
         output = static_cast<T *>(object);
         return true;
     }
-
-    // 处理 lua_pcall 的结果：成功返回 true；Lua 错误或 failure 文本转成本次 Binding 诊断。
-    /// @param succeeded lua_pcall 是否得到 LUA_OK。
-    /// @param failure 回调报告的常量输入错误；为 nullptr 时只处理 Lua 错误对象。
-    /// @return 无错误为 true；否则记录诊断并返回 false。
-    bool completeCall(bool succeeded, const char *failure = nullptr);
 
     // 确认 index 是当前参数栈中的正槽或真实负槽；伪索引和栈外位置记录 INVALID_ARGUMENT。
     /// @param index 要读取的 Lua 栈编号。

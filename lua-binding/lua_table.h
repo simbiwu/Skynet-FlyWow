@@ -62,49 +62,91 @@ class LuaTable
         return readField(key) && binding_->readTruthAt(-1, output);
     }
 
-    // 写入共享表可能抛出非 OOM Lua 错误，因此保留一次 pcall；转换失败不更新字段。
-    // 普通 table 可写任何合法 key；托管元表的 __gc 在注册与后续字段写入时均受保护。
+    /// 读取可选标量字段；省略或 nil 时保留调用方默认值，显式值按 readValue 转换。
+    /// @param key 待读取字段；通过一次 raw 查找取得值。
+    /// @param output 缺省时保持原值；显式值转换成功后覆盖。
+    /// @return 缺省或读取成功为 true；句柄或字段类型、范围错误时为 false。
+    template <typename Key, typename T> bool readOptionalValue(const Key &key, T &output) const
+    {
+        if (!valid())
+        {
+            return false;
+        }
+        detail::StackRestore stack(binding_->state_);
+        return readField(key) && (lua_isnil(binding_->state_, -1) || binding_->readAt(-1, output));
+    }
+
+    /// 读取可选子表；同一次查找决定保留默认句柄或接管子表引用。
+    /// @param key 可省略的子表字段。
+    /// @param output 缺省时保持原句柄；成功读取子表后替换。
+    /// @return 字段为 nil 或取得子表为 true；显式值不是 table 或句柄无效时为 false。
+    template <typename Key> bool readOptionalTable(const Key &key, LuaTable &output) const
+    {
+        if (!valid())
+        {
+            return false;
+        }
+        detail::StackRestore stack(binding_->state_);
+        return readField(key) &&
+               (lua_isnil(binding_->state_, -1) || binding_->readTableAt(-1, output));
+    }
+
+    /// 读取可选字段的 Lua 真值；nil 保留默认值，显式 false 覆盖默认值。
+    /// @param key 待读取字段；通过一次 raw 查找取得值。
+    /// @param output 调用方预置默认值；非 nil 时接收 Lua 真值。
+    /// @return 缺省或读取成功为 true；句柄或 key 不合法时为 false。
+    template <typename Key> bool readOptionalTruth(const Key &key, bool &output) const
+    {
+        if (!valid())
+        {
+            return false;
+        }
+        detail::StackRestore stack(binding_->state_);
+        return readField(key) &&
+               (lua_isnil(binding_->state_, -1) || binding_->readTruthAt(-1, output));
+    }
+
+    // 转换在当前 C++ 作用域完成。共享表 raw 写入由单独的保护调用捕获。
     /// @param key 真实整数或完整字符串 key。
     /// @param value 要保存的值；nullptr 删除字段，table/userdata 不复制对象。
-    /// @return 写入成功 true；失败 false 并记录诊断（无 owner 的句柄除外）。
+    /// @return 写入成功为 true；失败为 false 并记录诊断（无 owner 的句柄除外）。
     template <typename Key, typename T> bool writeValue(const Key &key, const T &value)
     {
         static_assert((std::is_integral_v<Key> && !std::is_same_v<Key, bool>) ||
                       std::is_convertible_v<const Key &, std::string>);
         if (!valid())
-            return false;
-        detail::StackRestore stack(binding_->state_);
-        struct Arguments
         {
-            const LuaTable *table;             ///< 本次写入的目标表，借用当前句柄。
-            const Key      &key;               ///< 借用调用方字段 key，不执行隐式转换。
-            const T        &value;             ///< 借用调用方待写入值，保护调用结束前有效。
-            const char     *failure = nullptr; ///< 转换或托管 __gc 写保护失败时的静态诊断。
-        } args{this, key, value};
+            return false;
+        }
 
-        // 参数 1 借用 Arguments；回调的 Lua 错误由 pcall 转为栈顶错误对象。
-        lua_pushcfunction(
-            binding_->state_,
-            [](lua_State *state) noexcept -> int
-            {
-                auto *data = static_cast<Arguments *>(lua_touserdata(state, 1));
-                lua_rawgeti(state, LUA_REGISTRYINDEX, data->table->reference_);
-                LuaBinding *binding = data->table->binding_;
-                if (!binding->pushRaw(state, data->key, &data->failure))
-                    return 0;
-                if (!LuaBinding::canWriteField(state, -2, -1))
-                {
-                    data->failure = "__gc is managed by userdata registration";
-                    return 0;
-                }
-                if (!binding->pushRaw(state, data->value, &data->failure))
-                    return 0;
-                lua_rawset(state, -3);
-                return 0;
-            });
-        lua_pushlightuserdata(binding_->state_, &args);
-        const bool ok = lua_pcall(binding_->state_, 1, 0, 0) == LUA_OK;
-        return binding_->completeCall(ok, args.failure);
+        auto *state = binding_->state_; // 当前回调的 Lua 栈，临时项随本函数退出清除。
+        detail::StackRestore stack(state);
+        // table/key 两槽外，预留 value 转换的峰值空间，也足够检查托管析构或压入写入回调。
+        if (!lua_checkstack(state, 2 + detail::kPushValueStackSlots))
+        {
+            binding_->setError("INTERNAL_ERROR", "Native table write exceeds stack capacity");
+            return false;
+        }
+
+        // [S] -> [S, table, key]；先拒绝覆盖托管 __gc，再转换 value。
+        const char *failure = nullptr; // codec 报告的类型或范围错误。
+        push();
+        if (!binding_->pushRaw(state, key, &failure))
+        {
+            binding_->setError("INVALID_ARGUMENT", failure);
+            return false;
+        }
+        if (!LuaBinding::canWriteField(state, -2, -1))
+        {
+            binding_->setError("INVALID_ARGUMENT", "__gc is managed by userdata registration");
+            return false;
+        }
+        if (!binding_->pushRaw(state, value, &failure))
+        {
+            binding_->setError("INVALID_ARGUMENT", failure);
+            return false;
+        }
+        return writeField();
     }
 
     /// 验证正整数 key 为连续 1..N，忽略其他 key；空数组输出 0，失败保持输出。
@@ -133,6 +175,10 @@ class LuaTable
     /// 将句柄引用的原表压入栈顶，不触发元方法；调用方保证句柄有效。
     /// @return 无返回值；栈顶新增一份临时表引用。
     void push() const;
+
+    /// 保护性写入栈顶的 table/key/value；调用方负责恢复临时栈。
+    /// @return 写入成功为 true；Lua 拒绝写入时记录 INTERNAL_ERROR 并返回 false。
+    bool writeField();
 
     /// 释放本句柄的 registry 引用并清空 owner；Lua 中其他引用仍可保活原表。
     /// @return 无返回值；空句柄可重复调用。

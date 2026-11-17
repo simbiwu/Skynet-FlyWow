@@ -154,27 +154,6 @@ const std::string &LuaBinding::errorCode() const
     return error_code_;
 }
 
-// Lua 错误对象在失败时仍位于栈顶；先复制诊断，再弹出。
-// 失败对象不是字符串时不触发隐式转换，避免报告错误时再进入 Lua 分配。
-bool LuaBinding::completeCall(bool succeeded, const char *failure)
-{
-    if (!succeeded)
-    {
-        setError("INTERNAL_ERROR", lua_type(state_, -1) == LUA_TSTRING ? lua_tostring(state_, -1)
-                                                                       : "Lua operation failed");
-        lua_pop(state_, 1);
-        return false;
-    }
-
-    // Lua 调用成功后仍可能有业务值转换失败；把该静态原因记录为参数错误。
-    if (failure)
-    {
-        setError("INVALID_ARGUMENT", failure);
-        return false;
-    }
-    return true;
-}
-
 // 直接构造 nil/error；Lua 复制诊断文本，返回值不借用 Binding 的字符串。
 int LuaBinding::pushError()
 {

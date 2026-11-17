@@ -28,10 +28,7 @@ int read_map_id(lua_State *state)
     }
 
     LuaTable result; // 返回表拥有独立引用，压入结果后析构不会删掉 Lua 返回值。
-    if (!lua_binding.newTable(result))
-    {
-        return lua_binding.pushError();
-    }
+    lua_binding.newTable(result);
     if (!result.writeValue("map_id", map_id))
     {
         return lua_binding.pushError();

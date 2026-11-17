@@ -530,10 +530,7 @@ int list_lua(lua_State *state)
         }
 
         LuaTable output;
-        if (!binding.newTable(output))
-        {
-            return mapNativeFailure(binding, binding.pushError());
-        }
+        binding.newTable(output);
         for (std::size_t i = 0; i < paths.size(); ++i)
         {
             if (!output.writeValue(static_cast<std::int64_t>(i + 1), paths[i]))
