@@ -159,10 +159,7 @@ int conversion_boundaries(lua_State *state)
     require(!lua_binding.readValue(-top - 1, value), "negative overflow accepted");
 
     LuaTable original; // 失败读取前持有的原表，检查输出未被替换。
-    if (!lua_binding.newTable(original))
-    {
-        return lua_binding.pushError();
-    }
+    lua_binding.newTable(original);
     require(original.writeValue("retained", 1), "initial table write failed");
     require(!lua_binding.readTable(1, original), "non-table accepted");
     int retained = 0; // 从原表回读的 retained 字段，确认失败保留句柄。
@@ -233,10 +230,7 @@ int table_operations(lua_State *state)
     require(child.readOptionalValue(0, truth) && !truth, "strict boolean rejected false");
 
     LuaTable parent; // 临时父表，先释放它再检查子表独立引用。
-    if (!lua_binding.newTable(parent))
-    {
-        return lua_binding.pushError();
-    }
+    lua_binding.newTable(parent);
     require(parent.writeValue("child", child), "parent child write failed");
     parent = LuaTable{}; // 子表独立 registry 引用，父表先销毁不影响子表。
     require(child.readValue("map_id", map_id), "child did not survive parent");
@@ -253,10 +247,7 @@ int drop_temporary(lua_State *state)
     LuaTable   weak;               // Lua 提供的弱值表，用于观察临时引用释放。
     require(lua_binding.readTable(1, weak), "weak table missing");
     LuaTable temporary; // 本回调唯一强引用的临时表，退出后应能被 GC。
-    if (!lua_binding.newTable(temporary))
-    {
-        return lua_binding.pushError();
-    }
+    lua_binding.newTable(temporary);
     require(weak.writeValue(1, temporary), "weak write failed");
     return lua_binding.returnValues();
 }
@@ -312,6 +303,12 @@ int read_tracked(lua_State *state)
     {
         return lua_binding.pushError();
     }
+    // 同一回调重复读取必须保留对象身份；移除原栈引用后仍可由 Binding 返回原对象。
+    Tracked *again = nullptr; // 第二次读取的借用地址，应与首个地址相同。
+    require(lua_binding.readUserdata(1, kTracked, again) && again == object,
+            "repeated userdata read changed identity");
+    lua_settop(state, 0);
+    lua_gc(state, LUA_GCCOLLECT);
     return lua_binding.returnValues(object->value, object);
 }
 
@@ -358,17 +355,15 @@ int userdata_errors(lua_State *state)
     lua_settop(state, stack_top);
     require(!meta.writeValue("__gc", nullptr), "managed collector could be overwritten");
     LuaTable ordinary;
-    require(lua_binding.newTable(ordinary) && ordinary.writeValue("__gc", nullptr),
+    lua_binding.newTable(ordinary);
+    require(ordinary.writeValue("__gc", nullptr),
             "ordinary field incorrectly reserved");
     Tracked *pointer = nullptr; // 闭包或测试宿主传入的外部借用地址，不归 Lua 释放。
     require(!lua_binding.newUserdata("missing.Type", pointer, readTestEnvironment(lua_binding)),
             "unregistered construction accepted");
     int      arbitrary = 0; // 未由封装创建的栈对象，必须拒绝包装为 userdata。
     LuaTable table;
-    if (!lua_binding.newTable(table))
-    {
-        return lua_binding.pushError();
-    }
+    lua_binding.newTable(table);
     require(!table.writeValue("arbitrary", &arbitrary), "arbitrary pointer wrapped as userdata");
     return lua_binding.returnValues(true);
 }
@@ -487,10 +482,7 @@ int upvalue_boundaries(lua_State *state)
 {
     LuaBinding lua_binding(state); // 本回调的错误与短期引用 owner，不跨调用保存。
     LuaTable   preserved;          // 用于确认失败不会把输出替换成 registry。
-    if (!lua_binding.newTable(preserved))
-    {
-        return lua_binding.pushError();
-    }
+    lua_binding.newTable(preserved);
     require(preserved.writeValue("marker", 17), "upvalue sentinel setup failed");
     for (int index :
          {0, -1, 2, 256, std::numeric_limits<int>::min(), std::numeric_limits<int>::max()})

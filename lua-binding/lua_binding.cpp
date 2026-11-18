@@ -209,11 +209,10 @@ bool LuaBinding::readTable(int index, LuaTable &output)
 }
 
 // 创建空 table 并保存到 registry，成功后由 output 接管引用。
-bool LuaBinding::newTable(LuaTable &output)
+void LuaBinding::newTable(LuaTable &output)
 {
     lua_newtable(state_);
     output = LuaTable(this, luaL_ref(state_, LUA_REGISTRYINDEX));
-    return true;
 }
 
 // 使用 Lua truthiness 读取已验证栈槽；Lua 的任意值都可读，不产生类型失败。
@@ -337,11 +336,9 @@ void LuaBinding::registerType(lua_State *state, const char *name, lua_CFunction 
     lua_pop(state, 1);
 }
 
-// 分配 Lua-owned 存储、设置未构造标记并挂接元表；临时引用交给 newUserdata 接管。
-bool LuaBinding::allocateUserdata(const std::string &name, std::size_t bytes, void *&storage,
-                                  int &reference)
+// 分配 Lua-owned 存储并挂接元表；栈保活对象，外层构造结束后恢复临时栈。
+bool LuaBinding::allocateUserdata(const std::string &name, std::size_t bytes, void *&storage)
 {
-    detail::StackRestore stack(state_);
     luaL_getmetatable(state_, name.c_str());
     if (!lua_istable(state_, -1))
     {
@@ -356,73 +353,46 @@ bool LuaBinding::allocateUserdata(const std::string &name, std::size_t bytes, vo
     lua_pushvalue(state_, -2);
     lua_setmetatable(state_, -2);
 
-    // luaL_ref 消耗 userdata，由外层负责构造以及接管或释放引用。
-    const int created_reference = luaL_ref(state_, LUA_REGISTRYINDEX);
-    storage   = object;
-    reference = created_reference;
+    // [元表, userdata] 留给外层；构造失败也由外层 StackRestore 释放栈引用。
+    storage = object;
     return true;
 }
 
-// 让当前 Binding 在 Native 回调期间保活 userdata；重复对象复用已有引用，新对象建立本回调的独立引用记录。
-void LuaBinding::retainUserdata(void *object, int reference)
+// 每次读取验证类型与存活状态；首次读取才建立当前 Binding 的强引用。
+void *LuaBinding::checkUserdata(int index, const std::string &name)
 {
+    // 固定负索引，元表和 uservalue 检查会短暂压栈。
+    index = lua_absindex(state_, index);
+    void *object = luaL_testudata(state_, index, name.c_str()); // 精确类型对应的 Lua-owned 存储。
+    if (!object)
+    {
+        setError("INVALID_ARGUMENT", lua_type(state_, index) != LUA_TUSERDATA
+                     ? "value must be full userdata with the registered metatable"
+                     : "value must be userdata with the registered metatable");
+        return nullptr;
+    }
+
+    // uservalue 1 表示对象构造完成且尚未析构；读取后弹出标记。
+    const int type = lua_getiuservalue(state_, index, 1); // 构造标记的实际 Lua 类型。
+    const bool alive = type == LUA_TBOOLEAN && lua_toboolean(state_, -1); // 当前对象存活状态。
+    lua_pop(state_, 1);
+    if (!alive)
+    {
+        setError("INVALID_ARGUMENT", "userdata has already been finalized");
+        return nullptr;
+    }
+
+    // 已持有的对象直接复用；首次读取复制原槽，registry 消耗副本并保活至回调结束。
     for (const auto &entry : userdata_refs_)
     {
         if (entry.object == object)
         {
-            luaL_unref(state_, LUA_REGISTRYINDEX, reference);
-            return;
+            return object;
         }
     }
-
+    lua_pushvalue(state_, index);
+    const int reference = luaL_ref(state_, LUA_REGISTRYINDEX); // 由 Binding 析构统一释放。
     userdata_refs_.push_back({object, reference});
-}
-
-// 验证精确元表和 alive 标记；成功返回借用对象地址并创建 registry 强引用。
-void *LuaBinding::inspectUserdata(lua_State *state, int index, const char *name, int &reference,
-                                  const char **failure)
-{
-    // 固定输入索引，后续读取 uservalue 与创建引用都复用同一 full userdata。
-    index = lua_absindex(state, index);
-    // luaL_testudata 同时确认具名元表身份并取得 userdata 内的 T 存储地址。
-    void *object = luaL_testudata(state, index, name); // 通过精确元表检查后取得 Lua-owned 对象存储。
-    if (!object)
-    {
-        // 仅在元表检查失败后区分原有诊断，不在成功路径重复检查类型。
-        *failure = lua_type(state, index) != LUA_TUSERDATA
-                       ? "value must be full userdata with the registered metatable"
-                       : "value must be userdata with the registered metatable";
-        return nullptr;
-    }
-
-    // 第一个 uservalue 是构造完成后才置真的 alive 标记；读取结果随后弹出。
-    const int  type  = lua_getiuservalue(state, index, 1);
-    const bool alive = type == LUA_TBOOLEAN && lua_toboolean(state, -1);
-    lua_pop(state, 1);
-    if (!alive)
-    {
-        *failure = "userdata has already been finalized";
-        return nullptr;
-    }
-
-    // 对象仍存活时建立临时强引用；外层 Binding 接管并在回调结束时释放.
-    lua_pushvalue(state, index);
-    reference = luaL_ref(state, LUA_REGISTRYINDEX);
-    return object;
-}
-
-// 读取 userdata 并建立回调内强引用；类型或存活检查失败时保持调用方输出不变。
-void *LuaBinding::checkUserdata(int index, const std::string &name)
-{
-    int reference = LUA_NOREF; // 成功后交给 Binding 的保活记录。
-    const char *failure = nullptr; // inspectUserdata 返回的静态类型或存活诊断。
-    void *object = inspectUserdata(state_, index, name.c_str(), reference, &failure);
-    if (!object)
-    {
-        setError("INVALID_ARGUMENT", failure);
-        return nullptr;
-    }
-    retainUserdata(object, reference);
     return object;
 }
 } // namespace flywow_lua_binding
