@@ -47,7 +47,7 @@ function pb.encode(name, value)
     return name
 end
 package.loaded.pb = pb
-local codec_module = require "codec"
+local codec_module = require "flywow_gateway_codec"
 -- 为每个构造测试创建 Codec 可消费的 Registry record。
 ---@param commands table 按 command_id 索引、包含消息类型名的测试命令表。
 ---@return table envelope_type 与 commands 字段完整的测试 Registry。

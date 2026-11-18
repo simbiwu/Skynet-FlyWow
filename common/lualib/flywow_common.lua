@@ -21,4 +21,10 @@ function M.elapsed_ms(started_tick, current_tick)
     return elapsed_ticks * MILLISECONDS_PER_TICK
 end
 
+--- 读取 Skynet 的单调时钟，供 FlyWow 各模块以毫秒计算时长或截止时间。
+---@return integer 当前单调毫秒读数，每 10ms 更新一次。
+function M.now_ms()
+    return require("skynet").now() * MILLISECONDS_PER_TICK
+end
+
 return M

@@ -5,8 +5,13 @@
 local root = assert(arg[1])
 package.path = root .. "/common/lualib/?.lua;" ..
     root .. "/gateway/lualib/?.lua;" .. package.path
-local handshake_module = require "handshake"
-local now, closed = 0, 0
+local handshake_module = require "flywow_gateway_handshake"
+local now_ms, closed = 0, 0 -- 测试控制的单调毫秒时钟与释放次数。
+
+---@return integer 当前测试设置的毫秒读数。
+local function read_clock_ms()
+    return now_ms
+end
 local crypto = {}
 -- 替身保持Native对象合同，失败可控；不执行I/O。
 ---@param hello string Gateway 输入的完整 HELLO 字节；替身只用它创建密码对象。
@@ -31,18 +36,11 @@ function crypto.create_context(hello)
     } })
     return native, string.char(2, 1) .. string.rep("c", 97)
 end
-local init_result = handshake_module.init(
-{
-    crypto        = crypto,
-    now           = function() return now end, -- 测试控制的 10ms tick 时钟。
-    timeout_ms    = 1000, -- 测试期限为 1000ms，now 每前进一步代表 10ms。
-}
-)
-assert(init_result.ok, init_result.message)
--- 握手模块单独初始化时也接受超过旧半周期上限的正整数期限。
-local long_timeout_result = handshake_module.init({crypto = crypto, now = function() return now end, timeout_ms = 0x80000000 * 10})
+local gateway_config = { handshake_timeout_ms = 1000 } -- 普通握手场景共用的超时配置。
+local long_timeout_result = handshake_module.init({ handshake_timeout_ms = 0x80000000 * 10 }, crypto, read_clock_ms)
 assert(long_timeout_result.ok, long_timeout_result.message)
-assert(handshake_module.init({crypto = crypto, now = function() return now end, timeout_ms = 1000}).ok)
+local init_result = handshake_module.init(gateway_config, crypto, read_clock_ms)
+assert(init_result.ok, init_result.message)
 local hello = string.char(1, 1, 4) .. string.rep("a", 64)
 local proof = string.char(3) .. string.rep("p", 32)
 local a = handshake_module.accept() -- 本次连接初始状态。
@@ -71,24 +69,24 @@ assert(not handshake_module.receive(d, string.char(3) .. string.rep("x", 32)).ok
 assert(closed == 2)
 local e = handshake_module.accept()
 assert(handshake_module.receive(e, hello).ok)
-now = 100
+now_ms = 1000
 assert(handshake_module.expired(e))
 assert(not handshake_module.receive(e, proof).ok)
 assert(closed == 3)
--- tick 超过 32 位后仍按起始时间计算期限，不随 HELLO 刷新。
-now = 0xfffffff0
+-- 即使时钟读数超过旧的 32 位 tick 范围，也按原接纳起点计算。
+now_ms = 0xfffffff0 * 10
 local f = handshake_module.accept()
-now = 0x100000020
+now_ms = 0x100000020 * 10
 assert(not handshake_module.expired(f))
-now = 0x100000060
+now_ms = 0x100000060 * 10
 assert(handshake_module.expired(f))
 handshake_module.close(f)
 -- READY 已生成但尚未写出时到达绝对期限，confirm 仍须拒绝并释放 Native 对象。
-now = 0
+now_ms = 0
 local confirming = handshake_module.accept() -- 本场景持有的最后确认前连接。
 assert(handshake_module.receive(confirming, hello).ok)
 assert(handshake_module.receive(confirming, proof).ok)
-now = 100
+now_ms = 1000
 local timeout_result = handshake_module.confirm(confirming) -- 写后确认观察到的期限失败。
 assert(not timeout_result.ok and timeout_result.code == "HANDSHAKE_TIMEOUT")
 assert(not handshake_module.ready(confirming))

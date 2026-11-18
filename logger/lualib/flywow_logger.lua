@@ -27,19 +27,22 @@ local logger_is_installed = false -- 当前 State 完成入口替换后置 true�
 
 --- 登记当前 Lua Service 的展示名称。
 --- 这里集中把 Service 名称转换为 Logger 的 R 消息，让 Native Logger 映射 source handle。
----@param service_name string 已限制长度的 Service 名称
+---@param service_name string install 从 SERVICE_NAME 取得并截断的展示名称。
+---@return nil 异步提交登记消息，无业务返回值。
 local function send_service_register(service_name)
     ORIGINAL_ERROR(LOGGER_COMMAND_REGISTER .. service_name)
 end
 
 --- 通知 Native Logger 当前 Service 即将退出。
 --- 这里集中把退出动作转换为 Logger 的 U 消息，清理来源登记。
+---@return nil 异步提交注销消息，无业务返回值。
 local function send_service_unregister()
     ORIGINAL_ERROR(LOGGER_COMMAND_UNREGISTER)
 end
 
 --- 创建 Native Logger 的刷新请求。
 --- 这里集中把刷新动作转换为 Logger 的 F 消息，调用方再通过 skynet.call 等待结果。
+---@return string Native Logger 识别的单字节刷新命令。
 local function make_flush_request()
     return LOGGER_COMMAND_FLUSH
 end
@@ -47,6 +50,8 @@ end
 --- 解析 skynet.error 的最后一个等级参数并异步发送。
 --- 未传等级默认 error；其余参数转成字符串后用一个空格连接。
 --- Native 消息格式为命令字符、等级数字、正文；等级与正文之间不插入分隔符。
+---@param min_level integer install 从配置解析出的最低严重等级；低于此等级的日志直接丢弃。
+---@return fun(...) adapter 替换当前 Lua State 的 skynet.error，过滤后异步投递。
 local function make_adapter(min_level)
     return function(...) -- VARARG_ALLOWED WHY: 保持 skynet.error 的未知参数个数与 nil 兼容。
         -- 取出可选等级；等级参数不再作为正文发送。
@@ -63,12 +68,12 @@ local function make_adapter(min_level)
         end
 
         -- 先得到正文，再一次性拼成 L+等级+正文，避免 Skynet 多参数拼接产生额外空格。
-        local parts = {}
+        local message_parts = {} -- 按参数顺序保存正文片段，包含显式传入的 nil。
         for i = 1, log_arguments.n do
-            parts[i] = tostring(log_arguments[i])
+            message_parts[i] = tostring(log_arguments[i])
         end
 
-        local body = table.concat(parts, " ")
+        local body = table.concat(message_parts, " ") -- 原生 Logger 收到的日志正文。
         ORIGINAL_ERROR(LOGGER_COMMAND_LOG .. tostring(level) .. body)
     end
 end
@@ -76,6 +81,8 @@ end
 --- 安装当前 Lua State 的适配；只在配置 logservice=flywow_logger 时生效，重复安装无副作用。
 --- Service 名来自标准 loader 的 SERVICE_NAME；注销在正常 skynet.exit 时发送。
 --- 不 yield，不修改其他 Service 的 Lua State；异常退出记录由有界登记表限制内存。
+--- 无效的级别配置会抛错。
+---@return nil 无业务返回值；已安装或使用其他 logservice 时直接返回。
 function logger.install()
     if logger_is_installed then
         return
@@ -105,30 +112,35 @@ function logger.install()
         return original_exit()
     end
 
+    -- 日志和退出入口都已安装，后续 install 可直接返回。
     logger_is_installed = true
 end
 
 --- 刷新 Logger 已接收的日志；唯一全局发现是 Skynet 标准 .logger 启动链名字。
 --- 返回 true，写盘失败抛错误；会 yield，业务先停止生产日志再调用，不能替代全进程静止屏障。
----@return boolean
+---@return boolean Native 确认刷新成功，或宿主未启用 FlyWow Logger 时返回 true。
 function logger.flush()
     if skynet.getenv("logservice") ~= "flywow_logger" then
         return true
     end
 
+    -- 当前 State 未注册 text 协议时，先补齐与原生 Logger 交换原始字节所需的协议。
     if not skynet._proto.text then
         skynet.register_protocol
         {
-            name   = "text",
-            id     = skynet.PTYPE_TEXT,
-            pack   = function(text) return text end,
-            unpack = skynet.tostring,
+            name   = "text",           -- 发起刷新调用时使用的协议名。
+            id     = skynet.PTYPE_TEXT, -- 原生 Logger 接收请求使用的协议号。
+            -- 刷新命令直接作为原始字节发送。
+            pack   = function(text)
+                return text
+            end,
+            unpack = skynet.tostring, -- 将回复缓冲区读成 Lua 字符串。
         }
     end
 
     -- flush 是唯一需要等待 Logger 响应的路径；普通日志仍然是异步投递。
-    local result = skynet.call(".logger", "text", make_flush_request())
-    assert(result == "OK", "FlyWow Logger flush failed")
+    local flush_reply = skynet.call(".logger", "text", make_flush_request()) -- Native 确认已收到的日志刷新成功时回复 OK。
+    assert(flush_reply == "OK", "FlyWow Logger flush failed")
     return true
 end
 

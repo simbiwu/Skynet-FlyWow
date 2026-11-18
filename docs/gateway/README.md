@@ -102,7 +102,7 @@ TCP 使用 uint16 big-endian 长度和 Envelope bytes；Gateway 在读取完整 
 
 收到 Skynet 非零写缓冲 warning 时，Gateway 摘除对应连接并执行强制传输关闭；size=0 为恢复通知，忽略。固定 Skynet 首次约在 1 MiB 积压时告警，该机制不是精确内存硬上限。
 
-`read_timeout_ms`、`idle_timeout_ms` 和 `handshake_timeout_ms` 均以毫秒配置。Skynet 时钟每 10ms 前进一步，Gateway 每 100ms 扫描超时连接，因此实际关闭可能晚于配置期限。`idle_timeout_ms` 限制客户端完整业务消息之间的空闲时间。WebSocket ping/pong 与服务端 Push 不重置该计时；TCP 正在读取定长数据时使用独立的 `read_timeout_ms`，同样以毫秒配置。
+握手、读取和空闲期限均以毫秒配置。Worker 为每条连接在堆中登记最早生效的期限，每 100ms 检查堆顶。握手总期限从连接接纳开始，握手确认后切换到业务空闲期限。TCP 帧头和帧体分别使用读取期限，WebSocket 的读取期限覆盖 HTTP Upgrade。完整客户端业务消息刷新空闲时间，传输层 ping/pong 和服务端 Push 不刷新。
 
 ## 连接广播
 
@@ -118,7 +118,7 @@ connection_id=0 的广播只作用于当前 Gateway 实例。多 Gateway 节点�
 
 宿主调用 Gateway 的 stop RPC 时，首个调用负责关闭监听与全部活动连接；Socket 关闭可能 yield，期间到达的重复 stop 立即成功返回 closed_connections=0，不等待或共享首次结果；此返回不表示首次停止已完成。停止完成后的重复调用返回成功且 `closed_connections=0`。
 
-`closed_connections` 统计 listener 关闭完成后连接快照中，由本次 stop 首次摘除并提交关闭的连接数。此前已经由 TCP 会话、超时或回调摘除的连接不计入；底层关闭失败仍计入，并通过 `GATEWAY_STOP_CLOSE_FAILED` 的 details 返回计数，因此它不代表 transport 关闭成功数量。
+`closed_connections` 统计 监听关闭之后，各 Worker 在本次 stop 中首次摘除并提交关闭的连接总数。此前已经由 TCP 会话、超时或回调摘除的连接不计入；底层关闭失败仍计入，并通过 `GATEWAY_STOP_CLOSE_FAILED` 的 details 返回计数，因此它不代表 transport 关闭成功数量。
 
 ## 生成与验证
 

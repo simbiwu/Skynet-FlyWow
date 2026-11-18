@@ -72,7 +72,7 @@ function M.init(codec_config)
     end
 
     -- Registry 骨架通过后逐项核对命令号与消息类型，并统计数量供后续 descriptor 校验使用。
-    local command_count = 0 -- 启动结果使用的已验证命令数。
+    local registered_command_count = 0 -- 用于拒绝没有任何可用命令的 Registry。
     for command_id, definition in pairs(candidate_registry.commands) do
         if type(command_id) ~= "number" or command_id % 1 ~= 0 or
             command_id < 1 or command_id > 0xffffffff or type(definition) ~= "table" or
@@ -83,9 +83,9 @@ function M.init(codec_config)
             return flywow_result.failure("GATEWAY_REGISTRY_INVALID", "gateway command definition is invalid",
                 { command_id = command_id })
         end
-        command_count = command_count + 1
+        registered_command_count = registered_command_count + 1
     end
-    if command_count == 0 then
+    if registered_command_count == 0 then
         return flywow_result.failure("GATEWAY_REGISTRY_INVALID", "gateway registry must contain at least one command")
     end
 
@@ -134,7 +134,7 @@ function M.init(codec_config)
 
     -- 校验完成后才发布 Registry，失败初始化不会覆盖模块已有协议表。
     registry = candidate_registry
-    return flywow_result.success(command_count)
+    return flywow_result.success()
 end
 
 --- 判断命令是否出现在已验证的生成表中。

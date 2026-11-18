@@ -5,9 +5,6 @@ local hotupgrade_common = require "flywow_hotupgrade_common" -- 提供默认状�
 -- 对 Service 暴露普通状态快照、候选 Stage、Commit 和 Abort 操作。
 local M = {}
 
----@class FlyWowHotUpgradeModuleStage
----@field entries table[] 本 State 每个候选模块的旧字段与新字段记录；Commit/Abort 处理，Finish 释放。
-
 --- 复制普通 Lua 状态图；数据限制失败时返回结构化错误。
 ---@param source_graph any 业务状态根值；只接受 nil、string、boolean、number 和普通 table。
 ---@param target_graph? table 可选的现存目标根表；成功时原地更新。

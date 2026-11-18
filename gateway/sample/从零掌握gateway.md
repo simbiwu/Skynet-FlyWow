@@ -344,7 +344,7 @@ skynet.start(function()
         return
     end
     skynet.error("COURSE_GATEWAY_READY transport=", result.value.transport,
-        " port=", result.value.port, " commands=", result.value.command_count)
+        " port=", result.value.port)
 end)
 ```
 
@@ -750,7 +750,6 @@ if not handshake_result.ok then
     return handshake_result
 end
 
-local command_count = codec_result.value
 ```
 
 配置中的三类 timeout 都使用毫秒。内部保存的是毫秒期限，比较时由 `flywow_common` 把 10ms tick 差换算为毫秒。
@@ -766,7 +765,7 @@ local command_count = codec_result.value
 
 codec 先检查这两个字段的类型，再打开 `descriptor_path` 读取全部字节并关闭文件句柄。读取成功后，它调用宿主的 `lua-protobuf` 的 `pb.load()`，把 Descriptor 中的消息定义注册到**当前 Gateway Lua State 的 protobuf 运行时**。接着它遍历 Registry 引用的类型名（Envelope、非空的 Request/Response），逐个调用 `pb.type(type_name)`。这样可以在开始监听前发现“Registry 指向了 Descriptor 中不存在的消息”这一类部署错误。
 
-成功时返回 `FlyWowResult.success(command_count)`；Gateway 从 `codec_result.value` 取得命令数，运行时直接调用 Codec 模块函数。预期失败通过 Result 返回：
+成功时返回 `FlyWowResult.success()`；Worker 在自己的 Lua State 中初始化 Codec。预期失败通过 Result 返回：
 
 | 错误码 | 含义 |
 | --- | --- |
@@ -1099,7 +1098,7 @@ module_state.phase = "running"
 skynet.fork(timeout_loop)
 ```
 
-之后才生成 `FlyWowResult.success({address,port,transport,command_count})`，由 `skynet.retpack(start_result)` 应答 WorldService。**`socket.listen` 与 `socket.start` 可能 yield**；只有取得最终 Result 后，WorldService 才从 `skynet.call` 恢复，向日志打印课程 READY。
+之后才生成包含 address、port 和 transport 的成功 Result，由 `skynet.retpack(start_result)` 应答 WorldService。**`socket.listen` 与 `socket.start` 可能 yield**；只有取得最终 Result 后，WorldService 才从 `skynet.call` 恢复，向日志打印课程 READY。
 
 这里真正有三层独立的“就绪”：Skynet Service 已加载 Lua 入口、Gateway 已监听并进入 `running`、某一个客户端已完成应用握手进入 `ready`。它们不是同一个布尔值。
 
@@ -1304,7 +1303,7 @@ skynet.start(function()
         return
     end
     skynet.error("COURSE_GATEWAY_READY transport=", result.value.transport,
-        " port=", result.value.port, " commands=", result.value.command_count)
+        " port=", result.value.port)
 
     -- 两位已经进入过新手村的玩家均断开后，走 Gateway 正式 stop 合同并结束课程进程。
     skynet.fork(function()
@@ -2168,14 +2167,14 @@ dispatch_payload(connection,payload)
                                            skynet.send(gateway,"lua","send_data", response)
                                              |
 Gateway 接收新的消息 <-------------------------+
-  deliver_outbound_message(response)
+  on_send_data(response)
   -> codec.encode_response
   -> write_connection -> socket.write(长度头 + Envelope)
 ```
 
 这里 **没有 Gateway 等待 WorldService 回包的 `skynet.call`，也没有保存 pending request 或 `request_id`**。WorldService 处理请求的时间不会延迟 Gateway 对这一请求的异步投递完成。两个 Service 的 Lua table 不共享内存，消息需要经过 Skynet 的序列化与投递。
 
-**【真实源码】** `deliver_outbound_message` 校验 `gateway_epoch`、逻辑 `connection_id`、command 和 ready，调用 `codec.encode_response` 生成 Envelope，再通过 `write_connection` 发送。`WorldService` 的 `{player_id=1001,scene_id=7,online_count=1}` 经过其 Registry `response_type` 编码，客户端按 command 1001 重新解码。这才算完整的一次请求响应。
+**【真实源码】** `on_send_data` 校验 `gateway_epoch`、逻辑 `connection_id`、command 和 ready，调用 `codec.encode_response` 生成 Envelope，再通过 `write_connection` 发送。`WorldService` 的 `{player_id=1001,scene_id=7,online_count=1}` 经过其 Registry `response_type` 编码，客户端按 command 1001 重新解码。这才算完整的一次请求响应。
 
 **阶段验收**：沿程序实际位置画出 Gateway 与 WorldService 的两条协程/消息执行链，明确哪里产生网络读等待、哪里 RPC 等待、哪里只有异步 send。能解释 `0` 代表 Skynet 普通 `send` 已接受投递，而不是业务已处理成功。
 
@@ -2294,7 +2293,7 @@ Gateway Service，Lua State G            WorldService，Lua State W
                                           └─ skynet.send(gateway,"lua","send_data",...)
            Gateway 后续收到独立的出站消息 <───┘
   Gateway 另一条消息分发协程 G-send
-  ├─ deliver_outbound_message(outbound)
+  ├─ on_send_data(outbound)
   ├─ codec.encode_response(...)
   ├─ write_connection(...)
   └─ return（无业务 RPC 返回）
@@ -2304,24 +2303,24 @@ Gateway Service，Lua State G            WorldService，Lua State W
 
 ### 4.9 出站源码精读：为什么回包能找到原来的连接
 
-现在从 WorldService 的 `send_to_gateway(epoch,connection_id,1001,data)` 返回到 Gateway Service 的 `skynet.dispatch`。该入口匹配 `command="send_data"`，调用 `deliver_outbound_message(outbound_message)`；和前面的入站同名 `send_data` **只代表宿主与网关互发的消息命令**，消息方向由发起者决定。
+现在从 WorldService 的 `send_to_gateway(epoch,connection_id,1001,data)` 返回到 Gateway Service 的 `skynet.dispatch`。该入口匹配 `command="send_data"`，调用 `on_send_data(message)`；和前面的入站同名 `send_data` **只代表宿主与网关互发的消息命令**，消息方向由发起者决定。
 
-**【真实源码局部：`gateway/service/flywow_gateway.lua` / `deliver_outbound_message()`】**：
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `on_send_data()`】**：
 
 ```lua
-if not module_state.gateway_config or type(outbound_message) ~= "table" or
-    outbound_message.gateway_epoch ~= module_state.epoch or
+if not module_state.gateway_config or type(message) ~= "table" or
+    message.gateway_epoch ~= module_state.epoch or
     module_state.phase ~= "running" then
     return
 end
 
-if not codec_module.has_response(outbound_message.command_id) then
+if not codec_module.has_response(message.command_id) then
     return
 end
 local encode_result = codec_module.encode_response(
-    outbound_message.command_id,
+    message.command_id,
     module_state.gateway_config.protocol_version,
-    outbound_message.data
+    message.data
 )
 ```
 
@@ -2330,7 +2329,7 @@ local encode_result = codec_module.encode_response(
 **【真实源码局部：同一函数的目标连接选择】**：
 
 ```lua
-if outbound_message.connection_id == 0 then
+if message.connection_id == 0 then
     for _, connection in pairs(module_state.connections) do
         if not connection.closed and
             handshake_module.ready(connection.handshake) then
@@ -2340,7 +2339,7 @@ if outbound_message.connection_id == 0 then
     return
 end
 
-local connection = module_state.connections[outbound_message.connection_id]
+local connection = module_state.connections[message.connection_id]
 if not connection or connection.closed or
     not handshake_module.ready(connection.handshake) then
     return
@@ -2401,7 +2400,7 @@ WorldService 清理 players，并调用 Gateway.stop()
 
 ### 5.2 源码深入：单播与广播
 
-**执行位置**：`gateway/service/flywow_gateway.lua` 的 `skynet.dispatch` 收到 `send_data`，调用 `deliver_outbound_message(outbound_message)`；其参数正是上一步 WorldService 的 `send_to_gateway()` 构造的 table。
+**执行位置**：`gateway/service/flywow_gateway.lua` 的 `skynet.dispatch` 收到 `send_data`，调用 `on_send_data(message)`；其参数正是上一步 WorldService 的 `send_to_gateway()` 构造的 table。
 
 1. 检查 `gateway_epoch` 和当前 Gateway 阶段；旧实例消息立即丢弃。
 2. 直接查询 `registry.commands[1002]` 并检查 `1002` 的 `response_type`（本例仅下行，所以客户端不能用 `1002` 发请求）。
@@ -2428,7 +2427,7 @@ skynet.send(state.gateway, "lua", "close",
 
 ```text
 Gateway 的 skynet.dispatch("lua", ...) 收到 command="close"
-  -> request_close(close_request)
+  -> on_close(request)
        -> 校验 gateway_epoch、connection_id
        -> module_state.connections[id]
        -> detach_connection(connection, "closed by handler")
@@ -2455,11 +2454,11 @@ WorldService 收到 gateway_disconnect
 
 ### 5.4 源码精读：为什么同一份出站消息可以广播
 
-上一节 B 入场后，`WorldService.on_enter_world()` 连续发出三条 `skynet.send`：B 的响应、B 的私信、面向当前 Gateway 的公告。Gateway 收到的是**三条独立的 Service 消息**，每条单独进入 `deliver_outbound_message()`；并不是在一次 RPC 中返回三个值。
+上一节 B 入场后，`WorldService.on_enter_world()` 连续发出三条 `skynet.send`：B 的响应、B 的私信、面向当前 Gateway 的公告。Gateway 收到的是**三条独立的 Service 消息**，每条单独进入 `on_send_data()`；并不是在一次 RPC 中返回三个值。
 
 广播时 `connection_id=0` 并非特殊的 fd。Gateway 先根据 `command=1002` 将 `{content="新手村已开放"}` 编成**一份** Envelope bytes，再遍历当时存活的连接。它在读循环里不会向 WorldService 查询“谁属于新手村”，只判断连接尚未 `closed` 且握手 `ready`。因此两条 ready 连接都能收到，未 ready 的连接即使已占据 `max_clients` 名额也不能收到业务公告。
 
-源码路径：`skynet.dispatch("lua", ...)` → `deliver_outbound_message()` → `codec.encode_response()` → `write_connection()`。这里没有 `skynet.call(handler)`，也没有广播批次的 ACK 状态；多 Gateway 节点的全局广播需要宿主分别向每个 Gateway 实例发送，当前 `connection_id=0` 的范围只限本实例。
+源码路径：`skynet.dispatch("lua", ...)` → `on_send_data()` → `codec.encode_response()` → `write_connection()`。这里没有 `skynet.call(handler)`，也没有广播批次的 ACK 状态；多 Gateway 节点的全局广播需要宿主分别向每个 Gateway 实例发送，当前 `connection_id=0` 的范围只限本实例。
 
 **针对本案例的可观察推演**：
 
@@ -2481,12 +2480,12 @@ send_data(epoch, connection_id=0, command_id=1002, "新手村已开放")
 
 ### 5.5 源码精读：逻辑摘除与物理关闭是两个阶段
 
-现在看 B 被主动断开的过程。`WorldService` 30 tick 后 `skynet.send(gateway,"lua","close",{gateway_epoch,connection_id})`。Gateway **文件末尾的 Service 分发入口**先调用 `request_close(close_request)`；该函数不执行同步 RPC 给业务 Service。
+现在看 B 被主动断开的过程。`WorldService` 30 tick 后 `skynet.send(gateway,"lua","close",{gateway_epoch,connection_id})`。Gateway **文件末尾的 Service 分发入口**先调用 `on_close(request)`；该函数不执行同步 RPC 给业务 Service。
 
-**【真实源码局部：`gateway/service/flywow_gateway.lua` / `request_close()`，省略初始参数类型校验】**：
+**【真实源码局部：`gateway/service/flywow_gateway.lua` / `on_close()`，省略初始参数类型校验】**：
 
 ```lua
-local connection = module_state.connections[close_request.connection_id]
+local connection = module_state.connections[request.connection_id]
 if not connection or not detach_connection(connection, "closed by handler") then
     return
 end
@@ -3034,7 +3033,7 @@ end
 
 假设 WebSocket 已在 tick 0 完成应用握手，之后一直没有业务包，`idle_timeout_ms=500`。在 tick 10、20、30、40 的扫描都还没超时；在 tick 50 经过 500ms，满足 `(50-0) * 10 >= 500`，执行 detach 和 transport close。**这是按源码推导的理想化时间线**：实际执行会受到 Skynet 消息调度、计时起点与网络收包时刻影响，不应声称毫秒级精确。
 
-若在 tick 30 收到一个已通过 Registry/Codec 检查的完整业务请求，`dispatch_payload` 更新 `connection.last_message=30`，那么 tick 50 时差值是 20，不会超时，直到新的期限达到。反过来，WebSocket ping/pong 由底层 `http.websocket` 处理，不进入 `dispatch_payload`，因此**不会刷新**本课 Gateway 的业务空闲起点。服务端 Push 走的是 `deliver_outbound_message`，也不会刷新该时间。
+若在 tick 30 收到一个已通过 Registry/Codec 检查的完整业务请求，`dispatch_payload` 更新 `connection.last_message=30`，那么 tick 50 时差值是 20，不会超时，直到新的期限达到。反过来，WebSocket ping/pong 由底层 `http.websocket` 处理，不进入 `dispatch_payload`，因此**不会刷新**本课 Gateway 的业务空闲起点。服务端 Push 走的是 `on_send_data`，也不会刷新该时间。
 
 `expired` 不是持久的“超时状态表”，而是这次扫描产生的临时快照：遍历期间不删 `module_state.connections`，第二个 for 循环才依次 detach/close；因为 `close_transport` 可能 yield，采用快照后不会因删除键或关闭让出协程而破坏本轮遍历。
 
@@ -3164,7 +3163,7 @@ module_state.phase = "stopped"
 
 1. **启动失败**：`COURSE_START_FAILED` 的 `result.code`；检查 `world.pb`、`world_registry.lua`、`lua_path`、`lua_cpath` 与 Native .so。`GATEWAY_REGISTRY_LOAD_FAILED`、`GATEWAY_DESCRIPTOR_READ_FAILED`、`GATEWAY_CRYPTO_LOAD_FAILED` 分属不同入口，不要混为一类。
 2. **连接建立但业务未到**：先辨别 HTTP Upgrade、应用四段握手、`ready`，再查 `ws_handler.message` / `run_tcp`。如果 `COURSE_ENTER` 没出现，先看 Gateway 是否完成 `dispatch_payload`，不先改业务 Service。
-3. **业务到达但没有响应**：确认 WorldService 收到的 `command_id`、`connection_id`、`gateway_epoch`；再查出站 `deliver_outbound_message` 是否因旧 epoch、不在 registry、连接已关闭或编码失败丢弃消息。
+3. **业务到达但没有响应**：确认 WorldService 收到的 `command_id`、`connection_id`、`gateway_epoch`；再查出站 `on_send_data` 是否因旧 epoch、不在 registry、连接已关闭或编码失败丢弃消息。
 4. **断线后玩家在线数未减**：追踪 `detach_connection` 是否发出 `gateway_disconnect`，以及 `on_disconnect` 查到的逻辑连接是否曾进入新手村。
 5. **测试卡住**：对照 `run.sh` 的服务器日志与 C++ 输出，不仅仅看 20 秒超时。区分没收到 READY、没有业务回包、B 未收到服务器 close 和 WorldService 未观察到两次 disconnect。
 
@@ -3176,7 +3175,7 @@ module_state.phase = "stopped"
 
 | 真正的生产文件                               | 本课程何时进入              | 阅读后必须掌握的东西                                                                                                                                                                                |
 | -------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gateway/service/flywow_gateway.lua` | 启动、接收请求、回包、关闭  | `start/normalize_config/accept_client/run_tcp/read_exact/ws_handler.message/dispatch_payload/deliver_outbound_message/request_close/detach_connection/close_transport/timeout_loop/stop` 的调用顺序 |
+| `gateway/service/flywow_gateway.lua` | 启动、接收请求、回包、关闭  | `start/normalize_config/accept_client/run_tcp/read_exact/ws_handler.message/dispatch_payload/on_send_data/on_close/detach_connection/close_transport/timeout_loop/stop` 的调用顺序 |
 | `gateway/tools/generate_gateway_registry.py` | 第一阶段生成协议表 | 直接输出按数字 command ID 查询的消息类型映射 |
 | `gateway/lualib/codec.lua`                   | 第一条业务请求              | `init/decode_envelope/decode_request/encode_response`：Descriptor 与 pb 编解码                                                                                                                       |
 | `gateway/lualib/handshake.lua`               | 连接握手                    | `accept/receive/confirm/ready/expired/close` 和握手上下文所有权                                                                                                                                     |
@@ -3209,7 +3208,7 @@ module_state.phase = "stopped"
 
 - [ ] 从空的 `gateway/sample/master_course/` 开始，亲手创建所有源文件，没有从旧课程复制业务协议产物。
 - [ ] `build_protocol.sh` 能生成本课程 `.pb` 和 Registry，并解释构建期与运行期职责边界。
-- [ ] 手动模式 `run.sh tcp server` 能启动真实 Gateway，Result 的 `command_count` 为 2。
+- [ ] 手动模式 `run.sh tcp server` 能启动真实 Gateway，Gateway 成功启动并返回正确的监听信息。
 - [ ] `run.sh tcp` 中，玩家 A/B 完成真实四段握手，并接收 1、2 人在线的 EnterWorldResponse。
 - [ ] B 独占私信，A/B 都收到广播；B 由 Gateway close，A 主动关闭；业务收到两个 disconnect，Gateway 正常 stop。
 - [ ] `run.sh tcp` 使用同一协议/业务处理跑通等价流程，并能画出 TCP framing。

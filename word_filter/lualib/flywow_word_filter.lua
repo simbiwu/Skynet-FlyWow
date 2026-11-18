@@ -26,7 +26,7 @@ local M = {}
 ---@field length integer 原文字节跨度；compact 时包含中间被忽略的分隔符
 
 ---@class flywow_word_filter_config
----@field keywords string[] 宿主提供的连续数组，创建时构建词库；空词库合法
+---@field keywords? string[] 宿主提供的连续数组，创建时构建词库；空词库合法
 ---@field file? string UTF-8 外部词库路径；每行一个词，空行忽略；与 keywords 二选一
 ---@field compact? boolean 默认 false；true 时忽略固定类别分隔符，可能增加误报
 
@@ -36,10 +36,10 @@ local Filter = {}
 Filter.__index = Filter
 
 --- 将 Native 查询或构建失败转换成 WordFilter 对外返回的错误码。
----@param error_value table Native 返回的诊断表；code 由 LuaBinding 或 WordFilter 写入。
----@return string error_code 调用方可直接判断的错误码。
-local function native_error_code(error_value)
-    local code = error_value.code -- Native 的机器错误码，供 Lua API 调用者判断失败原因。
+---@param native_error table Native 返回的诊断表；code 由 LuaBinding 或 WordFilter 写入。
+---@return flywow_word_filter_error error_code 调用方可直接判断的错误码。
+local function native_error_code(native_error)
+    local code = native_error.code -- Native 的机器错误码，供 Lua API 调用者判断失败原因。
     if code == "INTERNAL_ERROR" then
         return "internal_error"
     end
@@ -106,14 +106,14 @@ function M.create_filter(word_filter_config)
     end
 
     -- Native 校验词库原始键和每项字符串。构建成功后，输入数组不再参与查询。
-    local native_handle, error_value = word_filter_native.create_filter(keywords, compact == true)
+    local native_handle, native_error = word_filter_native.create_filter(keywords, compact == true)
     if not native_handle then
-        return nil, native_error_code(error_value)
+        return nil, native_error_code(native_error)
     end
 
     return setmetatable(
     {
-        native_handle = native_handle,
+        native_handle = native_handle, -- 当前 Filter 持有的只读词库，由 userdata 回收释放。
     }, Filter)
 end
 
@@ -123,9 +123,9 @@ end
 ---@return flywow_word_filter_match[]? 成功时返回按原文 byte 起点和 keyword_id 排序的全部命中；未命中返回空数组。
 ---@return flywow_word_filter_error? 非法 UTF-8、输入过长或结果超限时返回稳定错误码。
 function Filter:find(text)
-    local matches, error_value = word_filter_native.find(self.native_handle, text)
+    local matches, native_error = word_filter_native.find(self.native_handle, text)
     if not matches then
-        return nil, native_error_code(error_value)
+        return nil, native_error_code(native_error)
     end
 
     -- Native 返回全部命中但不保证顺序；按公开合同排序后再交给调用方。
@@ -145,9 +145,9 @@ end
 ---@return flywow_word_filter_error? 输入或命中数量超限时返回稳定错误码，不能把 nil 当作未命中。
 function Filter:contains(text)
     -- Native 成功时返回布尔值，nil 才表示输入或查询失败。
-    local matched, error_value = word_filter_native.contains(self.native_handle, text)
+    local matched, native_error = word_filter_native.contains(self.native_handle, text)
     if matched == nil then
-        return nil, native_error_code(error_value)
+        return nil, native_error_code(native_error)
     end
     return matched
 end

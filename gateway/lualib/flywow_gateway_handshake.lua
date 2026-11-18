@@ -3,7 +3,6 @@
 --- 生命周期：总连接配额归 Gateway；Gateway connection record 为每条连接保存 HandshakeContext 表，本模块通过该表追踪握手阶段并引用对应 Native 密码 userdata。
 --- 失败：可预期失败返回 FlyWowResult；Native Lua Binding 的 nil/error record 在本模块转换为稳定结果。
 local flywow_result = require "flywow_result"
-local flywow_common = require "flywow_common"
 
 local CLIENT_HELLO_SIZE = 67 -- 类型、版本与非压缩 P-256 公钥组成的完整 HELLO。
 local CLIENT_PROOF_SIZE = 33 -- 类型与 HMAC-SHA256 组成的完整客户端证明。
@@ -14,55 +13,19 @@ local M = {}
 local module_state =
 {
     crypto_module = nil, -- 当前 Service 注入的 Native 密码模块。
-    read_tick = nil, -- 当前 Service 注入的 tick 时钟。
-    timeout_ms = nil, -- 从 accept 起算的绝对期限，单位毫秒。
+    read_clock_ms = nil, -- 当前 Worker 注入的单调毫秒时钟。
+    gateway_config = nil, -- 与 Worker 共享的规范化配置，提供握手时长。
 }
 
 ---@class HandshakeContext
 --- Gateway connection record 为单条连接保存的握手状态表。
 ---@field phase "hello"|"proof"|"confirm"|"ready"|"closed" 当前握手阶段。
----@field started integer 绝对起始 tick；消息不会刷新总期限。
+---@field started_ms integer 连接接纳时的单调毫秒读数，握手消息不会刷新。
 ---@field crypto_context userdata|nil M.receive 在 HELLO 成功后保存的 Native userdata；它持有 proof key 和 transcript 摘要，M.close 负责关闭并清空。
 
 ---@class HandshakeOutput
 ---@field response_bytes string 当前阶段需写回客户端的完整握手消息。
 ---@field needs_confirmation boolean true 表示 SERVER_READY 写成功后还须提交 ready。
-
---- 初始化当前 Service 的握手模块；从 Gateway start 接收 Native 接口、时钟和期限。
----@param handshake_config table 含 crypto/now/timeout_ms；期限由 Gateway 以毫秒传入。
----@return FlyWowResult<nil> 成功表示当前 Service 握手配置已就绪；配置无效时返回 HANDSHAKE_CONFIG_INVALID。
-function M.init(handshake_config)
-    if type(handshake_config) ~= "table" then
-        return flywow_result.failure(
-            "HANDSHAKE_CONFIG_INVALID",
-            "handshake config must be a table"
-        )
-    end
-
-    -- 配置表形状有效后读取各依赖；下面验证 Native 接口、时钟和资源边界。
-    local candidate_crypto_module = handshake_config.crypto -- Gateway 注入的 Native 模块表；创建连接 userdata 并提供 verify/close。
-    local candidate_read_tick = handshake_config.now -- Gateway 注入的 10ms tick 时钟；每次读取当前值。
-    local candidate_timeout_ms = handshake_config.timeout_ms -- 从 accept 起算的握手总期限，单位为毫秒。
-    if type(candidate_crypto_module) ~= "table" or
-        type(candidate_crypto_module.create_context) ~= "function" or
-        type(candidate_read_tick) ~= "function" then
-        return flywow_result.failure(
-            "HANDSHAKE_CONFIG_INVALID",
-            "crypto.create_context and now function are required"
-        )
-    end
-    if math.type(candidate_timeout_ms) ~= "integer" or candidate_timeout_ms < 1 then
-        return flywow_result.failure(
-            "HANDSHAKE_CONFIG_INVALID",
-            "timeout_ms must be a positive integer"
-        )
-    end
-
-    -- 依赖全部通过校验后发布配置；Gateway 只在接受连接前初始化，不替换活动连接配置。
-    module_state.crypto_module, module_state.read_tick = candidate_crypto_module, candidate_read_tick
-    module_state.timeout_ms = candidate_timeout_ms
-    return flywow_result.success()
-end
 
 --- 释放连接持有的 Native 密码对象；重复调用不重复释放。
 ---@param context HandshakeContext|nil 当前连接的独占记录；终态不再持有 Native，活动记录的 Native 对象由此关闭。
@@ -81,6 +44,23 @@ local function release_context(context, final_phase)
     end
 end
 
+--- Worker 启动时登记共享配置、Native 密码接口和单调时钟。
+---@param gateway_config GatewayStartConfig Worker 的规范化配置，握手期间读取 handshake_timeout_ms。
+---@param crypto_module table Native 模块，收到合法 HELLO 时调用 create_context。
+---@param read_clock_ms fun(): integer Worker 注入的毫秒时钟，用于记录接入起点和判断到期。
+---@return FlyWowResult<nil> 初始化成功返回空结果，Native 接口缺失返回 HANDSHAKE_CONFIG_INVALID。
+function M.init(gateway_config, crypto_module, read_clock_ms)
+    if type(crypto_module) ~= "table" or type(crypto_module.create_context) ~= "function" then
+        return flywow_result.failure("HANDSHAKE_CONFIG_INVALID", "crypto.create_context is required")
+    end
+
+    -- 保存配置引用，所有连接直接读取 Worker 的握手时长配置。
+    module_state.gateway_config = gateway_config
+    module_state.crypto_module = crypto_module
+    module_state.read_clock_ms = read_clock_ms
+    return flywow_result.success()
+end
+
 --- Gateway 关闭连接时释放尚未完成的握手；重复关闭不重复释放 Native 对象。
 ---@param context HandshakeContext|nil 当前连接持有的握手上下文。
 ---@return nil 资源释放完成，无业务返回值。
@@ -93,23 +73,22 @@ end
 function M.accept()
     return
     {
-        phase          = "hello", -- 首次期待 HELLO；ready/closed 为释放 Native 后的终态。
-        started        = module_state.read_tick(), -- 从接纳起算的绝对起点，后续消息不刷新。
-        crypto_context = nil, -- 收到有效 HELLO 后持有 Native 对象，确认或关闭时释放。
+        phase           = "hello", -- 首次期待 HELLO；ready/closed 为释放 Native 后的终态。
+        started_ms      = module_state.read_clock_ms(), -- 握手总期限从接纳起算，后续消息不刷新起点。
+        crypto_context  = nil, -- 收到有效 HELLO 后持有 Native 对象，确认或关闭时释放。
     }
 end
 
 --- 检查从连接建立到现在经过的毫秒数，判断是否达到握手总期限。
----@param context HandshakeContext|nil accept 建立的记录；读取 phase 与 started，终态不再检查期限。
+---@param context HandshakeContext|nil accept 建立的记录；读取 phase 与 started_ms，终态不再检查期限。
 ---@return boolean 是否已超过握手绝对期限。
 function M.expired(context)
     if type(context) ~= "table" or context.phase == "ready" or context.phase == "closed" then
         return false
     end
 
-    -- common.elapsed_ms 把起始与当前的 tick 差换成毫秒，再与配置期限比较。
-    local elapsed_ms = flywow_common.elapsed_ms(context.started, module_state.read_tick()) -- 从 accept 起算的时长，单位毫秒。
-    return elapsed_ms >= module_state.timeout_ms
+    local elapsed_ms = module_state.read_clock_ms() - context.started_ms -- 自接纳起经过的毫秒数。
+    return elapsed_ms >= module_state.gateway_config.handshake_timeout_ms
 end
 
 --- 返回当前握手阶段的精确帧体长度；TCP 在读取 body 前使用。
@@ -134,7 +113,7 @@ end
 
 --- Gateway 收到完整 HELLO/PROOF 后调用，返回待写响应；Native 普通失败映射为握手错误并释放资源。
 --- 只进行同步密码运算，不 I/O、不 yield；依赖违反固定合同产生的意外错误由 Gateway 会话边界清理。
----@param context HandshakeContext accept 建立的独占记录；读取 phase/started，更新 phase 与 crypto_context。
+---@param context HandshakeContext accept 建立的独占记录；读取 phase 与 started_ms，更新 phase 与 crypto_context。
 ---@param bytes string 当前完整握手帧；只在本次同步处理期间借用。
 ---@return FlyWowResult<HandshakeOutput> 成功 value 含 response_bytes/needs_confirmation；失败时释放连接握手资源。
 function M.receive(context, bytes)
@@ -233,7 +212,7 @@ end
 
 --- Gateway 将 SERVER_READY 提交给本地传输后调用，复核期限、释放 Native 对象并开放业务；不表示对端已收到。
 --- 本函数不 I/O、不 yield；会话只能在本次写成功后调用，不能提前确认。
----@param context HandshakeContext receive 已推进到 confirm 的记录；检查 phase/started，释放 crypto_context 并提交 ready。
+---@param context HandshakeContext receive 已推进到 confirm 的记录；检查 phase 与 started_ms，释放 crypto_context 并提交 ready。
 ---@return FlyWowResult<nil> 成功表示 ready 已提交；阶段错误或期限过期时返回失败结果。
 function M.confirm(context)
     if type(context) ~= "table" or context.phase ~= "confirm" then

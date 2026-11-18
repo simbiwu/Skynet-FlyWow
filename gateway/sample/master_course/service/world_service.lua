@@ -7,20 +7,21 @@ local COMMAND_ENTER_WORLD = 1001 -- EnterWorldRequest/EnterWorldResponse 使用�
 local COMMAND_NOTICE = 1002 -- SystemNoticeResponse 只允许服务器主动下发。
 local state =
 {
-    gateway = nil, -- 本 Service 创建的 Gateway handle；所有出站消息都发送到它。
+    gateway = nil, -- 本 Service 创建的 Listener handle，用于启停 Gateway 和提交全局广播。
     players = {}, -- Gateway 逻辑 connection_id -> 已进入新手村的 player_id；收到 disconnect 时删除。
     online_count = 0, -- 本课程新手村已进入且未断开的玩家数。
     disconnected = 0, -- 本轮实际完成进入后又收到 disconnect 的玩家数；达到 2 用于结束样例。
 }
 
---- 将一个业务 Response 或 Push 异步交给 Gateway；是否真正写到网络由 Gateway 决定。
+--- 将业务响应或推送提交给指定 Gateway Service；单播目标为来源 Worker，广播目标为 Listener。
+---@param gateway_handle integer 单播使用入站消息的来源 Worker handle，广播使用 state.gateway。
 ---@param epoch string 入站请求给出的当前 Gateway 实例身份；广播也要使用它。
 ---@param connection_id integer 正数表示指定连接，0 表示向本 Gateway 全部 ready 连接广播。
 ---@param command_id integer Registry 中定义了 response_type 的命令编号。
 ---@param data table 本次响应或公告消息的 Protobuf 字段 table。
 ---@return nil 只提交 Skynet 异步消息，不等待客户端回包。
-local function send_to_gateway(epoch, connection_id, command_id, data)
-    skynet.send(state.gateway, "lua", "send_data",
+local function send_to_gateway(gateway_handle, epoch, connection_id, command_id, data)
+    skynet.send(gateway_handle, "lua", "send_data",
     {
         gateway_epoch = epoch, -- Gateway 用于拒绝上一轮实例的迟到消息。
         connection_id = connection_id, -- 此处不是底层 Socket fd。
@@ -31,8 +32,9 @@ end
 
 --- Gateway 解出 EnterWorldRequest 后调用；业务记录只在当前 WorldService Lua State 中保存。
 ---@param request table Gateway 发来的记录，使用 gateway_epoch、connection_id、command_id、data。
+---@param worker_handle integer 入站消息的 Skynet 来源地址，用于定向回包、推送和关闭该 Worker 持有的连接。
 ---@return nil 发送业务响应；第二个玩家入场时额外发送单播和广播。
-local function on_enter_world(request)
+local function on_enter_world(request, worker_handle)
     if request.command_id ~= COMMAND_ENTER_WORLD or type(request.data) ~= "table" then
         skynet.error("COURSE_UNEXPECTED_COMMAND")
         return
@@ -52,7 +54,7 @@ local function on_enter_world(request)
     skynet.error("COURSE_ENTER player=", player_id, " connection=", connection_id,
         " online=", state.online_count)
 
-    send_to_gateway(request.gateway_epoch, connection_id, COMMAND_ENTER_WORLD,
+    send_to_gateway(worker_handle, request.gateway_epoch, connection_id, COMMAND_ENTER_WORLD,
     {
         player_id    = player_id, -- 说明本次完成进入的是哪一名演示玩家。
         scene_id     = 7, -- 固定的新手村场景编号。
@@ -61,11 +63,11 @@ local function on_enter_world(request)
 
     if player_id == 1002 then
         -- B 入场后先向 B 单播；随后向本 Gateway 的两条 ready 连接广播。
-        send_to_gateway(request.gateway_epoch, connection_id, COMMAND_NOTICE,
+        send_to_gateway(worker_handle, request.gateway_epoch, connection_id, COMMAND_NOTICE,
         {
             content = "欢迎玩家1002", -- 只有 B 能收到的定向消息。
         })
-        send_to_gateway(request.gateway_epoch, 0, COMMAND_NOTICE,
+        send_to_gateway(state.gateway, request.gateway_epoch, 0, COMMAND_NOTICE,
         {
             content = "新手村已开放", -- 连接编号 0 是广播约定，不是玩家 0。
         })
@@ -74,7 +76,7 @@ local function on_enter_world(request)
         local epoch = request.gateway_epoch -- 延迟回调必须沿用收到 B 请求时的 Gateway 实例身份。
         local target_id = connection_id -- 延迟回调仅操作 B 的逻辑连接，不能拿 Socket fd 当身份。
         skynet.timeout(30, function()
-            skynet.send(state.gateway, "lua", "close",
+            skynet.send(worker_handle, "lua", "close",
             {
                 gateway_epoch = epoch, -- 拒绝旧 Gateway 实例的迟到关闭命令。
                 connection_id = target_id, -- 仅要求 Gateway 关闭玩家 B 的连接。
@@ -104,9 +106,9 @@ end
 skynet.start(function()
     -- 先注册 handler，再创建和启动 Gateway；否则请求可能没有接收方。
     skynet.name(HANDLER_NAME, skynet.self())
-    skynet.dispatch("lua", function(session, _, command, message)
+    skynet.dispatch("lua", function(session, source, command, message)
         if command == "send_data" then
-            on_enter_world(message)
+            on_enter_world(message, source)
         elseif command == "gateway_disconnect" then
             on_disconnect(message)
         else
@@ -142,7 +144,7 @@ skynet.start(function()
         return
     end
     skynet.error("COURSE_GATEWAY_READY transport=", result.value.transport,
-        " port=", result.value.port, " commands=", result.value.command_count)
+        " port=", result.value.port)
 
     -- 两位已经进入过新手村的玩家均断开后，走 Gateway 正式 stop 合同并结束课程进程。
     skynet.fork(function()

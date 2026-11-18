@@ -23,7 +23,7 @@ skynet.start(function()
     end
 
     skynet.name(SAMPLE_HANDLER_SERVICE, skynet.self())
-    skynet.dispatch("lua", function(session, _, command, message)
+    skynet.dispatch("lua", function(session, source, command, message)
         if command == "send_data" then
             if type(message) ~= "table" or message.command_id ~= 1101 or
                 type(message.data) ~= "table" or message.data.scenario_id ~= 1 or
@@ -35,8 +35,8 @@ skynet.start(function()
             module_state.request_received = true
             skynet.error("FLYWOW_GATEWAY_SAMPLE_REQUEST_RECEIVED mode=" .. SAMPLE_MODE)
 
-            -- 同一连接先收到 FrameJoin 响应，再收到服务端主动 FramePush。
-            skynet.send(module_state.gateway_service_handle, "lua", "send_data",
+            -- 来源 Worker 持有当前连接；响应和定向 Push 都直接发回同一个 Worker。
+            skynet.send(source, "lua", "send_data",
             {
                 gateway_epoch = message.gateway_epoch, -- 沿用请求的 Gateway 实例身份，拒绝旧实例消息。
                 connection_id = message.connection_id, -- 沿用来源连接号，定向投递给同一客户端。
@@ -49,7 +49,7 @@ skynet.start(function()
                 },
             })
 
-            skynet.send(module_state.gateway_service_handle, "lua", "send_data",
+            skynet.send(source, "lua", "send_data",
             {
                 gateway_epoch = message.gateway_epoch, -- 沿用请求的 Gateway 实例身份，拒绝旧实例消息。
                 connection_id = message.connection_id, -- 沿用来源连接号，定向投递给同一客户端。
@@ -93,7 +93,7 @@ skynet.start(function()
     end
     local gateway_info = gateway_start_result.value -- 实际监听地址、传输类型和命令数。
     if gateway_info.address ~= "127.0.0.1" or gateway_info.port ~= SAMPLE_PORT or
-        gateway_info.transport ~= SAMPLE_TRANSPORT or gateway_info.command_count <= 0 then
+        gateway_info.transport ~= SAMPLE_TRANSPORT then
         skynet.error("FLYWOW_GATEWAY_SAMPLE_FAILED unexpected Gateway start result")
         skynet.abort()
         return

@@ -3,16 +3,6 @@
 --- 生命周期：每个 Lua State require 缓存此模块；静态地图由 Native 进程 Registry 持有。
 --- Native 查询同步且不 yield；同一 Context 只允许其 owner 顺序调用。
 
----@class FlyWowNavigationPosition
----@field x_mm integer 世界 X，整数毫米；调用方持有的纯数据。
----@field y_mm integer 世界高度 Y，整数毫米；地面移动由地图归一化，空中由调用方指定。
----@field z_mm integer 世界 Z，整数毫米；不是 Grid 下标。
-
----@class FlyWowNavigationError
----@field code string 稳定机器错误码；按此字段分支，不解析文案。
----@field position? FlyWowNavigationPosition 空中推进预算失败时最后提交位置；其它错误可无此字段。
----@field message string 诊断上下文；只用于日志，不进入业务判断。
-
 ---@class FlyWowNavigationProfile
 ---@field unit_id integer 通用 Unit 类型 ID；Registry 按该 ID 排序并二分查找。
 ---@field radius_mm integer 非负体型半径，毫米；静态/动态 footprint 共同使用。
@@ -113,13 +103,13 @@
 ---@field find_path fun(self:FlyWowNavigationContext,unit_id:integer,start:FlyWowNavigationPosition,goal:FlyWowNavigationPosition,unit_instance_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError?
 ---@field find_path_to_range fun(self:FlyWowNavigationContext,unit_id:integer,start:FlyWowNavigationPosition,target:FlyWowNavigationPosition,range_mm:integer,unit_instance_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError? 以目标中心为圆心的通用导航范围查询，不代表战斗攻击规则。
 ---@field find_path_to_unit_range fun(self:FlyWowNavigationContext,mover_unit_id:integer,start_world:FlyWowNavigationPosition,target_unit_id:integer,target_world:FlyWowNavigationPosition,unit_instance_id:integer,allow_partial?:boolean):FlyWowNavigationPath?,FlyWowNavigationError? 双方导航半径限定不可重叠距离，Grid 对角线容差适配离散终点；不读取攻击距离。
----@field place_unit fun(self:FlyWowNavigationContext,unit_id:integer,unit_instance_id:integer,position:FlyWowNavigationPosition):FlyWowNavigationPosition?,FlyWowNavigationError?
----@field move_unit fun(self:FlyWowNavigationContext,unit_id:integer,unit_instance_id:integer,from_world:FlyWowNavigationPosition,to_world:FlyWowNavigationPosition):FlyWowNavigationPosition?,FlyWowNavigationError?
----@field release_unit fun(self:FlyWowNavigationContext,unit_instance_id:integer):boolean?,FlyWowNavigationError?
+---@field place_unit fun(self:FlyWowNavigationContext,unit_id:integer,unit_instance_id:integer,position:FlyWowNavigationPosition):FlyWowNavigationPosition?,FlyWowNavigationError? 提交出生占位；失败保留原占位。
+---@field move_unit fun(self:FlyWowNavigationContext,unit_id:integer,unit_instance_id:integer,from_world:FlyWowNavigationPosition,to_world:FlyWowNavigationPosition):FlyWowNavigationPosition?,FlyWowNavigationError? 复验并提交移动子步；成功返回 Y 按地表归一化的世界位置。
+---@field release_unit fun(self:FlyWowNavigationContext,unit_instance_id:integer):boolean?,FlyWowNavigationError? 释放该实例在当前 Context 中占用的格子。
 ---@field advance_path fun(self:FlyWowNavigationContext,request:FlyWowNavigationAdvanceRequest):FlyWowNavigationAdvanceResult?,FlyWowNavigationError?
 ---@field unit_radius_mm fun(self:FlyWowNavigationContext,unit_id:integer):integer?,FlyWowNavigationError? 读取当前 Registry 中该 Unit 类型的导航半径。
 ---@field map_version fun(self:FlyWowNavigationContext):integer?,FlyWowNavigationError? 读取 Context 固定地图的资产版本。
----@field cell_size_mm fun(self:FlyWowNavigationContext):integer?,FlyWowNavigationError?
+---@field cell_size_mm fun(self:FlyWowNavigationContext):integer?,FlyWowNavigationError? 读取 Context 所持地图的正方形格子边长，单位为毫米。
 ---@field close fun(self:FlyWowNavigationContext) 幂等释放大块 Context 内存，无返回值；GC 兜底析构 userdata。
 
 ---@class FlyWowNavigationIdentity

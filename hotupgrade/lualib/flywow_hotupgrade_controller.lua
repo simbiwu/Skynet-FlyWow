@@ -115,17 +115,13 @@ end
 --- 例如 lualib/player/logic.lua 转成 lualib.player.logic；非法扩展名或反斜杠返回 nil。
 ---@param relative_path string 相对发布包根目录的普通 Lua 文件路径；本函数去掉 .lua 并把 / 换成 .。
 ---@return string|nil relative_module_name 去掉 .lua 并转为点分隔的模块名；路径不合法时为 nil。
-local function module_name(relative_path)
+local function cache_alias_from_path(relative_path)
     if relative_path:sub(-4) ~= ".lua" or relative_path:find("\\", 1, true) then
         return nil
     end
 
     return relative_path:sub(1, -5):gsub("/", ".")
 end
-
----@class FlyWowHotUpgradeTargetMetadata
----@field module_paths string[] 当前 State 已声明模块的宿主相对文件路径数组
----@field has_service_update boolean 是否在本 State 提供私有状态及函数更新入口
 
 ---@class FlyWowHotUpgradeRegisteredService
 ---@field service_name string Skynet Service 入口名，用于匹配 Service Patch
@@ -160,11 +156,6 @@ end
 ---@field source string 从本批 Patch 读取并固定的 Lua 文件内容，作为正式部署内容
 ---@field name? string 普通模块的缓存别名；Service 入口只部署，不设置此字段
 
----@class FlyWowHotUpgradeModulePatch
----@field name string 目标 Lua State 的缓存别名；如 lualib/player.lua 对应 lualib.player
----@field host_relative_path string 相对宿主根的真实文件路径；Controller 按它匹配，目标按它取得原加载参数
----@field source string 本批读取并固定的模块源码，随 Update 发给匹配 Service
-
 ---@class FlyWowHotUpgradeServicePatchSource
 ---@field patch_relative_path string 相对于本批 patch_dir 的 Service .patch 路径，例如 service/player_service.patch；用于目标匹配和错误诊断，不用于宿主部署
 ---@field service_patch_source string 本批读取并固定的 Service .patch 源码，随 Update 请求发送
@@ -184,11 +175,6 @@ end
 ---@field current_service_handle? integer 当前或最近一次处理的业务 Service handle；status 对外返回此值
 ---@field waiter? thread 等待创建/登记或首次模块加载完成的批次协程
 ---@field error? FlyWowResult 本批首个失败或恢复失败结果
-
----@class FlyWowHotUpgradeControlRequest
----@field batch_id string Controller Service handle 与本进程递增序号组成；仅在该 Controller 生命周期有效
----@field modules? FlyWowHotUpgradeModulePatch[] Controller 按目标已登记文件筛选、按缓存别名排序的候选；不含业务对象
----@field service_patch_source? string Update 请求携带的 Service .patch 源码；没有匹配的 Service Patch 时为 nil
 
 ---@class FlyWowHotUpgradeManagementRequest
 ---@field path? string begin 的 Patch Root 相对目录
@@ -885,7 +871,7 @@ local function freeze_patch_files(controller, batch)
             batch.files[#batch.files + 1] = file
             if not is_service then
                 -- 普通 Lua 文件对应的 require 名；按斜杠转点，例如 a/b.lua 得到 a.b。
-                local name = module_name(relative_path)
+                local name = cache_alias_from_path(relative_path)
                 if not name or name == "" or module_names[name] then
                     return flywow_result.failure("HU_INVALID_PATCH", "Lua 路径映射重复或无效: " .. relative_path)
                 end

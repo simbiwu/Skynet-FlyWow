@@ -350,7 +350,6 @@ local function scenario(overrides, expect_start_failure, use_real_handshake, omi
     end
 
     -- 查询 API 使用同一 Registry；下游 Gateway 按其结果决定是否解码或编码消息。
-    codec.command_count = 1 -- 本场景 Registry 声明一个命令。
     --- 按本场景 Registry 查询命令。
     ---@param command_id integer 入站命令号。
     ---@return boolean found 命令是否存在。
@@ -390,10 +389,10 @@ local function scenario(overrides, expect_start_failure, use_real_handshake, omi
     package.loaded["http.websocket"] = websocket
     package.loaded["test.registry"] = registry
     -- 模块初始化只报告命令数；运行操作直接使用本场景替身模块。
-    codec.init = function() return flywow_result.success(codec.command_count) end
-    package.loaded["codec"] = codec
+    codec.init = function() return flywow_result.success() end
+    package.loaded["flywow_gateway_codec"] = codec
     package.loaded["flywow_gateway_crypto"] = {}
-    package.loaded["handshake"] =
+    package.loaded["flywow_gateway_handshake"] =
     {
         -- 每个连接使用独立替身上下文；真实密码学握手由 Native 测试覆盖。
         init = function() return flywow_result.success() end,
@@ -424,8 +423,8 @@ local function scenario(overrides, expect_start_failure, use_real_handshake, omi
     }
     -- 组合边界场景使用真实 receive/confirm/close；文件 userdata 只替代 Native 的密码运算与释放动作。
     if use_real_handshake then
-        package.loaded["handshake"] = nil
-        e.handshake = require "handshake" -- 本场景真实模块；验证握手状态和 Native 对象释放。
+        package.loaded["flywow_gateway_handshake"] = nil
+        e.handshake = require "flywow_gateway_handshake" -- 本场景真实模块；验证握手状态和 Native 对象释放。
         e.crypto_closed = 0 -- 记录此场景实际释放的密码对象数量。
         local crypto = {} -- 固定 Native 合同的可控密码替身，不替换 Lua 状态机。
         --- Gateway 状态机收到 HELLO 时创建独占 userdata，普通密码错误返回 nil/error。
